@@ -46,6 +46,14 @@ impl Rect {
     pub const fn bottom(&self) -> i32 {
         self.y + self.height
     }
+
+    /// Whether `other` lies entirely within this rectangle.
+    pub const fn contains(&self, other: &Rect) -> bool {
+        other.x >= self.x
+            && other.y >= self.y
+            && other.right() <= self.right()
+            && other.bottom() <= self.bottom()
+    }
 }
 
 #[cfg(test)]
@@ -73,5 +81,14 @@ mod tests {
         assert!(r.has_positive_area());
         assert_eq!(r.right(), 0);
         assert_eq!(r.bottom(), 0);
+    }
+
+    #[test]
+    fn rect_contains_is_inclusive_of_edges() {
+        let outer = Rect::new(0, 0, 100, 100);
+        assert!(outer.contains(&Rect::new(0, 0, 100, 100)));
+        assert!(outer.contains(&Rect::new(10, 10, 50, 50)));
+        assert!(!outer.contains(&Rect::new(-1, 0, 100, 100)));
+        assert!(!outer.contains(&Rect::new(0, 0, 101, 100)));
     }
 }

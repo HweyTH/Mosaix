@@ -17,9 +17,12 @@ pub struct WindowId(pub isize);
 
 /// Display / monitor identity.
 ///
-/// Populated from `HMONITOR` on Windows or `CGDirectDisplayID` on macOS.
+/// Populated from an `HMONITOR` (cast to `isize`, matching `WindowId`'s
+/// treatment of `HWND` -- both are pointer-sized opaque handles, so a
+/// narrower integer type would risk truncating two distinct handles onto
+/// the same ID) on Windows, or `CGDirectDisplayID` on macOS.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct DisplayId(pub u32);
+pub struct DisplayId(pub isize);
 
 /// Application identity derived from the executable path or bundle ID.
 ///

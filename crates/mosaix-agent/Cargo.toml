@@ -10,3 +10,9 @@ name = "mosaix-agent"
 path = "src/main.rs"
 
 [dependencies]
+mosaix-engine = { path = "../mosaix-engine" }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+mosaix-platform-windows = { path = "../mosaix-platform-windows" }
