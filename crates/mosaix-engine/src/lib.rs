@@ -191,7 +191,7 @@ mod tests {
     use mosaix_domain::{DisplayId, Rect, Rotation};
     use std::time::{Duration, Instant};
 
-    fn display(id: u64, fingerprint: &str, x: i32) -> Display {
+    fn display(id: isize, fingerprint: &str, x: i32) -> Display {
         Display {
             id: DisplayId(id),
             stable_fingerprint: fingerprint.to_string(),

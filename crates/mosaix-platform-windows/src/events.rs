@@ -222,8 +222,9 @@ pub fn start_event_hooks() -> Result<(EventHooks, Receiver<RawEvent>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{move_resize_window, Bounds};
+    use crate::move_resize_window;
     use crate::test_support::create_test_window;
+    use mosaix_domain::Rect;
     use std::time::{Duration, Instant};
     use windows::Win32::UI::WindowsAndMessaging::DestroyWindow;
 
@@ -258,15 +259,7 @@ mod tests {
             "expected WindowCreated for the freshly created window"
         );
 
-        move_resize_window(
-            hwnd,
-            Bounds {
-                x: 10,
-                y: 10,
-                width: 300,
-                height: 200,
-            },
-        )
+        move_resize_window(hwnd, Rect::new(10, 10, 300, 200))
         .expect("move/resize should succeed");
 
         assert!(
