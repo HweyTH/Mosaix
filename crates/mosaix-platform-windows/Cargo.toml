@@ -1,0 +1,8 @@
+[package]
+name = "mosaix-platform-windows"
+description = "Windows platform adapter: Win32 window management, event hooks, and DPI handling."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]

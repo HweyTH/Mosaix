@@ -1,0 +1,8 @@
+[package]
+name = "mosaix-engine"
+description = "Authoritative state reducer, reconciliation, placement diff, and transaction planning."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]

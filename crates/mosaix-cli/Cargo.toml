@@ -1,0 +1,12 @@
+[package]
+name = "mosaix-cli"
+description = "Mosaix command-line client."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "mosaix"
+path = "src/main.rs"
+
+[dependencies]

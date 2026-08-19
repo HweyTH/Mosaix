@@ -1,0 +1,8 @@
+[package]
+name = "mosaix-ipc"
+description = "IPC protocol definitions and local transport implementations."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]

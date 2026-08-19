@@ -1,0 +1,8 @@
+[package]
+name = "mosaix-rules"
+description = "Window rule matching, precedence resolution, and evaluation explanations."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]

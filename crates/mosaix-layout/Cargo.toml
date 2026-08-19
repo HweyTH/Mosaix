@@ -1,0 +1,8 @@
+[package]
+name = "mosaix-layout"
+description = "Layout planners: manual zone planner and automatic tree planner with strategies and normalization."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]

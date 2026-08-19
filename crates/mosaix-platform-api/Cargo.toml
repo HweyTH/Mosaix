@@ -1,0 +1,8 @@
+[package]
+name = "mosaix-platform-api"
+description = "Platform adapter traits, capability model, and shared platform abstractions."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
