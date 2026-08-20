@@ -18,11 +18,13 @@
 //! commands) exists yet for them to operate on -- they land once those
 //! domain types do.
 
+use std::collections::HashMap;
 use std::sync::mpsc::{sync_channel, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
-use mosaix_domain::{topology_fingerprint, Display};
+use mosaix_domain::{topology_fingerprint, Display, DisplayId, Rect, WindowId};
+use mosaix_layout::{cycle_display, throw_preserving_ratio, DisplayDirection};
 
 /// Default bound on the event queue before a sender blocks. Chosen
 /// generously relative to expected event rates -- architecture doc section
@@ -32,15 +34,41 @@ pub const DEFAULT_QUEUE_CAPACITY: usize = 256;
 
 /// State the reducer owns and is the only writer of.
 ///
-/// Only display topology exists as real domain state today; window
-/// registry, workspaces, and rules will extend this as those domain types
-/// land (architecture doc section 7).
+/// Display topology and per-window placement exist as real domain state
+/// today; a full window registry, workspaces, and rules will extend this
+/// as those domain types land (architecture doc section 7).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct EngineState {
     /// Bumped on every committed mutation (architecture doc section 13:
     /// "Monotonic state revision on every committed mutation").
     pub revision: u64,
     pub displays: Vec<Display>,
+    /// Where each tracked window currently sits, keyed by window. Entries
+    /// are created (and their `previous_placement` remembered) by
+    /// [`Event::WindowPlaced`] and [`Event::WindowThrowToDisplayRequested`].
+    pub windows: HashMap<WindowId, WindowPlacement>,
+}
+
+/// A tracked window's current bounds and display, plus the display and
+/// bounds it had immediately before its most recent placement, if any --
+/// the "remembered pre-snap size" [`mosaix_layout`]'s zone planner docs say
+/// belongs with whatever tracks window state, not the stateless planner
+/// itself (architecture doc section 20, "restore" command).
+///
+/// Both the display and the bounds are remembered together, not bounds
+/// alone: a placement can move a window to a different display (a throw),
+/// so bounds computed relative to the source display would be wrong if
+/// reapplied under the target display's `display_id`.
+///
+/// Phase 1's restore is a single remembered step, not a full undo stack
+/// (that's Phase 2's "undo" -- architecture doc section 20), so
+/// `previous_placement` holds at most one prior placement, and restoring
+/// clears it rather than pushing the restored state back onto a stack.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WindowPlacement {
+    pub display_id: DisplayId,
+    pub bounds: Rect,
+    pub previous_placement: Option<(DisplayId, Rect)>,
 }
 
 /// An event the reducer applies to [`EngineState`]. Producers (platform
@@ -54,6 +82,36 @@ pub enum Event {
     /// decides, via [`topology_fingerprint`], whether anything actually
     /// changed.
     DisplayTopologyChanged(Vec<Display>),
+
+    /// A window was snapped or otherwise placed at `bounds` on
+    /// `display_id`. Producers (a zone-snap command that resolved bounds
+    /// via [`mosaix_layout`], drag-to-snap, etc.) send this after
+    /// computing the new bounds; the reducer records it as the window's
+    /// current placement and stashes wherever it was before as the one
+    /// step [`Event::WindowRestoreRequested`] can undo.
+    WindowPlaced {
+        window_id: WindowId,
+        display_id: DisplayId,
+        bounds: Rect,
+    },
+
+    /// Undo the window's most recent placement, returning it to the
+    /// display and bounds it had immediately before (architecture doc
+    /// section 20, "restore"). A no-op if the window isn't tracked, or has
+    /// no remembered prior placement (e.g. it was only ever placed once,
+    /// or was already restored).
+    WindowRestoreRequested { window_id: WindowId },
+
+    /// Move a window to the adjacent display in `direction`, preserving
+    /// its position/size as a fraction of the display's work area
+    /// (architecture doc section 20, "next-display" command). A no-op if
+    /// the window isn't tracked, its current display is no longer in the
+    /// topology, or there's no adjacent display to move to (e.g. only one
+    /// display is connected).
+    WindowThrowToDisplayRequested {
+        window_id: WindowId,
+        direction: DisplayDirection,
+    },
 }
 
 /// Applies one event to `state`. Must never panic -- a single bad event
@@ -70,7 +128,78 @@ fn apply(state: &mut EngineState, event: Event) {
             state.displays = displays;
             state.revision += 1;
         }
+
+        Event::WindowPlaced { window_id, display_id, bounds } => {
+            place_window(state, window_id, display_id, bounds);
+        }
+
+        Event::WindowRestoreRequested { window_id } => {
+            let Some(placement) = state.windows.get_mut(&window_id) else {
+                tracing::debug!(?window_id, "restore requested for an untracked window; ignoring");
+                return;
+            };
+            let Some((previous_display_id, previous_bounds)) = placement.previous_placement.take() else {
+                tracing::debug!(?window_id, "restore requested but no prior placement is remembered; ignoring");
+                return;
+            };
+            placement.display_id = previous_display_id;
+            placement.bounds = previous_bounds;
+            state.revision += 1;
+        }
+
+        Event::WindowThrowToDisplayRequested { window_id, direction } => {
+            let Some(placement) = state.windows.get(&window_id) else {
+                tracing::debug!(?window_id, "throw-to-display requested for an untracked window; ignoring");
+                return;
+            };
+            let (from_display_id, bounds) = (placement.display_id, placement.bounds);
+
+            let Some(to_display_id) = cycle_display(&state.displays, from_display_id, direction) else {
+                tracing::debug!(?window_id, "no adjacent display to throw the window to; ignoring");
+                return;
+            };
+            let Some(from_work_area) = work_area_of(&state.displays, from_display_id) else {
+                tracing::debug!(
+                    ?window_id,
+                    ?from_display_id,
+                    "window's display is no longer in the topology; ignoring throw"
+                );
+                return;
+            };
+            let Some(to_work_area) = work_area_of(&state.displays, to_display_id) else {
+                tracing::debug!(?window_id, ?to_display_id, "target display vanished mid-throw; ignoring");
+                return;
+            };
+
+            let new_bounds = throw_preserving_ratio(bounds, from_work_area, to_work_area);
+            place_window(state, window_id, to_display_id, new_bounds);
+        }
     }
+}
+
+/// The work area of the display with `id`, if it's still in `displays`.
+fn work_area_of(displays: &[Display], id: DisplayId) -> Option<Rect> {
+    displays.iter().find(|display| display.id == id).map(|display| display.work_area)
+}
+
+/// Records `bounds` as `window_id`'s current placement on `display_id`,
+/// stashing wherever it was before (if it was already tracked) as the one
+/// step [`Event::WindowRestoreRequested`] can undo, and bumps the
+/// revision.
+fn place_window(state: &mut EngineState, window_id: WindowId, display_id: DisplayId, bounds: Rect) {
+    let previous_placement = state
+        .windows
+        .get(&window_id)
+        .map(|placement| (placement.display_id, placement.bounds));
+    state.windows.insert(
+        window_id,
+        WindowPlacement {
+            display_id,
+            bounds,
+            previous_placement,
+        },
+    );
+    state.revision += 1;
 }
 
 /// The queue actually carries this, not `Event` directly, so [`stop`]
@@ -165,6 +294,7 @@ pub fn spawn_engine_with_capacity(initial_displays: Vec<Display>, capacity: usiz
     let initial_state = EngineState {
         revision: 0,
         displays: initial_displays,
+        windows: HashMap::new(),
     };
     let state = Arc::new(Mutex::new(initial_state.clone()));
 
@@ -256,6 +386,244 @@ mod tests {
 
         assert_eq!(state.revision, 2);
         assert_eq!(state.displays.len(), 2);
+    }
+
+    #[test]
+    fn apply_window_placed_tracks_the_window_with_no_previous_bounds() {
+        let mut state = EngineState::default();
+        let bounds = Rect::new(0, 0, 960, 1080);
+        apply(
+            &mut state,
+            Event::WindowPlaced { window_id: WindowId(1), display_id: DisplayId(1), bounds },
+        );
+
+        let placement = state.windows.get(&WindowId(1)).expect("window should be tracked");
+        assert_eq!(placement.display_id, DisplayId(1));
+        assert_eq!(placement.bounds, bounds);
+        assert_eq!(placement.previous_placement, None);
+        assert_eq!(state.revision, 1);
+    }
+
+    #[test]
+    fn apply_window_placed_again_remembers_the_prior_display_and_bounds() {
+        let mut state = EngineState::default();
+        let first = Rect::new(0, 0, 960, 1080);
+        let second = Rect::new(0, 0, 1920, 1080);
+        apply(
+            &mut state,
+            Event::WindowPlaced { window_id: WindowId(1), display_id: DisplayId(1), bounds: first },
+        );
+        apply(
+            &mut state,
+            Event::WindowPlaced { window_id: WindowId(1), display_id: DisplayId(1), bounds: second },
+        );
+
+        let placement = state.windows.get(&WindowId(1)).unwrap();
+        assert_eq!(placement.bounds, second);
+        assert_eq!(placement.previous_placement, Some((DisplayId(1), first)));
+        assert_eq!(state.revision, 2);
+    }
+
+    #[test]
+    fn apply_restore_reverts_to_the_previous_bounds_and_clears_it() {
+        let mut state = EngineState::default();
+        let first = Rect::new(0, 0, 960, 1080);
+        let second = Rect::new(0, 0, 1920, 1080);
+        apply(
+            &mut state,
+            Event::WindowPlaced { window_id: WindowId(1), display_id: DisplayId(1), bounds: first },
+        );
+        apply(
+            &mut state,
+            Event::WindowPlaced { window_id: WindowId(1), display_id: DisplayId(1), bounds: second },
+        );
+        apply(&mut state, Event::WindowRestoreRequested { window_id: WindowId(1) });
+
+        let placement = state.windows.get(&WindowId(1)).unwrap();
+        assert_eq!(placement.bounds, first, "restore should return to the bounds before the last placement");
+        assert_eq!(placement.display_id, DisplayId(1));
+        assert_eq!(placement.previous_placement, None, "restore is a single step, not a stack");
+        assert_eq!(state.revision, 3);
+    }
+
+    #[test]
+    fn apply_restore_after_a_cross_display_throw_reverts_the_display_too() {
+        // Regression test: a naive implementation that remembers only
+        // `bounds` (not which display they belonged to) would restore
+        // source-display-relative coordinates while leaving `display_id`
+        // at the post-throw target display.
+        let mut state = EngineState::default();
+        apply(
+            &mut state,
+            Event::DisplayTopologyChanged(vec![display(1, "MON-A", 0), display(2, "MON-B", 1920)]),
+        );
+        let original_bounds = Rect::new(0, 0, 960, 1080);
+        apply(
+            &mut state,
+            Event::WindowPlaced { window_id: WindowId(1), display_id: DisplayId(1), bounds: original_bounds },
+        );
+        apply(
+            &mut state,
+            Event::WindowThrowToDisplayRequested { window_id: WindowId(1), direction: DisplayDirection::Next },
+        );
+        apply(&mut state, Event::WindowRestoreRequested { window_id: WindowId(1) });
+
+        let placement = state.windows.get(&WindowId(1)).unwrap();
+        assert_eq!(placement.display_id, DisplayId(1), "restore must move the window back to its source display");
+        assert_eq!(placement.bounds, original_bounds);
+    }
+
+    #[test]
+    fn apply_restore_twice_only_undoes_one_step() {
+        let mut state = EngineState::default();
+        let first = Rect::new(0, 0, 960, 1080);
+        let second = Rect::new(0, 0, 1920, 1080);
+        apply(
+            &mut state,
+            Event::WindowPlaced { window_id: WindowId(1), display_id: DisplayId(1), bounds: first },
+        );
+        apply(
+            &mut state,
+            Event::WindowPlaced { window_id: WindowId(1), display_id: DisplayId(1), bounds: second },
+        );
+        apply(&mut state, Event::WindowRestoreRequested { window_id: WindowId(1) });
+        let revision_after_first_restore = state.revision;
+        apply(&mut state, Event::WindowRestoreRequested { window_id: WindowId(1) });
+
+        let placement = state.windows.get(&WindowId(1)).unwrap();
+        assert_eq!(placement.bounds, first, "a second restore with nothing remembered must be a no-op");
+        assert_eq!(state.revision, revision_after_first_restore, "a no-op restore must not bump the revision");
+    }
+
+    #[test]
+    fn apply_restore_is_a_noop_for_an_untracked_window() {
+        let mut state = EngineState::default();
+        apply(&mut state, Event::WindowRestoreRequested { window_id: WindowId(1) });
+
+        assert_eq!(state.revision, 0);
+        assert!(state.windows.is_empty());
+    }
+
+    #[test]
+    fn apply_throw_moves_the_window_to_the_next_display_preserving_its_ratio() {
+        let mut state = EngineState::default();
+        apply(
+            &mut state,
+            Event::DisplayTopologyChanged(vec![display(1, "MON-A", 0), display(2, "MON-B", 1920)]),
+        );
+        let left_half = Rect::new(0, 0, 960, 1080);
+        apply(
+            &mut state,
+            Event::WindowPlaced { window_id: WindowId(1), display_id: DisplayId(1), bounds: left_half },
+        );
+        apply(
+            &mut state,
+            Event::WindowThrowToDisplayRequested { window_id: WindowId(1), direction: DisplayDirection::Next },
+        );
+
+        let placement = state.windows.get(&WindowId(1)).unwrap();
+        assert_eq!(placement.display_id, DisplayId(2));
+        assert_eq!(
+            placement.bounds,
+            Rect::new(1920, 0, 960, 1080),
+            "half-width, full-height should be preserved on the target display"
+        );
+        assert_eq!(
+            placement.previous_placement,
+            Some((DisplayId(1), left_half)),
+            "a throw should itself be restorable"
+        );
+    }
+
+    #[test]
+    fn apply_throw_prev_wraps_around_to_the_last_display() {
+        let mut state = EngineState::default();
+        apply(
+            &mut state,
+            Event::DisplayTopologyChanged(vec![display(1, "MON-A", 0), display(2, "MON-B", 1920)]),
+        );
+        apply(
+            &mut state,
+            Event::WindowPlaced {
+                window_id: WindowId(1),
+                display_id: DisplayId(1),
+                bounds: Rect::new(0, 0, 1920, 1080),
+            },
+        );
+        apply(
+            &mut state,
+            Event::WindowThrowToDisplayRequested { window_id: WindowId(1), direction: DisplayDirection::Prev },
+        );
+
+        assert_eq!(state.windows.get(&WindowId(1)).unwrap().display_id, DisplayId(2));
+    }
+
+    #[test]
+    fn apply_throw_is_a_noop_for_an_untracked_window() {
+        let mut state = EngineState::default();
+        apply(
+            &mut state,
+            Event::DisplayTopologyChanged(vec![display(1, "MON-A", 0), display(2, "MON-B", 1920)]),
+        );
+        apply(
+            &mut state,
+            Event::WindowThrowToDisplayRequested { window_id: WindowId(1), direction: DisplayDirection::Next },
+        );
+
+        assert_eq!(state.revision, 1, "only the topology change should have bumped the revision");
+        assert!(state.windows.is_empty());
+    }
+
+    #[test]
+    fn apply_throw_is_a_noop_with_only_one_display() {
+        let mut state = EngineState::default();
+        apply(&mut state, Event::DisplayTopologyChanged(vec![display(1, "MON-A", 0)]));
+        let bounds = Rect::new(0, 0, 960, 1080);
+        apply(
+            &mut state,
+            Event::WindowPlaced { window_id: WindowId(1), display_id: DisplayId(1), bounds },
+        );
+        let revision_before_throw = state.revision;
+        apply(
+            &mut state,
+            Event::WindowThrowToDisplayRequested { window_id: WindowId(1), direction: DisplayDirection::Next },
+        );
+
+        let placement = state.windows.get(&WindowId(1)).unwrap();
+        assert_eq!(placement.bounds, bounds, "with no other display, the window must not move");
+        assert_eq!(placement.display_id, DisplayId(1));
+        assert_eq!(state.revision, revision_before_throw);
+    }
+
+    #[test]
+    fn apply_throw_is_a_noop_when_the_windows_display_left_the_topology() {
+        let mut state = EngineState::default();
+        apply(
+            &mut state,
+            Event::DisplayTopologyChanged(vec![display(1, "MON-A", 0), display(2, "MON-B", 1920)]),
+        );
+        apply(
+            &mut state,
+            Event::WindowPlaced {
+                window_id: WindowId(1),
+                display_id: DisplayId(1),
+                bounds: Rect::new(0, 0, 960, 1080),
+            },
+        );
+        // Display 1 (the window's display) unplugs, leaving only display 2.
+        apply(&mut state, Event::DisplayTopologyChanged(vec![display(2, "MON-B", 1920)]));
+        let revision_before_throw = state.revision;
+        apply(
+            &mut state,
+            Event::WindowThrowToDisplayRequested { window_id: WindowId(1), direction: DisplayDirection::Next },
+        );
+
+        assert_eq!(
+            state.windows.get(&WindowId(1)).unwrap().display_id,
+            DisplayId(1),
+            "the window's placement should be left untouched"
+        );
+        assert_eq!(state.revision, revision_before_throw);
     }
 
     #[test]
