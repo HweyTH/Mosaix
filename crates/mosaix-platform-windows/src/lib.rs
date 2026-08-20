@@ -19,6 +19,8 @@ pub mod enumeration;
 #[cfg(windows)]
 pub mod events;
 #[cfg(windows)]
+pub mod hotkeys;
+#[cfg(windows)]
 pub mod shutdown;
 #[cfg(windows)]
 pub mod win32_helpers;
@@ -31,6 +33,10 @@ pub use adapter::WindowsPlatformAdapter;
 pub use display::{enumerate_displays, watch_display_topology, DisplayWatcher, TopologyEvent};
 #[cfg(windows)]
 pub use events::{start_event_hooks, EventHooks, RawEvent, WindowHandle};
+#[cfg(windows)]
+pub use hotkeys::{
+    start_hotkeys, HotkeyBinding, HotkeyFired, HotkeyRegistrationResult, HotkeyRegistrations,
+};
 #[cfg(windows)]
 pub use shutdown::register_shutdown_signal;
 
@@ -60,6 +66,10 @@ pub enum WindowError {
     EnumerateDisplaysFailed,
     #[error("shutdown handler is already registered for this process")]
     ShutdownHandlerAlreadyRegistered,
+    #[error("failed to register hotkey: {0}")]
+    HotkeyRegistrationFailed(windows::core::Error),
+    #[error("failed to start hotkey registration thread")]
+    HotkeyThreadStartFailed,
 }
 
 #[cfg(windows)]
