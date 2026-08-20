@@ -47,6 +47,10 @@ pub struct EngineState {
     /// are created (and their `previous_placement` remembered) by
     /// [`Event::WindowPlaced`] and [`Event::WindowThrowToDisplayRequested`].
     pub windows: HashMap<WindowId, WindowPlacement>,
+    /// The window that currently has OS foreground focus, `None` until the
+    /// first [`Event::WindowFocused`] is observed. Sourced from the OS's
+    /// foreground-change notification (architecture doc section 8.2).
+    pub focused_window: Option<WindowId>,
 }
 
 /// A tracked window's current bounds and display, plus the display and
@@ -112,6 +116,11 @@ pub enum Event {
         window_id: WindowId,
         direction: DisplayDirection,
     },
+
+    /// The OS reported `window_id` as having gained foreground focus.
+    /// Sourced from the platform adapter's foreground-change notification;
+    /// updates [`EngineState::focused_window`].
+    WindowFocused { window_id: WindowId },
 }
 
 /// Applies one event to `state`. Must never panic -- a single bad event
@@ -173,6 +182,11 @@ fn apply(state: &mut EngineState, event: Event) {
 
             let new_bounds = throw_preserving_ratio(bounds, from_work_area, to_work_area);
             place_window(state, window_id, to_display_id, new_bounds);
+        }
+
+        Event::WindowFocused { window_id } => {
+            state.focused_window = Some(window_id);
+            state.revision += 1;
         }
     }
 }
@@ -295,6 +309,7 @@ pub fn spawn_engine_with_capacity(initial_displays: Vec<Display>, capacity: usiz
         revision: 0,
         displays: initial_displays,
         windows: HashMap::new(),
+        focused_window: None,
     };
     let state = Arc::new(Mutex::new(initial_state.clone()));
 
@@ -624,6 +639,27 @@ mod tests {
             "the window's placement should be left untouched"
         );
         assert_eq!(state.revision, revision_before_throw);
+    }
+
+    #[test]
+    fn apply_focused_sets_the_focused_window_and_bumps_revision() {
+        let mut state = EngineState::default();
+        assert_eq!(state.focused_window, None);
+
+        apply(&mut state, Event::WindowFocused { window_id: WindowId(1) });
+
+        assert_eq!(state.focused_window, Some(WindowId(1)));
+        assert_eq!(state.revision, 1);
+    }
+
+    #[test]
+    fn apply_focused_again_with_a_different_window_replaces_it() {
+        let mut state = EngineState::default();
+        apply(&mut state, Event::WindowFocused { window_id: WindowId(1) });
+        apply(&mut state, Event::WindowFocused { window_id: WindowId(2) });
+
+        assert_eq!(state.focused_window, Some(WindowId(2)));
+        assert_eq!(state.revision, 2);
     }
 
     #[test]

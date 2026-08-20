@@ -41,7 +41,7 @@ pub use hotkeys::{
 pub use shutdown::register_shutdown_signal;
 
 #[cfg(windows)]
-use mosaix_domain::Rect;
+use mosaix_domain::{Rect, WindowId};
 #[cfg(windows)]
 use windows::Win32::Foundation::{HWND, RECT};
 #[cfg(windows)]
@@ -85,6 +85,17 @@ pub type Result<T> = std::result::Result<T, WindowError>;
 pub fn enable_per_monitor_dpi_awareness() -> Result<()> {
     unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) }
         .map_err(WindowError::from)
+}
+
+/// Converts an `events`/`hotkeys`-module [`WindowHandle`] into a domain
+/// [`WindowId`]. Lives here rather than in `events.rs`, which is
+/// deliberately kept free of a `mosaix-domain` dependency (see that
+/// module's doc comment); this is the seam where standalone Win32 spikes
+/// meet domain-typed code, same as `enumeration.rs`'s equivalent
+/// `WindowId(hwnd.0 as isize)` construction.
+#[cfg(windows)]
+pub fn window_id_from_handle(handle: WindowHandle) -> WindowId {
+    WindowId(handle.0)
 }
 
 /// Moves and resizes a top-level window without changing its z-order or

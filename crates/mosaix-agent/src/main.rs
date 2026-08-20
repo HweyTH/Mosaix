@@ -62,6 +62,37 @@ fn main() {
         }
     };
 
+    let event_hooks_and_forwarder = match mosaix_platform_windows::start_event_hooks() {
+        Ok((hooks, raw_events)) => {
+            let events = engine.events();
+            let forwarder = std::thread::spawn(move || {
+                // Only `RawEvent::Focused` is forwarded here. The other
+                // variants (WindowCreated/WindowDestroyed/LocationChanged/
+                // MoveResizeStart/MoveResizeEnd) aren't consumed by the
+                // engine yet -- LocationChanged lands with the
+                // bounds-observed event a later ticket adds; the rest
+                // aren't needed yet.
+                for event in raw_events {
+                    if let mosaix_platform_windows::RawEvent::Focused(handle) = event {
+                        let window_id = mosaix_platform_windows::window_id_from_handle(handle);
+                        if events
+                            .send(mosaix_engine::Event::WindowFocused { window_id })
+                            .is_err()
+                        {
+                            tracing::warn!("reducer stopped; focus forwarder exiting");
+                            break;
+                        }
+                    }
+                }
+            });
+            Some((hooks, forwarder))
+        }
+        Err(err) => {
+            tracing::error!(%err, "failed to start OS event hooks; the agent will not observe focus changes");
+            None
+        }
+    };
+
     let shutdown = mosaix_platform_windows::register_shutdown_signal()
         .expect("failed to register shutdown signal handler at startup");
     tracing::info!(
@@ -72,6 +103,10 @@ fn main() {
 
     if let Some((watcher, forwarder)) = watcher_and_forwarder {
         watcher.stop();
+        let _ = forwarder.join();
+    }
+    if let Some((hooks, forwarder)) = event_hooks_and_forwarder {
+        hooks.stop();
         let _ = forwarder.join();
     }
     engine.stop();
