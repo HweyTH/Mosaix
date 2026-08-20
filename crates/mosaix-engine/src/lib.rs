@@ -24,7 +24,10 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 use mosaix_domain::{topology_fingerprint, Display, DisplayId, Rect, WindowId};
-use mosaix_layout::{cycle_display, throw_preserving_ratio, DisplayDirection};
+use mosaix_layout::{
+    cycle_display, resolve_zone_cycle, snap_to_half, throw_preserving_ratio, CycleStep,
+    DisplayDirection, HalfZone, HorizontalDirection,
+};
 
 /// Default bound on the event queue before a sender blocks. Chosen
 /// generously relative to expected event rates -- architecture doc section
@@ -47,6 +50,10 @@ pub struct EngineState {
     /// are created (and their `previous_placement` remembered) by
     /// [`Event::WindowPlaced`] and [`Event::WindowThrowToDisplayRequested`].
     pub windows: HashMap<WindowId, WindowPlacement>,
+    /// The window that currently has OS foreground focus, `None` until the
+    /// first [`Event::WindowFocused`] is observed. Sourced from the OS's
+    /// foreground-change notification (architecture doc section 8.2).
+    pub focused_window: Option<WindowId>,
 }
 
 /// A tracked window's current bounds and display, plus the display and
@@ -69,6 +76,40 @@ pub struct WindowPlacement {
     pub display_id: DisplayId,
     pub bounds: Rect,
     pub previous_placement: Option<(DisplayId, Rect)>,
+    /// The horizontal zone command and step that produced this placement,
+    /// if it came from [`Event::ZoneSnapRequested`] with a left/right
+    /// direction (CONTEXT.md "Cycle step"). `None` for windows never
+    /// horizontally zone-snapped, and left untouched by placements that
+    /// don't participate in cycling (top/bottom zone-snaps, restores,
+    /// throws, plain [`Event::WindowPlaced`]) -- only a repeated
+    /// same-direction [`Event::ZoneSnapRequested`] advances it, and only a
+    /// future bounds-observed event mismatching the expected placement
+    /// transaction resets it (ADR 0001; that reset lands with ticket 05).
+    pub cycle_step: Option<(HorizontalDirection, CycleStep)>,
+}
+
+/// The direction a zone-snap hotkey requests (CONTEXT.md "Zone"). Only
+/// [`ZoneSnapDirection::Left`]/[`ZoneSnapDirection::Right`] participate in
+/// zone cycling -- `ZoneSnapDirection::horizontal` is how
+/// [`Event::ZoneSnapRequested`]'s handler tells them apart from top/bottom.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZoneSnapDirection {
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
+impl ZoneSnapDirection {
+    /// The matching [`HorizontalDirection`] for `Left`/`Right`, `None` for
+    /// `Top`/`Bottom` (which stay single-shot and never cycle).
+    fn horizontal(self) -> Option<HorizontalDirection> {
+        match self {
+            ZoneSnapDirection::Left => Some(HorizontalDirection::Left),
+            ZoneSnapDirection::Right => Some(HorizontalDirection::Right),
+            ZoneSnapDirection::Top | ZoneSnapDirection::Bottom => None,
+        }
+    }
 }
 
 /// An event the reducer applies to [`EngineState`]. Producers (platform
@@ -112,6 +153,45 @@ pub enum Event {
         window_id: WindowId,
         direction: DisplayDirection,
     },
+
+    /// The OS reported `window_id` as having gained foreground focus.
+    /// Sourced from the platform adapter's foreground-change notification;
+    /// updates [`EngineState::focused_window`].
+    WindowFocused { window_id: WindowId },
+
+    /// A zone-snap hotkey fired for `direction` (architecture doc section
+    /// 20's directional snap commands; CONTEXT.md "Zone cycle"). Carries no
+    /// window id -- it resolves against [`EngineState::focused_window`] at
+    /// apply time and is a no-op if nothing is focused or the focused
+    /// window isn't tracked. For [`ZoneSnapDirection::Left`]/`Right`, a
+    /// repeated same-direction request advances the focused window's zone
+    /// cycle (half -> third -> two-thirds -> half); any other case (first
+    /// press, or a different direction than last time) starts that
+    /// direction's cycle fresh at half. For `Top`/`Bottom` this always
+    /// resolves to half with no cycle-step bookkeeping. Either way, the
+    /// resolved bounds are placed through the same `place_window` path as
+    /// any other placement, so the result remains restorable.
+    ZoneSnapRequested { direction: ZoneSnapDirection },
+
+    /// The OS reported `window_id`'s current display and bounds, following
+    /// its own location-changed notification -- which fires for both
+    /// programmatic and interactive moves alike, so this does not by
+    /// itself mean something *other* than Mosaix moved the window.
+    /// Compared against the window's own last placement transaction (ADR
+    /// 0001, ARCHITECTURE.md section 8.3): a match confirms the
+    /// observation is just an echo of Mosaix's own last placement and
+    /// leaves cycle-step state untouched; a mismatch means something else
+    /// moved or resized the window (a manual drag, another app, a native
+    /// OS snap), which invalidates (resets to step 1) the window's
+    /// cycle-step state. Either way this never alters the window's tracked
+    /// placement bounds -- reconciling tracked state from raw observation
+    /// is a separate, out-of-scope concern (`.scratch/cycle-sizes-and-global-hotkeys/issues/05-placement-transaction-correlation.md`).
+    /// A no-op for an untracked window.
+    WindowBoundsObserved {
+        window_id: WindowId,
+        display_id: DisplayId,
+        bounds: Rect,
+    },
 }
 
 /// Applies one event to `state`. Must never panic -- a single bad event
@@ -130,7 +210,7 @@ fn apply(state: &mut EngineState, event: Event) {
         }
 
         Event::WindowPlaced { window_id, display_id, bounds } => {
-            place_window(state, window_id, display_id, bounds);
+            place_window(state, window_id, display_id, bounds, None);
         }
 
         Event::WindowRestoreRequested { window_id } => {
@@ -172,7 +252,72 @@ fn apply(state: &mut EngineState, event: Event) {
             };
 
             let new_bounds = throw_preserving_ratio(bounds, from_work_area, to_work_area);
-            place_window(state, window_id, to_display_id, new_bounds);
+            place_window(state, window_id, to_display_id, new_bounds, None);
+        }
+
+        Event::WindowFocused { window_id } => {
+            state.focused_window = Some(window_id);
+            state.revision += 1;
+        }
+
+        Event::ZoneSnapRequested { direction } => {
+            let Some(window_id) = state.focused_window else {
+                tracing::debug!("zone-snap requested with no focused window; ignoring");
+                return;
+            };
+            let Some(placement) = state.windows.get(&window_id) else {
+                tracing::debug!(?window_id, "zone-snap requested for an untracked focused window; ignoring");
+                return;
+            };
+            let display_id = placement.display_id;
+            let Some(work_area) = work_area_of(&state.displays, display_id) else {
+                tracing::debug!(
+                    ?window_id,
+                    ?display_id,
+                    "focused window's display is no longer in the topology; ignoring zone-snap"
+                );
+                return;
+            };
+
+            if let Some(horizontal_direction) = direction.horizontal() {
+                let next_step = match placement.cycle_step {
+                    Some((previous_direction, previous_step)) if previous_direction == horizontal_direction => {
+                        previous_step.next()
+                    }
+                    _ => CycleStep::Half,
+                };
+                let bounds = resolve_zone_cycle(work_area, horizontal_direction, next_step);
+                place_window(state, window_id, display_id, bounds, Some((horizontal_direction, next_step)));
+            } else {
+                let zone = if direction == ZoneSnapDirection::Top {
+                    HalfZone::TopHalf
+                } else {
+                    HalfZone::BottomHalf
+                };
+                let bounds = snap_to_half(work_area, zone);
+                place_window(state, window_id, display_id, bounds, None);
+            }
+        }
+
+        Event::WindowBoundsObserved { window_id, display_id, bounds } => {
+            let Some(placement) = state.windows.get_mut(&window_id) else {
+                tracing::debug!(?window_id, "bounds observed for an untracked window; ignoring");
+                return;
+            };
+            if placement.display_id == display_id && placement.bounds == bounds {
+                tracing::debug!(
+                    ?window_id,
+                    "observed bounds match the last placement transaction; cycle state unaffected"
+                );
+                return;
+            }
+            if placement.cycle_step.take().is_some() {
+                tracing::debug!(
+                    ?window_id,
+                    "observed bounds don't match the last placement transaction; cycle step reset"
+                );
+                state.revision += 1;
+            }
         }
     }
 }
@@ -186,17 +331,29 @@ fn work_area_of(displays: &[Display], id: DisplayId) -> Option<Rect> {
 /// stashing wherever it was before (if it was already tracked) as the one
 /// step [`Event::WindowRestoreRequested`] can undo, and bumps the
 /// revision.
-fn place_window(state: &mut EngineState, window_id: WindowId, display_id: DisplayId, bounds: Rect) {
-    let previous_placement = state
-        .windows
-        .get(&window_id)
-        .map(|placement| (placement.display_id, placement.bounds));
+///
+/// `cycle_step` is the placement's new cycle-step state. Pass `None` to
+/// carry forward whatever the window already had (`None` if it wasn't
+/// tracked yet) unchanged -- every caller does this except
+/// [`Event::ZoneSnapRequested`]'s left/right handling, which passes
+/// `Some((direction, step))` to record the cycle position it just resolved.
+fn place_window(
+    state: &mut EngineState,
+    window_id: WindowId,
+    display_id: DisplayId,
+    bounds: Rect,
+    cycle_step: Option<(HorizontalDirection, CycleStep)>,
+) {
+    let existing = state.windows.get(&window_id);
+    let previous_placement = existing.map(|placement| (placement.display_id, placement.bounds));
+    let cycle_step = cycle_step.or_else(|| existing.and_then(|placement| placement.cycle_step));
     state.windows.insert(
         window_id,
         WindowPlacement {
             display_id,
             bounds,
             previous_placement,
+            cycle_step,
         },
     );
     state.revision += 1;
@@ -295,6 +452,7 @@ pub fn spawn_engine_with_capacity(initial_displays: Vec<Display>, capacity: usiz
         revision: 0,
         displays: initial_displays,
         windows: HashMap::new(),
+        focused_window: None,
     };
     let state = Arc::new(Mutex::new(initial_state.clone()));
 
@@ -624,6 +782,364 @@ mod tests {
             "the window's placement should be left untouched"
         );
         assert_eq!(state.revision, revision_before_throw);
+    }
+
+    #[test]
+    fn apply_focused_sets_the_focused_window_and_bumps_revision() {
+        let mut state = EngineState::default();
+        assert_eq!(state.focused_window, None);
+
+        apply(&mut state, Event::WindowFocused { window_id: WindowId(1) });
+
+        assert_eq!(state.focused_window, Some(WindowId(1)));
+        assert_eq!(state.revision, 1);
+    }
+
+    #[test]
+    fn apply_focused_again_with_a_different_window_replaces_it() {
+        let mut state = EngineState::default();
+        apply(&mut state, Event::WindowFocused { window_id: WindowId(1) });
+        apply(&mut state, Event::WindowFocused { window_id: WindowId(2) });
+
+        assert_eq!(state.focused_window, Some(WindowId(2)));
+        assert_eq!(state.revision, 2);
+    }
+
+    #[test]
+    fn apply_zone_snap_left_on_first_press_snaps_to_left_half() {
+        let mut state = EngineState::default();
+        apply(&mut state, Event::DisplayTopologyChanged(vec![display(1, "MON-A", 0)]));
+        apply(
+            &mut state,
+            Event::WindowPlaced {
+                window_id: WindowId(1),
+                display_id: DisplayId(1),
+                bounds: Rect::new(0, 0, 1920, 1080),
+            },
+        );
+        apply(&mut state, Event::WindowFocused { window_id: WindowId(1) });
+
+        apply(&mut state, Event::ZoneSnapRequested { direction: ZoneSnapDirection::Left });
+
+        let placement = state.windows.get(&WindowId(1)).unwrap();
+        assert_eq!(placement.bounds, Rect::new(0, 0, 960, 1080));
+        assert_eq!(placement.cycle_step, Some((HorizontalDirection::Left, CycleStep::Half)));
+    }
+
+    #[test]
+    fn apply_zone_snap_left_repeated_advances_half_third_two_thirds_then_wraps() {
+        let mut state = EngineState::default();
+        apply(&mut state, Event::DisplayTopologyChanged(vec![display(1, "MON-A", 0)]));
+        apply(
+            &mut state,
+            Event::WindowPlaced {
+                window_id: WindowId(1),
+                display_id: DisplayId(1),
+                bounds: Rect::new(0, 0, 1920, 1080),
+            },
+        );
+        apply(&mut state, Event::WindowFocused { window_id: WindowId(1) });
+
+        apply(&mut state, Event::ZoneSnapRequested { direction: ZoneSnapDirection::Left });
+        apply(&mut state, Event::ZoneSnapRequested { direction: ZoneSnapDirection::Left });
+        let placement = state.windows.get(&WindowId(1)).unwrap();
+        assert_eq!(placement.bounds, Rect::new(0, 0, 640, 1080), "second press should shrink to the left third");
+        assert_eq!(placement.cycle_step, Some((HorizontalDirection::Left, CycleStep::Third)));
+
+        apply(&mut state, Event::ZoneSnapRequested { direction: ZoneSnapDirection::Left });
+        let placement = state.windows.get(&WindowId(1)).unwrap();
+        assert_eq!(placement.bounds, Rect::new(0, 0, 1280, 1080), "third press should expand to the left two-thirds");
+        assert_eq!(placement.cycle_step, Some((HorizontalDirection::Left, CycleStep::TwoThirds)));
+
+        apply(&mut state, Event::ZoneSnapRequested { direction: ZoneSnapDirection::Left });
+        let placement = state.windows.get(&WindowId(1)).unwrap();
+        assert_eq!(placement.bounds, Rect::new(0, 0, 960, 1080), "fourth press should wrap back to half");
+        assert_eq!(placement.cycle_step, Some((HorizontalDirection::Left, CycleStep::Half)));
+    }
+
+    #[test]
+    fn apply_zone_snap_right_runs_its_own_independent_cycle_from_half() {
+        let mut state = EngineState::default();
+        apply(&mut state, Event::DisplayTopologyChanged(vec![display(1, "MON-A", 0)]));
+        apply(
+            &mut state,
+            Event::WindowPlaced {
+                window_id: WindowId(1),
+                display_id: DisplayId(1),
+                bounds: Rect::new(0, 0, 1920, 1080),
+            },
+        );
+        apply(&mut state, Event::WindowFocused { window_id: WindowId(1) });
+
+        apply(&mut state, Event::ZoneSnapRequested { direction: ZoneSnapDirection::Left });
+        apply(&mut state, Event::ZoneSnapRequested { direction: ZoneSnapDirection::Left });
+        apply(&mut state, Event::ZoneSnapRequested { direction: ZoneSnapDirection::Right });
+
+        let placement = state.windows.get(&WindowId(1)).unwrap();
+        assert_eq!(
+            placement.bounds,
+            Rect::new(960, 0, 960, 1080),
+            "switching direction should start a fresh cycle at half, not continue the other direction's step"
+        );
+        assert_eq!(placement.cycle_step, Some((HorizontalDirection::Right, CycleStep::Half)));
+    }
+
+    #[test]
+    fn apply_zone_snap_top_always_resolves_to_top_half_and_never_cycles() {
+        let mut state = EngineState::default();
+        apply(&mut state, Event::DisplayTopologyChanged(vec![display(1, "MON-A", 0)]));
+        apply(
+            &mut state,
+            Event::WindowPlaced {
+                window_id: WindowId(1),
+                display_id: DisplayId(1),
+                bounds: Rect::new(0, 0, 1920, 1080),
+            },
+        );
+        apply(&mut state, Event::WindowFocused { window_id: WindowId(1) });
+
+        apply(&mut state, Event::ZoneSnapRequested { direction: ZoneSnapDirection::Top });
+        apply(&mut state, Event::ZoneSnapRequested { direction: ZoneSnapDirection::Top });
+
+        let placement = state.windows.get(&WindowId(1)).unwrap();
+        assert_eq!(placement.bounds, Rect::new(0, 0, 1920, 540), "repeated top presses must stay at half, never cycle");
+        assert_eq!(placement.cycle_step, None, "top/bottom must not write cycle-step state");
+    }
+
+    #[test]
+    fn apply_zone_snap_bottom_always_resolves_to_bottom_half_and_leaves_cycle_step_untouched() {
+        let mut state = EngineState::default();
+        apply(&mut state, Event::DisplayTopologyChanged(vec![display(1, "MON-A", 0)]));
+        apply(
+            &mut state,
+            Event::WindowPlaced {
+                window_id: WindowId(1),
+                display_id: DisplayId(1),
+                bounds: Rect::new(0, 0, 1920, 1080),
+            },
+        );
+        apply(&mut state, Event::WindowFocused { window_id: WindowId(1) });
+        apply(&mut state, Event::ZoneSnapRequested { direction: ZoneSnapDirection::Left });
+
+        apply(&mut state, Event::ZoneSnapRequested { direction: ZoneSnapDirection::Bottom });
+
+        let placement = state.windows.get(&WindowId(1)).unwrap();
+        assert_eq!(placement.bounds, Rect::new(0, 540, 1920, 540));
+        assert_eq!(
+            placement.cycle_step,
+            Some((HorizontalDirection::Left, CycleStep::Half)),
+            "top/bottom must not read or write cycle-step state, so left's cycle position survives underneath"
+        );
+    }
+
+    #[test]
+    fn apply_zone_snap_is_a_noop_with_no_focused_window() {
+        let mut state = EngineState::default();
+        apply(&mut state, Event::DisplayTopologyChanged(vec![display(1, "MON-A", 0)]));
+        let bounds = Rect::new(0, 0, 1920, 1080);
+        apply(
+            &mut state,
+            Event::WindowPlaced { window_id: WindowId(1), display_id: DisplayId(1), bounds },
+        );
+        let revision_before = state.revision;
+
+        apply(&mut state, Event::ZoneSnapRequested { direction: ZoneSnapDirection::Left });
+
+        assert_eq!(state.revision, revision_before, "no focused window must be a no-op");
+        assert_eq!(state.windows.get(&WindowId(1)).unwrap().bounds, bounds);
+    }
+
+    #[test]
+    fn apply_zone_snap_is_a_noop_when_the_focused_window_is_untracked() {
+        let mut state = EngineState::default();
+        apply(&mut state, Event::DisplayTopologyChanged(vec![display(1, "MON-A", 0)]));
+        apply(&mut state, Event::WindowFocused { window_id: WindowId(1) });
+        let revision_before = state.revision;
+
+        apply(&mut state, Event::ZoneSnapRequested { direction: ZoneSnapDirection::Left });
+
+        assert_eq!(state.revision, revision_before, "an untracked focused window must be a no-op");
+        assert!(state.windows.is_empty());
+    }
+
+    #[test]
+    fn apply_zone_snap_is_a_noop_when_the_focused_windows_display_left_the_topology() {
+        let mut state = EngineState::default();
+        apply(
+            &mut state,
+            Event::DisplayTopologyChanged(vec![display(1, "MON-A", 0), display(2, "MON-B", 1920)]),
+        );
+        let bounds = Rect::new(0, 0, 960, 1080);
+        apply(
+            &mut state,
+            Event::WindowPlaced { window_id: WindowId(1), display_id: DisplayId(1), bounds },
+        );
+        apply(&mut state, Event::WindowFocused { window_id: WindowId(1) });
+        // Display 1 (the focused window's display) unplugs, leaving only display 2.
+        apply(&mut state, Event::DisplayTopologyChanged(vec![display(2, "MON-B", 1920)]));
+        let revision_before = state.revision;
+
+        apply(&mut state, Event::ZoneSnapRequested { direction: ZoneSnapDirection::Left });
+
+        assert_eq!(state.revision, revision_before, "a vanished display must leave the placement untouched");
+        assert_eq!(state.windows.get(&WindowId(1)).unwrap().bounds, bounds);
+    }
+
+    #[test]
+    fn apply_bounds_observed_matching_the_last_placement_leaves_cycle_state_alone() {
+        let mut state = EngineState::default();
+        apply(&mut state, Event::DisplayTopologyChanged(vec![display(1, "MON-A", 0)]));
+        apply(
+            &mut state,
+            Event::WindowPlaced {
+                window_id: WindowId(1),
+                display_id: DisplayId(1),
+                bounds: Rect::new(0, 0, 1920, 1080),
+            },
+        );
+        apply(&mut state, Event::WindowFocused { window_id: WindowId(1) });
+        apply(&mut state, Event::ZoneSnapRequested { direction: ZoneSnapDirection::Left });
+        let revision_before = state.revision;
+
+        // The OS echoes back exactly the bounds/display Mosaix's own
+        // placement just produced.
+        apply(
+            &mut state,
+            Event::WindowBoundsObserved {
+                window_id: WindowId(1),
+                display_id: DisplayId(1),
+                bounds: Rect::new(0, 0, 960, 1080),
+            },
+        );
+
+        let placement = state.windows.get(&WindowId(1)).unwrap();
+        assert_eq!(
+            placement.cycle_step,
+            Some((HorizontalDirection::Left, CycleStep::Half)),
+            "a matching observation must leave cycle state untouched"
+        );
+        assert_eq!(state.revision, revision_before, "a matching observation must not bump the revision");
+    }
+
+    #[test]
+    fn apply_bounds_observed_not_matching_the_last_placement_resets_cycle_step() {
+        let mut state = EngineState::default();
+        apply(&mut state, Event::DisplayTopologyChanged(vec![display(1, "MON-A", 0)]));
+        apply(
+            &mut state,
+            Event::WindowPlaced {
+                window_id: WindowId(1),
+                display_id: DisplayId(1),
+                bounds: Rect::new(0, 0, 1920, 1080),
+            },
+        );
+        apply(&mut state, Event::WindowFocused { window_id: WindowId(1) });
+        apply(&mut state, Event::ZoneSnapRequested { direction: ZoneSnapDirection::Left });
+        apply(&mut state, Event::ZoneSnapRequested { direction: ZoneSnapDirection::Left });
+        let revision_before = state.revision;
+
+        // A manual drag left the window somewhere Mosaix's own last
+        // placement (the left third) didn't put it.
+        apply(
+            &mut state,
+            Event::WindowBoundsObserved {
+                window_id: WindowId(1),
+                display_id: DisplayId(1),
+                bounds: Rect::new(100, 100, 400, 400),
+            },
+        );
+
+        let placement = state.windows.get(&WindowId(1)).unwrap();
+        assert_eq!(placement.cycle_step, None, "a non-matching observation must reset cycle step to step 1");
+        assert_eq!(
+            placement.bounds,
+            Rect::new(0, 0, 640, 1080),
+            "tracked placement bounds must not be altered by an observation"
+        );
+        assert_eq!(state.revision, revision_before + 1);
+    }
+
+    #[test]
+    fn apply_bounds_observed_mismatch_then_zone_snap_restarts_the_cycle_at_half() {
+        let mut state = EngineState::default();
+        apply(&mut state, Event::DisplayTopologyChanged(vec![display(1, "MON-A", 0)]));
+        apply(
+            &mut state,
+            Event::WindowPlaced {
+                window_id: WindowId(1),
+                display_id: DisplayId(1),
+                bounds: Rect::new(0, 0, 1920, 1080),
+            },
+        );
+        apply(&mut state, Event::WindowFocused { window_id: WindowId(1) });
+        apply(&mut state, Event::ZoneSnapRequested { direction: ZoneSnapDirection::Left });
+        apply(&mut state, Event::ZoneSnapRequested { direction: ZoneSnapDirection::Left });
+        apply(
+            &mut state,
+            Event::WindowBoundsObserved {
+                window_id: WindowId(1),
+                display_id: DisplayId(1),
+                bounds: Rect::new(100, 100, 400, 400),
+            },
+        );
+
+        apply(&mut state, Event::ZoneSnapRequested { direction: ZoneSnapDirection::Left });
+
+        let placement = state.windows.get(&WindowId(1)).unwrap();
+        assert_eq!(
+            placement.bounds,
+            Rect::new(0, 0, 960, 1080),
+            "the next same-direction press after an external move must start back at half"
+        );
+        assert_eq!(placement.cycle_step, Some((HorizontalDirection::Left, CycleStep::Half)));
+    }
+
+    #[test]
+    fn apply_bounds_observed_is_a_noop_for_an_untracked_window() {
+        let mut state = EngineState::default();
+
+        apply(
+            &mut state,
+            Event::WindowBoundsObserved {
+                window_id: WindowId(1),
+                display_id: DisplayId(1),
+                bounds: Rect::new(0, 0, 100, 100),
+            },
+        );
+
+        assert_eq!(state.revision, 0);
+        assert!(state.windows.is_empty());
+    }
+
+    #[test]
+    fn apply_bounds_observed_mismatch_with_no_cycle_step_does_not_bump_the_revision() {
+        let mut state = EngineState::default();
+        apply(&mut state, Event::DisplayTopologyChanged(vec![display(1, "MON-A", 0)]));
+        apply(
+            &mut state,
+            Event::WindowPlaced {
+                window_id: WindowId(1),
+                display_id: DisplayId(1),
+                bounds: Rect::new(0, 0, 1920, 1080),
+            },
+        );
+        let revision_before = state.revision;
+
+        apply(
+            &mut state,
+            Event::WindowBoundsObserved {
+                window_id: WindowId(1),
+                display_id: DisplayId(1),
+                bounds: Rect::new(100, 100, 400, 400),
+            },
+        );
+
+        let placement = state.windows.get(&WindowId(1)).unwrap();
+        assert_eq!(placement.cycle_step, None);
+        assert_eq!(
+            state.revision, revision_before,
+            "resetting an already-None cycle step is not a real change, so must not bump the revision"
+        );
     }
 
     #[test]

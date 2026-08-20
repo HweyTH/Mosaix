@@ -19,6 +19,8 @@ pub mod enumeration;
 #[cfg(windows)]
 pub mod events;
 #[cfg(windows)]
+pub mod hotkeys;
+#[cfg(windows)]
 pub mod shutdown;
 #[cfg(windows)]
 pub mod win32_helpers;
@@ -32,12 +34,18 @@ pub use display::{enumerate_displays, watch_display_topology, DisplayWatcher, To
 #[cfg(windows)]
 pub use events::{start_event_hooks, EventHooks, RawEvent, WindowHandle};
 #[cfg(windows)]
+pub use hotkeys::{
+    start_hotkeys, HotkeyBinding, HotkeyFired, HotkeyRegistrationResult, HotkeyRegistrations,
+};
+#[cfg(windows)]
 pub use shutdown::register_shutdown_signal;
 
 #[cfg(windows)]
-use mosaix_domain::Rect;
+use mosaix_domain::{DisplayId, Rect, WindowId};
 #[cfg(windows)]
 use windows::Win32::Foundation::{HWND, RECT};
+#[cfg(windows)]
+use windows::Win32::Graphics::Gdi::{MonitorFromWindow, MONITOR_DEFAULTTONULL};
 #[cfg(windows)]
 use windows::Win32::UI::HiDpi::{
     SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
@@ -60,6 +68,10 @@ pub enum WindowError {
     EnumerateDisplaysFailed,
     #[error("shutdown handler is already registered for this process")]
     ShutdownHandlerAlreadyRegistered,
+    #[error("failed to register hotkey: {0}")]
+    HotkeyRegistrationFailed(windows::core::Error),
+    #[error("failed to start hotkey registration thread")]
+    HotkeyThreadStartFailed,
 }
 
 #[cfg(windows)]
@@ -75,6 +87,17 @@ pub type Result<T> = std::result::Result<T, WindowError>;
 pub fn enable_per_monitor_dpi_awareness() -> Result<()> {
     unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) }
         .map_err(WindowError::from)
+}
+
+/// Converts an `events`/`hotkeys`-module [`WindowHandle`] into a domain
+/// [`WindowId`]. Lives here rather than in `events.rs`, which is
+/// deliberately kept free of a `mosaix-domain` dependency (see that
+/// module's doc comment); this is the seam where standalone Win32 spikes
+/// meet domain-typed code, same as `enumeration.rs`'s equivalent
+/// `WindowId(hwnd.0 as isize)` construction.
+#[cfg(windows)]
+pub fn window_id_from_handle(handle: WindowHandle) -> WindowId {
+    WindowId(handle.0)
 }
 
 /// Moves and resizes a top-level window without changing its z-order or
@@ -128,6 +151,35 @@ pub fn window_bounds(hwnd: HWND) -> Result<Rect> {
     ))
 }
 
+/// The display currently containing `hwnd`, identified by
+/// `MonitorFromWindow` -- consistent with [`display::enumerate_displays`]'s
+/// `DisplayId(hmonitor.0 as isize)`. `None` if the window has no
+/// associated monitor (an invalid handle, most commonly).
+#[cfg(windows)]
+pub fn window_display_id(hwnd: HWND) -> Option<DisplayId> {
+    let hmonitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL) };
+    if hmonitor.is_invalid() {
+        None
+    } else {
+        Some(DisplayId(hmonitor.0 as isize))
+    }
+}
+
+/// The display and bounds a `LocationChanged` observation should report
+/// for `handle`, in one call -- the bridging seam for callers (like
+/// `mosaix-agent`'s bounds-observed forwarder) that only have an
+/// `events`-module [`WindowHandle`], not an `HWND`, and so don't want the
+/// `windows` crate as a direct dependency, same idea as
+/// [`window_id_from_handle`]. `None` if either underlying read fails (the
+/// window has since been destroyed, most commonly).
+#[cfg(windows)]
+pub fn observed_window_state(handle: WindowHandle) -> Option<(DisplayId, Rect)> {
+    let hwnd = HWND::from(handle);
+    let bounds = window_bounds(hwnd).ok()?;
+    let display_id = window_display_id(hwnd)?;
+    Some((display_id, bounds))
+}
+
 #[cfg(all(windows, test))]
 mod tests {
     use super::*;
@@ -147,6 +199,33 @@ mod tests {
         let invalid = HWND(std::ptr::null_mut());
         let err = move_resize_window(invalid, Rect::new(0, 0, 100, 100));
         assert!(matches!(err, Err(WindowError::InvalidWindow)));
+
+        unsafe { DestroyWindow(hwnd) }.expect("cleanup should succeed");
+    }
+
+    #[test]
+    fn window_display_id_resolves_a_real_window_and_rejects_an_invalid_handle() {
+        let hwnd = create_test_window();
+
+        assert!(window_display_id(hwnd).is_some(), "a real, on-screen window should resolve to a display");
+
+        let invalid = HWND(std::ptr::null_mut());
+        assert_eq!(window_display_id(invalid), None);
+
+        unsafe { DestroyWindow(hwnd) }.expect("cleanup should succeed");
+    }
+
+    #[test]
+    fn observed_window_state_reports_bounds_and_display_from_a_handle() {
+        let hwnd = create_test_window();
+        let target = Rect::new(50, 60, 300, 200);
+        move_resize_window(hwnd, target).expect("move/resize should succeed");
+
+        let handle = WindowHandle::from(hwnd);
+        let (display_id, bounds) = observed_window_state(handle).expect("should read back state");
+
+        assert_eq!(bounds, target);
+        assert_eq!(Some(display_id), window_display_id(hwnd));
 
         unsafe { DestroyWindow(hwnd) }.expect("cleanup should succeed");
     }

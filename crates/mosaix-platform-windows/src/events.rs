@@ -19,11 +19,12 @@ use std::thread::{self, JoinHandle};
 
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::System::Threading::GetCurrentThreadId;
-use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent};
+use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, EVENT_OBJECT_CREATE, EVENT_OBJECT_DESTROY, EVENT_OBJECT_LOCATIONCHANGE,
-    EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MOVESIZEEND, EVENT_SYSTEM_MOVESIZESTART, GetMessageW,
-    MSG, OBJID_WINDOW, PostThreadMessageW, TranslateMessage, WINEVENT_OUTOFCONTEXT, WM_QUIT,
+    DispatchMessageW, GetMessageW, PostThreadMessageW, TranslateMessage, EVENT_OBJECT_CREATE,
+    EVENT_OBJECT_DESTROY, EVENT_OBJECT_LOCATIONCHANGE, EVENT_SYSTEM_FOREGROUND,
+    EVENT_SYSTEM_MOVESIZEEND, EVENT_SYSTEM_MOVESIZESTART, MSG, OBJID_WINDOW, WINEVENT_OUTOFCONTEXT,
+    WM_QUIT,
 };
 
 use crate::{Result, WindowError};
@@ -111,7 +112,15 @@ unsafe fn register_hooks() -> Result<Vec<HWINEVENTHOOK>> {
     let mut hooks = Vec::with_capacity(ranges.len());
     for (min, max) in ranges {
         let hook = unsafe {
-            SetWinEventHook(min, max, None, Some(win_event_proc), 0, 0, WINEVENT_OUTOFCONTEXT)
+            SetWinEventHook(
+                min,
+                max,
+                None,
+                Some(win_event_proc),
+                0,
+                0,
+                WINEVENT_OUTOFCONTEXT,
+            )
         };
         if hook.is_invalid() {
             for hook in hooks {
@@ -223,25 +232,10 @@ pub fn start_event_hooks() -> Result<(EventHooks, Receiver<RawEvent>)> {
 mod tests {
     use super::*;
     use crate::move_resize_window;
-    use crate::test_support::create_test_window;
+    use crate::test_support::{create_test_window, wait_for};
     use mosaix_domain::Rect;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
     use windows::Win32::UI::WindowsAndMessaging::DestroyWindow;
-
-    fn wait_for(rx: &Receiver<RawEvent>, matches: impl Fn(&RawEvent) -> bool, timeout: Duration) -> bool {
-        let deadline = Instant::now() + timeout;
-        loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return false;
-            }
-            match rx.recv_timeout(remaining) {
-                Ok(event) if matches(&event) => return true,
-                Ok(_) => continue,
-                Err(_) => return false,
-            }
-        }
-    }
 
     #[test]
     fn observes_create_location_change_and_destroy() {
@@ -259,8 +253,7 @@ mod tests {
             "expected WindowCreated for the freshly created window"
         );
 
-        move_resize_window(hwnd, Rect::new(10, 10, 300, 200))
-        .expect("move/resize should succeed");
+        move_resize_window(hwnd, Rect::new(10, 10, 300, 200)).expect("move/resize should succeed");
 
         assert!(
             wait_for(

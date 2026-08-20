@@ -15,6 +15,9 @@
 //! the agent instead -- it's meant to run all day.
 
 #[cfg(windows)]
+mod keybindings;
+
+#[cfg(windows)]
 fn main() {
     // Must happen before any window/monitor query.
     mosaix_platform_windows::enable_per_monitor_dpi_awareness()
@@ -62,6 +65,101 @@ fn main() {
         }
     };
 
+    let event_hooks_and_forwarder = match mosaix_platform_windows::start_event_hooks() {
+        Ok((hooks, raw_events)) => {
+            let events = engine.events();
+            let forwarder = std::thread::spawn(move || {
+                // `RawEvent::Focused` and `RawEvent::LocationChanged` are
+                // forwarded here. The other variants (WindowCreated/
+                // WindowDestroyed/MoveResizeStart/MoveResizeEnd) aren't
+                // consumed by the engine yet.
+                for event in raw_events {
+                    match event {
+                        mosaix_platform_windows::RawEvent::Focused(handle) => {
+                            let window_id = mosaix_platform_windows::window_id_from_handle(handle);
+                            if events
+                                .send(mosaix_engine::Event::WindowFocused { window_id })
+                                .is_err()
+                            {
+                                tracing::warn!("reducer stopped; focus forwarder exiting");
+                                break;
+                            }
+                        }
+                        mosaix_platform_windows::RawEvent::LocationChanged(handle) => {
+                            let window_id = mosaix_platform_windows::window_id_from_handle(handle);
+                            let Some((display_id, bounds)) =
+                                mosaix_platform_windows::observed_window_state(handle)
+                            else {
+                                tracing::debug!(
+                                    ?window_id,
+                                    "could not read bounds/display for a location-changed window; skipping"
+                                );
+                                continue;
+                            };
+                            if events
+                                .send(mosaix_engine::Event::WindowBoundsObserved {
+                                    window_id,
+                                    display_id,
+                                    bounds,
+                                })
+                                .is_err()
+                            {
+                                tracing::warn!("reducer stopped; bounds-observed forwarder exiting");
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            });
+            Some((hooks, forwarder))
+        }
+        Err(err) => {
+            tracing::error!(%err, "failed to start OS event hooks; the agent will not observe focus changes");
+            None
+        }
+    };
+
+    let default_bindings = keybindings::default_bindings();
+    let hotkeys_and_forwarder = match mosaix_platform_windows::start_hotkeys(
+        default_bindings.iter().map(|entry| entry.binding).collect(),
+    ) {
+        Ok((registrations, hotkey_events)) => {
+            for result in &registrations.results {
+                if let Err(err) = &result.outcome {
+                    let direction = keybindings::direction_for_id(&default_bindings, result.id);
+                    tracing::error!(
+                        hotkey_id = result.id,
+                        ?direction,
+                        %err,
+                        "failed to register default hotkey; that binding will not work, the rest still will"
+                    );
+                }
+            }
+            let events = engine.events();
+            let forwarder = std::thread::spawn(move || {
+                for fired in hotkey_events {
+                    let Some(direction) = keybindings::direction_for_id(&default_bindings, fired.id) else {
+                        tracing::warn!(hotkey_id = fired.id, "hotkey fired for an unknown id; ignoring");
+                        continue;
+                    };
+                    if events
+                        .send(mosaix_engine::Event::ZoneSnapRequested { direction })
+                        .is_err()
+                    {
+                        tracing::warn!("reducer stopped; hotkey forwarder exiting");
+                        break;
+                    }
+                }
+            });
+            Some((registrations, forwarder))
+        }
+        Err(err) => {
+            tracing::error!(%err, "failed to start hotkey registration thread; snap hotkeys will not work");
+            None
+        }
+    };
+
     let shutdown = mosaix_platform_windows::register_shutdown_signal()
         .expect("failed to register shutdown signal handler at startup");
     tracing::info!(
@@ -72,6 +170,14 @@ fn main() {
 
     if let Some((watcher, forwarder)) = watcher_and_forwarder {
         watcher.stop();
+        let _ = forwarder.join();
+    }
+    if let Some((hooks, forwarder)) = event_hooks_and_forwarder {
+        hooks.stop();
+        let _ = forwarder.join();
+    }
+    if let Some((registrations, forwarder)) = hotkeys_and_forwarder {
+        registrations.stop();
         let _ = forwarder.join();
     }
     engine.stop();

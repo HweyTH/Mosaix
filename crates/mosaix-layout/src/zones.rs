@@ -160,6 +160,54 @@ pub fn snap_to_third(container: Rect, zone: ThirdZone) -> Rect {
     )
 }
 
+/// The horizontal direction a zone-snap hotkey cycles in (CONTEXT.md "Zone
+/// cycle"). Vertical snapping (top/bottom) never cycles, so it has no
+/// counterpart here -- it continues to resolve via [`snap_to_half`] alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HorizontalDirection {
+    Left,
+    Right,
+}
+
+/// A window's position within its zone cycle for a given
+/// [`HorizontalDirection`] -- half, then the matching third, then the
+/// matching two-thirds, wrapping back to half (CONTEXT.md "Cycle step").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CycleStep {
+    Half,
+    Third,
+    TwoThirds,
+}
+
+impl CycleStep {
+    /// The step a repeated same-direction press advances to, wrapping from
+    /// `TwoThirds` back to `Half` rather than dead-ending.
+    pub fn next(self) -> CycleStep {
+        match self {
+            CycleStep::Half => CycleStep::Third,
+            CycleStep::Third => CycleStep::TwoThirds,
+            CycleStep::TwoThirds => CycleStep::Half,
+        }
+    }
+}
+
+/// Resolves `direction`'s zone cycle at `step` against `container`
+/// (typically a display's work area) -- half on [`CycleStep::Half`], the
+/// matching third on [`CycleStep::Third`], the matching two-thirds on
+/// [`CycleStep::TwoThirds`] (CONTEXT.md "Zone cycle"). Delegates to
+/// [`snap_to_half`]/[`snap_to_third`], so it inherits their container-offset
+/// handling and gapless thirds.
+pub fn resolve_zone_cycle(container: Rect, direction: HorizontalDirection, step: CycleStep) -> Rect {
+    match (direction, step) {
+        (HorizontalDirection::Left, CycleStep::Half) => snap_to_half(container, HalfZone::LeftHalf),
+        (HorizontalDirection::Right, CycleStep::Half) => snap_to_half(container, HalfZone::RightHalf),
+        (HorizontalDirection::Left, CycleStep::Third) => snap_to_third(container, ThirdZone::LeftThird),
+        (HorizontalDirection::Right, CycleStep::Third) => snap_to_third(container, ThirdZone::RightThird),
+        (HorizontalDirection::Left, CycleStep::TwoThirds) => snap_to_third(container, ThirdZone::LeftTwoThirds),
+        (HorizontalDirection::Right, CycleStep::TwoThirds) => snap_to_third(container, ThirdZone::RightTwoThirds),
+    }
+}
+
 /// Centers a window of `window_size` (width, height) within `container`
 /// (typically a display's work area), preserving the window's size unless
 /// it's larger than `container` on an axis, in which case that axis is
@@ -475,5 +523,98 @@ mod tests {
     fn maximize_to_work_area_fills_the_container_exactly() {
         let container = Rect::new(-1920, 40, 1920, 1040);
         assert_eq!(maximize_to_work_area(container), container);
+    }
+
+    #[test]
+    fn resolve_zone_cycle_left_half_matches_snap_to_half() {
+        assert_eq!(
+            resolve_zone_cycle(WORK_AREA, HorizontalDirection::Left, CycleStep::Half),
+            Rect::new(0, 0, 960, 1080)
+        );
+    }
+
+    #[test]
+    fn resolve_zone_cycle_right_half_matches_snap_to_half() {
+        assert_eq!(
+            resolve_zone_cycle(WORK_AREA, HorizontalDirection::Right, CycleStep::Half),
+            Rect::new(960, 0, 960, 1080)
+        );
+    }
+
+    #[test]
+    fn resolve_zone_cycle_left_third_matches_snap_to_third() {
+        assert_eq!(
+            resolve_zone_cycle(WORK_AREA, HorizontalDirection::Left, CycleStep::Third),
+            Rect::new(0, 0, 640, 1080)
+        );
+    }
+
+    #[test]
+    fn resolve_zone_cycle_right_third_matches_snap_to_third() {
+        assert_eq!(
+            resolve_zone_cycle(WORK_AREA, HorizontalDirection::Right, CycleStep::Third),
+            Rect::new(1280, 0, 640, 1080)
+        );
+    }
+
+    #[test]
+    fn resolve_zone_cycle_left_two_thirds_matches_snap_to_third() {
+        assert_eq!(
+            resolve_zone_cycle(WORK_AREA, HorizontalDirection::Left, CycleStep::TwoThirds),
+            Rect::new(0, 0, 1280, 1080)
+        );
+    }
+
+    #[test]
+    fn resolve_zone_cycle_right_two_thirds_matches_snap_to_third() {
+        assert_eq!(
+            resolve_zone_cycle(WORK_AREA, HorizontalDirection::Right, CycleStep::TwoThirds),
+            Rect::new(640, 0, 1280, 1080)
+        );
+    }
+
+    #[test]
+    fn resolve_zone_cycle_respects_a_container_offset() {
+        let container = Rect::new(-1920, 40, 1920, 1040);
+
+        assert_eq!(
+            resolve_zone_cycle(container, HorizontalDirection::Left, CycleStep::Half),
+            Rect::new(-1920, 40, 960, 1040)
+        );
+        assert_eq!(
+            resolve_zone_cycle(container, HorizontalDirection::Right, CycleStep::TwoThirds),
+            Rect::new(-1280, 40, 1280, 1040)
+        );
+    }
+
+    #[test]
+    fn resolve_zone_cycle_left_and_right_steps_are_gapless_and_cover_the_container_on_a_non_multiple_of_three_width() {
+        let container = Rect::new(0, 0, 100, 50);
+        let left_third = resolve_zone_cycle(container, HorizontalDirection::Left, CycleStep::Third);
+        let left_two_thirds = resolve_zone_cycle(container, HorizontalDirection::Left, CycleStep::TwoThirds);
+        let right_third = resolve_zone_cycle(container, HorizontalDirection::Right, CycleStep::Third);
+        let right_two_thirds = resolve_zone_cycle(container, HorizontalDirection::Right, CycleStep::TwoThirds);
+
+        assert_eq!(left_third.x, container.x);
+        assert_eq!(left_two_thirds.x, container.x);
+        assert_eq!(right_two_thirds.right(), container.right());
+        assert_eq!(right_third.right(), container.right());
+        assert_eq!(
+            left_two_thirds.right(),
+            right_third.x,
+            "left two-thirds and right third must share an exact edge, not fall short by rounding"
+        );
+        assert_eq!(
+            left_third.right(),
+            right_two_thirds.x,
+            "left third and right two-thirds must share an exact edge, not fall short by rounding"
+        );
+    }
+
+    #[test]
+    fn cycle_step_advances_half_to_third_to_two_thirds_and_wraps_back_to_half() {
+        assert_eq!(CycleStep::Half.next(), CycleStep::Third);
+        assert_eq!(CycleStep::Third.next(), CycleStep::TwoThirds);
+        assert_eq!(CycleStep::TwoThirds.next(), CycleStep::Half);
     }
 }

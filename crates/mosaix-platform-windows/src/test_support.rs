@@ -1,7 +1,10 @@
-//! Shared helpers for creating a real, throwaway top-level window in tests.
-//! Used by both the move/resize and event-hook test suites.
+//! Shared helpers for creating a real, throwaway top-level window and for
+//! polling a channel with a timeout in tests. Used by the move/resize,
+//! event-hook, and hotkey test suites.
 
+use std::sync::mpsc::Receiver;
 use std::sync::Once;
+use std::time::{Duration, Instant};
 
 use windows::core::w;
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
@@ -58,4 +61,24 @@ pub(crate) fn create_test_window() -> HWND {
         )
     }
     .expect("failed to create test window")
+}
+
+/// Polls `rx` until an event matching `matches` arrives or `timeout` elapses.
+pub(crate) fn wait_for<T>(
+    rx: &Receiver<T>,
+    matches: impl Fn(&T) -> bool,
+    timeout: Duration,
+) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        match rx.recv_timeout(remaining) {
+            Ok(event) if matches(&event) => return true,
+            Ok(_) => continue,
+            Err(_) => return false,
+        }
+    }
 }
