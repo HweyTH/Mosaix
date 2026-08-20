@@ -15,6 +15,9 @@
 //! the agent instead -- it's meant to run all day.
 
 #[cfg(windows)]
+mod keybindings;
+
+#[cfg(windows)]
 fn main() {
     // Must happen before any window/monitor query.
     mosaix_platform_windows::enable_per_monitor_dpi_awareness()
@@ -117,6 +120,46 @@ fn main() {
         }
     };
 
+    let default_bindings = keybindings::default_bindings();
+    let hotkeys_and_forwarder = match mosaix_platform_windows::start_hotkeys(
+        default_bindings.iter().map(|entry| entry.binding).collect(),
+    ) {
+        Ok((registrations, hotkey_events)) => {
+            for result in &registrations.results {
+                if let Err(err) = &result.outcome {
+                    let direction = keybindings::direction_for_id(&default_bindings, result.id);
+                    tracing::error!(
+                        hotkey_id = result.id,
+                        ?direction,
+                        %err,
+                        "failed to register default hotkey; that binding will not work, the rest still will"
+                    );
+                }
+            }
+            let events = engine.events();
+            let forwarder = std::thread::spawn(move || {
+                for fired in hotkey_events {
+                    let Some(direction) = keybindings::direction_for_id(&default_bindings, fired.id) else {
+                        tracing::warn!(hotkey_id = fired.id, "hotkey fired for an unknown id; ignoring");
+                        continue;
+                    };
+                    if events
+                        .send(mosaix_engine::Event::ZoneSnapRequested { direction })
+                        .is_err()
+                    {
+                        tracing::warn!("reducer stopped; hotkey forwarder exiting");
+                        break;
+                    }
+                }
+            });
+            Some((registrations, forwarder))
+        }
+        Err(err) => {
+            tracing::error!(%err, "failed to start hotkey registration thread; snap hotkeys will not work");
+            None
+        }
+    };
+
     let shutdown = mosaix_platform_windows::register_shutdown_signal()
         .expect("failed to register shutdown signal handler at startup");
     tracing::info!(
@@ -131,6 +174,10 @@ fn main() {
     }
     if let Some((hooks, forwarder)) = event_hooks_and_forwarder {
         hooks.stop();
+        let _ = forwarder.join();
+    }
+    if let Some((registrations, forwarder)) = hotkeys_and_forwarder {
+        registrations.stop();
         let _ = forwarder.join();
     }
     engine.stop();
