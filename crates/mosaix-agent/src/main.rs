@@ -66,22 +66,46 @@ fn main() {
         Ok((hooks, raw_events)) => {
             let events = engine.events();
             let forwarder = std::thread::spawn(move || {
-                // Only `RawEvent::Focused` is forwarded here. The other
-                // variants (WindowCreated/WindowDestroyed/LocationChanged/
-                // MoveResizeStart/MoveResizeEnd) aren't consumed by the
-                // engine yet -- LocationChanged lands with the
-                // bounds-observed event a later ticket adds; the rest
-                // aren't needed yet.
+                // `RawEvent::Focused` and `RawEvent::LocationChanged` are
+                // forwarded here. The other variants (WindowCreated/
+                // WindowDestroyed/MoveResizeStart/MoveResizeEnd) aren't
+                // consumed by the engine yet.
                 for event in raw_events {
-                    if let mosaix_platform_windows::RawEvent::Focused(handle) = event {
-                        let window_id = mosaix_platform_windows::window_id_from_handle(handle);
-                        if events
-                            .send(mosaix_engine::Event::WindowFocused { window_id })
-                            .is_err()
-                        {
-                            tracing::warn!("reducer stopped; focus forwarder exiting");
-                            break;
+                    match event {
+                        mosaix_platform_windows::RawEvent::Focused(handle) => {
+                            let window_id = mosaix_platform_windows::window_id_from_handle(handle);
+                            if events
+                                .send(mosaix_engine::Event::WindowFocused { window_id })
+                                .is_err()
+                            {
+                                tracing::warn!("reducer stopped; focus forwarder exiting");
+                                break;
+                            }
                         }
+                        mosaix_platform_windows::RawEvent::LocationChanged(handle) => {
+                            let window_id = mosaix_platform_windows::window_id_from_handle(handle);
+                            let Some((display_id, bounds)) =
+                                mosaix_platform_windows::observed_window_state(handle)
+                            else {
+                                tracing::debug!(
+                                    ?window_id,
+                                    "could not read bounds/display for a location-changed window; skipping"
+                                );
+                                continue;
+                            };
+                            if events
+                                .send(mosaix_engine::Event::WindowBoundsObserved {
+                                    window_id,
+                                    display_id,
+                                    bounds,
+                                })
+                                .is_err()
+                            {
+                                tracing::warn!("reducer stopped; bounds-observed forwarder exiting");
+                                break;
+                            }
+                        }
+                        _ => {}
                     }
                 }
             });
