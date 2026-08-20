@@ -7,4 +7,5 @@ license.workspace = true
 
 [dependencies]
 mosaix-domain = { path = "../mosaix-domain" }
+mosaix-layout = { path = "../mosaix-layout" }
 tracing = { workspace = true }
