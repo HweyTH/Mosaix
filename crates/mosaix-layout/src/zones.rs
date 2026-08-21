@@ -21,7 +21,7 @@
 //! rounds from *cumulative* weight instead, guaranteeing the three columns
 //! are gapless and cover the container exactly.
 
-use mosaix_domain::{allocate_edges, NormalizedRect, Rect};
+use mosaix_domain::{allocate_edges, Gaps, NormalizedRect, Rect};
 
 /// A named half-zone a window can be snapped to (architecture doc section
 /// 8.1, "Snap to named zone"; section 20, "Focused-window halves").
@@ -239,6 +239,45 @@ pub fn center_on(container: Rect, window_size: (i32, i32)) -> Rect {
 /// section 20, "Focused-window ... maximize").
 pub fn maximize_to_work_area(container: Rect) -> Rect {
     container
+}
+
+/// Insets `raw_zone`'s edges by `gaps`, applied after a zone function has
+/// computed the raw rect (ADR 0006, CONTEXT.md "Gap (outer / inner)") --
+/// kept as a separate post-processing step rather than a parameter on
+/// `snap_to_half`/`snap_to_quarter`/`snap_to_third`/`resolve_zone_cycle`.
+///
+/// An edge of `raw_zone` that coincides with the matching edge of
+/// `container` is treated as touching the container's boundary and gets
+/// `gaps.outer`; any other edge is treated as bordering a hypothetical
+/// neighboring zone and gets `gaps.inner`.
+pub fn apply_gaps(raw_zone: Rect, container: Rect, gaps: Gaps) -> Rect {
+    let left_gap = if raw_zone.x == container.x {
+        gaps.outer
+    } else {
+        gaps.inner
+    };
+    let top_gap = if raw_zone.y == container.y {
+        gaps.outer
+    } else {
+        gaps.inner
+    };
+    let right_gap = if raw_zone.right() == container.right() {
+        gaps.outer
+    } else {
+        gaps.inner
+    };
+    let bottom_gap = if raw_zone.bottom() == container.bottom() {
+        gaps.outer
+    } else {
+        gaps.inner
+    };
+
+    let x = raw_zone.x + left_gap;
+    let y = raw_zone.y + top_gap;
+    let right = raw_zone.right() - right_gap;
+    let bottom = raw_zone.bottom() - bottom_gap;
+
+    Rect::new(x, y, right - x, bottom - y)
 }
 
 #[cfg(test)]
@@ -616,5 +655,82 @@ mod tests {
         assert_eq!(CycleStep::Half.next(), CycleStep::Third);
         assert_eq!(CycleStep::Third.next(), CycleStep::TwoThirds);
         assert_eq!(CycleStep::TwoThirds.next(), CycleStep::Half);
+    }
+
+    #[test]
+    fn apply_gaps_insets_all_four_edges_with_the_outer_gap_when_the_zone_touches_every_container_edge(
+    ) {
+        // e.g. maximize_to_work_area's output -- every edge touches the container.
+        let raw_zone = maximize_to_work_area(WORK_AREA);
+        let gaps = Gaps::new(10, 4);
+
+        assert_eq!(
+            apply_gaps(raw_zone, WORK_AREA, gaps),
+            Rect::new(10, 10, 1900, 1060)
+        );
+    }
+
+    #[test]
+    fn apply_gaps_gives_left_half_outer_gap_on_three_sides_and_inner_gap_on_its_interior_right_edge(
+    ) {
+        let raw_zone = snap_to_half(WORK_AREA, HalfZone::LeftHalf);
+        let gaps = Gaps::new(10, 4);
+
+        assert_eq!(
+            apply_gaps(raw_zone, WORK_AREA, gaps),
+            Rect::new(10, 10, 960 - 10 - 4, 1060)
+        );
+    }
+
+    #[test]
+    fn apply_gaps_gives_right_half_outer_gap_on_three_sides_and_inner_gap_on_its_interior_left_edge(
+    ) {
+        let raw_zone = snap_to_half(WORK_AREA, HalfZone::RightHalf);
+        let gaps = Gaps::new(10, 4);
+
+        assert_eq!(
+            apply_gaps(raw_zone, WORK_AREA, gaps),
+            Rect::new(960 + 4, 10, 960 - 10 - 4, 1060)
+        );
+    }
+
+    #[test]
+    fn apply_gaps_gives_a_corner_quarter_outer_gap_on_two_edges_and_inner_gap_on_the_other_two() {
+        // TopLeft touches the container's top and left edges (outer); its
+        // right and bottom edges border hypothetical neighboring zones (inner).
+        let raw_zone = snap_to_quarter(WORK_AREA, QuarterZone::TopLeft);
+        let gaps = Gaps::new(10, 4);
+
+        assert_eq!(
+            apply_gaps(raw_zone, WORK_AREA, gaps),
+            Rect::new(10, 10, 960 - 10 - 4, 540 - 10 - 4)
+        );
+    }
+
+    #[test]
+    fn apply_gaps_gives_bottom_right_quarter_outer_gap_on_bottom_and_right_and_inner_on_top_and_left(
+    ) {
+        let raw_zone = snap_to_quarter(WORK_AREA, QuarterZone::BottomRight);
+        let gaps = Gaps::new(10, 4);
+
+        assert_eq!(
+            apply_gaps(raw_zone, WORK_AREA, gaps),
+            Rect::new(960 + 4, 540 + 4, 960 - 10 - 4, 540 - 10 - 4)
+        );
+    }
+
+    #[test]
+    fn apply_gaps_with_zero_outer_and_inner_gaps_is_a_no_op() {
+        let raw_zone = snap_to_half(WORK_AREA, HalfZone::LeftHalf);
+        assert_eq!(
+            apply_gaps(raw_zone, WORK_AREA, Gaps::new(0, 0)),
+            raw_zone
+        );
+
+        let maximized = maximize_to_work_area(WORK_AREA);
+        assert_eq!(
+            apply_gaps(maximized, WORK_AREA, Gaps::new(0, 0)),
+            maximized
+        );
     }
 }
