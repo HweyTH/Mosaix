@@ -132,6 +132,16 @@ pub fn move_resize_window(hwnd: HWND, bounds: Rect) -> Result<()> {
     }
 }
 
+/// Like [`move_resize_window`], but takes the domain [`WindowId`] a caller
+/// outside this crate actually has (from [`mosaix_engine::EngineState`]'s
+/// tracked placements), converting to the raw `HWND` at this boundary so
+/// callers like `mosaix-agent`'s executor never need to depend on `windows`
+/// crate types themselves.
+#[cfg(windows)]
+pub fn move_resize_window_by_id(window_id: WindowId, bounds: Rect) -> Result<()> {
+    move_resize_window(HWND::from(WindowHandle(window_id.0)), bounds)
+}
+
 /// Reads a top-level window's current position and size in physical-pixel
 /// screen coordinates.
 #[cfg(windows)]
