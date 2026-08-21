@@ -23,10 +23,11 @@ use std::sync::mpsc::{sync_channel, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
+use mosaix_config::{ResolvedConfig, ResolvedConfigSet};
 use mosaix_domain::{topology_fingerprint, Display, DisplayId, Rect, WindowId};
 use mosaix_layout::{
-    cycle_display, resolve_zone_cycle, snap_to_half, throw_preserving_ratio, CycleStep,
-    DisplayDirection, HalfZone, HorizontalDirection,
+    apply_gaps, cycle_display, resolve_zone_cycle, snap_to_half, throw_preserving_ratio,
+    CycleStep, DisplayDirection, HalfZone, HorizontalDirection,
 };
 
 /// Default bound on the event queue before a sender blocks. Chosen
@@ -48,12 +49,31 @@ pub struct EngineState {
     pub displays: Vec<Display>,
     /// Where each tracked window currently sits, keyed by window. Entries
     /// are created (and their `previous_placement` remembered) by
-    /// [`Event::WindowPlaced`] and [`Event::WindowThrowToDisplayRequested`].
+    /// [`Event::WindowPlaced`] and [`Event::WindowThrowToDisplayRequested`],
+    /// or, for a window seen focused before either of those ever fires,
+    /// by [`Event::WindowFocused`] itself (with no `previous_placement`).
     pub windows: HashMap<WindowId, WindowPlacement>,
     /// The window that currently has OS foreground focus, `None` until the
     /// first [`Event::WindowFocused`] is observed. Sourced from the OS's
     /// foreground-change notification (architecture doc section 8.2).
     pub focused_window: Option<WindowId>,
+    /// The currently active hotkeys/gaps/behavior settings (CONTEXT.md
+    /// "Resolved config") -- whichever of `config_set`'s `base` or one of
+    /// its `profiles` currently matches `displays`' topology. Updated by
+    /// [`Event::ConfigChanged`] (ADR 0005) and, per ADR 0004/this ticket, by
+    /// [`Event::DisplayTopologyChanged`] re-selecting against the same
+    /// `config_set` whenever the topology itself changes. Defaults to
+    /// `ResolvedConfig::default()` (no hotkeys bound) before the first
+    /// config load completes -- the same "nothing observed yet" role
+    /// `displays: Vec::new()` plays for topology.
+    pub resolved_config: ResolvedConfig,
+    /// The full base-config-plus-profiles set most recently delivered by
+    /// [`Event::ConfigChanged`] (ADR 0004, 0005) -- kept around so
+    /// [`Event::DisplayTopologyChanged`] has something to re-select
+    /// `resolved_config` from without needing its own copy of every
+    /// profile. Never read directly by anything outside the reducer;
+    /// `resolved_config` is what the rest of the system consults.
+    pub config_set: ResolvedConfigSet,
 }
 
 /// A tracked window's current bounds and display, plus the display and
@@ -154,10 +174,22 @@ pub enum Event {
         direction: DisplayDirection,
     },
 
-    /// The OS reported `window_id` as having gained foreground focus.
+    /// The OS reported `window_id` as having gained foreground focus, along
+    /// with its current display and bounds as observed at that moment.
     /// Sourced from the platform adapter's foreground-change notification;
-    /// updates [`EngineState::focused_window`].
-    WindowFocused { window_id: WindowId },
+    /// updates [`EngineState::focused_window`]. If `window_id` isn't
+    /// already tracked, it's registered using the observed placement (with
+    /// no `previous_placement`) -- otherwise its existing tracked placement
+    /// is left untouched, since Mosaix's own last placement is more
+    /// trustworthy than a point-in-time OS observation. This is how a
+    /// window becomes tracked in the first place: nothing else in the
+    /// system ever sends [`Event::WindowPlaced`] for a window Mosaix didn't
+    /// itself just place.
+    WindowFocused {
+        window_id: WindowId,
+        display_id: DisplayId,
+        bounds: Rect,
+    },
 
     /// A zone-snap hotkey fired for `direction` (architecture doc section
     /// 20's directional snap commands; CONTEXT.md "Zone cycle"). Carries no
@@ -192,6 +224,18 @@ pub enum Event {
         display_id: DisplayId,
         bounds: Rect,
     },
+
+    /// `mosaix-config`'s directory watcher validated a new candidate
+    /// config directory successfully (ADR 0005, 0007, 0008); carries the
+    /// full base-config-plus-profiles set, not a diff. Sent for the
+    /// initial startup load as well as every subsequent hot-edit -- an
+    /// edit that fails validation never produces this event at all, so
+    /// [`EngineState::config_set`] (and the [`EngineState::resolved_config`]
+    /// re-selected from it) simply keeps its last-known-good value (ADR
+    /// 0007). The active profile is re-selected against [`EngineState`]'s
+    /// current topology exactly the way [`Event::DisplayTopologyChanged`]
+    /// re-selects it against the current config set (ADR 0004).
+    ConfigChanged(ResolvedConfigSet),
 }
 
 /// Applies one event to `state`. Must never panic -- a single bad event
@@ -206,20 +250,32 @@ fn apply(state: &mut EngineState, event: Event) {
             }
             tracing::info!(display_count = displays.len(), "display topology changed");
             state.displays = displays;
+            state.resolved_config = select_resolved_config(&state.config_set, &state.displays);
             state.revision += 1;
         }
 
-        Event::WindowPlaced { window_id, display_id, bounds } => {
+        Event::WindowPlaced {
+            window_id,
+            display_id,
+            bounds,
+        } => {
             place_window(state, window_id, display_id, bounds, None);
         }
 
         Event::WindowRestoreRequested { window_id } => {
             let Some(placement) = state.windows.get_mut(&window_id) else {
-                tracing::debug!(?window_id, "restore requested for an untracked window; ignoring");
+                tracing::debug!(
+                    ?window_id,
+                    "restore requested for an untracked window; ignoring"
+                );
                 return;
             };
-            let Some((previous_display_id, previous_bounds)) = placement.previous_placement.take() else {
-                tracing::debug!(?window_id, "restore requested but no prior placement is remembered; ignoring");
+            let Some((previous_display_id, previous_bounds)) = placement.previous_placement.take()
+            else {
+                tracing::debug!(
+                    ?window_id,
+                    "restore requested but no prior placement is remembered; ignoring"
+                );
                 return;
             };
             placement.display_id = previous_display_id;
@@ -227,15 +283,25 @@ fn apply(state: &mut EngineState, event: Event) {
             state.revision += 1;
         }
 
-        Event::WindowThrowToDisplayRequested { window_id, direction } => {
+        Event::WindowThrowToDisplayRequested {
+            window_id,
+            direction,
+        } => {
             let Some(placement) = state.windows.get(&window_id) else {
-                tracing::debug!(?window_id, "throw-to-display requested for an untracked window; ignoring");
+                tracing::debug!(
+                    ?window_id,
+                    "throw-to-display requested for an untracked window; ignoring"
+                );
                 return;
             };
             let (from_display_id, bounds) = (placement.display_id, placement.bounds);
 
-            let Some(to_display_id) = cycle_display(&state.displays, from_display_id, direction) else {
-                tracing::debug!(?window_id, "no adjacent display to throw the window to; ignoring");
+            let Some(to_display_id) = cycle_display(&state.displays, from_display_id, direction)
+            else {
+                tracing::debug!(
+                    ?window_id,
+                    "no adjacent display to throw the window to; ignoring"
+                );
                 return;
             };
             let Some(from_work_area) = work_area_of(&state.displays, from_display_id) else {
@@ -247,7 +313,11 @@ fn apply(state: &mut EngineState, event: Event) {
                 return;
             };
             let Some(to_work_area) = work_area_of(&state.displays, to_display_id) else {
-                tracing::debug!(?window_id, ?to_display_id, "target display vanished mid-throw; ignoring");
+                tracing::debug!(
+                    ?window_id,
+                    ?to_display_id,
+                    "target display vanished mid-throw; ignoring"
+                );
                 return;
             };
 
@@ -255,7 +325,22 @@ fn apply(state: &mut EngineState, event: Event) {
             place_window(state, window_id, to_display_id, new_bounds, None);
         }
 
-        Event::WindowFocused { window_id } => {
+        Event::WindowFocused {
+            window_id,
+            display_id,
+            bounds,
+        } => {
+            if !state.windows.contains_key(&window_id) {
+                state.windows.insert(
+                    window_id,
+                    WindowPlacement {
+                        display_id,
+                        bounds,
+                        previous_placement: None,
+                        cycle_step: None,
+                    },
+                );
+            }
             state.focused_window = Some(window_id);
             state.revision += 1;
         }
@@ -266,7 +351,10 @@ fn apply(state: &mut EngineState, event: Event) {
                 return;
             };
             let Some(placement) = state.windows.get(&window_id) else {
-                tracing::debug!(?window_id, "zone-snap requested for an untracked focused window; ignoring");
+                tracing::debug!(
+                    ?window_id,
+                    "zone-snap requested for an untracked focused window; ignoring"
+                );
                 return;
             };
             let display_id = placement.display_id;
@@ -281,27 +369,44 @@ fn apply(state: &mut EngineState, event: Event) {
 
             if let Some(horizontal_direction) = direction.horizontal() {
                 let next_step = match placement.cycle_step {
-                    Some((previous_direction, previous_step)) if previous_direction == horizontal_direction => {
+                    Some((previous_direction, previous_step))
+                        if previous_direction == horizontal_direction =>
+                    {
                         previous_step.next()
                     }
                     _ => CycleStep::Half,
                 };
-                let bounds = resolve_zone_cycle(work_area, horizontal_direction, next_step);
-                place_window(state, window_id, display_id, bounds, Some((horizontal_direction, next_step)));
+                let raw_bounds = resolve_zone_cycle(work_area, horizontal_direction, next_step);
+                let bounds = apply_gaps(raw_bounds, work_area, state.resolved_config.gaps);
+                place_window(
+                    state,
+                    window_id,
+                    display_id,
+                    bounds,
+                    Some((horizontal_direction, next_step)),
+                );
             } else {
                 let zone = if direction == ZoneSnapDirection::Top {
                     HalfZone::TopHalf
                 } else {
                     HalfZone::BottomHalf
                 };
-                let bounds = snap_to_half(work_area, zone);
+                let raw_bounds = snap_to_half(work_area, zone);
+                let bounds = apply_gaps(raw_bounds, work_area, state.resolved_config.gaps);
                 place_window(state, window_id, display_id, bounds, None);
             }
         }
 
-        Event::WindowBoundsObserved { window_id, display_id, bounds } => {
+        Event::WindowBoundsObserved {
+            window_id,
+            display_id,
+            bounds,
+        } => {
             let Some(placement) = state.windows.get_mut(&window_id) else {
-                tracing::debug!(?window_id, "bounds observed for an untracked window; ignoring");
+                tracing::debug!(
+                    ?window_id,
+                    "bounds observed for an untracked window; ignoring"
+                );
                 return;
             };
             if placement.display_id == display_id && placement.bounds == bounds {
@@ -319,12 +424,71 @@ fn apply(state: &mut EngineState, event: Event) {
                 state.revision += 1;
             }
         }
+
+        Event::ConfigChanged(config_set) => {
+            if config_set == state.config_set {
+                tracing::debug!("config event was not a real change; ignoring");
+                return;
+            }
+            tracing::info!("resolved config changed");
+            state.resolved_config = select_resolved_config(&config_set, &state.displays);
+            state.config_set = config_set;
+            state.revision += 1;
+        }
     }
+}
+
+/// The resolved config that should be active for `displays`' current
+/// topology: whichever profile in `config_set.profiles` has a `fingerprint`
+/// matching [`topology_fingerprint`] of `displays`, or `config_set.base` if
+/// none does (ADR 0004 -- profiles are opt-in overrides, never
+/// auto-created, so "no match" is an ordinary outcome, not an error).
+/// Shared by [`Event::ConfigChanged`] and [`Event::DisplayTopologyChanged`]
+/// so a topology already seen before always re-selects the same profile it
+/// matched last time.
+fn select_resolved_config(config_set: &ResolvedConfigSet, displays: &[Display]) -> ResolvedConfig {
+    let fingerprint = topology_fingerprint(displays);
+    config_set
+        .profiles
+        .iter()
+        .find(|profile| profile.fingerprint == fingerprint)
+        .map(|profile| profile.config.clone())
+        .unwrap_or_else(|| config_set.base.clone())
 }
 
 /// The work area of the display with `id`, if it's still in `displays`.
 fn work_area_of(displays: &[Display], id: DisplayId) -> Option<Rect> {
-    displays.iter().find(|display| display.id == id).map(|display| display.work_area)
+    displays
+        .iter()
+        .find(|display| display.id == id)
+        .map(|display| display.work_area)
+}
+
+/// The windows in `current` that need a real `SetWindowPos` call to catch
+/// up to the reducer -- new since `previous`, or moved/resized since
+/// `previous` (architecture doc section 6's "Placement diff" stage,
+/// scoped down to what a poll-driven executor needs: it doesn't do
+/// transaction planning, just "what changed since I last looked").
+///
+/// A window present in `previous` but missing from `current` needs no
+/// call -- there's nothing sensible to move it to, and the engine never
+/// removes tracked windows today anyway.
+pub fn diff_placements(
+    previous: &HashMap<WindowId, WindowPlacement>,
+    current: &HashMap<WindowId, WindowPlacement>,
+) -> Vec<(WindowId, DisplayId, Rect)> {
+    current
+        .iter()
+        .filter(|(window_id, placement)| {
+            previous
+                .get(window_id)
+                .map(|prior| {
+                    prior.display_id != placement.display_id || prior.bounds != placement.bounds
+                })
+                .unwrap_or(true)
+        })
+        .map(|(window_id, placement)| (*window_id, placement.display_id, placement.bounds))
+        .collect()
 }
 
 /// Records `bounds` as `window_id`'s current placement on `display_id`,
@@ -387,10 +551,12 @@ impl EventSender {
     /// event queue"). Fails, returning the event back, once the reducer
     /// has stopped.
     pub fn send(&self, event: Event) -> std::result::Result<(), Event> {
-        self.inner.send(Message::Event(event)).map_err(|err| match err.0 {
-            Message::Event(event) => event,
-            Message::Shutdown => unreachable!("only EngineHandle::stop sends Shutdown"),
-        })
+        self.inner
+            .send(Message::Event(event))
+            .map_err(|err| match err.0 {
+                Message::Event(event) => event,
+                Message::Shutdown => unreachable!("only EngineHandle::stop sends Shutdown"),
+            })
     }
 }
 
@@ -411,7 +577,19 @@ impl EngineHandle {
     /// The latest committed state. Never blocks on the reducer; readers
     /// see a consistent snapshot as of the most recently applied event.
     pub fn snapshot(&self) -> EngineState {
-        self.state.lock().expect("engine state mutex poisoned").clone()
+        self.state
+            .lock()
+            .expect("engine state mutex poisoned")
+            .clone()
+    }
+
+    /// A cloneable handle for reading committed state from another thread
+    /// (e.g. a platform executor polling for placements to apply), without
+    /// needing the [`EngineHandle`] itself.
+    pub fn state_reader(&self) -> StateReader {
+        StateReader {
+            state: Arc::clone(&self.state),
+        }
     }
 
     /// Signals the reducer thread to exit and waits for it to do so.
@@ -439,20 +617,53 @@ impl Drop for EngineHandle {
     }
 }
 
-/// Spawns the reducer thread with `initial_displays` as the starting
-/// state, using [`DEFAULT_QUEUE_CAPACITY`].
-pub fn spawn_engine(initial_displays: Vec<Display>) -> EngineHandle {
-    spawn_engine_with_capacity(initial_displays, DEFAULT_QUEUE_CAPACITY)
+/// A cloneable handle for reading the engine's latest committed state.
+/// See [`EngineHandle::state_reader`].
+#[derive(Clone)]
+pub struct StateReader {
+    state: Arc<Mutex<EngineState>>,
+}
+
+impl StateReader {
+    /// The latest committed state. Never blocks on the reducer; readers
+    /// see a consistent snapshot as of the most recently applied event.
+    pub fn snapshot(&self) -> EngineState {
+        self.state
+            .lock()
+            .expect("engine state mutex poisoned")
+            .clone()
+    }
+}
+
+/// Spawns the reducer thread with `initial_displays` and `initial_config_set`
+/// as the starting state, using [`DEFAULT_QUEUE_CAPACITY`]. The active
+/// `resolved_config` starts pre-selected against `initial_displays` (the
+/// same selection [`Event::DisplayTopologyChanged`] would perform), so a
+/// topology already matching a saved profile at startup takes effect
+/// immediately -- without waiting for a subsequent topology-change event
+/// that may never come.
+pub fn spawn_engine(
+    initial_displays: Vec<Display>,
+    initial_config_set: ResolvedConfigSet,
+) -> EngineHandle {
+    spawn_engine_with_capacity(initial_displays, initial_config_set, DEFAULT_QUEUE_CAPACITY)
 }
 
 /// Like [`spawn_engine`], with an explicit event-queue bound.
-pub fn spawn_engine_with_capacity(initial_displays: Vec<Display>, capacity: usize) -> EngineHandle {
+pub fn spawn_engine_with_capacity(
+    initial_displays: Vec<Display>,
+    initial_config_set: ResolvedConfigSet,
+    capacity: usize,
+) -> EngineHandle {
     let (tx, rx) = sync_channel::<Message>(capacity);
+    let initial_resolved_config = select_resolved_config(&initial_config_set, &initial_displays);
     let initial_state = EngineState {
         revision: 0,
         displays: initial_displays,
         windows: HashMap::new(),
         focused_window: None,
+        resolved_config: initial_resolved_config,
+        config_set: initial_config_set,
     };
     let state = Arc::new(Mutex::new(initial_state.clone()));
 
@@ -476,6 +687,7 @@ pub fn spawn_engine_with_capacity(initial_displays: Vec<Display>, capacity: usiz
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mosaix_config::ResolvedProfile;
     use mosaix_domain::{DisplayId, Rect, Rotation};
     use std::time::{Duration, Instant};
 
@@ -501,10 +713,7 @@ mod tests {
         }
     }
 
-    fn wait_for(
-        mut condition: impl FnMut() -> bool,
-        timeout: Duration,
-    ) -> bool {
+    fn wait_for(mut condition: impl FnMut() -> bool, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
             if condition() {
@@ -518,7 +727,10 @@ mod tests {
     #[test]
     fn apply_bumps_revision_on_genuine_topology_change() {
         let mut state = EngineState::default();
-        apply(&mut state, Event::DisplayTopologyChanged(vec![display(1, "MON-A", 0)]));
+        apply(
+            &mut state,
+            Event::DisplayTopologyChanged(vec![display(1, "MON-A", 0)]),
+        );
 
         assert_eq!(state.revision, 1);
         assert_eq!(state.displays.len(), 1);
@@ -527,16 +739,28 @@ mod tests {
     #[test]
     fn apply_ignores_a_repeated_topology_hint() {
         let mut state = EngineState::default();
-        apply(&mut state, Event::DisplayTopologyChanged(vec![display(1, "MON-A", 0)]));
-        apply(&mut state, Event::DisplayTopologyChanged(vec![display(1, "MON-A", 0)]));
+        apply(
+            &mut state,
+            Event::DisplayTopologyChanged(vec![display(1, "MON-A", 0)]),
+        );
+        apply(
+            &mut state,
+            Event::DisplayTopologyChanged(vec![display(1, "MON-A", 0)]),
+        );
 
-        assert_eq!(state.revision, 1, "an identical re-enumeration must not bump the revision");
+        assert_eq!(
+            state.revision, 1,
+            "an identical re-enumeration must not bump the revision"
+        );
     }
 
     #[test]
     fn apply_bumps_revision_again_when_topology_actually_changes() {
         let mut state = EngineState::default();
-        apply(&mut state, Event::DisplayTopologyChanged(vec![display(1, "MON-A", 0)]));
+        apply(
+            &mut state,
+            Event::DisplayTopologyChanged(vec![display(1, "MON-A", 0)]),
+        );
         apply(
             &mut state,
             Event::DisplayTopologyChanged(vec![display(1, "MON-A", 0), display(2, "MON-B", 1920)]),
@@ -552,10 +776,17 @@ mod tests {
         let bounds = Rect::new(0, 0, 960, 1080);
         apply(
             &mut state,
-            Event::WindowPlaced { window_id: WindowId(1), display_id: DisplayId(1), bounds },
+            Event::WindowPlaced {
+                window_id: WindowId(1),
+                display_id: DisplayId(1),
+                bounds,
+            },
         );
 
-        let placement = state.windows.get(&WindowId(1)).expect("window should be tracked");
+        let placement = state
+            .windows
+            .get(&WindowId(1))
+            .expect("window should be tracked");
         assert_eq!(placement.display_id, DisplayId(1));
         assert_eq!(placement.bounds, bounds);
         assert_eq!(placement.previous_placement, None);
@@ -569,11 +800,19 @@ mod tests {
         let second = Rect::new(0, 0, 1920, 1080);
         apply(
             &mut state,
-            Event::WindowPlaced { window_id: WindowId(1), display_id: DisplayId(1), bounds: first },
+            Event::WindowPlaced {
+                window_id: WindowId(1),
+                display_id: DisplayId(1),
+                bounds: first,
+            },
         );
         apply(
             &mut state,
-            Event::WindowPlaced { window_id: WindowId(1), display_id: DisplayId(1), bounds: second },
+            Event::WindowPlaced {
+                window_id: WindowId(1),
+                display_id: DisplayId(1),
+                bounds: second,
+            },
         );
 
         let placement = state.windows.get(&WindowId(1)).unwrap();
@@ -589,18 +828,37 @@ mod tests {
         let second = Rect::new(0, 0, 1920, 1080);
         apply(
             &mut state,
-            Event::WindowPlaced { window_id: WindowId(1), display_id: DisplayId(1), bounds: first },
+            Event::WindowPlaced {
+                window_id: WindowId(1),
+                display_id: DisplayId(1),
+                bounds: first,
+            },
         );
         apply(
             &mut state,
-            Event::WindowPlaced { window_id: WindowId(1), display_id: DisplayId(1), bounds: second },
+            Event::WindowPlaced {
+                window_id: WindowId(1),
+                display_id: DisplayId(1),
+                bounds: second,
+            },
         );
-        apply(&mut state, Event::WindowRestoreRequested { window_id: WindowId(1) });
+        apply(
+            &mut state,
+            Event::WindowRestoreRequested {
+                window_id: WindowId(1),
+            },
+        );
 
         let placement = state.windows.get(&WindowId(1)).unwrap();
-        assert_eq!(placement.bounds, first, "restore should return to the bounds before the last placement");
+        assert_eq!(
+            placement.bounds, first,
+            "restore should return to the bounds before the last placement"
+        );
         assert_eq!(placement.display_id, DisplayId(1));
-        assert_eq!(placement.previous_placement, None, "restore is a single step, not a stack");
+        assert_eq!(
+            placement.previous_placement, None,
+            "restore is a single step, not a stack"
+        );
         assert_eq!(state.revision, 3);
     }
 
@@ -618,16 +876,32 @@ mod tests {
         let original_bounds = Rect::new(0, 0, 960, 1080);
         apply(
             &mut state,
-            Event::WindowPlaced { window_id: WindowId(1), display_id: DisplayId(1), bounds: original_bounds },
+            Event::WindowPlaced {
+                window_id: WindowId(1),
+                display_id: DisplayId(1),
+                bounds: original_bounds,
+            },
         );
         apply(
             &mut state,
-            Event::WindowThrowToDisplayRequested { window_id: WindowId(1), direction: DisplayDirection::Next },
+            Event::WindowThrowToDisplayRequested {
+                window_id: WindowId(1),
+                direction: DisplayDirection::Next,
+            },
         );
-        apply(&mut state, Event::WindowRestoreRequested { window_id: WindowId(1) });
+        apply(
+            &mut state,
+            Event::WindowRestoreRequested {
+                window_id: WindowId(1),
+            },
+        );
 
         let placement = state.windows.get(&WindowId(1)).unwrap();
-        assert_eq!(placement.display_id, DisplayId(1), "restore must move the window back to its source display");
+        assert_eq!(
+            placement.display_id,
+            DisplayId(1),
+            "restore must move the window back to its source display"
+        );
         assert_eq!(placement.bounds, original_bounds);
     }
 
@@ -638,25 +912,54 @@ mod tests {
         let second = Rect::new(0, 0, 1920, 1080);
         apply(
             &mut state,
-            Event::WindowPlaced { window_id: WindowId(1), display_id: DisplayId(1), bounds: first },
+            Event::WindowPlaced {
+                window_id: WindowId(1),
+                display_id: DisplayId(1),
+                bounds: first,
+            },
         );
         apply(
             &mut state,
-            Event::WindowPlaced { window_id: WindowId(1), display_id: DisplayId(1), bounds: second },
+            Event::WindowPlaced {
+                window_id: WindowId(1),
+                display_id: DisplayId(1),
+                bounds: second,
+            },
         );
-        apply(&mut state, Event::WindowRestoreRequested { window_id: WindowId(1) });
+        apply(
+            &mut state,
+            Event::WindowRestoreRequested {
+                window_id: WindowId(1),
+            },
+        );
         let revision_after_first_restore = state.revision;
-        apply(&mut state, Event::WindowRestoreRequested { window_id: WindowId(1) });
+        apply(
+            &mut state,
+            Event::WindowRestoreRequested {
+                window_id: WindowId(1),
+            },
+        );
 
         let placement = state.windows.get(&WindowId(1)).unwrap();
-        assert_eq!(placement.bounds, first, "a second restore with nothing remembered must be a no-op");
-        assert_eq!(state.revision, revision_after_first_restore, "a no-op restore must not bump the revision");
+        assert_eq!(
+            placement.bounds, first,
+            "a second restore with nothing remembered must be a no-op"
+        );
+        assert_eq!(
+            state.revision, revision_after_first_restore,
+            "a no-op restore must not bump the revision"
+        );
     }
 
     #[test]
     fn apply_restore_is_a_noop_for_an_untracked_window() {
         let mut state = EngineState::default();
-        apply(&mut state, Event::WindowRestoreRequested { window_id: WindowId(1) });
+        apply(
+            &mut state,
+            Event::WindowRestoreRequested {
+                window_id: WindowId(1),
+            },
+        );
 
         assert_eq!(state.revision, 0);
         assert!(state.windows.is_empty());
@@ -672,11 +975,18 @@ mod tests {
         let left_half = Rect::new(0, 0, 960, 1080);
         apply(
             &mut state,
-            Event::WindowPlaced { window_id: WindowId(1), display_id: DisplayId(1), bounds: left_half },
+            Event::WindowPlaced {
+                window_id: WindowId(1),
+                display_id: DisplayId(1),
+                bounds: left_half,
+            },
         );
         apply(
             &mut state,
-            Event::WindowThrowToDisplayRequested { window_id: WindowId(1), direction: DisplayDirection::Next },
+            Event::WindowThrowToDisplayRequested {
+                window_id: WindowId(1),
+                direction: DisplayDirection::Next,
+            },
         );
 
         let placement = state.windows.get(&WindowId(1)).unwrap();
@@ -710,10 +1020,16 @@ mod tests {
         );
         apply(
             &mut state,
-            Event::WindowThrowToDisplayRequested { window_id: WindowId(1), direction: DisplayDirection::Prev },
+            Event::WindowThrowToDisplayRequested {
+                window_id: WindowId(1),
+                direction: DisplayDirection::Prev,
+            },
         );
 
-        assert_eq!(state.windows.get(&WindowId(1)).unwrap().display_id, DisplayId(2));
+        assert_eq!(
+            state.windows.get(&WindowId(1)).unwrap().display_id,
+            DisplayId(2)
+        );
     }
 
     #[test]
@@ -725,30 +1041,49 @@ mod tests {
         );
         apply(
             &mut state,
-            Event::WindowThrowToDisplayRequested { window_id: WindowId(1), direction: DisplayDirection::Next },
+            Event::WindowThrowToDisplayRequested {
+                window_id: WindowId(1),
+                direction: DisplayDirection::Next,
+            },
         );
 
-        assert_eq!(state.revision, 1, "only the topology change should have bumped the revision");
+        assert_eq!(
+            state.revision, 1,
+            "only the topology change should have bumped the revision"
+        );
         assert!(state.windows.is_empty());
     }
 
     #[test]
     fn apply_throw_is_a_noop_with_only_one_display() {
         let mut state = EngineState::default();
-        apply(&mut state, Event::DisplayTopologyChanged(vec![display(1, "MON-A", 0)]));
+        apply(
+            &mut state,
+            Event::DisplayTopologyChanged(vec![display(1, "MON-A", 0)]),
+        );
         let bounds = Rect::new(0, 0, 960, 1080);
         apply(
             &mut state,
-            Event::WindowPlaced { window_id: WindowId(1), display_id: DisplayId(1), bounds },
+            Event::WindowPlaced {
+                window_id: WindowId(1),
+                display_id: DisplayId(1),
+                bounds,
+            },
         );
         let revision_before_throw = state.revision;
         apply(
             &mut state,
-            Event::WindowThrowToDisplayRequested { window_id: WindowId(1), direction: DisplayDirection::Next },
+            Event::WindowThrowToDisplayRequested {
+                window_id: WindowId(1),
+                direction: DisplayDirection::Next,
+            },
         );
 
         let placement = state.windows.get(&WindowId(1)).unwrap();
-        assert_eq!(placement.bounds, bounds, "with no other display, the window must not move");
+        assert_eq!(
+            placement.bounds, bounds,
+            "with no other display, the window must not move"
+        );
         assert_eq!(placement.display_id, DisplayId(1));
         assert_eq!(state.revision, revision_before_throw);
     }
@@ -769,11 +1104,17 @@ mod tests {
             },
         );
         // Display 1 (the window's display) unplugs, leaving only display 2.
-        apply(&mut state, Event::DisplayTopologyChanged(vec![display(2, "MON-B", 1920)]));
+        apply(
+            &mut state,
+            Event::DisplayTopologyChanged(vec![display(2, "MON-B", 1920)]),
+        );
         let revision_before_throw = state.revision;
         apply(
             &mut state,
-            Event::WindowThrowToDisplayRequested { window_id: WindowId(1), direction: DisplayDirection::Next },
+            Event::WindowThrowToDisplayRequested {
+                window_id: WindowId(1),
+                direction: DisplayDirection::Next,
+            },
         );
 
         assert_eq!(
@@ -788,18 +1129,45 @@ mod tests {
     fn apply_focused_sets_the_focused_window_and_bumps_revision() {
         let mut state = EngineState::default();
         assert_eq!(state.focused_window, None);
+        let bounds = Rect::new(0, 0, 1920, 1080);
 
-        apply(&mut state, Event::WindowFocused { window_id: WindowId(1) });
+        apply(
+            &mut state,
+            Event::WindowFocused {
+                window_id: WindowId(1),
+                display_id: DisplayId(1),
+                bounds,
+            },
+        );
 
         assert_eq!(state.focused_window, Some(WindowId(1)));
         assert_eq!(state.revision, 1);
+        let placement = state.windows.get(&WindowId(1)).unwrap();
+        assert_eq!(placement.display_id, DisplayId(1));
+        assert_eq!(placement.bounds, bounds);
+        assert_eq!(placement.previous_placement, None);
     }
 
     #[test]
     fn apply_focused_again_with_a_different_window_replaces_it() {
         let mut state = EngineState::default();
-        apply(&mut state, Event::WindowFocused { window_id: WindowId(1) });
-        apply(&mut state, Event::WindowFocused { window_id: WindowId(2) });
+        let bounds = Rect::new(0, 0, 1920, 1080);
+        apply(
+            &mut state,
+            Event::WindowFocused {
+                window_id: WindowId(1),
+                display_id: DisplayId(1),
+                bounds,
+            },
+        );
+        apply(
+            &mut state,
+            Event::WindowFocused {
+                window_id: WindowId(2),
+                display_id: DisplayId(1),
+                bounds,
+            },
+        );
 
         assert_eq!(state.focused_window, Some(WindowId(2)));
         assert_eq!(state.revision, 2);
@@ -808,7 +1176,10 @@ mod tests {
     #[test]
     fn apply_zone_snap_left_on_first_press_snaps_to_left_half() {
         let mut state = EngineState::default();
-        apply(&mut state, Event::DisplayTopologyChanged(vec![display(1, "MON-A", 0)]));
+        apply(
+            &mut state,
+            Event::DisplayTopologyChanged(vec![display(1, "MON-A", 0)]),
+        );
         apply(
             &mut state,
             Event::WindowPlaced {
@@ -817,19 +1188,37 @@ mod tests {
                 bounds: Rect::new(0, 0, 1920, 1080),
             },
         );
-        apply(&mut state, Event::WindowFocused { window_id: WindowId(1) });
+        apply(
+            &mut state,
+            Event::WindowFocused {
+                window_id: WindowId(1),
+                display_id: DisplayId(1),
+                bounds: Rect::new(0, 0, 1920, 1080),
+            },
+        );
 
-        apply(&mut state, Event::ZoneSnapRequested { direction: ZoneSnapDirection::Left });
+        apply(
+            &mut state,
+            Event::ZoneSnapRequested {
+                direction: ZoneSnapDirection::Left,
+            },
+        );
 
         let placement = state.windows.get(&WindowId(1)).unwrap();
         assert_eq!(placement.bounds, Rect::new(0, 0, 960, 1080));
-        assert_eq!(placement.cycle_step, Some((HorizontalDirection::Left, CycleStep::Half)));
+        assert_eq!(
+            placement.cycle_step,
+            Some((HorizontalDirection::Left, CycleStep::Half))
+        );
     }
 
     #[test]
     fn apply_zone_snap_left_repeated_advances_half_third_two_thirds_then_wraps() {
         let mut state = EngineState::default();
-        apply(&mut state, Event::DisplayTopologyChanged(vec![display(1, "MON-A", 0)]));
+        apply(
+            &mut state,
+            Event::DisplayTopologyChanged(vec![display(1, "MON-A", 0)]),
+        );
         apply(
             &mut state,
             Event::WindowPlaced {
@@ -838,29 +1227,80 @@ mod tests {
                 bounds: Rect::new(0, 0, 1920, 1080),
             },
         );
-        apply(&mut state, Event::WindowFocused { window_id: WindowId(1) });
+        apply(
+            &mut state,
+            Event::WindowFocused {
+                window_id: WindowId(1),
+                display_id: DisplayId(1),
+                bounds: Rect::new(0, 0, 1920, 1080),
+            },
+        );
 
-        apply(&mut state, Event::ZoneSnapRequested { direction: ZoneSnapDirection::Left });
-        apply(&mut state, Event::ZoneSnapRequested { direction: ZoneSnapDirection::Left });
+        apply(
+            &mut state,
+            Event::ZoneSnapRequested {
+                direction: ZoneSnapDirection::Left,
+            },
+        );
+        apply(
+            &mut state,
+            Event::ZoneSnapRequested {
+                direction: ZoneSnapDirection::Left,
+            },
+        );
         let placement = state.windows.get(&WindowId(1)).unwrap();
-        assert_eq!(placement.bounds, Rect::new(0, 0, 640, 1080), "second press should shrink to the left third");
-        assert_eq!(placement.cycle_step, Some((HorizontalDirection::Left, CycleStep::Third)));
+        assert_eq!(
+            placement.bounds,
+            Rect::new(0, 0, 640, 1080),
+            "second press should shrink to the left third"
+        );
+        assert_eq!(
+            placement.cycle_step,
+            Some((HorizontalDirection::Left, CycleStep::Third))
+        );
 
-        apply(&mut state, Event::ZoneSnapRequested { direction: ZoneSnapDirection::Left });
+        apply(
+            &mut state,
+            Event::ZoneSnapRequested {
+                direction: ZoneSnapDirection::Left,
+            },
+        );
         let placement = state.windows.get(&WindowId(1)).unwrap();
-        assert_eq!(placement.bounds, Rect::new(0, 0, 1280, 1080), "third press should expand to the left two-thirds");
-        assert_eq!(placement.cycle_step, Some((HorizontalDirection::Left, CycleStep::TwoThirds)));
+        assert_eq!(
+            placement.bounds,
+            Rect::new(0, 0, 1280, 1080),
+            "third press should expand to the left two-thirds"
+        );
+        assert_eq!(
+            placement.cycle_step,
+            Some((HorizontalDirection::Left, CycleStep::TwoThirds))
+        );
 
-        apply(&mut state, Event::ZoneSnapRequested { direction: ZoneSnapDirection::Left });
+        apply(
+            &mut state,
+            Event::ZoneSnapRequested {
+                direction: ZoneSnapDirection::Left,
+            },
+        );
         let placement = state.windows.get(&WindowId(1)).unwrap();
-        assert_eq!(placement.bounds, Rect::new(0, 0, 960, 1080), "fourth press should wrap back to half");
-        assert_eq!(placement.cycle_step, Some((HorizontalDirection::Left, CycleStep::Half)));
+        assert_eq!(
+            placement.bounds,
+            Rect::new(0, 0, 960, 1080),
+            "fourth press should wrap back to half"
+        );
+        assert_eq!(
+            placement.cycle_step,
+            Some((HorizontalDirection::Left, CycleStep::Half))
+        );
     }
 
     #[test]
     fn apply_zone_snap_right_runs_its_own_independent_cycle_from_half() {
         let mut state = EngineState::default();
-        apply(&mut state, Event::DisplayTopologyChanged(vec![display(1, "MON-A", 0)]));
+        apply(
+            &mut state,
+            Event::DisplayTopologyChanged(vec![display(1, "MON-A", 0)]),
+        );
         apply(
             &mut state,
             Event::WindowPlaced {
@@ -869,11 +1309,33 @@ mod tests {
                 bounds: Rect::new(0, 0, 1920, 1080),
             },
         );
-        apply(&mut state, Event::WindowFocused { window_id: WindowId(1) });
+        apply(
+            &mut state,
+            Event::WindowFocused {
+                window_id: WindowId(1),
+                display_id: DisplayId(1),
+                bounds: Rect::new(0, 0, 1920, 1080),
+            },
+        );
 
-        apply(&mut state, Event::ZoneSnapRequested { direction: ZoneSnapDirection::Left });
-        apply(&mut state, Event::ZoneSnapRequested { direction: ZoneSnapDirection::Left });
-        apply(&mut state, Event::ZoneSnapRequested { direction: ZoneSnapDirection::Right });
+        apply(
+            &mut state,
+            Event::ZoneSnapRequested {
+                direction: ZoneSnapDirection::Left,
+            },
+        );
+        apply(
+            &mut state,
+            Event::ZoneSnapRequested {
+                direction: ZoneSnapDirection::Left,
+            },
+        );
+        apply(
+            &mut state,
+            Event::ZoneSnapRequested {
+                direction: ZoneSnapDirection::Right,
+            },
+        );
 
         let placement = state.windows.get(&WindowId(1)).unwrap();
         assert_eq!(
@@ -881,13 +1343,19 @@ mod tests {
             Rect::new(960, 0, 960, 1080),
             "switching direction should start a fresh cycle at half, not continue the other direction's step"
         );
-        assert_eq!(placement.cycle_step, Some((HorizontalDirection::Right, CycleStep::Half)));
+        assert_eq!(
+            placement.cycle_step,
+            Some((HorizontalDirection::Right, CycleStep::Half))
+        );
     }
 
     #[test]
     fn apply_zone_snap_top_always_resolves_to_top_half_and_never_cycles() {
         let mut state = EngineState::default();
-        apply(&mut state, Event::DisplayTopologyChanged(vec![display(1, "MON-A", 0)]));
+        apply(
+            &mut state,
+            Event::DisplayTopologyChanged(vec![display(1, "MON-A", 0)]),
+        );
         apply(
             &mut state,
             Event::WindowPlaced {
@@ -896,20 +1364,47 @@ mod tests {
                 bounds: Rect::new(0, 0, 1920, 1080),
             },
         );
-        apply(&mut state, Event::WindowFocused { window_id: WindowId(1) });
+        apply(
+            &mut state,
+            Event::WindowFocused {
+                window_id: WindowId(1),
+                display_id: DisplayId(1),
+                bounds: Rect::new(0, 0, 1920, 1080),
+            },
+        );
 
-        apply(&mut state, Event::ZoneSnapRequested { direction: ZoneSnapDirection::Top });
-        apply(&mut state, Event::ZoneSnapRequested { direction: ZoneSnapDirection::Top });
+        apply(
+            &mut state,
+            Event::ZoneSnapRequested {
+                direction: ZoneSnapDirection::Top,
+            },
+        );
+        apply(
+            &mut state,
+            Event::ZoneSnapRequested {
+                direction: ZoneSnapDirection::Top,
+            },
+        );
 
         let placement = state.windows.get(&WindowId(1)).unwrap();
-        assert_eq!(placement.bounds, Rect::new(0, 0, 1920, 540), "repeated top presses must stay at half, never cycle");
-        assert_eq!(placement.cycle_step, None, "top/bottom must not write cycle-step state");
+        assert_eq!(
+            placement.bounds,
+            Rect::new(0, 0, 1920, 540),
+            "repeated top presses must stay at half, never cycle"
+        );
+        assert_eq!(
+            placement.cycle_step, None,
+            "top/bottom must not write cycle-step state"
+        );
     }
 
     #[test]
     fn apply_zone_snap_bottom_always_resolves_to_bottom_half_and_leaves_cycle_step_untouched() {
         let mut state = EngineState::default();
-        apply(&mut state, Event::DisplayTopologyChanged(vec![display(1, "MON-A", 0)]));
+        apply(
+            &mut state,
+            Event::DisplayTopologyChanged(vec![display(1, "MON-A", 0)]),
+        );
         apply(
             &mut state,
             Event::WindowPlaced {
@@ -918,10 +1413,27 @@ mod tests {
                 bounds: Rect::new(0, 0, 1920, 1080),
             },
         );
-        apply(&mut state, Event::WindowFocused { window_id: WindowId(1) });
-        apply(&mut state, Event::ZoneSnapRequested { direction: ZoneSnapDirection::Left });
+        apply(
+            &mut state,
+            Event::WindowFocused {
+                window_id: WindowId(1),
+                display_id: DisplayId(1),
+                bounds: Rect::new(0, 0, 1920, 1080),
+            },
+        );
+        apply(
+            &mut state,
+            Event::ZoneSnapRequested {
+                direction: ZoneSnapDirection::Left,
+            },
+        );
 
-        apply(&mut state, Event::ZoneSnapRequested { direction: ZoneSnapDirection::Bottom });
+        apply(
+            &mut state,
+            Event::ZoneSnapRequested {
+                direction: ZoneSnapDirection::Bottom,
+            },
+        );
 
         let placement = state.windows.get(&WindowId(1)).unwrap();
         assert_eq!(placement.bounds, Rect::new(0, 540, 1920, 540));
@@ -933,33 +1445,201 @@ mod tests {
     }
 
     #[test]
-    fn apply_zone_snap_is_a_noop_with_no_focused_window() {
+    fn apply_zone_snap_applies_the_active_configs_gaps_to_a_half_snap() {
         let mut state = EngineState::default();
-        apply(&mut state, Event::DisplayTopologyChanged(vec![display(1, "MON-A", 0)]));
-        let bounds = Rect::new(0, 0, 1920, 1080);
         apply(
             &mut state,
-            Event::WindowPlaced { window_id: WindowId(1), display_id: DisplayId(1), bounds },
+            Event::DisplayTopologyChanged(vec![display(1, "MON-A", 0)]),
         );
-        let revision_before = state.revision;
+        apply(
+            &mut state,
+            Event::ConfigChanged(config_set_with_gaps(mosaix_domain::Gaps::new(10, 4))),
+        );
+        apply(
+            &mut state,
+            Event::WindowFocused {
+                window_id: WindowId(1),
+                display_id: DisplayId(1),
+                bounds: Rect::new(0, 0, 1920, 1080),
+            },
+        );
 
-        apply(&mut state, Event::ZoneSnapRequested { direction: ZoneSnapDirection::Left });
+        apply(
+            &mut state,
+            Event::ZoneSnapRequested {
+                direction: ZoneSnapDirection::Left,
+            },
+        );
 
-        assert_eq!(state.revision, revision_before, "no focused window must be a no-op");
-        assert_eq!(state.windows.get(&WindowId(1)).unwrap().bounds, bounds);
+        let placement = state.windows.get(&WindowId(1)).unwrap();
+        assert_eq!(
+            placement.bounds,
+            Rect::new(10, 10, 960 - 10 - 4, 1080 - 10 - 10),
+            "left half's outer edges get the outer gap, its interior right edge gets the inner gap"
+        );
     }
 
     #[test]
-    fn apply_zone_snap_is_a_noop_when_the_focused_window_is_untracked() {
+    fn apply_zone_snap_applies_the_active_configs_gaps_to_a_cycled_third_step() {
         let mut state = EngineState::default();
-        apply(&mut state, Event::DisplayTopologyChanged(vec![display(1, "MON-A", 0)]));
-        apply(&mut state, Event::WindowFocused { window_id: WindowId(1) });
+        apply(
+            &mut state,
+            Event::DisplayTopologyChanged(vec![display(1, "MON-A", 0)]),
+        );
+        apply(
+            &mut state,
+            Event::ConfigChanged(config_set_with_gaps(mosaix_domain::Gaps::new(10, 4))),
+        );
+        apply(
+            &mut state,
+            Event::WindowFocused {
+                window_id: WindowId(1),
+                display_id: DisplayId(1),
+                bounds: Rect::new(0, 0, 1920, 1080),
+            },
+        );
+
+        apply(
+            &mut state,
+            Event::ZoneSnapRequested {
+                direction: ZoneSnapDirection::Left,
+            },
+        );
+        apply(
+            &mut state,
+            Event::ZoneSnapRequested {
+                direction: ZoneSnapDirection::Left,
+            },
+        );
+
+        let placement = state.windows.get(&WindowId(1)).unwrap();
+        assert_eq!(
+            placement.bounds,
+            Rect::new(10, 10, 640 - 10 - 4, 1080 - 10 - 10),
+            "the left third's interior right edge still gets the inner gap after cycling"
+        );
+    }
+
+    #[test]
+    fn apply_zone_snap_reflects_a_gap_change_on_the_very_next_placement_with_no_restart() {
+        let mut state = EngineState::default();
+        apply(
+            &mut state,
+            Event::DisplayTopologyChanged(vec![display(1, "MON-A", 0)]),
+        );
+        apply(
+            &mut state,
+            Event::ConfigChanged(config_set_with_gaps(mosaix_domain::Gaps::new(10, 4))),
+        );
+        apply(
+            &mut state,
+            Event::WindowFocused {
+                window_id: WindowId(1),
+                display_id: DisplayId(1),
+                bounds: Rect::new(0, 0, 1920, 1080),
+            },
+        );
+        apply(
+            &mut state,
+            Event::ZoneSnapRequested {
+                direction: ZoneSnapDirection::Left,
+            },
+        );
+        assert_eq!(
+            state.windows.get(&WindowId(1)).unwrap().bounds,
+            Rect::new(10, 10, 960 - 10 - 4, 1080 - 10 - 10)
+        );
+
+        // A hot-edited config (or a topology-triggered profile switch)
+        // delivers new gap values with no restart.
+        apply(
+            &mut state,
+            Event::ConfigChanged(config_set_with_gaps(mosaix_domain::Gaps::new(20, 8))),
+        );
+        apply(
+            &mut state,
+            Event::ZoneSnapRequested {
+                direction: ZoneSnapDirection::Left,
+            },
+        );
+
+        let placement = state.windows.get(&WindowId(1)).unwrap();
+        assert_eq!(
+            placement.bounds,
+            Rect::new(20, 20, 640 - 20 - 8, 1080 - 20 - 20),
+            "the cycled third step must use the newly-configured gaps, not the ones active at the first press"
+        );
+    }
+
+    #[test]
+    fn apply_zone_snap_is_a_noop_with_no_focused_window() {
+        let mut state = EngineState::default();
+        apply(
+            &mut state,
+            Event::DisplayTopologyChanged(vec![display(1, "MON-A", 0)]),
+        );
+        let bounds = Rect::new(0, 0, 1920, 1080);
+        apply(
+            &mut state,
+            Event::WindowPlaced {
+                window_id: WindowId(1),
+                display_id: DisplayId(1),
+                bounds,
+            },
+        );
         let revision_before = state.revision;
 
-        apply(&mut state, Event::ZoneSnapRequested { direction: ZoneSnapDirection::Left });
+        apply(
+            &mut state,
+            Event::ZoneSnapRequested {
+                direction: ZoneSnapDirection::Left,
+            },
+        );
 
-        assert_eq!(state.revision, revision_before, "an untracked focused window must be a no-op");
-        assert!(state.windows.is_empty());
+        assert_eq!(
+            state.revision, revision_before,
+            "no focused window must be a no-op"
+        );
+        assert_eq!(state.windows.get(&WindowId(1)).unwrap().bounds, bounds);
+    }
+
+    /// Reproduces the exact event sequence the real agent produces for
+    /// "focus a window you've never snapped before, then press a snap
+    /// hotkey": `mosaix-agent`'s focus forwarder (main.rs) sends
+    /// `WindowFocused` carrying the window's OS-observed placement, and
+    /// nothing else ever sends `WindowPlaced` for a window Mosaix didn't
+    /// itself just place. `WindowFocused` must therefore register the
+    /// window itself, or every snap hotkey silently no-ops on first use.
+    #[test]
+    fn zone_snap_on_a_freshly_focused_never_placed_window_snaps_it_using_the_observed_bounds() {
+        let mut state = EngineState::default();
+        apply(
+            &mut state,
+            Event::DisplayTopologyChanged(vec![display(1, "MON-A", 0)]),
+        );
+        apply(
+            &mut state,
+            Event::WindowFocused {
+                window_id: WindowId(1),
+                display_id: DisplayId(1),
+                bounds: Rect::new(100, 100, 800, 600),
+            },
+        );
+
+        apply(
+            &mut state,
+            Event::ZoneSnapRequested {
+                direction: ZoneSnapDirection::Left,
+            },
+        );
+
+        let placement = state.windows.get(&WindowId(1)).unwrap();
+        assert_eq!(
+            placement.bounds,
+            Rect::new(0, 0, 960, 1080),
+            "a snap hotkey on a freshly-focused, never-explicitly-placed window must snap it, \
+             not silently no-op"
+        );
     }
 
     #[test]
@@ -972,23 +1652,48 @@ mod tests {
         let bounds = Rect::new(0, 0, 960, 1080);
         apply(
             &mut state,
-            Event::WindowPlaced { window_id: WindowId(1), display_id: DisplayId(1), bounds },
+            Event::WindowPlaced {
+                window_id: WindowId(1),
+                display_id: DisplayId(1),
+                bounds,
+            },
         );
-        apply(&mut state, Event::WindowFocused { window_id: WindowId(1) });
+        apply(
+            &mut state,
+            Event::WindowFocused {
+                window_id: WindowId(1),
+                display_id: DisplayId(1),
+                bounds,
+            },
+        );
         // Display 1 (the focused window's display) unplugs, leaving only display 2.
-        apply(&mut state, Event::DisplayTopologyChanged(vec![display(2, "MON-B", 1920)]));
+        apply(
+            &mut state,
+            Event::DisplayTopologyChanged(vec![display(2, "MON-B", 1920)]),
+        );
         let revision_before = state.revision;
 
-        apply(&mut state, Event::ZoneSnapRequested { direction: ZoneSnapDirection::Left });
+        apply(
+            &mut state,
+            Event::ZoneSnapRequested {
+                direction: ZoneSnapDirection::Left,
+            },
+        );
 
-        assert_eq!(state.revision, revision_before, "a vanished display must leave the placement untouched");
+        assert_eq!(
+            state.revision, revision_before,
+            "a vanished display must leave the placement untouched"
+        );
         assert_eq!(state.windows.get(&WindowId(1)).unwrap().bounds, bounds);
     }
 
     #[test]
     fn apply_bounds_observed_matching_the_last_placement_leaves_cycle_state_alone() {
         let mut state = EngineState::default();
-        apply(&mut state, Event::DisplayTopologyChanged(vec![display(1, "MON-A", 0)]));
+        apply(
+            &mut state,
+            Event::DisplayTopologyChanged(vec![display(1, "MON-A", 0)]),
+        );
         apply(
             &mut state,
             Event::WindowPlaced {
@@ -997,8 +1702,20 @@ mod tests {
                 bounds: Rect::new(0, 0, 1920, 1080),
             },
         );
-        apply(&mut state, Event::WindowFocused { window_id: WindowId(1) });
-        apply(&mut state, Event::ZoneSnapRequested { direction: ZoneSnapDirection::Left });
+        apply(
+            &mut state,
+            Event::WindowFocused {
+                window_id: WindowId(1),
+                display_id: DisplayId(1),
+                bounds: Rect::new(0, 0, 1920, 1080),
+            },
+        );
+        apply(
+            &mut state,
+            Event::ZoneSnapRequested {
+                direction: ZoneSnapDirection::Left,
+            },
+        );
         let revision_before = state.revision;
 
         // The OS echoes back exactly the bounds/display Mosaix's own
@@ -1018,13 +1735,19 @@ mod tests {
             Some((HorizontalDirection::Left, CycleStep::Half)),
             "a matching observation must leave cycle state untouched"
         );
-        assert_eq!(state.revision, revision_before, "a matching observation must not bump the revision");
+        assert_eq!(
+            state.revision, revision_before,
+            "a matching observation must not bump the revision"
+        );
     }
 
     #[test]
     fn apply_bounds_observed_not_matching_the_last_placement_resets_cycle_step() {
         let mut state = EngineState::default();
-        apply(&mut state, Event::DisplayTopologyChanged(vec![display(1, "MON-A", 0)]));
+        apply(
+            &mut state,
+            Event::DisplayTopologyChanged(vec![display(1, "MON-A", 0)]),
+        );
         apply(
             &mut state,
             Event::WindowPlaced {
@@ -1033,9 +1756,26 @@ mod tests {
                 bounds: Rect::new(0, 0, 1920, 1080),
             },
         );
-        apply(&mut state, Event::WindowFocused { window_id: WindowId(1) });
-        apply(&mut state, Event::ZoneSnapRequested { direction: ZoneSnapDirection::Left });
-        apply(&mut state, Event::ZoneSnapRequested { direction: ZoneSnapDirection::Left });
+        apply(
+            &mut state,
+            Event::WindowFocused {
+                window_id: WindowId(1),
+                display_id: DisplayId(1),
+                bounds: Rect::new(0, 0, 1920, 1080),
+            },
+        );
+        apply(
+            &mut state,
+            Event::ZoneSnapRequested {
+                direction: ZoneSnapDirection::Left,
+            },
+        );
+        apply(
+            &mut state,
+            Event::ZoneSnapRequested {
+                direction: ZoneSnapDirection::Left,
+            },
+        );
         let revision_before = state.revision;
 
         // A manual drag left the window somewhere Mosaix's own last
@@ -1050,7 +1790,10 @@ mod tests {
         );
 
         let placement = state.windows.get(&WindowId(1)).unwrap();
-        assert_eq!(placement.cycle_step, None, "a non-matching observation must reset cycle step to step 1");
+        assert_eq!(
+            placement.cycle_step, None,
+            "a non-matching observation must reset cycle step to step 1"
+        );
         assert_eq!(
             placement.bounds,
             Rect::new(0, 0, 640, 1080),
@@ -1062,7 +1805,10 @@ mod tests {
     #[test]
     fn apply_bounds_observed_mismatch_then_zone_snap_restarts_the_cycle_at_half() {
         let mut state = EngineState::default();
-        apply(&mut state, Event::DisplayTopologyChanged(vec![display(1, "MON-A", 0)]));
+        apply(
+            &mut state,
+            Event::DisplayTopologyChanged(vec![display(1, "MON-A", 0)]),
+        );
         apply(
             &mut state,
             Event::WindowPlaced {
@@ -1071,9 +1817,26 @@ mod tests {
                 bounds: Rect::new(0, 0, 1920, 1080),
             },
         );
-        apply(&mut state, Event::WindowFocused { window_id: WindowId(1) });
-        apply(&mut state, Event::ZoneSnapRequested { direction: ZoneSnapDirection::Left });
-        apply(&mut state, Event::ZoneSnapRequested { direction: ZoneSnapDirection::Left });
+        apply(
+            &mut state,
+            Event::WindowFocused {
+                window_id: WindowId(1),
+                display_id: DisplayId(1),
+                bounds: Rect::new(0, 0, 1920, 1080),
+            },
+        );
+        apply(
+            &mut state,
+            Event::ZoneSnapRequested {
+                direction: ZoneSnapDirection::Left,
+            },
+        );
+        apply(
+            &mut state,
+            Event::ZoneSnapRequested {
+                direction: ZoneSnapDirection::Left,
+            },
+        );
         apply(
             &mut state,
             Event::WindowBoundsObserved {
@@ -1083,7 +1846,12 @@ mod tests {
             },
         );
 
-        apply(&mut state, Event::ZoneSnapRequested { direction: ZoneSnapDirection::Left });
+        apply(
+            &mut state,
+            Event::ZoneSnapRequested {
+                direction: ZoneSnapDirection::Left,
+            },
+        );
 
         let placement = state.windows.get(&WindowId(1)).unwrap();
         assert_eq!(
@@ -1091,7 +1859,10 @@ mod tests {
             Rect::new(0, 0, 960, 1080),
             "the next same-direction press after an external move must start back at half"
         );
-        assert_eq!(placement.cycle_step, Some((HorizontalDirection::Left, CycleStep::Half)));
+        assert_eq!(
+            placement.cycle_step,
+            Some((HorizontalDirection::Left, CycleStep::Half))
+        );
     }
 
     #[test]
@@ -1114,7 +1885,10 @@ mod tests {
     #[test]
     fn apply_bounds_observed_mismatch_with_no_cycle_step_does_not_bump_the_revision() {
         let mut state = EngineState::default();
-        apply(&mut state, Event::DisplayTopologyChanged(vec![display(1, "MON-A", 0)]));
+        apply(
+            &mut state,
+            Event::DisplayTopologyChanged(vec![display(1, "MON-A", 0)]),
+        );
         apply(
             &mut state,
             Event::WindowPlaced {
@@ -1142,9 +1916,168 @@ mod tests {
         );
     }
 
+    fn resolved_config_with_left_binding(combo: &str) -> ResolvedConfig {
+        let mut hotkeys = std::collections::BTreeMap::new();
+        hotkeys.insert(
+            mosaix_config::Command::SnapLeft,
+            mosaix_config::KeyCombo::parse(combo).unwrap(),
+        );
+        ResolvedConfig {
+            hotkeys,
+            gaps: mosaix_domain::Gaps::default(),
+            behavior: mosaix_config::BehaviorSection::default(),
+        }
+    }
+
+    fn config_set_with_left_binding(combo: &str) -> ResolvedConfigSet {
+        ResolvedConfigSet {
+            base: resolved_config_with_left_binding(combo),
+            profiles: Vec::new(),
+        }
+    }
+
+    fn config_set_with_gaps(gaps: mosaix_domain::Gaps) -> ResolvedConfigSet {
+        ResolvedConfigSet {
+            base: ResolvedConfig {
+                hotkeys: std::collections::BTreeMap::new(),
+                gaps,
+                behavior: mosaix_config::BehaviorSection::default(),
+            },
+            profiles: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn apply_config_changed_updates_resolved_config_and_bumps_revision() {
+        let mut state = EngineState::default();
+        assert_eq!(state.resolved_config, ResolvedConfig::default());
+
+        let new_config_set = config_set_with_left_binding("ctrl+alt+left");
+        apply(&mut state, Event::ConfigChanged(new_config_set.clone()));
+
+        assert_eq!(state.resolved_config, new_config_set.base);
+        assert_eq!(state.config_set, new_config_set);
+        assert_eq!(state.revision, 1);
+    }
+
+    #[test]
+    fn apply_config_changed_ignores_an_identical_resolved_config() {
+        let mut state = EngineState::default();
+        let config_set = config_set_with_left_binding("ctrl+alt+left");
+        apply(&mut state, Event::ConfigChanged(config_set.clone()));
+        let revision_after_first = state.revision;
+
+        apply(&mut state, Event::ConfigChanged(config_set));
+
+        assert_eq!(
+            state.revision, revision_after_first,
+            "re-delivering an identical resolved config must not bump the revision"
+        );
+    }
+
+    #[test]
+    fn apply_config_changed_again_with_different_settings_replaces_it() {
+        let mut state = EngineState::default();
+        apply(
+            &mut state,
+            Event::ConfigChanged(config_set_with_left_binding("ctrl+alt+left")),
+        );
+        let revision_after_first = state.revision;
+
+        let second_config_set = config_set_with_left_binding("ctrl+shift+left");
+        apply(&mut state, Event::ConfigChanged(second_config_set.clone()));
+
+        assert_eq!(state.resolved_config, second_config_set.base);
+        assert_eq!(state.revision, revision_after_first + 1);
+    }
+
+    #[test]
+    fn apply_topology_change_selects_a_profile_matching_the_new_topology() {
+        let mut state = EngineState::default();
+        let displays = vec![display(1, "MON-A", 0)];
+        let profile = ResolvedProfile {
+            fingerprint: topology_fingerprint(&displays),
+            config: resolved_config_with_left_binding("ctrl+shift+left"),
+        };
+        let config_set = ResolvedConfigSet {
+            base: ResolvedConfig::default(),
+            profiles: vec![profile.clone()],
+        };
+        apply(&mut state, Event::ConfigChanged(config_set));
+        assert_eq!(
+            state.resolved_config,
+            ResolvedConfig::default(),
+            "no display observed yet, so no profile should match"
+        );
+
+        apply(&mut state, Event::DisplayTopologyChanged(displays));
+
+        assert_eq!(
+            state.resolved_config, profile.config,
+            "the topology change should re-select the profile matching its fingerprint"
+        );
+    }
+
+    #[test]
+    fn apply_topology_change_with_no_matching_profile_falls_back_to_base() {
+        let mut state = EngineState::default();
+        let base = resolved_config_with_left_binding("ctrl+alt+left");
+        let profile = ResolvedProfile {
+            fingerprint: "a fingerprint no display will ever produce".to_string(),
+            config: resolved_config_with_left_binding("ctrl+shift+left"),
+        };
+        let config_set = ResolvedConfigSet {
+            base: base.clone(),
+            profiles: vec![profile],
+        };
+        apply(&mut state, Event::ConfigChanged(config_set));
+
+        apply(
+            &mut state,
+            Event::DisplayTopologyChanged(vec![display(1, "MON-A", 0)]),
+        );
+
+        assert_eq!(
+            state.resolved_config, base,
+            "an unrecognized topology must fall back to base config, not error or invent a profile"
+        );
+    }
+
+    #[test]
+    fn apply_topology_round_trip_between_two_known_topologies_reselects_the_same_profile() {
+        let mut state = EngineState::default();
+        let displays_a = vec![display(1, "MON-A", 0)];
+        let displays_b = vec![display(2, "MON-B", 0)];
+        let profile_a = ResolvedProfile {
+            fingerprint: topology_fingerprint(&displays_a),
+            config: resolved_config_with_left_binding("ctrl+shift+left"),
+        };
+        let profile_b = ResolvedProfile {
+            fingerprint: topology_fingerprint(&displays_b),
+            config: resolved_config_with_left_binding("ctrl+alt+left"),
+        };
+        let config_set = ResolvedConfigSet {
+            base: ResolvedConfig::default(),
+            profiles: vec![profile_a.clone(), profile_b.clone()],
+        };
+        apply(&mut state, Event::ConfigChanged(config_set));
+
+        apply(&mut state, Event::DisplayTopologyChanged(displays_a.clone()));
+        assert_eq!(state.resolved_config, profile_a.config);
+
+        apply(&mut state, Event::DisplayTopologyChanged(displays_b));
+        assert_eq!(state.resolved_config, profile_b.config);
+
+        apply(&mut state, Event::DisplayTopologyChanged(displays_a));
+        assert_eq!(
+            state.resolved_config, profile_a.config,
+            "switching back to a previously-seen topology must re-select the same profile"
+        );
+    }
+
     #[test]
     fn spawned_engine_starts_with_initial_state_and_applies_events() {
-        let handle = spawn_engine(vec![display(1, "MON-A", 0)]);
+        let handle = spawn_engine(vec![display(1, "MON-A", 0)], ResolvedConfigSet::default());
         assert_eq!(handle.snapshot().revision, 0);
         assert_eq!(handle.snapshot().displays.len(), 1);
 
@@ -1167,12 +2100,124 @@ mod tests {
 
     #[test]
     fn stopping_the_engine_closes_the_queue_and_joins_cleanly() {
-        let handle = spawn_engine(Vec::new());
+        let handle = spawn_engine(Vec::new(), ResolvedConfigSet::default());
         let events = handle.events();
         handle.stop();
 
         // The reducer thread is gone; the queue is closed, so further
         // sends must fail rather than hang.
-        assert!(events.send(Event::DisplayTopologyChanged(Vec::new())).is_err());
+        assert!(events
+            .send(Event::DisplayTopologyChanged(Vec::new()))
+            .is_err());
+    }
+
+    #[test]
+    fn diff_placements_is_empty_when_nothing_changed() {
+        let mut windows = HashMap::new();
+        windows.insert(
+            WindowId(1),
+            WindowPlacement {
+                display_id: DisplayId(1),
+                bounds: Rect::new(0, 0, 960, 1080),
+                previous_placement: None,
+                cycle_step: None,
+            },
+        );
+
+        assert!(diff_placements(&windows, &windows.clone()).is_empty());
+    }
+
+    #[test]
+    fn diff_placements_reports_new_and_moved_windows_but_not_unchanged_ones() {
+        let unchanged = WindowPlacement {
+            display_id: DisplayId(1),
+            bounds: Rect::new(0, 0, 960, 1080),
+            previous_placement: None,
+            cycle_step: None,
+        };
+        let mut previous = HashMap::new();
+        previous.insert(WindowId(1), unchanged);
+        previous.insert(
+            WindowId(2),
+            WindowPlacement {
+                bounds: Rect::new(0, 0, 1920, 1080),
+                ..unchanged
+            },
+        );
+
+        let mut current = HashMap::new();
+        current.insert(WindowId(1), unchanged); // untouched
+        current.insert(
+            WindowId(2),
+            WindowPlacement {
+                bounds: Rect::new(960, 0, 960, 1080),
+                ..unchanged
+            }, // moved
+        );
+        current.insert(
+            WindowId(3),
+            WindowPlacement {
+                bounds: Rect::new(0, 0, 640, 1080),
+                ..unchanged
+            }, // new
+        );
+
+        let mut diff = diff_placements(&previous, &current);
+        diff.sort_by_key(|(window_id, _, _)| window_id.0);
+
+        assert_eq!(
+            diff,
+            vec![
+                (WindowId(2), DisplayId(1), Rect::new(960, 0, 960, 1080)),
+                (WindowId(3), DisplayId(1), Rect::new(0, 0, 640, 1080)),
+            ],
+            "unchanged WindowId(1) must be excluded; moved WindowId(2) and new WindowId(3) must both be reported"
+        );
+    }
+
+    /// The seam a platform executor polls: run the exact event sequence a
+    /// real snap hotkey produces through a real spawned engine, and confirm
+    /// `diff_placements` against successive [`StateReader`] snapshots
+    /// reports the window that now needs a real `SetWindowPos` call. This
+    /// is what closes the gap in "the engine computes a new placement but
+    /// nothing ever moves the real window" -- the executor only has to
+    /// react to what this reports.
+    #[test]
+    fn state_reader_diff_reports_the_window_a_snap_hotkey_just_placed() {
+        let handle = spawn_engine(vec![display(1, "MON-A", 0)], ResolvedConfigSet::default());
+        let reader = handle.state_reader();
+        let before = reader.snapshot().windows;
+
+        handle
+            .events()
+            .send(Event::WindowFocused {
+                window_id: WindowId(1),
+                display_id: DisplayId(1),
+                bounds: Rect::new(100, 100, 800, 600),
+            })
+            .expect("reducer should still be running");
+        handle
+            .events()
+            .send(Event::ZoneSnapRequested {
+                direction: ZoneSnapDirection::Left,
+            })
+            .expect("reducer should still be running");
+
+        assert!(
+            wait_for(
+                || reader.snapshot().windows.contains_key(&WindowId(1)),
+                Duration::from_secs(2)
+            ),
+            "expected the snap to be committed"
+        );
+        let after = reader.snapshot().windows;
+
+        assert_eq!(
+            diff_placements(&before, &after),
+            vec![(WindowId(1), DisplayId(1), Rect::new(0, 0, 960, 1080))],
+            "an executor polling before/after this snap must be told to move WindowId(1)"
+        );
+
+        handle.stop();
     }
 }
