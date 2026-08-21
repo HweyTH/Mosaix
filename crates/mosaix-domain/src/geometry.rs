@@ -56,6 +56,27 @@ impl Rect {
     }
 }
 
+/// Configurable gap insets applied to a computed zone [`Rect`] as a
+/// post-processing step (ADR 0006), kept separate from the pure zone
+/// functions that compute the rect itself.
+///
+/// Both values are uniform scalars, not per-edge -- see CONTEXT.md's "Gap
+/// (outer / inner)" glossary entry. *Outer gap* insets edges that touch the
+/// container's boundary; *inner gap* insets edges that would border a
+/// neighboring zone.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Gaps {
+    pub outer: i32,
+    pub inner: i32,
+}
+
+impl Gaps {
+    /// Create a new gap configuration.
+    pub const fn new(outer: i32, inner: i32) -> Self {
+        Self { outer, inner }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
