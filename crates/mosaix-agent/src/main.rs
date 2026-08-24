@@ -152,6 +152,14 @@ fn main() {
 
     let engine = mosaix_engine::spawn_engine(initial_displays, initial_config_set);
 
+    let ipc_server = match mosaix_ipc::IpcServer::start(engine.events(), engine.state_reader()) {
+        Ok(server) => Some(server),
+        Err(err) => {
+            tracing::error!(%err, "failed to start IPC server; the mosaix CLI will be unavailable");
+            None
+        }
+    };
+
     // Watches `config_dir` for hot-edits and forwards each successfully
     // validated reload into the reducer as `Event::ConfigChanged`,
     // structurally identical to the display-topology forwarder below. A
@@ -368,7 +376,14 @@ fn main() {
         std::thread::spawn(move || {
             let mut previous = std::collections::HashMap::new();
             loop {
-                let current = state_reader.snapshot().windows;
+                let snapshot = state_reader.snapshot();
+                if snapshot.paused {
+                    match executor_stop_rx.recv_timeout(PLACEMENT_POLL_INTERVAL) {
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                        Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
+                }
+                let current = snapshot.windows;
                 for (window_id, _display_id, bounds) in
                     mosaix_engine::diff_placements(&previous, &current)
                 {
@@ -412,6 +427,9 @@ fn main() {
     let _ = hotkey_rebind_forwarder.join();
     let _ = executor_stop_tx.send(());
     let _ = executor_forwarder.join();
+    if let Some(server) = ipc_server {
+        server.stop();
+    }
     engine.stop();
     tracing::info!("mosaix-agent stopped");
 }

@@ -26,8 +26,8 @@ use std::thread::{self, JoinHandle};
 use mosaix_config::{ResolvedConfig, ResolvedConfigSet};
 use mosaix_domain::{topology_fingerprint, Display, DisplayId, Rect, WindowId};
 use mosaix_layout::{
-    apply_gaps, cycle_display, resolve_zone_cycle, snap_to_half, throw_preserving_ratio,
-    CycleStep, DisplayDirection, HalfZone, HorizontalDirection,
+    apply_gaps, cycle_display, resolve_zone_cycle, snap_to_half, throw_preserving_ratio, CycleStep,
+    DisplayDirection, HalfZone, HorizontalDirection,
 };
 
 /// Default bound on the event queue before a sender blocks. Chosen
@@ -74,6 +74,13 @@ pub struct EngineState {
     /// profile. Never read directly by anything outside the reducer;
     /// `resolved_config` is what the rest of the system consults.
     pub config_set: ResolvedConfigSet,
+    /// Whether window management is paused. When `true`, placement-related
+    /// events (`ZoneSnapRequested`, `WindowPlaced`, `WindowThrowToDisplayRequested`)
+    /// are suppressed — logged and discarded. Observation events
+    /// (`DisplayTopologyChanged`, `WindowFocused`, `WindowBoundsObserved`,
+    /// `ConfigChanged`) still process normally so state stays accurate for
+    /// when the user resumes.
+    pub paused: bool,
 }
 
 /// A tracked window's current bounds and display, plus the display and
@@ -236,6 +243,15 @@ pub enum Event {
     /// current topology exactly the way [`Event::DisplayTopologyChanged`]
     /// re-selects it against the current config set (ADR 0004).
     ConfigChanged(ResolvedConfigSet),
+
+    /// Pause all window management. Placement-related events become no-ops
+    /// until [`Event::ResumeRequested`] fires. Idempotent — pausing when
+    /// already paused is a no-op.
+    PauseRequested,
+
+    /// Resume window management after a pause. Idempotent — resuming when
+    /// not paused is a no-op.
+    ResumeRequested,
 }
 
 /// Applies one event to `state`. Must never panic -- a single bad event
@@ -259,6 +275,10 @@ fn apply(state: &mut EngineState, event: Event) {
             display_id,
             bounds,
         } => {
+            if state.paused {
+                tracing::debug!("window placed while paused; ignoring");
+                return;
+            }
             place_window(state, window_id, display_id, bounds, None);
         }
 
@@ -287,6 +307,10 @@ fn apply(state: &mut EngineState, event: Event) {
             window_id,
             direction,
         } => {
+            if state.paused {
+                tracing::debug!("throw-to-display requested while paused; ignoring");
+                return;
+            }
             let Some(placement) = state.windows.get(&window_id) else {
                 tracing::debug!(
                     ?window_id,
@@ -330,22 +354,21 @@ fn apply(state: &mut EngineState, event: Event) {
             display_id,
             bounds,
         } => {
-            if !state.windows.contains_key(&window_id) {
-                state.windows.insert(
-                    window_id,
-                    WindowPlacement {
-                        display_id,
-                        bounds,
-                        previous_placement: None,
-                        cycle_step: None,
-                    },
-                );
-            }
+            state.windows.entry(window_id).or_insert(WindowPlacement {
+                display_id,
+                bounds,
+                previous_placement: None,
+                cycle_step: None,
+            });
             state.focused_window = Some(window_id);
             state.revision += 1;
         }
 
         Event::ZoneSnapRequested { direction } => {
+            if state.paused {
+                tracing::debug!("zone-snap requested while paused; ignoring");
+                return;
+            }
             let Some(window_id) = state.focused_window else {
                 tracing::debug!("zone-snap requested with no focused window; ignoring");
                 return;
@@ -433,6 +456,26 @@ fn apply(state: &mut EngineState, event: Event) {
             tracing::info!("resolved config changed");
             state.resolved_config = select_resolved_config(&config_set, &state.displays);
             state.config_set = config_set;
+            state.revision += 1;
+        }
+
+        Event::PauseRequested => {
+            if state.paused {
+                tracing::debug!("pause requested but already paused; ignoring");
+                return;
+            }
+            tracing::info!("window management paused");
+            state.paused = true;
+            state.revision += 1;
+        }
+
+        Event::ResumeRequested => {
+            if !state.paused {
+                tracing::debug!("resume requested but not paused; ignoring");
+                return;
+            }
+            tracing::info!("window management resumed");
+            state.paused = false;
             state.revision += 1;
         }
     }
@@ -664,6 +707,7 @@ pub fn spawn_engine_with_capacity(
         focused_window: None,
         resolved_config: initial_resolved_config,
         config_set: initial_config_set,
+        paused: false,
     };
     let state = Arc::new(Mutex::new(initial_state.clone()));
 
@@ -2062,7 +2106,10 @@ mod tests {
         };
         apply(&mut state, Event::ConfigChanged(config_set));
 
-        apply(&mut state, Event::DisplayTopologyChanged(displays_a.clone()));
+        apply(
+            &mut state,
+            Event::DisplayTopologyChanged(displays_a.clone()),
+        );
         assert_eq!(state.resolved_config, profile_a.config);
 
         apply(&mut state, Event::DisplayTopologyChanged(displays_b));
@@ -2219,5 +2266,120 @@ mod tests {
         );
 
         handle.stop();
+    }
+
+    #[test]
+    fn apply_pause_sets_paused_and_bumps_revision() {
+        let mut state = EngineState::default();
+        apply(&mut state, Event::PauseRequested);
+        assert!(state.paused);
+        assert_eq!(state.revision, 1);
+    }
+
+    #[test]
+    fn apply_pause_twice_is_idempotent() {
+        let mut state = EngineState::default();
+        apply(&mut state, Event::PauseRequested);
+        apply(&mut state, Event::PauseRequested);
+        assert!(state.paused);
+        assert_eq!(state.revision, 1);
+    }
+
+    #[test]
+    fn apply_resume_clears_paused_and_bumps_revision() {
+        let mut state = EngineState::default();
+        state.paused = true;
+        apply(&mut state, Event::ResumeRequested);
+        assert!(!state.paused);
+        assert_eq!(state.revision, 1);
+    }
+
+    #[test]
+    fn apply_resume_when_not_paused_is_idempotent() {
+        let mut state = EngineState::default();
+        apply(&mut state, Event::ResumeRequested);
+        assert!(!state.paused);
+        assert_eq!(state.revision, 0);
+    }
+
+    #[test]
+    fn apply_zone_snap_is_suppressed_while_paused() {
+        let mut state = EngineState::default();
+        state.paused = true;
+        state.focused_window = Some(WindowId(1));
+        apply(
+            &mut state,
+            Event::ZoneSnapRequested {
+                direction: ZoneSnapDirection::Left,
+            },
+        );
+        assert_eq!(state.revision, 0);
+    }
+
+    #[test]
+    fn apply_window_placed_is_suppressed_while_paused() {
+        let mut state = EngineState::default();
+        state.paused = true;
+        apply(
+            &mut state,
+            Event::WindowPlaced {
+                window_id: WindowId(1),
+                display_id: DisplayId(1),
+                bounds: Rect::new(0, 0, 100, 100),
+            },
+        );
+        assert_eq!(state.revision, 0);
+    }
+
+    #[test]
+    fn apply_throw_is_suppressed_while_paused() {
+        let mut state = EngineState::default();
+        state.paused = true;
+        apply(
+            &mut state,
+            Event::WindowThrowToDisplayRequested {
+                window_id: WindowId(1),
+                direction: mosaix_layout::DisplayDirection::Next,
+            },
+        );
+        assert_eq!(state.revision, 0);
+    }
+
+    #[test]
+    fn apply_display_topology_still_processes_while_paused() {
+        let mut state = EngineState::default();
+        state.paused = true;
+        apply(
+            &mut state,
+            Event::DisplayTopologyChanged(vec![display(1, "MON-A", 0)]),
+        );
+        assert_eq!(state.revision, 1);
+    }
+
+    #[test]
+    fn apply_focus_still_processes_while_paused() {
+        let mut state = EngineState::default();
+        state.paused = true;
+        apply(
+            &mut state,
+            Event::WindowFocused {
+                window_id: WindowId(1),
+                display_id: DisplayId(1),
+                bounds: Rect::new(0, 0, 100, 100),
+            },
+        );
+        assert_eq!(state.revision, 1);
+    }
+
+    #[test]
+    fn apply_config_still_processes_while_paused() {
+        let mut state = EngineState::default();
+        state.paused = true;
+        let config_set = ResolvedConfigSet {
+            base: ResolvedConfig::default(),
+            profiles: vec![],
+        };
+        apply(&mut state, Event::ConfigChanged(config_set));
+        assert!(state.paused);
     }
 }
