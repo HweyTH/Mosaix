@@ -71,6 +71,44 @@ pub fn snap_to_half(container: Rect, zone: HalfZone) -> Rect {
     zone.normalized().to_rect(container)
 }
 
+/// The half-zone an edge-triggered drag-to-snap would pick when the cursor
+/// is at `point` inside `work_area` (Feature 34). Returns `Some` only when
+/// `point` lies within `edge_threshold` pixels of a work-area edge;
+/// anywhere else (including outside the work area) is `None`.
+///
+/// Evaluation order is fixed — left, right, top, bottom — so a corner hit
+/// is deterministic (horizontal edges win). Matches the four half-zone
+/// hotkey commands; quarters are out of scope for the v1 drag preview.
+pub fn half_zone_at_edge(
+    work_area: Rect,
+    point: (i32, i32),
+    edge_threshold: i32,
+) -> Option<HalfZone> {
+    let (x, y) = point;
+    if x < work_area.x
+        || y < work_area.y
+        || x >= work_area.right()
+        || y >= work_area.bottom()
+    {
+        return None;
+    }
+
+    let threshold = edge_threshold.max(0);
+    if x - work_area.x <= threshold {
+        return Some(HalfZone::LeftHalf);
+    }
+    if work_area.right() - 1 - x <= threshold {
+        return Some(HalfZone::RightHalf);
+    }
+    if y - work_area.y <= threshold {
+        return Some(HalfZone::TopHalf);
+    }
+    if work_area.bottom() - 1 - y <= threshold {
+        return Some(HalfZone::BottomHalf);
+    }
+    None
+}
+
 /// A named quarter-zone a window can be snapped to (architecture doc
 /// section 20, "Focused-window ... quarters").
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -316,6 +354,101 @@ mod tests {
             snap_to_half(WORK_AREA, HalfZone::BottomHalf),
             Rect::new(0, 540, 1920, 540)
         );
+    }
+
+    #[test]
+    fn half_zone_at_edge_returns_none_when_the_point_is_outside_the_work_area() {
+        assert_eq!(half_zone_at_edge(WORK_AREA, (-1, 100), 24), None);
+        assert_eq!(half_zone_at_edge(WORK_AREA, (100, -1), 24), None);
+        assert_eq!(half_zone_at_edge(WORK_AREA, (1920, 100), 24), None);
+        assert_eq!(half_zone_at_edge(WORK_AREA, (100, 1080), 24), None);
+    }
+
+    #[test]
+    fn half_zone_at_edge_returns_none_when_the_point_is_away_from_every_edge() {
+        assert_eq!(half_zone_at_edge(WORK_AREA, (960, 540), 24), None);
+        assert_eq!(half_zone_at_edge(WORK_AREA, (25, 25), 24), None);
+    }
+
+    #[test]
+    fn half_zone_at_edge_picks_each_edge_within_the_threshold() {
+        assert_eq!(
+            half_zone_at_edge(WORK_AREA, (0, 540), 24),
+            Some(HalfZone::LeftHalf)
+        );
+        assert_eq!(
+            half_zone_at_edge(WORK_AREA, (24, 540), 24),
+            Some(HalfZone::LeftHalf)
+        );
+        assert_eq!(
+            half_zone_at_edge(WORK_AREA, (1919, 540), 24),
+            Some(HalfZone::RightHalf)
+        );
+        assert_eq!(
+            half_zone_at_edge(WORK_AREA, (1895, 540), 24),
+            Some(HalfZone::RightHalf)
+        );
+        assert_eq!(
+            half_zone_at_edge(WORK_AREA, (960, 0), 24),
+            Some(HalfZone::TopHalf)
+        );
+        assert_eq!(
+            half_zone_at_edge(WORK_AREA, (960, 24), 24),
+            Some(HalfZone::TopHalf)
+        );
+        assert_eq!(
+            half_zone_at_edge(WORK_AREA, (960, 1079), 24),
+            Some(HalfZone::BottomHalf)
+        );
+        assert_eq!(
+            half_zone_at_edge(WORK_AREA, (960, 1055), 24),
+            Some(HalfZone::BottomHalf)
+        );
+    }
+
+    #[test]
+    fn half_zone_at_edge_prefers_horizontal_edges_at_corners() {
+        // Top-left corner: left wins over top (fixed evaluation order).
+        assert_eq!(
+            half_zone_at_edge(WORK_AREA, (0, 0), 24),
+            Some(HalfZone::LeftHalf)
+        );
+        // Bottom-right corner: right wins over bottom.
+        assert_eq!(
+            half_zone_at_edge(WORK_AREA, (1919, 1079), 24),
+            Some(HalfZone::RightHalf)
+        );
+    }
+
+    #[test]
+    fn half_zone_at_edge_respects_a_work_area_offset() {
+        let work_area = Rect::new(-1920, 40, 1920, 1040);
+        assert_eq!(
+            half_zone_at_edge(work_area, (-1920, 500), 24),
+            Some(HalfZone::LeftHalf)
+        );
+        assert_eq!(
+            half_zone_at_edge(work_area, (-1, 500), 24),
+            Some(HalfZone::RightHalf)
+        );
+        assert_eq!(
+            half_zone_at_edge(work_area, (-960, 40), 24),
+            Some(HalfZone::TopHalf)
+        );
+        assert_eq!(
+            half_zone_at_edge(work_area, (-960, 1079), 24),
+            Some(HalfZone::BottomHalf)
+        );
+        assert_eq!(half_zone_at_edge(work_area, (-960, 540), 24), None);
+    }
+
+    #[test]
+    fn half_zone_at_edge_treats_a_negative_threshold_as_zero() {
+        assert_eq!(
+            half_zone_at_edge(WORK_AREA, (0, 540), -1),
+            Some(HalfZone::LeftHalf)
+        );
+        assert_eq!(half_zone_at_edge(WORK_AREA, (1, 540), -1), None);
     }
 
     #[test]
