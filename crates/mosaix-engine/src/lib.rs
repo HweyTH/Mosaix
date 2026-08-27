@@ -1,10 +1,9 @@
 //! Authoritative state reducer, reconciliation, placement diff, and transaction planning.
 //!
-//! Currently holds the event queue and reducer described in the
-//! architecture doc's "Concurrency model" (section 14.1): "Native adapter
-//! threads translate callbacks into normalized events. A bounded
-//! multi-producer queue feeds one reducer task. The reducer is the only
-//! writer of domain state."
+//! Holds the event queue and reducer described in the architecture doc's
+//! "Concurrency model" (section 14.1): "Native adapter threads translate
+//! callbacks into normalized events. A bounded multi-producer queue feeds
+//! one reducer task. The reducer is the only writer of domain state."
 //!
 //! [`spawn_engine`] starts one dedicated thread that owns [`EngineState`]
 //! outright -- no lock guards the mutation itself, because nothing else
@@ -13,10 +12,28 @@
 //! threads can read a consistent snapshot; that `Mutex` is not a second
 //! mutation path.
 //!
-//! Reconciliation, placement diffing, and transaction planning belong here
-//! too per the crate's description, but nothing upstream (window registry,
-//! commands) exists yet for them to operate on -- they land once those
-//! domain types do.
+//! ## Resilience features
+//!
+//! - **Startup reconciliation** ([`Event::StartupReconciliation`]): The
+//!   agent enumerates all open windows at launch and bulk-registers them so
+//!   the engine starts with an accurate picture of what's already on screen.
+//!
+//! - **Sleep/wake recovery** ([`Event::WakeReconciliation`]): After the
+//!   system resumes from sleep the display topology may have changed.  The
+//!   agent re-enumerates displays and windows and sends this event, which
+//!   migrates any window whose previous display is gone to the nearest
+//!   surviving one.
+//!
+//! - **Display hotplug** ([`Event::DisplayTopologyChanged`]): When a monitor
+//!   is unplugged, windows tracked on the vanished display are migrated to
+//!   the nearest surviving display rather than being left off-screen.
+//!
+//! - **Per-window circuit breaker** ([`Event::PlacementRejected`],
+//!   [`CIRCUIT_BREAKER_THRESHOLD`]): If a window repeatedly rejects
+//!   `SetWindowPos` (e.g. because it enforces a minimum size), the engine
+//!   marks it temporarily unmanaged after
+//!   [`CIRCUIT_BREAKER_THRESHOLD`] consecutive rejections.  A deliberate
+//!   zone-snap command from the user resets the breaker.
 
 use std::collections::HashMap;
 use std::sync::mpsc::{sync_channel, SyncSender};
@@ -26,8 +43,8 @@ use std::thread::{self, JoinHandle};
 use mosaix_config::{ResolvedConfig, ResolvedConfigSet};
 use mosaix_domain::{topology_fingerprint, Display, DisplayId, Rect, WindowId};
 use mosaix_layout::{
-    apply_gaps, cycle_display, resolve_zone_cycle, snap_to_half, throw_preserving_ratio,
-    CycleStep, DisplayDirection, HalfZone, HorizontalDirection,
+    apply_gaps, cycle_display, resolve_zone_cycle, snap_to_half, throw_preserving_ratio, CycleStep,
+    DisplayDirection, HalfZone, HorizontalDirection,
 };
 
 /// Default bound on the event queue before a sender blocks. Chosen
@@ -35,6 +52,13 @@ use mosaix_layout::{
 /// 18 budgets "ordinary OS event to stable layout plan" at under 100ms at
 /// p95, so a deep queue is not needed to absorb bursts.
 pub const DEFAULT_QUEUE_CAPACITY: usize = 256;
+
+/// Number of consecutive placement rejections before a window's circuit
+/// breaker opens and the engine stops trying to manage it.  Chosen to
+/// tolerate a transient mis-report while reacting quickly enough that the
+/// user never sees a sustained battle between Mosaix and a stubborn app.
+/// The breaker resets automatically on any explicit zone-snap command.
+pub const CIRCUIT_BREAKER_THRESHOLD: u8 = 3;
 
 /// State the reducer owns and is the only writer of.
 ///
@@ -74,6 +98,21 @@ pub struct EngineState {
     /// profile. Never read directly by anything outside the reducer;
     /// `resolved_config` is what the rest of the system consults.
     pub config_set: ResolvedConfigSet,
+    /// Whether window management is paused. When `true`, placement-related
+    /// events (`ZoneSnapRequested`, `WindowPlaced`, `WindowThrowToDisplayRequested`)
+    /// are suppressed — logged and discarded. Observation events
+    /// (`DisplayTopologyChanged`, `WindowFocused`, `WindowBoundsObserved`,
+    /// `ConfigChanged`) still process normally so state stays accurate for
+    /// when the user resumes.
+    pub paused: bool,
+}
+
+impl EngineState {
+    /// The number of windows whose circuit breaker is currently open
+    /// (Feature 31).  Useful for diagnostics via `mosaix state --json`.
+    pub fn circuit_breaker_count(&self) -> usize {
+        self.windows.values().filter(|p| p.circuit_open()).count()
+    }
 }
 
 /// A tracked window's current bounds and display, plus the display and
@@ -106,7 +145,24 @@ pub struct WindowPlacement {
     /// future bounds-observed event mismatching the expected placement
     /// transaction resets it (ADR 0001; that reset lands with ticket 05).
     pub cycle_step: Option<(HorizontalDirection, CycleStep)>,
+    /// Consecutive `SetWindowPos` rejection count for the circuit breaker
+    /// (see [`CIRCUIT_BREAKER_THRESHOLD`]).  Each [`Event::PlacementRejected`]
+    /// increments this; reaching the threshold causes the engine to stop
+    /// issuing placements for this window.  Any explicit user zone-snap
+    /// command resets it to zero, giving the user a deliberate escape hatch.
+    pub rejection_count: u8,
 }
+
+impl WindowPlacement {
+    /// Returns `true` if the circuit breaker has opened for this window --
+    /// i.e. the engine should not issue any further automatic placements
+    /// until the user explicitly resets it with a zone-snap command.
+    pub fn circuit_open(&self) -> bool {
+        self.rejection_count >= CIRCUIT_BREAKER_THRESHOLD
+    }
+}
+
+
 
 /// The direction a zone-snap hotkey requests (CONTEXT.md "Zone"). Only
 /// [`ZoneSnapDirection::Left`]/[`ZoneSnapDirection::Right`] participate in
@@ -236,6 +292,55 @@ pub enum Event {
     /// current topology exactly the way [`Event::DisplayTopologyChanged`]
     /// re-selects it against the current config set (ADR 0004).
     ConfigChanged(ResolvedConfigSet),
+
+    /// Pause all window management. Placement-related events become no-ops
+    /// until [`Event::ResumeRequested`] fires. Idempotent — pausing when
+    /// already paused is a no-op.
+    PauseRequested,
+
+    /// Resume window management after a pause. Idempotent — resuming when
+    /// not paused is a no-op.
+    ResumeRequested,
+
+    /// Bulk-register all windows that were already open when the agent
+    /// started (feature 28 — startup reconciliation). Each entry is
+    /// `(window_id, display_id, bounds)` as observed by the platform
+    /// adapter's initial enumeration.  Windows already tracked (e.g. by
+    /// an earlier [`Event::WindowFocused`]) are silently skipped; windows
+    /// not yet tracked are registered with no `previous_placement`.  The
+    /// event is sent once, right after the engine is spawned, before any
+    /// OS event hooks are active.
+    StartupReconciliation {
+        windows: Vec<(WindowId, DisplayId, Rect)>,
+    },
+
+    /// Re-synchronise display topology and tracked windows after the
+    /// system wakes from sleep (feature 29 — sleep/wake recovery).
+    ///
+    /// The agent re-enumerates both displays and windows after a
+    /// configurable settling delay and sends this event.  The handler:
+    ///   1. Applies the new display topology (same fingerprint-based guard
+    ///      as [`Event::DisplayTopologyChanged`]).
+    ///   2. Migrates orphaned windows (whose previous `display_id` no
+    ///      longer exists) to the nearest surviving display, preserving
+    ///      their normalized position via [`throw_preserving_ratio`].
+    ///   3. Bulk-registers any newly observed windows that the engine
+    ///      doesn't know about yet.
+    WakeReconciliation {
+        displays: Vec<Display>,
+        windows: Vec<(WindowId, DisplayId, Rect)>,
+    },
+
+    /// The platform reported that the `SetWindowPos` call for `window_id`
+    /// was rejected — the window's actual bounds after a settling period
+    /// differ too much from the target (feature 31 — circuit breaker).
+    ///
+    /// Increments the window's `rejection_count`.  When the count reaches
+    /// [`CIRCUIT_BREAKER_THRESHOLD`], subsequent automatic placements for
+    /// that window are suppressed and a warning is logged.  The count is
+    /// reset to zero by any explicit [`Event::ZoneSnapRequested`] so the
+    /// user always has an escape hatch.
+    PlacementRejected { window_id: WindowId },
 }
 
 /// Applies one event to `state`. Must never panic -- a single bad event
@@ -249,6 +354,11 @@ fn apply(state: &mut EngineState, event: Event) {
                 return;
             }
             tracing::info!(display_count = displays.len(), "display topology changed");
+            // Feature 30 — display hotplug: migrate windows whose previous
+            // display is no longer present in the new topology to the nearest
+            // surviving display.  We do this *before* committing `displays` so
+            // we can still read the old topology to compute the migration.
+            migrate_orphaned_windows(state, &displays);
             state.displays = displays;
             state.resolved_config = select_resolved_config(&state.config_set, &state.displays);
             state.revision += 1;
@@ -259,6 +369,10 @@ fn apply(state: &mut EngineState, event: Event) {
             display_id,
             bounds,
         } => {
+            if state.paused {
+                tracing::debug!("window placed while paused; ignoring");
+                return;
+            }
             place_window(state, window_id, display_id, bounds, None);
         }
 
@@ -287,6 +401,10 @@ fn apply(state: &mut EngineState, event: Event) {
             window_id,
             direction,
         } => {
+            if state.paused {
+                tracing::debug!("throw-to-display requested while paused; ignoring");
+                return;
+            }
             let Some(placement) = state.windows.get(&window_id) else {
                 tracing::debug!(
                     ?window_id,
@@ -330,22 +448,22 @@ fn apply(state: &mut EngineState, event: Event) {
             display_id,
             bounds,
         } => {
-            if !state.windows.contains_key(&window_id) {
-                state.windows.insert(
-                    window_id,
-                    WindowPlacement {
-                        display_id,
-                        bounds,
-                        previous_placement: None,
-                        cycle_step: None,
-                    },
-                );
-            }
+            state.windows.entry(window_id).or_insert(WindowPlacement {
+                display_id,
+                bounds,
+                previous_placement: None,
+                cycle_step: None,
+                rejection_count: 0,
+            });
             state.focused_window = Some(window_id);
             state.revision += 1;
         }
 
         Event::ZoneSnapRequested { direction } => {
+            if state.paused {
+                tracing::debug!("zone-snap requested while paused; ignoring");
+                return;
+            }
             let Some(window_id) = state.focused_window else {
                 tracing::debug!("zone-snap requested with no focused window; ignoring");
                 return;
@@ -367,6 +485,22 @@ fn apply(state: &mut EngineState, event: Event) {
                 return;
             };
 
+            // Feature 31 — circuit breaker reset: an explicit zone-snap command
+            // from the user always resets the rejection counter, giving a
+            // deliberate escape hatch even for windows that previously rejected
+            // automatic placements.
+            if let Some(placement) = state.windows.get_mut(&window_id) {
+                if placement.rejection_count > 0 {
+                    tracing::info!(
+                        ?window_id,
+                        "zone-snap command resetting circuit breaker for window"
+                    );
+                    placement.rejection_count = 0;
+                }
+            }
+
+            // Re-borrow immutably after the mutable get above.
+            let placement = state.windows.get(&window_id).expect("checked above");
             if let Some(horizontal_direction) = direction.horizontal() {
                 let next_step = match placement.cycle_step {
                     Some((previous_direction, previous_step))
@@ -435,6 +569,114 @@ fn apply(state: &mut EngineState, event: Event) {
             state.config_set = config_set;
             state.revision += 1;
         }
+
+        Event::PauseRequested => {
+            if state.paused {
+                tracing::debug!("pause requested but already paused; ignoring");
+                return;
+            }
+            tracing::info!("window management paused");
+            state.paused = true;
+            state.revision += 1;
+        }
+
+        Event::ResumeRequested => {
+            if !state.paused {
+                tracing::debug!("resume requested but not paused; ignoring");
+                return;
+            }
+            tracing::info!("window management resumed");
+            state.paused = false;
+            state.revision += 1;
+        }
+
+        // Feature 28 — startup reconciliation.
+        Event::StartupReconciliation { windows } => {
+            let mut registered = 0usize;
+            for (window_id, display_id, bounds) in windows {
+                state.windows.entry(window_id).or_insert_with(|| {
+                    registered += 1;
+                    WindowPlacement {
+                        display_id,
+                        bounds,
+                        previous_placement: None,
+                        cycle_step: None,
+                        rejection_count: 0,
+                    }
+                });
+            }
+            if registered > 0 {
+                tracing::info!(registered, "startup reconciliation registered existing windows");
+                state.revision += 1;
+            } else {
+                tracing::debug!("startup reconciliation: no new windows to register");
+            }
+        }
+
+        // Feature 29 — sleep/wake recovery.
+        Event::WakeReconciliation { displays, windows } => {
+            tracing::info!(
+                display_count = displays.len(),
+                window_count = windows.len(),
+                "wake reconciliation starting"
+            );
+            // Step 1: migrate orphaned windows using the old topology before
+            // committing the new one (same as the hotplug path in
+            // DisplayTopologyChanged).
+            if topology_fingerprint(&displays) != topology_fingerprint(&state.displays) {
+                migrate_orphaned_windows(state, &displays);
+                state.displays = displays;
+                state.resolved_config =
+                    select_resolved_config(&state.config_set, &state.displays);
+            }
+            // Step 2: bulk-register any newly observed windows.
+            let mut registered = 0usize;
+            for (window_id, display_id, bounds) in windows {
+                state.windows.entry(window_id).or_insert_with(|| {
+                    registered += 1;
+                    WindowPlacement {
+                        display_id,
+                        bounds,
+                        previous_placement: None,
+                        cycle_step: None,
+                        rejection_count: 0,
+                    }
+                });
+            }
+            tracing::info!(
+                registered,
+                "wake reconciliation complete"
+            );
+            state.revision += 1;
+        }
+
+        // Feature 31 — per-window circuit breaker.
+        Event::PlacementRejected { window_id } => {
+            let Some(placement) = state.windows.get_mut(&window_id) else {
+                tracing::debug!(
+                    ?window_id,
+                    "placement rejection for an untracked window; ignoring"
+                );
+                return;
+            };
+            placement.rejection_count = placement.rejection_count.saturating_add(1);
+            if placement.rejection_count == CIRCUIT_BREAKER_THRESHOLD {
+                tracing::warn!(
+                    ?window_id,
+                    threshold = CIRCUIT_BREAKER_THRESHOLD,
+                    "circuit breaker opened: window repeatedly rejected placement; \
+                     stopping automatic management until user resets with a zone-snap command"
+                );
+                state.revision += 1;
+            } else {
+                tracing::debug!(
+                    ?window_id,
+                    rejection_count = placement.rejection_count,
+                    threshold = CIRCUIT_BREAKER_THRESHOLD,
+                    "placement rejection recorded"
+                );
+            }
+        }
     }
 }
 
@@ -473,12 +715,18 @@ fn work_area_of(displays: &[Display], id: DisplayId) -> Option<Rect> {
 /// A window present in `previous` but missing from `current` needs no
 /// call -- there's nothing sensible to move it to, and the engine never
 /// removes tracked windows today anyway.
+///
+/// Windows whose circuit breaker is open (Feature 31) are excluded from
+/// the diff so the executor never issues a `SetWindowPos` call for them --
+/// they will re-appear in the diff automatically once the user resets the
+/// breaker via a zone-snap command.
 pub fn diff_placements(
     previous: &HashMap<WindowId, WindowPlacement>,
     current: &HashMap<WindowId, WindowPlacement>,
 ) -> Vec<(WindowId, DisplayId, Rect)> {
     current
         .iter()
+        .filter(|(_, placement)| !placement.circuit_open())
         .filter(|(window_id, placement)| {
             previous
                 .get(window_id)
@@ -501,16 +749,34 @@ pub fn diff_placements(
 /// tracked yet) unchanged -- every caller does this except
 /// [`Event::ZoneSnapRequested`]'s left/right handling, which passes
 /// `Some((direction, step))` to record the cycle position it just resolved.
+///
+/// Returns `false` if the placement was suppressed because the window's
+/// circuit breaker is open (Feature 31). The caller is free to ignore this
+/// return value -- it's informational only; the event has already been
+/// handled (by doing nothing).
 fn place_window(
     state: &mut EngineState,
     window_id: WindowId,
     display_id: DisplayId,
     bounds: Rect,
     cycle_step: Option<(HorizontalDirection, CycleStep)>,
-) {
+) -> bool {
     let existing = state.windows.get(&window_id);
+    // Feature 31 — circuit breaker: if the window is in open-circuit state
+    // (repeated rejections), suppress this placement without modifying state.
+    if existing.is_some_and(|p| p.circuit_open()) {
+        tracing::debug!(
+            ?window_id,
+            "placement suppressed: circuit breaker is open for this window"
+        );
+        return false;
+    }
     let previous_placement = existing.map(|placement| (placement.display_id, placement.bounds));
     let cycle_step = cycle_step.or_else(|| existing.and_then(|placement| placement.cycle_step));
+    // Preserve rejection_count across placements so the breaker state survives
+    // non-user-initiated placements (e.g. throw-to-display).  Only an explicit
+    // zone-snap command resets it (handled in Event::ZoneSnapRequested above).
+    let rejection_count = existing.map_or(0, |p| p.rejection_count);
     state.windows.insert(
         window_id,
         WindowPlacement {
@@ -518,9 +784,91 @@ fn place_window(
             bounds,
             previous_placement,
             cycle_step,
+            rejection_count,
         },
     );
     state.revision += 1;
+    true
+}
+
+/// Migrate windows whose current `display_id` is absent from `new_displays`
+/// to the nearest surviving display, preserving their normalized position
+/// via [`throw_preserving_ratio`].  Called *before* `state.displays` is
+/// updated so the old topology is still available to compute ratios from.
+///
+/// This is the shared implementation for both [`Event::DisplayTopologyChanged`]
+/// (hotplug, Feature 30) and [`Event::WakeReconciliation`] (sleep/wake, Feature 29).
+fn migrate_orphaned_windows(state: &mut EngineState, new_displays: &[Display]) {
+    if new_displays.is_empty() {
+        // No surviving displays -- nothing sensible to migrate to.  Leave
+        // windows untouched; they'll be reconciled when a display comes back.
+        tracing::warn!("all displays disappeared; deferring window migration until a display returns");
+        return;
+    }
+
+    let mut migrated = 0usize;
+    // Collect the set of display IDs that are *leaving* the topology.
+    let vanished_ids: Vec<DisplayId> = state
+        .displays
+        .iter()
+        .filter(|d| !new_displays.iter().any(|nd| nd.id == d.id))
+        .map(|d| d.id)
+        .collect();
+
+    if vanished_ids.is_empty() {
+        return;
+    }
+
+    tracing::info!(
+        vanished_count = vanished_ids.len(),
+        "migrating windows from vanished displays"
+    );
+
+    // For each window on a vanished display, find the nearest surviving
+    // display by comparing display center-points, then throw the window to it.
+    for placement in state.windows.values_mut() {
+        if !vanished_ids.contains(&placement.display_id) {
+            continue;
+        }
+
+        // Find the old display's geometry.
+        let Some(old_display) = state.displays.iter().find(|d| d.id == placement.display_id)
+        else {
+            continue;
+        };
+
+        // Find the nearest new display by Euclidean distance between centers.
+        let old_cx = old_display.full_bounds.x + old_display.full_bounds.width / 2;
+        let old_cy = old_display.full_bounds.y + old_display.full_bounds.height / 2;
+
+        let Some(nearest) = new_displays.iter().min_by_key(|nd| {
+            let cx = nd.full_bounds.x + nd.full_bounds.width / 2;
+            let cy = nd.full_bounds.y + nd.full_bounds.height / 2;
+            let dx = (cx - old_cx) as i64;
+            let dy = (cy - old_cy) as i64;
+            dx * dx + dy * dy
+        }) else {
+            continue;
+        };
+
+        // Preserve the window's normalized position on the new display.
+        let new_bounds =
+            throw_preserving_ratio(placement.bounds, old_display.work_area, nearest.work_area);
+
+        tracing::info!(
+            ?placement.display_id,
+            new_display_id = ?nearest.id,
+            "migrating window from vanished display"
+        );
+
+        placement.display_id = nearest.id;
+        placement.bounds = new_bounds;
+        migrated += 1;
+    }
+
+    if migrated > 0 {
+        tracing::info!(migrated, "window migration complete");
+    }
 }
 
 /// The queue actually carries this, not `Event` directly, so [`stop`]
@@ -664,6 +1012,7 @@ pub fn spawn_engine_with_capacity(
         focused_window: None,
         resolved_config: initial_resolved_config,
         config_set: initial_config_set,
+        paused: false,
     };
     let state = Arc::new(Mutex::new(initial_state.clone()));
 
@@ -1090,6 +1439,12 @@ mod tests {
 
     #[test]
     fn apply_throw_is_a_noop_when_the_windows_display_left_the_topology() {
+        // Regression test: when a monitor unplugs, the window is *migrated*
+        // to the surviving display by `DisplayTopologyChanged`.  A subsequent
+        // throw then operates on that surviving display -- but with only one
+        // display remaining there is no adjacent display to throw to, so the
+        // throw is still a no-op.  The key assertion is that the window ends
+        // up on the surviving display, not stranded on the vanished one.
         let mut state = EngineState::default();
         apply(
             &mut state,
@@ -1104,10 +1459,20 @@ mod tests {
             },
         );
         // Display 1 (the window's display) unplugs, leaving only display 2.
+        // `migrate_orphaned_windows` moves the window to display 2 as part of
+        // the topology-change handler.
         apply(
             &mut state,
             Event::DisplayTopologyChanged(vec![display(2, "MON-B", 1920)]),
         );
+
+        // The window must have been migrated to display 2.
+        assert_eq!(
+            state.windows.get(&WindowId(1)).unwrap().display_id,
+            DisplayId(2),
+            "the window must be migrated to the surviving display on hotplug"
+        );
+
         let revision_before_throw = state.revision;
         apply(
             &mut state,
@@ -1117,12 +1482,16 @@ mod tests {
             },
         );
 
+        // Only one display remains, so the throw is still a no-op.
         assert_eq!(
             state.windows.get(&WindowId(1)).unwrap().display_id,
-            DisplayId(1),
-            "the window's placement should be left untouched"
+            DisplayId(2),
+            "with no adjacent display, the throw must be a no-op on the migrated display"
         );
-        assert_eq!(state.revision, revision_before_throw);
+        assert_eq!(
+            state.revision, revision_before_throw,
+            "throw with no adjacent display must not bump the revision"
+        );
     }
 
     #[test]
@@ -1643,19 +2012,23 @@ mod tests {
     }
 
     #[test]
-    fn apply_zone_snap_is_a_noop_when_the_focused_windows_display_left_the_topology() {
+    fn apply_zone_snap_on_migrated_window_works_on_surviving_display() {
+        // When a monitor unplugs, `migrate_orphaned_windows` moves any window
+        // that was on it to the nearest surviving display.  A subsequent
+        // zone-snap must therefore operate on the window's *new* display, not
+        // fail because the original display is gone.
         let mut state = EngineState::default();
         apply(
             &mut state,
             Event::DisplayTopologyChanged(vec![display(1, "MON-A", 0), display(2, "MON-B", 1920)]),
         );
-        let bounds = Rect::new(0, 0, 960, 1080);
+        let original_bounds = Rect::new(0, 0, 960, 1080);
         apply(
             &mut state,
             Event::WindowPlaced {
                 window_id: WindowId(1),
                 display_id: DisplayId(1),
-                bounds,
+                bounds: original_bounds,
             },
         );
         apply(
@@ -1663,16 +2036,25 @@ mod tests {
             Event::WindowFocused {
                 window_id: WindowId(1),
                 display_id: DisplayId(1),
-                bounds,
+                bounds: original_bounds,
             },
         );
         // Display 1 (the focused window's display) unplugs, leaving only display 2.
+        // `migrate_orphaned_windows` runs as part of the topology-change handler,
+        // moving the window to display 2.
         apply(
             &mut state,
             Event::DisplayTopologyChanged(vec![display(2, "MON-B", 1920)]),
         );
-        let revision_before = state.revision;
 
+        // Confirm migration happened.
+        assert_eq!(
+            state.windows.get(&WindowId(1)).unwrap().display_id,
+            DisplayId(2),
+            "window must have been migrated to display 2"
+        );
+
+        let revision_before = state.revision;
         apply(
             &mut state,
             Event::ZoneSnapRequested {
@@ -1680,11 +2062,24 @@ mod tests {
             },
         );
 
-        assert_eq!(
-            state.revision, revision_before,
-            "a vanished display must leave the placement untouched"
+        // Zone snap must now succeed, using display 2's work area.
+        assert!(
+            state.revision > revision_before,
+            "zone-snap on a migrated window must produce a new placement (revision must bump)"
         );
-        assert_eq!(state.windows.get(&WindowId(1)).unwrap().bounds, bounds);
+        // The window must now be on display 2 with a valid left-half snap.
+        let placement = state.windows.get(&WindowId(1)).unwrap();
+        assert_eq!(
+            placement.display_id,
+            DisplayId(2),
+            "window must remain on display 2 after snap"
+        );
+        // Left-half of display 2's 1920x1080 work area (starts at x=1920).
+        assert_eq!(
+            placement.bounds,
+            Rect::new(1920, 0, 960, 1080),
+            "snap must produce the left half of display 2's work area"
+        );
     }
 
     #[test]
@@ -2062,7 +2457,10 @@ mod tests {
         };
         apply(&mut state, Event::ConfigChanged(config_set));
 
-        apply(&mut state, Event::DisplayTopologyChanged(displays_a.clone()));
+        apply(
+            &mut state,
+            Event::DisplayTopologyChanged(displays_a.clone()),
+        );
         assert_eq!(state.resolved_config, profile_a.config);
 
         apply(&mut state, Event::DisplayTopologyChanged(displays_b));
@@ -2121,6 +2519,7 @@ mod tests {
                 bounds: Rect::new(0, 0, 960, 1080),
                 previous_placement: None,
                 cycle_step: None,
+                rejection_count: 0,
             },
         );
 
@@ -2134,6 +2533,7 @@ mod tests {
             bounds: Rect::new(0, 0, 960, 1080),
             previous_placement: None,
             cycle_step: None,
+            rejection_count: 0,
         };
         let mut previous = HashMap::new();
         previous.insert(WindowId(1), unchanged);
@@ -2219,5 +2619,511 @@ mod tests {
         );
 
         handle.stop();
+    }
+
+    #[test]
+    fn apply_pause_sets_paused_and_bumps_revision() {
+        let mut state = EngineState::default();
+        apply(&mut state, Event::PauseRequested);
+        assert!(state.paused);
+        assert_eq!(state.revision, 1);
+    }
+
+    #[test]
+    fn apply_pause_twice_is_idempotent() {
+        let mut state = EngineState::default();
+        apply(&mut state, Event::PauseRequested);
+        apply(&mut state, Event::PauseRequested);
+        assert!(state.paused);
+        assert_eq!(state.revision, 1);
+    }
+
+    #[test]
+    fn apply_resume_clears_paused_and_bumps_revision() {
+        let mut state = EngineState::default();
+        state.paused = true;
+        apply(&mut state, Event::ResumeRequested);
+        assert!(!state.paused);
+        assert_eq!(state.revision, 1);
+    }
+
+    #[test]
+    fn apply_resume_when_not_paused_is_idempotent() {
+        let mut state = EngineState::default();
+        apply(&mut state, Event::ResumeRequested);
+        assert!(!state.paused);
+        assert_eq!(state.revision, 0);
+    }
+
+    #[test]
+    fn apply_zone_snap_is_suppressed_while_paused() {
+        let mut state = EngineState::default();
+        state.paused = true;
+        state.focused_window = Some(WindowId(1));
+        apply(
+            &mut state,
+            Event::ZoneSnapRequested {
+                direction: ZoneSnapDirection::Left,
+            },
+        );
+        assert_eq!(state.revision, 0);
+    }
+
+    #[test]
+    fn apply_window_placed_is_suppressed_while_paused() {
+        let mut state = EngineState::default();
+        state.paused = true;
+        apply(
+            &mut state,
+            Event::WindowPlaced {
+                window_id: WindowId(1),
+                display_id: DisplayId(1),
+                bounds: Rect::new(0, 0, 100, 100),
+            },
+        );
+        assert_eq!(state.revision, 0);
+    }
+
+    #[test]
+    fn apply_throw_is_suppressed_while_paused() {
+        let mut state = EngineState::default();
+        state.paused = true;
+        apply(
+            &mut state,
+            Event::WindowThrowToDisplayRequested {
+                window_id: WindowId(1),
+                direction: mosaix_layout::DisplayDirection::Next,
+            },
+        );
+        assert_eq!(state.revision, 0);
+    }
+
+    #[test]
+    fn apply_display_topology_still_processes_while_paused() {
+        let mut state = EngineState::default();
+        state.paused = true;
+        apply(
+            &mut state,
+            Event::DisplayTopologyChanged(vec![display(1, "MON-A", 0)]),
+        );
+        assert_eq!(state.revision, 1);
+    }
+
+    #[test]
+    fn apply_focus_still_processes_while_paused() {
+        let mut state = EngineState::default();
+        state.paused = true;
+        apply(
+            &mut state,
+            Event::WindowFocused {
+                window_id: WindowId(1),
+                display_id: DisplayId(1),
+                bounds: Rect::new(0, 0, 100, 100),
+            },
+        );
+        assert_eq!(state.revision, 1);
+    }
+
+    #[test]
+    fn apply_config_still_processes_while_paused() {
+        let mut state = EngineState::default();
+        state.paused = true;
+        let config_set = ResolvedConfigSet {
+            base: ResolvedConfig::default(),
+            profiles: vec![],
+        };
+        apply(&mut state, Event::ConfigChanged(config_set));
+        assert!(state.paused);
+    }
+
+    // ── Feature 28: Startup reconciliation ────────────────────────────────
+
+    #[test]
+    fn startup_reconciliation_registers_untracked_windows() {
+        let mut state = EngineState::default();
+        apply(
+            &mut state,
+            Event::DisplayTopologyChanged(vec![display(1, "MON-A", 0)]),
+        );
+        let windows = vec![
+            (WindowId(10), DisplayId(1), Rect::new(0, 0, 960, 1080)),
+            (WindowId(20), DisplayId(1), Rect::new(960, 0, 960, 1080)),
+        ];
+        apply(&mut state, Event::StartupReconciliation { windows });
+
+        assert!(
+            state.windows.contains_key(&WindowId(10)),
+            "window 10 must be registered by reconciliation"
+        );
+        assert!(
+            state.windows.contains_key(&WindowId(20)),
+            "window 20 must be registered by reconciliation"
+        );
+        assert_eq!(
+            state.windows.get(&WindowId(10)).unwrap().display_id,
+            DisplayId(1)
+        );
+    }
+
+    #[test]
+    fn startup_reconciliation_does_not_overwrite_already_tracked_windows() {
+        // If a WindowFocused event arrived before StartupReconciliation
+        // (e.g. due to event ordering), the existing placement must win.
+        let mut state = EngineState::default();
+        apply(
+            &mut state,
+            Event::DisplayTopologyChanged(vec![display(1, "MON-A", 0)]),
+        );
+        let focused_bounds = Rect::new(100, 100, 800, 600);
+        apply(
+            &mut state,
+            Event::WindowFocused {
+                window_id: WindowId(10),
+                display_id: DisplayId(1),
+                bounds: focused_bounds,
+            },
+        );
+        // Reconciliation reports different bounds for the same window.
+        apply(
+            &mut state,
+            Event::StartupReconciliation {
+                windows: vec![(WindowId(10), DisplayId(1), Rect::new(0, 0, 960, 1080))],
+            },
+        );
+
+        // The focused-event placement must be preserved.
+        assert_eq!(
+            state.windows.get(&WindowId(10)).unwrap().bounds,
+            focused_bounds,
+            "an already-tracked window's placement must not be overwritten by reconciliation"
+        );
+    }
+
+    #[test]
+    fn startup_reconciliation_with_empty_list_is_a_noop() {
+        let mut state = EngineState::default();
+        apply(
+            &mut state,
+            Event::StartupReconciliation { windows: vec![] },
+        );
+        assert_eq!(state.revision, 0, "empty reconciliation must not bump the revision");
+        assert!(state.windows.is_empty());
+    }
+
+    // ── Feature 29 / 30: Display migration (hotplug and wake) ─────────────
+
+    #[test]
+    fn topology_change_migrates_window_to_nearest_surviving_display() {
+        // The window starts on MON-A (left monitor).  When MON-A unplugs,
+        // the window must be migrated to MON-B (the only survivor).
+        let mut state = EngineState::default();
+        apply(
+            &mut state,
+            Event::DisplayTopologyChanged(vec![display(1, "MON-A", 0), display(2, "MON-B", 1920)]),
+        );
+        apply(
+            &mut state,
+            Event::WindowPlaced {
+                window_id: WindowId(1),
+                display_id: DisplayId(1),
+                bounds: Rect::new(0, 0, 960, 1080),
+            },
+        );
+        // MON-A unplugs.
+        apply(
+            &mut state,
+            Event::DisplayTopologyChanged(vec![display(2, "MON-B", 1920)]),
+        );
+
+        let placement = state.windows.get(&WindowId(1)).unwrap();
+        assert_eq!(
+            placement.display_id,
+            DisplayId(2),
+            "window must be migrated to the surviving display"
+        );
+        // Bounds must be within display 2's work area (x in 1920..3840).
+        assert!(
+            placement.bounds.x >= 1920,
+            "migrated bounds must be on display 2's x range"
+        );
+    }
+
+    #[test]
+    fn topology_change_with_no_displays_does_not_migrate() {
+        // If all displays disappear (USB dock fully unplugged), we leave windows
+        // in place rather than crashing or migrating to nothing.
+        let mut state = EngineState::default();
+        apply(
+            &mut state,
+            Event::DisplayTopologyChanged(vec![display(1, "MON-A", 0)]),
+        );
+        apply(
+            &mut state,
+            Event::WindowPlaced {
+                window_id: WindowId(1),
+                display_id: DisplayId(1),
+                bounds: Rect::new(0, 0, 960, 1080),
+            },
+        );
+        let bounds_before = state.windows.get(&WindowId(1)).unwrap().bounds;
+
+        // Topology fingerprints differ when the display list changes, so even an
+        // empty list is processed (the fingerprint of [] != fingerprint of [MON-A]).
+        // But migration must gracefully handle the empty-display case.
+        apply(
+            &mut state,
+            Event::DisplayTopologyChanged(vec![]),
+        );
+
+        assert_eq!(
+            state.windows.get(&WindowId(1)).unwrap().bounds,
+            bounds_before,
+            "with no surviving displays, window bounds must be left intact"
+        );
+    }
+
+    #[test]
+    fn wake_reconciliation_updates_topology_and_registers_new_windows() {
+        let mut state = EngineState::default();
+        apply(
+            &mut state,
+            Event::DisplayTopologyChanged(vec![display(1, "MON-A", 0)]),
+        );
+        apply(
+            &mut state,
+            Event::WindowPlaced {
+                window_id: WindowId(1),
+                display_id: DisplayId(1),
+                bounds: Rect::new(0, 0, 960, 1080),
+            },
+        );
+
+        // After wake: a new display appears and a new window opened while asleep.
+        let new_displays = vec![display(1, "MON-A", 0), display(2, "MON-B", 1920)];
+        let new_windows = vec![
+            (WindowId(1), DisplayId(1), Rect::new(0, 0, 960, 1080)), // already tracked
+            (WindowId(99), DisplayId(2), Rect::new(1920, 0, 960, 1080)), // new
+        ];
+        apply(
+            &mut state,
+            Event::WakeReconciliation {
+                displays: new_displays,
+                windows: new_windows,
+            },
+        );
+
+        assert_eq!(state.displays.len(), 2, "topology must include the new display");
+        assert!(
+            state.windows.contains_key(&WindowId(99)),
+            "new window observed after wake must be registered"
+        );
+        // Window 1's placement must not be overwritten.
+        assert_eq!(
+            state.windows.get(&WindowId(1)).unwrap().bounds,
+            Rect::new(0, 0, 960, 1080)
+        );
+    }
+
+    // ── Feature 31: Per-window circuit breaker ────────────────────────────
+
+    #[test]
+    fn placement_rejected_increments_rejection_count() {
+        let mut state = EngineState::default();
+        apply(
+            &mut state,
+            Event::DisplayTopologyChanged(vec![display(1, "MON-A", 0)]),
+        );
+        apply(
+            &mut state,
+            Event::WindowPlaced {
+                window_id: WindowId(1),
+                display_id: DisplayId(1),
+                bounds: Rect::new(0, 0, 960, 1080),
+            },
+        );
+        apply(&mut state, Event::PlacementRejected { window_id: WindowId(1) });
+        apply(&mut state, Event::PlacementRejected { window_id: WindowId(1) });
+
+        assert_eq!(
+            state.windows.get(&WindowId(1)).unwrap().rejection_count,
+            2
+        );
+        // Not yet at threshold; circuit must still be closed.
+        assert!(
+            !state.windows.get(&WindowId(1)).unwrap().circuit_open(),
+            "circuit must not open before threshold is reached"
+        );
+    }
+
+    #[test]
+    fn circuit_breaker_opens_at_threshold_and_suppresses_placements() {
+        let mut state = EngineState::default();
+        apply(
+            &mut state,
+            Event::DisplayTopologyChanged(vec![display(1, "MON-A", 0)]),
+        );
+        apply(
+            &mut state,
+            Event::WindowPlaced {
+                window_id: WindowId(1),
+                display_id: DisplayId(1),
+                bounds: Rect::new(0, 0, 960, 1080),
+            },
+        );
+        // Drive to threshold.
+        for _ in 0..CIRCUIT_BREAKER_THRESHOLD {
+            apply(&mut state, Event::PlacementRejected { window_id: WindowId(1) });
+        }
+
+        assert!(
+            state.windows.get(&WindowId(1)).unwrap().circuit_open(),
+            "circuit must be open after reaching the threshold"
+        );
+
+        // A new WindowPlaced must be suppressed by place_window.
+        let revision_before = state.revision;
+        apply(
+            &mut state,
+            Event::WindowPlaced {
+                window_id: WindowId(1),
+                display_id: DisplayId(1),
+                bounds: Rect::new(100, 100, 400, 300),
+            },
+        );
+        assert_eq!(
+            state.revision, revision_before,
+            "placement must be suppressed while circuit is open"
+        );
+        assert_eq!(
+            state.windows.get(&WindowId(1)).unwrap().bounds,
+            Rect::new(0, 0, 960, 1080),
+            "window bounds must remain unchanged while circuit is open"
+        );
+    }
+
+    #[test]
+    fn zone_snap_resets_circuit_breaker_and_places_the_window() {
+        let mut state = EngineState::default();
+        apply(
+            &mut state,
+            Event::DisplayTopologyChanged(vec![display(1, "MON-A", 0)]),
+        );
+        apply(
+            &mut state,
+            Event::WindowPlaced {
+                window_id: WindowId(1),
+                display_id: DisplayId(1),
+                bounds: Rect::new(0, 0, 960, 1080),
+            },
+        );
+        apply(
+            &mut state,
+            Event::WindowFocused {
+                window_id: WindowId(1),
+                display_id: DisplayId(1),
+                bounds: Rect::new(0, 0, 960, 1080),
+            },
+        );
+        // Open the circuit.
+        for _ in 0..CIRCUIT_BREAKER_THRESHOLD {
+            apply(&mut state, Event::PlacementRejected { window_id: WindowId(1) });
+        }
+        assert!(state.windows.get(&WindowId(1)).unwrap().circuit_open());
+
+        // Zone-snap must reset the breaker and snap the window.
+        apply(
+            &mut state,
+            Event::ZoneSnapRequested {
+                direction: ZoneSnapDirection::Left,
+            },
+        );
+
+        let placement = state.windows.get(&WindowId(1)).unwrap();
+        assert_eq!(
+            placement.rejection_count, 0,
+            "zone-snap must reset the rejection count to zero"
+        );
+        assert!(
+            !placement.circuit_open(),
+            "circuit must be closed after zone-snap"
+        );
+        // The window must have actually been snapped.
+        assert_eq!(
+            placement.bounds,
+            Rect::new(0, 0, 960, 1080),
+            "left-half snap on display 1"
+        );
+    }
+
+    #[test]
+    fn circuit_breaker_count_reports_open_circuit_windows() {
+        let mut state = EngineState::default();
+        apply(
+            &mut state,
+            Event::DisplayTopologyChanged(vec![display(1, "MON-A", 0)]),
+        );
+        for id in [1, 2, 3] {
+            apply(
+                &mut state,
+                Event::WindowPlaced {
+                    window_id: WindowId(id),
+                    display_id: DisplayId(1),
+                    bounds: Rect::new(0, 0, 960, 1080),
+                },
+            );
+        }
+        assert_eq!(state.circuit_breaker_count(), 0);
+
+        // Open circuit on window 1 and 3, but not 2.
+        for _ in 0..CIRCUIT_BREAKER_THRESHOLD {
+            apply(&mut state, Event::PlacementRejected { window_id: WindowId(1) });
+            apply(&mut state, Event::PlacementRejected { window_id: WindowId(3) });
+        }
+
+        assert_eq!(
+            state.circuit_breaker_count(),
+            2,
+            "two windows should have open circuits"
+        );
+    }
+
+    #[test]
+    fn diff_placements_excludes_open_circuit_windows() {
+        // Windows whose circuit is open must not appear in the diff so the
+        // executor never tries to `SetWindowPos` them again.
+        let mut previous: HashMap<WindowId, WindowPlacement> = HashMap::new();
+        let open_circuit = WindowPlacement {
+            display_id: DisplayId(1),
+            bounds: Rect::new(0, 0, 100, 100),
+            previous_placement: None,
+            cycle_step: None,
+            rejection_count: CIRCUIT_BREAKER_THRESHOLD,
+        };
+        let healthy = WindowPlacement {
+            display_id: DisplayId(1),
+            bounds: Rect::new(100, 100, 200, 200),
+            previous_placement: None,
+            cycle_step: None,
+            rejection_count: 0,
+        };
+        previous.insert(WindowId(1), open_circuit);
+        previous.insert(WindowId(2), healthy);
+
+        // In `current`, both windows moved.
+        let mut current = previous.clone();
+        current.get_mut(&WindowId(1)).unwrap().bounds = Rect::new(50, 50, 100, 100);
+        current.get_mut(&WindowId(2)).unwrap().bounds = Rect::new(200, 200, 200, 200);
+
+        let diff = diff_placements(&previous, &current);
+        let ids: Vec<WindowId> = diff.iter().map(|(id, _, _)| *id).collect();
+
+        assert!(
+            !ids.contains(&WindowId(1)),
+            "open-circuit window must not appear in the placement diff"
+        );
+        assert!(
+            ids.contains(&WindowId(2)),
+            "healthy window with changed bounds must appear in the diff"
+        );
     }
 }

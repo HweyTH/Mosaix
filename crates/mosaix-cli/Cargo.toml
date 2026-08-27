@@ -10,3 +10,6 @@ name = "mosaix"
 path = "src/main.rs"
 
 [dependencies]
+mosaix-ipc = { path = "../mosaix-ipc" }
+clap = { workspace = true }
+serde_json = { workspace = true }

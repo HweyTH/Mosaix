@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 mosaix-engine = { path = "../mosaix-engine" }
 mosaix-config = { path = "../mosaix-config" }
+mosaix-ipc = { path = "../mosaix-ipc" }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 

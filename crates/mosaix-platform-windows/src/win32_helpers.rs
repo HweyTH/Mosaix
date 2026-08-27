@@ -9,8 +9,12 @@ use mosaix_domain::Rect;
 use windows::Win32::Foundation::{CloseHandle, HWND, RECT};
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
 use windows::core::PWSTR;
+use windows::Win32::Security::{
+    GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
+};
 use windows::Win32::System::Threading::{
-    OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+    OpenProcess, OpenProcessToken, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+    PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GetClassNameW, GetWindowLongW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
@@ -143,4 +147,48 @@ pub fn is_iconic(hwnd: HWND) -> bool {
 /// Check if a window is maximized (zoomed).
 pub fn is_zoomed(hwnd: HWND) -> bool {
     unsafe { IsZoomed(hwnd).as_bool() }
+}
+
+/// Check whether the process owning `pid` is running elevated (as Administrator).
+///
+/// Returns:
+/// - `Some(true)` — the process is elevated (high mandatory integrity level).
+/// - `Some(false)` — the process is not elevated.
+/// - `None` — the process token could not be opened.  This typically means
+///   Mosaix itself is running unelevated and the target process is elevated
+///   (or is a protected system process), which is functionally equivalent to
+///   `Some(true)` for the purposes of window management: we cannot send it
+///   `SetWindowPos` calls either way.
+///
+/// Callers that cannot distinguish `None` from `Some(true)` should treat them
+/// identically — if we cannot even inspect the token, we certainly cannot
+/// manage the window.
+pub fn is_process_elevated(pid: u32) -> Option<bool> {
+    unsafe {
+        // We only need PROCESS_QUERY_LIMITED_INFORMATION to open the token.
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let mut token = windows::Win32::Foundation::HANDLE::default();
+        let opened = OpenProcessToken(process, TOKEN_QUERY, &mut token);
+        let _ = CloseHandle(process);
+        if !opened.is_ok() {
+            return None;
+        }
+
+        let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
+        let mut return_length: u32 = 0;
+        let queried = GetTokenInformation(
+            token,
+            TokenElevation,
+            Some(&mut elevation as *mut TOKEN_ELEVATION as *mut _),
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut return_length,
+        );
+        let _ = CloseHandle(token);
+
+        if queried.is_ok() {
+            Some(elevation.TokenIsElevated != 0)
+        } else {
+            None
+        }
+    }
 }

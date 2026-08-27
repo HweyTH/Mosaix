@@ -32,11 +32,12 @@ use windows::Win32::Graphics::Gdi::{
     EnumDisplayMonitors, EnumDisplaySettingsW, GetMonitorInfoW, DEVMODEW, DMDO_180, DMDO_270,
     DMDO_90, ENUM_CURRENT_SETTINGS, HDC, HMONITOR, MONITORINFOEXW,
 };
+
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, PostThreadMessageW,
     RegisterClassW, TranslateMessage, MONITORINFOF_PRIMARY, MSG, WINDOW_EX_STYLE,
-    WM_DISPLAYCHANGE, WM_QUIT, WNDCLASSW, WS_OVERLAPPED,
+    WM_DISPLAYCHANGE, WM_POWERBROADCAST, WM_QUIT, WNDCLASSW, WS_OVERLAPPED,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
@@ -143,12 +144,30 @@ pub fn enumerate_displays() -> Result<Vec<Display>> {
 /// to re-check, not an authoritative delta.
 #[derive(Debug, Clone)]
 pub enum TopologyEvent {
+    /// The display configuration changed (monitor connect/disconnect,
+    /// resolution, DPI, or arrangement change via `WM_DISPLAYCHANGE`).
     Changed(Vec<Display>),
+    /// The system just resumed from sleep or hibernation
+    /// (`WM_POWERBROADCAST` / `PBT_APMRESUMEAUTOMATIC`).  Carries a fresh
+    /// display enumeration taken after a brief settling delay (monitors need
+    /// time to re-initialize after wake).  The agent should use this to
+    /// send [`mosaix_engine::Event::WakeReconciliation`] rather than the
+    /// ordinary [`mosaix_engine::Event::DisplayTopologyChanged`], because
+    /// wake recovery also needs to re-enumerate windows.
+    WakeFromSleep(Vec<Display>),
 }
 
 thread_local! {
     static TOPOLOGY_SENDER: RefCell<Option<Sender<TopologyEvent>>> = const { RefCell::new(None) };
 }
+
+/// Settling delay after a wake event before re-enumerating displays.
+///
+/// Monitors need time to re-initialize after the system wakes from sleep.
+/// Querying the display list too quickly can return an empty or stale
+/// topology.  Two seconds is a conservative but safe budget that avoids
+/// returning a stale (possibly empty) topology.
+const WAKE_SETTLE_MILLIS: u64 = 2000;
 
 unsafe extern "system" fn topology_wndproc(
     hwnd: HWND,
@@ -165,6 +184,34 @@ unsafe extern "system" fn topology_wndproc(
         });
         return LRESULT(0);
     }
+
+    // Feature 29 — sleep/wake recovery.
+    //
+    // `PBT_APMRESUMEAUTOMATIC` (0x0012) fires when the system wakes (both
+    // from user action and automatic wake).  We wait for the display
+    // subsystem to settle before re-enumerating, then emit `WakeFromSleep`
+    // so the agent can send `Event::WakeReconciliation` and also
+    // re-enumerate windows.
+    //
+    // The `windows` crate v0.58 does not expose this particular constant
+    // through its generated API, so we use the raw value from the SDK docs:
+    // https://learn.microsoft.com/en-us/windows/win32/power/pbt-apmresumeautomatic
+    if msg == WM_POWERBROADCAST && wparam.0 as u32 == 0x0012u32 {
+        tracing::info!("system wake detected; waiting for display subsystem to settle");
+        std::thread::sleep(std::time::Duration::from_millis(WAKE_SETTLE_MILLIS));
+        let displays = enumerate_displays().unwrap_or_default();
+        tracing::info!(
+            display_count = displays.len(),
+            "display enumeration complete after wake"
+        );
+        TOPOLOGY_SENDER.with(|sender| {
+            if let Some(tx) = sender.borrow().as_ref() {
+                let _ = tx.send(TopologyEvent::WakeFromSleep(displays));
+            }
+        });
+        return LRESULT(0);
+    }
+
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
 }
 
@@ -333,6 +380,9 @@ mod tests {
         match event {
             TopologyEvent::Changed(displays) => {
                 assert!(!displays.is_empty(), "expected the fresh enumeration to be non-empty");
+            }
+            TopologyEvent::WakeFromSleep(_) => {
+                panic!("expected TopologyEvent::Changed after WM_DISPLAYCHANGE, got WakeFromSleep");
             }
         }
 
