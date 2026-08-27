@@ -21,7 +21,11 @@ pub mod events;
 #[cfg(windows)]
 pub mod hotkeys;
 #[cfg(windows)]
+pub mod overlay;
+#[cfg(windows)]
 pub mod shutdown;
+#[cfg(windows)]
+pub mod tray;
 #[cfg(windows)]
 pub mod win32_helpers;
 #[cfg(all(windows, test))]
@@ -40,12 +44,16 @@ pub use hotkeys::{
     start_hotkeys, HotkeyBinding, HotkeyFired, HotkeyRegistrationResult, HotkeyRegistrations,
 };
 #[cfg(windows)]
+pub use overlay::{start_preview_overlay, PreviewOverlay};
+#[cfg(windows)]
 pub use shutdown::register_shutdown_signal;
+#[cfg(windows)]
+pub use tray::{start_tray, TrayEvent, TrayHandle};
 
 #[cfg(windows)]
 use mosaix_domain::{DisplayId, Rect, WindowId};
 #[cfg(windows)]
-use windows::Win32::Foundation::{HWND, RECT};
+use windows::Win32::Foundation::{HWND, POINT, RECT};
 #[cfg(windows)]
 use windows::Win32::Graphics::Gdi::{MonitorFromWindow, MONITOR_DEFAULTTONULL};
 #[cfg(windows)]
@@ -54,7 +62,7 @@ use windows::Win32::UI::HiDpi::{
 };
 #[cfg(windows)]
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetWindowRect, IsWindow, SetWindowPos, SWP_NOACTIVATE, SWP_NOZORDER,
+    GetCursorPos, GetWindowRect, IsWindow, SetWindowPos, SWP_NOACTIVATE, SWP_NOZORDER,
 };
 
 #[cfg(windows)]
@@ -214,6 +222,15 @@ pub fn is_window_elevated(handle: WindowHandle) -> bool {
     // Treat None (can't open token) the same as Some(true): either way we
     // cannot interact with the window.
     win32_helpers::is_process_elevated(pid).unwrap_or(true)
+}
+
+/// The current cursor position in physical-pixel screen coordinates
+/// (`GetCursorPos`). Used by the snap-preview drag controller (Feature 34).
+#[cfg(windows)]
+pub fn cursor_position() -> Result<(i32, i32)> {
+    let mut point = POINT::default();
+    unsafe { GetCursorPos(&mut point) }.map_err(WindowError::from)?;
+    Ok((point.x, point.y))
 }
 
 #[cfg(all(windows, test))]

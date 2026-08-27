@@ -18,16 +18,23 @@ use crate::enable_per_monitor_dpi_awareness;
 
 static DPI_AWARENESS: Once = Once::new();
 
+/// Ensures per-monitor DPI awareness for tests. Safe to call from any test
+/// module in this crate: the first caller wins, later callers are no-ops
+/// (a second OS call would return access-denied).
+pub(crate) fn ensure_dpi_awareness() {
+    DPI_AWARENESS.call_once(|| {
+        // Ignore failure: another test may already have set it, or the OS
+        // may refuse a second call in-process.
+        let _ = enable_per_monitor_dpi_awareness();
+    });
+}
+
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
 }
 
 pub(crate) fn create_test_window() -> HWND {
-    // A second call in-process would error; harmless to skip here since
-    // this is the only place in the test binary that needs it.
-    DPI_AWARENESS.call_once(|| {
-        enable_per_monitor_dpi_awareness().expect("failed to set DPI awareness");
-    });
+    ensure_dpi_awareness();
 
     let class_name = w!("MosaixPlatformWindowsSpikeTestWindow");
     let hinstance: HINSTANCE = unsafe { GetModuleHandleW(None) }

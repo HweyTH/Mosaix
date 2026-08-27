@@ -60,3 +60,7 @@ _Avoid_: Empty topology (an observation with no displays is not authoritative st
 **Placement rejection**:
 A placement whose platform call fails, or whose observed bounds remain more than two pixels per edge from the target after a 500 ms settling period. Smaller differences are treated as coordinate-rounding noise.
 _Avoid_: Resize failure (a placement may fail while moving, resizing, or both)
+
+**Snap preview overlay**:
+A single layered, click-through rectangle drawn by the agent to show where a window will land (ADR 0009). Two triggers: (1) *post-commit flash* — after a zone-snap hotkey, the overlay shows the engine's committed placement for a short dwell; (2) *edge-triggered drag-to-snap* — during an interactive move/resize, the overlay shows the half-zone under the cursor when near a work-area edge, and dropping there commits via `Event::WindowPlaced`. Not a settings surface and not a full FancyZones-style always-on zone map.
+_Avoid_: Preview (alone), ghost window, highlight

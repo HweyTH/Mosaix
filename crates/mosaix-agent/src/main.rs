@@ -19,6 +19,8 @@
 
 #[cfg(windows)]
 mod hotkeys;
+#[cfg(windows)]
+mod overlay;
 
 /// Starts `RegisterHotKey` registration for `bindings` and a forwarder
 /// thread translating each firing into `Event::ZoneSnapRequested`,
@@ -27,10 +29,16 @@ mod hotkeys;
 /// 0002's partial-success posture, preserved through every re-registration,
 /// not just the first); only a failure to start the registration thread
 /// itself is reported to the caller.
+///
+/// When `overlay_tx` is present, each successful enqueue also signals the
+/// snap-preview controller (Feature 34) with the pre-send revision so it
+/// can flash the committed placement.
 #[cfg(windows)]
 fn start_hotkeys_and_forward(
     bindings: Vec<mosaix_platform_windows::HotkeyBinding>,
     events: mosaix_engine::EventSender,
+    state_reader: mosaix_engine::StateReader,
+    overlay_tx: Option<std::sync::mpsc::Sender<overlay::OverlayRequest>>,
 ) -> mosaix_platform_windows::Result<(
     mosaix_platform_windows::HotkeyRegistrations,
     std::thread::JoinHandle<()>,
@@ -57,12 +65,18 @@ fn start_hotkeys_and_forward(
                 continue;
             };
             let direction = hotkeys::direction_for_command(command);
+            let pre_revision = state_reader.snapshot().revision;
             if events
                 .send(mosaix_engine::Event::ZoneSnapRequested { direction })
                 .is_err()
             {
                 tracing::warn!("reducer stopped; hotkey forwarder exiting");
                 break;
+            }
+            if let Some(tx) = &overlay_tx {
+                let _ = tx.send(overlay::OverlayRequest::FlashAfterSnap {
+                    revision: pre_revision,
+                });
             }
         }
     });
@@ -307,14 +321,35 @@ fn main() {
         }
     };
 
+    // Feature 34 — snap preview overlay. Started before the hotkey and
+    // event-hook forwarders so both can feed it. Failure degrades to no
+    // overlay rather than blocking the rest of the agent.
+    let (overlay_tx, overlay_controller) =
+        match mosaix_platform_windows::start_preview_overlay() {
+            Ok(preview) => {
+                let (tx, join_handle) = overlay::start_overlay_controller(
+                    engine.state_reader(),
+                    engine.events(),
+                    preview,
+                );
+                (Some(tx), Some(join_handle))
+            }
+            Err(err) => {
+                tracing::error!(
+                    %err,
+                    "failed to start snap preview overlay; drag/hotkey previews will be unavailable"
+                );
+                (None, None)
+            }
+        };
+
     let event_hooks_and_forwarder = match mosaix_platform_windows::start_event_hooks() {
         Ok((hooks, raw_events)) => {
             let events = engine.events();
+            let overlay_tx = overlay_tx.clone();
             let forwarder = std::thread::spawn(move || {
-                // `RawEvent::Focused` and `RawEvent::LocationChanged` are
-                // forwarded here. The other variants (WindowCreated/
-                // WindowDestroyed/MoveResizeStart/MoveResizeEnd) aren't
-                // consumed by the engine yet.
+                // Focus and location changes feed the engine; move/resize
+                // start/end feed the snap-preview drag controller (Feature 34).
                 for event in raw_events {
                     match event {
                         mosaix_platform_windows::RawEvent::Focused(handle) => {
@@ -365,6 +400,20 @@ fn main() {
                                 break;
                             }
                         }
+                        mosaix_platform_windows::RawEvent::MoveResizeStart(handle) => {
+                            if let Some(tx) = &overlay_tx {
+                                let window_id =
+                                    mosaix_platform_windows::window_id_from_handle(handle);
+                                let _ = tx.send(overlay::OverlayRequest::DragStarted { window_id });
+                            }
+                        }
+                        mosaix_platform_windows::RawEvent::MoveResizeEnd(handle) => {
+                            if let Some(tx) = &overlay_tx {
+                                let window_id =
+                                    mosaix_platform_windows::window_id_from_handle(handle);
+                                let _ = tx.send(overlay::OverlayRequest::DragEnded { window_id });
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -387,6 +436,8 @@ fn main() {
     let initial_hotkey_registration = match start_hotkeys_and_forward(
         hotkeys::bindings_from_resolved(&last_registered_hotkeys),
         engine.events(),
+        engine.state_reader(),
+        overlay_tx.clone(),
     ) {
         Ok(pair) => Some(pair),
         Err(err) => {
@@ -408,6 +459,7 @@ fn main() {
     let hotkey_rebind_forwarder = {
         let state_reader = engine.state_reader();
         let events = engine.events();
+        let overlay_tx = overlay_tx.clone();
         std::thread::spawn(move || {
             let mut previous_hotkeys = last_registered_hotkeys;
             let mut current_registration = initial_hotkey_registration;
@@ -430,6 +482,8 @@ fn main() {
                 current_registration = match start_hotkeys_and_forward(
                     hotkeys::bindings_from_resolved(&current_hotkeys),
                     events.clone(),
+                    state_reader.clone(),
+                    overlay_tx.clone(),
                 ) {
                     Ok(pair) => Some(pair),
                     Err(err) => {
@@ -547,14 +601,119 @@ fn main() {
         })
     };
 
+    // Feature 33 — system tray icon. Pause/Resume mirrors the IPC handler;
+    // Settings opens the config folder; Quit joins the merged shutdown path.
+    // The `TrayHandle` stays on the main path so console quit can stop it
+    // and unblock the forwarder (which only sees tray-channel disconnect).
+    let (quit_tx, quit_rx) = std::sync::mpsc::channel::<&'static str>();
+    let tray_and_forwarder = match mosaix_platform_windows::start_tray() {
+        Ok((tray, tray_events)) => {
+            let events = engine.events();
+            let state_reader = engine.state_reader();
+            let quit_tx = quit_tx.clone();
+            let config_dir_for_tray = config_dir.clone();
+            let tray_for_status = engine.state_reader();
+            // Status updates need the handle; share via a channel of bools
+            // that the forwarder pushes and a tiny status thread applies —
+            // simpler: keep handle in the forwarder and use a stop channel
+            // from main so console quit unblocks without hanging.
+            let (tray_stop_tx, tray_stop_rx) = std::sync::mpsc::channel::<()>();
+            let forwarder = std::thread::spawn(move || {
+                const TRAY_STATUS_POLL: std::time::Duration =
+                    std::time::Duration::from_millis(250);
+                let mut last_paused = state_reader.snapshot().paused;
+                tray.set_paused(last_paused);
+                loop {
+                    // Prefer an explicit stop from main (console quit path).
+                    match tray_stop_rx.try_recv() {
+                        Ok(()) | Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+                        Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                    }
+                    match tray_events.recv_timeout(TRAY_STATUS_POLL) {
+                        Ok(mosaix_platform_windows::TrayEvent::TogglePause) => {
+                            let paused = state_reader.snapshot().paused;
+                            let event = if paused {
+                                mosaix_engine::Event::ResumeRequested
+                            } else {
+                                mosaix_engine::Event::PauseRequested
+                            };
+                            if events.send(event).is_err() {
+                                tracing::warn!("reducer stopped; tray forwarder exiting");
+                                break;
+                            }
+                        }
+                        Ok(mosaix_platform_windows::TrayEvent::OpenConfig) => {
+                            match &config_dir_for_tray {
+                                Some(dir) => {
+                                    if let Err(err) = std::process::Command::new("explorer")
+                                        .arg(dir)
+                                        .spawn()
+                                    {
+                                        tracing::error!(
+                                            %err,
+                                            path = %dir.display(),
+                                            "failed to open config folder from tray"
+                                        );
+                                    }
+                                }
+                                None => {
+                                    tracing::warn!(
+                                        "tray Open config folder: no config directory available"
+                                    );
+                                }
+                            }
+                        }
+                        Ok(mosaix_platform_windows::TrayEvent::Quit) => {
+                            let _ = quit_tx.send("tray");
+                            break;
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            let paused = tray_for_status.snapshot().paused;
+                            if paused != last_paused {
+                                tray.set_paused(paused);
+                                last_paused = paused;
+                            }
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
+                }
+                // Dropping `tray` removes the icon and joins its thread.
+            });
+            Some((tray_stop_tx, forwarder))
+        }
+        Err(err) => {
+            tracing::error!(
+                %err,
+                "failed to start system tray icon; pause/quit via tray will be unavailable"
+            );
+            None
+        }
+    };
+
     let shutdown = mosaix_platform_windows::register_shutdown_signal()
         .expect("failed to register shutdown signal handler at startup");
-    tracing::info!(
-        "mosaix-agent ready; waiting for a shutdown signal (Ctrl+C, console close, logoff, or system shutdown)"
-    );
-    let _ = shutdown.recv();
-    tracing::info!("shutdown signal received; stopping");
+    // Console shutdown and tray Quit both feed one channel so main has a
+    // single place to wait (Feature 33).
+    {
+        let quit_tx = quit_tx.clone();
+        std::thread::spawn(move || {
+            let _ = shutdown.recv();
+            let _ = quit_tx.send("console");
+        });
+    }
+    // Drop our clone so the channel closes once every forwarder exits.
+    drop(quit_tx);
 
+    tracing::info!(
+        "mosaix-agent ready; waiting for a shutdown signal (Ctrl+C, console close, logoff, system shutdown, or tray Quit)"
+    );
+    let source = quit_rx.recv().unwrap_or("unknown");
+    tracing::info!(source, "shutdown signal received; stopping");
+
+    if let Some((tray_stop_tx, forwarder)) = tray_and_forwarder {
+        let _ = tray_stop_tx.send(());
+        let _ = forwarder.join();
+    }
     if let Some((watcher, forwarder)) = watcher_and_forwarder {
         watcher.stop();
         let _ = forwarder.join();
@@ -569,6 +728,19 @@ fn main() {
     }
     let _ = hotkey_rebind_stop_tx.send(());
     let _ = hotkey_rebind_forwarder.join();
+
+    // The overlay controller stops only when every `OverlayRequest` sender is
+    // gone, so this must come after the three forwarders that hold clones --
+    // the event-hook forwarder, the hotkey forwarder, and the rebind poller
+    // (which owns the current hotkey registration and so the hotkey forwarder
+    // with it). Dropping main's sender any earlier leaves those clones alive,
+    // the controller blocked in `recv`, and this join hanging forever, which
+    // is a shutdown that never completes rather than a graceful one.
+    drop(overlay_tx);
+    if let Some(join_handle) = overlay_controller {
+        let _ = join_handle.join();
+    }
+
     let _ = executor_stop_tx.send(());
     let _ = executor_forwarder.join();
     if let Some(server) = ipc_server {
