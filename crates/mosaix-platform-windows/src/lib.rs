@@ -32,6 +32,8 @@ pub use adapter::WindowsPlatformAdapter;
 #[cfg(windows)]
 pub use display::{enumerate_displays, watch_display_topology, DisplayWatcher, TopologyEvent};
 #[cfg(windows)]
+pub use enumeration::enumerate_windows;
+#[cfg(windows)]
 pub use events::{start_event_hooks, EventHooks, RawEvent, WindowHandle};
 #[cfg(windows)]
 pub use hotkeys::{
@@ -98,6 +100,14 @@ pub fn enable_per_monitor_dpi_awareness() -> Result<()> {
 #[cfg(windows)]
 pub fn window_id_from_handle(handle: WindowHandle) -> WindowId {
     WindowId(handle.0)
+}
+
+/// The reverse of [`window_id_from_handle`]: converts a domain [`WindowId`]
+/// back to a platform [`WindowHandle`] so callers can pass it to functions
+/// like [`observed_window_state`] and [`is_window_elevated`].
+#[cfg(windows)]
+pub fn window_handle_from_id(id: WindowId) -> WindowHandle {
+    WindowHandle(id.0)
 }
 
 /// Moves and resizes a top-level window without changing its z-order or
@@ -188,6 +198,22 @@ pub fn observed_window_state(handle: WindowHandle) -> Option<(DisplayId, Rect)> 
     let bounds = window_bounds(hwnd).ok()?;
     let display_id = window_display_id(hwnd)?;
     Some((display_id, bounds))
+}
+
+/// Returns `true` if the window's owning process is running elevated (as
+/// Administrator) or if the token cannot be inspected (which implies an
+/// elevated or protected process that Mosaix cannot manage regardless).
+///
+/// This is a convenience wrapper for [`win32_helpers::is_process_elevated`]
+/// used by the placement executor to distinguish "the window is elevated and
+/// UIPI blocks us" from other failure modes when `SetWindowPos` returns an
+/// error.
+pub fn is_window_elevated(handle: WindowHandle) -> bool {
+    let hwnd = HWND::from(handle);
+    let pid = win32_helpers::get_process_id(hwnd);
+    // Treat None (can't open token) the same as Some(true): either way we
+    // cannot interact with the window.
+    win32_helpers::is_process_elevated(pid).unwrap_or(true)
 }
 
 #[cfg(all(windows, test))]

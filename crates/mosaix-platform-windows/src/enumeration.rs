@@ -71,6 +71,7 @@ unsafe extern "system" fn enum_windows_callback(hwnd: HWND, lparam: LPARAM) -> B
 /// 5. Extended style (tool window / no-activate checks)
 /// 6. Non-zero size?
 /// 7. Class blocklist?
+/// 8. Elevated process? (Feature 32 — UIPI would block `SetWindowPos`)
 pub fn is_manageable_window(hwnd: HWND) -> bool {
     // 1. Must be visible
     if !win32_helpers::is_window_visible(hwnd) {
@@ -151,6 +152,32 @@ pub fn is_manageable_window(hwnd: HWND) -> bool {
             trace!(?hwnd, "rejected: empty-title ApplicationFrameWindow");
             return false;
         }
+    }
+
+    // 8. Feature 32 — elevated-process check (UIPI).
+    //
+    // Windows User Interface Privilege Isolation (UIPI) prevents unelevated
+    // processes (like Mosaix running normally) from sending window messages —
+    // including `SetWindowPos` — to elevated processes.  Attempting to resize
+    // an elevated window is a silent no-op at best; at worst it triggers
+    // repeated placement rejections that open the circuit breaker.
+    //
+    // We treat `None` (can't open token) the same as `Some(true)` (confirmed
+    // elevated): if we can't inspect the token we can't manage the window.
+    let pid = win32_helpers::get_process_id(hwnd);
+    match win32_helpers::is_process_elevated(pid) {
+        Some(true) | None => {
+            let title = win32_helpers::get_window_text(hwnd);
+            tracing::warn!(
+                ?hwnd,
+                pid,
+                %title,
+                "skipping elevated window: UIPI would block SetWindowPos \
+                 (run Mosaix as Administrator to manage elevated apps)"
+            );
+            return false;
+        }
+        Some(false) => {} // unelevated — proceed normally
     }
 
     true
