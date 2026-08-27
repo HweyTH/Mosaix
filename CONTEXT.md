@@ -16,7 +16,7 @@ _Avoid_: Repeat, resize loop
 A window's current position within its zone cycle -- which of half/third/two-thirds it's currently on for the direction it was last snapped in. Tracked per window in the engine, reset to the first step whenever the window is moved by anything other than Mosaix's own last placement (see Placement transaction correlation).
 
 **Placement transaction correlation**:
-The mechanism (ARCHITECTURE.md section 8.3) by which the engine matches an incoming window bounds-changed notification against the transaction it expects from its own last placement command, to tell "Mosaix moved this" apart from "something else moved this" (a manual drag, another app, a native OS snap). Described in the architecture doc but not yet implemented -- `mosaix-engine` doesn't handle bounds-changed events at all yet, and `mosaix-platform-windows`'s `LocationChanged` OS event isn't wired to it. Cycle step invalidation depends on this landing first.
+The mechanism (ARCHITECTURE.md section 8.3) by which Mosaix compares an observed window placement with its expected placement, distinguishing its own move from an external move or a rejected placement.
 _Avoid_: Transaction (alone, without "placement" -- too generic)
 
 **Base config**:
@@ -32,3 +32,31 @@ The merged result of base config plus whichever profile (if any) matches the cur
 **Gap** (outer / inner):
 Configurable inset applied to a computed zone `Rect` after `mosaix-layout`'s zone functions produce it (ADR 0006). *Outer gap* insets edges that touch the display's work-area boundary; *inner gap* insets edges that would border a neighboring zone, even under manual-snap-only Phase 1 where no second window is actually being placed. Applied by `apply_gaps`, kept separate from the pure zone-fraction functions (`snap_to_half` etc.), which stay gap-unaware.
 _Avoid_: Padding (as a synonym for gap in code/docs -- ARCHITECTURE.md section 12.1 uses "gaps, padding" as two words together; keep "gap" specific to this outer/inner inset concept and don't use "padding" interchangeably for it)
+
+**Balanced grid**:
+The initial automatic-tiling policy: each display's managed windows are arranged into a deterministic, near-square grid covering that display's work area, and the grid is recomputed whenever its managed-window inventory or work area changes.
+_Avoid_: Automatic layout (when the specific balanced-grid policy is meant), retile
+
+**Managed window**:
+A top-level window that Mosaix automatically includes in tiling because the platform reports it as movable and resizable. Elevated windows and windows with an open placement circuit are temporarily excluded rather than treated as permanently unmanaged.
+_Avoid_: Tileable window, tracked window (which may include observed but currently excluded windows)
+
+**Active tiling set**:
+The managed windows currently eligible to occupy cells in a display's balanced grid. Minimized, elevated, and open-circuit windows remain observed but do not reserve grid cells until they become eligible again.
+_Avoid_: Window inventory (which also contains currently excluded windows)
+
+**Visual window order**:
+The deterministic startup order for a display's balanced grid, derived from observed window positions from top to bottom and then left to right, with native window ID used only as a final tie-breaker.
+_Avoid_: Enumeration order, handle order
+
+**Display migration**:
+The reassignment of windows whose previous display disappeared to the nearest surviving display before balanced grids are recomputed. Windows on surviving displays keep their assignment, and connecting a new display does not redistribute existing windows into it.
+_Avoid_: Redistribution, retile (when specifically describing cross-display reassignment)
+
+**Usable topology snapshot**:
+A successful display observation containing at least one active display. Failed or empty observations during sleep, wake, or hotplug do not replace the last-known topology and instead trigger reconciliation retries.
+_Avoid_: Empty topology (an observation with no displays is not authoritative state)
+
+**Placement rejection**:
+A placement whose platform call fails, or whose observed bounds remain more than two pixels per edge from the target after a 500 ms settling period. Smaller differences are treated as coordinate-rounding noise.
+_Avoid_: Resize failure (a placement may fail while moving, resizing, or both)
