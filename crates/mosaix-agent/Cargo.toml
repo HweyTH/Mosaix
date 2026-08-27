@@ -17,6 +17,8 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
+mosaix-domain = { path = "../mosaix-domain" }
+mosaix-layout = { path = "../mosaix-layout" }
 mosaix-platform-windows = { path = "../mosaix-platform-windows" }
 
 [target.'cfg(windows)'.dependencies.windows]
