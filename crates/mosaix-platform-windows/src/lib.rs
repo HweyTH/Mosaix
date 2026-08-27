@@ -25,6 +25,8 @@ pub mod overlay;
 #[cfg(windows)]
 pub mod shutdown;
 #[cfg(windows)]
+pub mod tray;
+#[cfg(windows)]
 pub mod win32_helpers;
 #[cfg(all(windows, test))]
 mod test_support;
@@ -45,6 +47,8 @@ pub use hotkeys::{
 pub use overlay::{start_preview_overlay, PreviewOverlay};
 #[cfg(windows)]
 pub use shutdown::register_shutdown_signal;
+#[cfg(windows)]
+pub use tray::{start_tray, TrayEvent, TrayHandle};
 
 #[cfg(windows)]
 use mosaix_domain::{DisplayId, Rect, WindowId};
