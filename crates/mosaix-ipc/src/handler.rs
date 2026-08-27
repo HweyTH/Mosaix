@@ -10,16 +10,22 @@ pub struct StateSnapshot {
     pub window_count: usize,
     pub focused_window: Option<isize>,
     pub paused: bool,
+    /// Number of windows whose circuit breaker is currently open (Feature 31).
+    /// These windows are excluded from automatic placement until the user
+    /// explicitly resets them with a zone-snap command.
+    pub circuit_breaker_count: usize,
 }
 
 impl From<EngineState> for StateSnapshot {
     fn from(state: EngineState) -> Self {
+        let circuit_breaker_count = state.circuit_breaker_count();
         Self {
             revision: state.revision,
             display_count: state.displays.len(),
             window_count: state.windows.len(),
             focused_window: state.focused_window.map(|id| id.0),
             paused: state.paused,
+            circuit_breaker_count,
         }
     }
 }
