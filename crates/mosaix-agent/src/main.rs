@@ -152,6 +152,45 @@ fn main() {
 
     let engine = mosaix_engine::spawn_engine(initial_displays, initial_config_set);
 
+    // Feature 28 — startup reconciliation.
+    //
+    // Before the OS-event hooks are active, enumerate every existing window
+    // and register it with the engine so that already-open apps are tracked
+    // from the start.  Any windows that a very-early-arriving
+    // `Event::WindowFocused` already registered are silently skipped by the
+    // engine's `or_insert` logic.
+    {
+        let windows = match mosaix_platform_windows::enumerate_windows() {
+            Ok(w) => w,
+            Err(err) => {
+                tracing::error!(%err, "failed to enumerate windows for startup reconciliation; skipping");
+                Vec::new()
+            }
+        };
+        let placements: Vec<_> = windows
+            .iter()
+            .filter_map(|window| {
+                let handle = mosaix_platform_windows::window_handle_from_id(window.id);
+                let (display_id, bounds) =
+                    mosaix_platform_windows::observed_window_state(handle)?;
+                Some((window.id, display_id, bounds))
+            })
+            .collect();
+        tracing::info!(
+            window_count = placements.len(),
+            "sending startup reconciliation with pre-existing windows"
+        );
+        if engine
+            .events()
+            .send(mosaix_engine::Event::StartupReconciliation {
+                windows: placements,
+            })
+            .is_err()
+        {
+            tracing::error!("reducer stopped before startup reconciliation could be sent");
+        }
+    }
+
     let ipc_server = match mosaix_ipc::IpcServer::start(engine.events(), engine.state_reader()) {
         Ok(server) => Some(server),
         Err(err) => {
@@ -192,6 +231,9 @@ fn main() {
         None => None,
     };
 
+    // Display topology watcher — forwards `WM_DISPLAYCHANGE` events (hotplug,
+    // resolution change) and `WM_POWERBROADCAST` wake events from the
+    // platform layer into the engine.
     let watcher_and_forwarder = match mosaix_platform_windows::watch_display_topology() {
         Ok((watcher, topology_events)) => {
             let events = engine.events();
@@ -205,6 +247,48 @@ fn main() {
                             {
                                 tracing::warn!(
                                     "reducer stopped; display topology forwarder exiting"
+                                );
+                                break;
+                            }
+                        }
+                        // Feature 29 — sleep/wake recovery.
+                        //
+                        // After wake the platform layer re-enumerates displays
+                        // and sends `WakeFromSleep`.  We also re-enumerate
+                        // windows here because the platform layer's hidden
+                        // window only sees display events, not window events.
+                        mosaix_platform_windows::TopologyEvent::WakeFromSleep(displays) => {
+                            let windows = match mosaix_platform_windows::enumerate_windows() {
+                                Ok(w) => w,
+                                Err(err) => {
+                                    tracing::error!(%err, "failed to enumerate windows after wake; sending display-only reconciliation");
+                                    Vec::new()
+                                }
+                            };
+                            let placements: Vec<_> = windows
+                                .iter()
+                                .filter_map(|window| {
+                                    let handle =
+                                        mosaix_platform_windows::window_handle_from_id(window.id);
+                                    let (display_id, bounds) =
+                                        mosaix_platform_windows::observed_window_state(handle)?;
+                                    Some((window.id, display_id, bounds))
+                                })
+                                .collect();
+                            tracing::info!(
+                                display_count = displays.len(),
+                                window_count = placements.len(),
+                                "forwarding wake reconciliation to engine"
+                            );
+                            if events
+                                .send(mosaix_engine::Event::WakeReconciliation {
+                                    displays,
+                                    windows: placements,
+                                })
+                                .is_err()
+                            {
+                                tracing::warn!(
+                                    "reducer stopped; wake reconciliation forwarder exiting"
                                 );
                                 break;
                             }
@@ -369,10 +453,23 @@ fn main() {
     // ever calls `move_resize_window`, and the reducer deliberately never
     // touches the OS itself -- without this, a snap hotkey updates
     // `EngineState` but the window on screen never moves.
+    //
+    // Feature 31 — after each `SetWindowPos` call, the executor waits
+    // briefly and re-reads the window's actual bounds.  If they differ
+    // significantly from the target, a `PlacementRejected` event is sent
+    // back to the engine, which increments the per-window circuit breaker.
     const PLACEMENT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+    /// How long to wait after a `SetWindowPos` before re-reading the
+    /// window's actual bounds to detect rejection (Feature 31).
+    const REJECTION_SETTLE_MILLIS: u64 = 100;
+    /// Absolute pixel tolerance for rejection detection — if the observed
+    /// bounds differ from the target by more than this in *any* axis, the
+    /// placement is considered rejected.
+    const REJECTION_TOLERANCE_PX: i32 = 10;
     let (executor_stop_tx, executor_stop_rx) = std::sync::mpsc::channel::<()>();
     let executor_forwarder = {
         let state_reader = engine.state_reader();
+        let rejection_events = engine.events();
         std::thread::spawn(move || {
             let mut previous = std::collections::HashMap::new();
             loop {
@@ -391,6 +488,53 @@ fn main() {
                         mosaix_platform_windows::move_resize_window_by_id(window_id, bounds)
                     {
                         tracing::warn!(?window_id, %err, "failed to apply computed placement to the real window");
+
+                        // Feature 32 — if the window is elevated we cannot
+                        // manage it at all; emit a PlacementRejected to open
+                        // the circuit breaker quickly rather than retrying.
+                        let handle = mosaix_platform_windows::window_handle_from_id(window_id);
+                        if mosaix_platform_windows::is_window_elevated(handle) {
+                            tracing::warn!(
+                                ?window_id,
+                                "window is elevated (Administrator); emitting PlacementRejected"
+                            );
+                            let _ = rejection_events.send(
+                                mosaix_engine::Event::PlacementRejected { window_id },
+                            );
+                        }
+                        continue;
+                    }
+
+                    // Feature 31 — rejection detection.
+                    //
+                    // Wait briefly for the window to settle, then re-read its
+                    // actual bounds.  If they deviate too far from the
+                    // intended placement, the window is rejecting our resize
+                    // (e.g. min-size constraint), so we notify the engine.
+                    std::thread::sleep(std::time::Duration::from_millis(REJECTION_SETTLE_MILLIS));
+                    let handle = mosaix_platform_windows::window_handle_from_id(window_id);
+                    if let Some((_actual_display, actual_bounds)) =
+                        mosaix_platform_windows::observed_window_state(handle)
+                    {
+                        let dx = (actual_bounds.x - bounds.x).abs();
+                        let dy = (actual_bounds.y - bounds.y).abs();
+                        let dw = (actual_bounds.width - bounds.width).abs();
+                        let dh = (actual_bounds.height - bounds.height).abs();
+                        if dx > REJECTION_TOLERANCE_PX
+                            || dy > REJECTION_TOLERANCE_PX
+                            || dw > REJECTION_TOLERANCE_PX
+                            || dh > REJECTION_TOLERANCE_PX
+                        {
+                            tracing::debug!(
+                                ?window_id,
+                                ?bounds,
+                                ?actual_bounds,
+                                "placement rejected: actual bounds differ from target"
+                            );
+                            let _ = rejection_events.send(
+                                mosaix_engine::Event::PlacementRejected { window_id },
+                            );
+                        }
                     }
                 }
                 previous = current;
