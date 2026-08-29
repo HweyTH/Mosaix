@@ -2,6 +2,7 @@
 resolver = "2"
 
 members = [
+    "apps/mosaix-settings/src-tauri",
     "crates/mosaix-domain",
     "crates/mosaix-layout",
     "crates/mosaix-rules",

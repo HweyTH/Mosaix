@@ -1,0 +1,22 @@
+[package]
+name = "mosaix-settings"
+description = "Mosaix desktop settings and visual layout editor."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+build = "build.rs"
+
+[lib]
+name = "mosaix_settings_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "mosaix-settings"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2.6.3", features = [] }
+
+[dependencies]
+serde = { workspace = true }
+tauri = { version = "2.11.5", features = [] }

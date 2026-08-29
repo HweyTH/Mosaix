@@ -1,0 +1,243 @@
+export type Appearance = "dark" | "light";
+
+export interface ZoneDraft {
+  id: number;
+  name: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+export interface LayoutDraft {
+  name: string;
+  gap: number;
+  allowOverlap: boolean;
+  zones: ZoneDraft[];
+}
+
+export interface EditorSnapshot {
+  appearance: Appearance;
+  display: {
+    name: string;
+    resolution: string;
+    scalePercent: number;
+  };
+  draft: LayoutDraft;
+}
+
+export interface CommandReceipt {
+  revision: number;
+  status: "previewing" | "applied";
+}
+
+export interface DesktopBridge {
+  loadEditorSnapshot(): Promise<EditorSnapshot>;
+  previewLayout(draft: LayoutDraft): Promise<CommandReceipt>;
+  saveAndApplyLayout(draft: LayoutDraft): Promise<CommandReceipt>;
+  setAppearance(appearance: Appearance): Promise<void>;
+}
+
+function escapeHtml(value: string): string {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
+}
+
+function renderZones(snapshot: EditorSnapshot, selectedZoneId: number): string {
+  return snapshot.draft.zones
+    .map(
+      (zone, index) => `
+        <button class="zone${zone.id === selectedZoneId ? " active" : ""}" data-zone="${zone.id}" style="left:calc(${zone.x}% + ${snapshot.draft.gap / 2}px);top:calc(${zone.y}% + ${snapshot.draft.gap / 2}px);width:calc(${zone.width}% - ${snapshot.draft.gap}px);height:calc(${zone.height}% - ${snapshot.draft.gap}px)">
+          <strong>${escapeHtml(zone.name)}</strong>
+          <span class="zone-index">${index + 1}</span>
+          <small>${zone.width}% × ${zone.height}%</small>
+          <span class="resize-handle" aria-hidden="true"></span>
+        </button>`,
+    )
+    .join("");
+}
+
+export async function mountLayoutEditor(root: HTMLElement, bridge: DesktopBridge): Promise<void> {
+  const snapshot = await bridge.loadEditorSnapshot();
+  let selectedZoneId = snapshot.draft.zones[0]?.id ?? 0;
+  let commandStatus = "Ready";
+  const history: LayoutDraft[] = [];
+
+  const rememberDraft = (): void => {
+    history.push(structuredClone(snapshot.draft));
+  };
+
+  const nextZoneId = (): number => Math.max(0, ...snapshot.draft.zones.map((zone) => zone.id)) + 1;
+
+  const render = (): void => {
+    const selectedZone = snapshot.draft.zones.find((zone) => zone.id === selectedZoneId);
+    document.body.className = snapshot.appearance === "dark" ? "night-tide" : "warm-paper";
+    root.innerHTML = `
+      <main class="spatial-editor">
+        <div class="ambient ambient-one"></div><div class="ambient ambient-two"></div>
+        <header class="brand-block">
+          <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
+          <span class="brand-name">Mosaix</span>
+          <small data-product-subtitle>Layout Tab</small>
+        </header>
+        <div class="top-actions">
+          <button class="soft-button" data-preview><i></i>Live preview</button>
+          <button class="primary-button" data-save-apply>Save &amp; apply</button>
+        </div>
+        <aside class="tool-dock" aria-label="Canvas tools">
+          <button class="icon-button active" aria-label="Select zone">↖</button>
+          <button class="icon-button" data-command="split" aria-label="Split zone">⑂</button>
+          <button class="icon-button" data-add-zone aria-label="Add zone">＋</button>
+        </aside>
+        <section class="world" aria-label="Layout canvas">
+          <div class="display-meta"><span><i></i>PRIMARY DISPLAY</span><span>${escapeHtml(snapshot.display.resolution)} · ${snapshot.display.scalePercent}%</span></div>
+          <div class="monitor-shell">
+            <div class="work-area">${renderZones(snapshot, selectedZoneId)}<span class="work-label">WORK AREA · ${escapeHtml(snapshot.display.resolution)}</span></div>
+          </div>
+          <div class="monitor-foot"><span></span><i></i><span></span></div>
+        </section>
+        ${selectedZone ? `
+          <aside class="properties" aria-label="Zone properties">
+            <div class="panel-title">ZONE ${String(selectedZone.id).padStart(2, "0")}</div>
+            <label class="field"><span>Label</span><input data-zone-name value="${escapeHtml(selectedZone.name)}" /></label>
+            <div class="geometry-grid">
+              <div><span>X</span><b>${selectedZone.x}.00%</b></div><div><span>Y</span><b>${selectedZone.y}.00%</b></div>
+              <div><span>Width</span><b>${selectedZone.width}.00%</b></div><div><span>Height</span><b>${selectedZone.height}.00%</b></div>
+            </div>
+            <div class="panel-rule"></div>
+            <label class="field"><span>Gap</span><div class="range-line"><input data-gap type="range" min="0" max="32" value="${snapshot.draft.gap}" /><output>${snapshot.draft.gap}px</output></div></label>
+            <label class="toggle-line"><span>Allow zone overlap<small>Zones can share the same space</small></span><input data-allow-overlap type="checkbox" ${snapshot.draft.allowOverlap ? "checked" : ""} /></label>
+          </aside>` : ""}
+        <nav class="command-dock" aria-label="Zone commands">
+          <button data-command="undo" ${history.length === 0 ? "disabled" : ""}><kbd>⌘ Z</kbd> Undo</button><button data-command="split"><kbd>S</kbd> Split</button><button data-command="duplicate"><kbd>D</kbd> Duplicate</button><button data-command="delete"><kbd>⌫</kbd> Delete</button>
+          <button class="new-zone" data-add-zone>＋ New zone</button>
+        </nav>
+        <nav class="appearance-toggle" aria-label="Appearance">
+          <button data-appearance="dark" aria-pressed="${snapshot.appearance === "dark"}"><i>☾</i><span>Dark<small>Night Tide</small></span></button>
+          <button data-appearance="light" aria-pressed="${snapshot.appearance === "light"}"><i>☀</i><span>Light<small>Warm Paper</small></span></button>
+        </nav>
+        <div class="command-status" role="status">${commandStatus}</div>
+      </main>`;
+
+    root.querySelectorAll<HTMLElement>("[data-zone]").forEach((zone) => {
+      zone.addEventListener("click", () => {
+        selectedZoneId = Number(zone.dataset.zone);
+        render();
+      });
+    });
+    root.querySelector<HTMLInputElement>("[data-zone-name]")?.addEventListener("change", (event) => {
+      const selected = snapshot.draft.zones.find((zone) => zone.id === selectedZoneId);
+      if (selected) {
+        rememberDraft();
+        selected.name = (event.currentTarget as HTMLInputElement).value || "Untitled zone";
+      }
+      render();
+    });
+    root.querySelector<HTMLInputElement>("[data-gap]")?.addEventListener("change", (event) => {
+      rememberDraft();
+      snapshot.draft.gap = Number((event.currentTarget as HTMLInputElement).value);
+      render();
+    });
+    root.querySelector<HTMLInputElement>("[data-allow-overlap]")?.addEventListener("change", (event) => {
+      rememberDraft();
+      snapshot.draft.allowOverlap = (event.currentTarget as HTMLInputElement).checked;
+      render();
+    });
+    root.querySelectorAll<HTMLElement>("[data-add-zone]").forEach((button) => {
+      button.addEventListener("click", () => {
+        rememberDraft();
+        const id = nextZoneId();
+        snapshot.draft.zones.push({ id, name: `Zone ${id}`, x: 69, y: 69, width: 29, height: 29 });
+        selectedZoneId = id;
+        render();
+      });
+    });
+    root.querySelectorAll<HTMLElement>("[data-command]").forEach((button) => {
+      button.addEventListener("click", () => {
+        const command = button.dataset.command;
+        const selectedIndex = snapshot.draft.zones.findIndex((zone) => zone.id === selectedZoneId);
+        const selected = snapshot.draft.zones[selectedIndex];
+
+        if (command === "undo") {
+          const previous = history.pop();
+          if (previous) snapshot.draft = previous;
+          if (!snapshot.draft.zones.some((zone) => zone.id === selectedZoneId)) {
+            selectedZoneId = snapshot.draft.zones[0]?.id ?? 0;
+          }
+        } else if (command === "split" && selected) {
+          rememberDraft();
+          const sibling = structuredClone(selected);
+          sibling.id = nextZoneId();
+          sibling.name = `${selected.name} 2`;
+          if (selected.width >= selected.height) {
+            const firstWidth = selected.width / 2;
+            selected.width = firstWidth;
+            sibling.x = selected.x + firstWidth;
+            sibling.width -= firstWidth;
+          } else {
+            const firstHeight = selected.height / 2;
+            selected.height = firstHeight;
+            sibling.y = selected.y + firstHeight;
+            sibling.height -= firstHeight;
+          }
+          snapshot.draft.zones.splice(selectedIndex + 1, 0, sibling);
+          selectedZoneId = sibling.id;
+        } else if (command === "duplicate" && selected) {
+          rememberDraft();
+          const duplicate = structuredClone(selected);
+          duplicate.id = nextZoneId();
+          duplicate.name = `${selected.name} copy`;
+          snapshot.draft.zones.push(duplicate);
+          selectedZoneId = duplicate.id;
+        } else if (command === "delete" && selected && snapshot.draft.zones.length > 1) {
+          rememberDraft();
+          snapshot.draft.zones.splice(selectedIndex, 1);
+          selectedZoneId = snapshot.draft.zones[Math.min(selectedIndex, snapshot.draft.zones.length - 1)]!.id;
+        }
+        render();
+      });
+    });
+    root.querySelector<HTMLElement>("[data-preview]")?.addEventListener("click", () => {
+      commandStatus = "Previewing…";
+      void bridge.previewLayout(structuredClone(snapshot.draft)).then((receipt) => {
+        commandStatus = `Preview active · revision ${receipt.revision}`;
+        render();
+      }).catch((error: unknown) => {
+        commandStatus = `Preview failed · ${String(error)}`;
+        render();
+      });
+    });
+    root.querySelector<HTMLElement>("[data-save-apply]")?.addEventListener("click", () => {
+      commandStatus = "Applying…";
+      void bridge.saveAndApplyLayout(structuredClone(snapshot.draft)).then((receipt) => {
+        commandStatus = `Saved · revision ${receipt.revision}`;
+        render();
+      }).catch((error: unknown) => {
+        commandStatus = `Apply failed · ${String(error)}`;
+        render();
+      });
+    });
+    root.querySelectorAll<HTMLElement>("[data-appearance]").forEach((button) => {
+      button.addEventListener("click", () => {
+        const appearance = button.dataset.appearance as Appearance;
+        const previousAppearance = snapshot.appearance;
+        commandStatus = "Changing appearance…";
+        void bridge.setAppearance(appearance).then(() => {
+          snapshot.appearance = appearance;
+          commandStatus = "Appearance updated";
+          render();
+        }).catch((error: unknown) => {
+          snapshot.appearance = previousAppearance;
+          commandStatus = `Appearance failed · ${String(error)}`;
+          render();
+        });
+      });
+    });
+  };
+
+  render();
+}
