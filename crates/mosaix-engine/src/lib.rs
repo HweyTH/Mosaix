@@ -41,11 +41,14 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 use mosaix_config::{ResolvedConfig, ResolvedConfigSet};
-use mosaix_domain::{topology_fingerprint, Display, DisplayId, Rect, WindowId};
-use mosaix_layout::{
-    apply_gaps, cycle_display, resolve_zone_cycle, snap_to_half, throw_preserving_ratio, CycleStep,
-    DisplayDirection, HalfZone, HorizontalDirection,
+use mosaix_domain::{
+    topology_fingerprint, Display, DisplayId, Rect, Window, WindowId, WindowLifecycle,
 };
+use mosaix_layout::{
+    apply_gaps, cycle_display, plan_balanced_grid, resolve_zone_cycle, snap_to_half,
+    throw_preserving_ratio, CycleStep, DisplayDirection, HalfZone, HorizontalDirection,
+};
+use mosaix_rules::{builtin_rules, ManageAction, Rule, RuleEvaluator};
 
 /// Default bound on the event queue before a sender blocks. Chosen
 /// generously relative to expected event rates -- architecture doc section
@@ -60,12 +63,50 @@ pub const DEFAULT_QUEUE_CAPACITY: usize = 256;
 /// The breaker resets automatically on any explicit zone-snap command.
 pub const CIRCUIT_BREAKER_THRESHOLD: u8 = 3;
 
+/// A platform-neutral operation the engine has committed and an adapter must
+/// perform, in reducer order.  Effects contain no native handles or Win32
+/// structures so deterministic engine tests can observe intent directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EngineEffect {
+    PlaceWindow {
+        window_id: WindowId,
+        display_id: DisplayId,
+        bounds: Rect,
+    },
+}
+
+/// Why an observed managed window currently can or cannot enter the active
+/// tiling set. These stable enums are safe to publish in machine-readable
+/// state and deliberately contain neither titles nor executable paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EligibilityReason {
+    Eligible,
+    FloatingRule,
+    NotTileable,
+    Minimized,
+    Maximized,
+    Fullscreen,
+    Hidden,
+    Cloaked,
+    CircuitOpen,
+}
+
+/// The engine-owned record for one observed window. `Exclude` windows are
+/// deliberately absent from this inventory; `Tile` and `Float` stay
+/// inspectable even when not currently eligible for a grid cell.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedWindow {
+    pub window: Window,
+    pub action: ManageAction,
+    pub eligibility: EligibilityReason,
+}
+
 /// State the reducer owns and is the only writer of.
 ///
 /// Display topology and per-window placement exist as real domain state
 /// today; a full window registry, workspaces, and rules will extend this
 /// as those domain types land (architecture doc section 7).
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default)]
 pub struct EngineState {
     /// Bumped on every committed mutation (architecture doc section 13:
     /// "Monotonic state revision on every committed mutation").
@@ -77,6 +118,15 @@ pub struct EngineState {
     /// or, for a window seen focused before either of those ever fires,
     /// by [`Event::WindowFocused`] itself (with no `previous_placement`).
     pub windows: HashMap<WindowId, WindowPlacement>,
+    /// Authoritative managed-window inventory. The engine is its sole writer.
+    pub inventory: HashMap<WindowId, ManagedWindow>,
+    /// Latest normalized observations, including rule-excluded windows so a
+    /// rule reload can reconsider them without an adapter round-trip.
+    observed_windows: HashMap<WindowId, Window>,
+    /// Ordered rules currently used to resolve the inventory.
+    pub rules: Vec<Rule>,
+    /// Stable member order for each display's Balanced grid.
+    pub visual_window_order: HashMap<DisplayId, Vec<WindowId>>,
     /// The window that currently has OS foreground focus, `None` until the
     /// first [`Event::WindowFocused`] is observed. Sourced from the OS's
     /// foreground-change notification (architecture doc section 8.2).
@@ -105,6 +155,11 @@ pub struct EngineState {
     /// `ConfigChanged`) still process normally so state stays accurate for
     /// when the user resumes.
     pub paused: bool,
+    /// Whether the matched topology profile currently owns automatic tiling.
+    pub automatic_tiling_active: bool,
+    /// Ordered effects emitted by committed placement transitions. Consumers
+    /// retain a cursor; the log is part of the published deterministic state.
+    pub effects: Vec<EngineEffect>,
 }
 
 impl EngineState {
@@ -161,8 +216,6 @@ impl WindowPlacement {
         self.rejection_count >= CIRCUIT_BREAKER_THRESHOLD
     }
 }
-
-
 
 /// The direction a zone-snap hotkey requests (CONTEXT.md "Zone"). Only
 /// [`ZoneSnapDirection::Left`]/[`ZoneSnapDirection::Right`] participate in
@@ -341,6 +394,15 @@ pub enum Event {
     /// reset to zero by any explicit [`Event::ZoneSnapRequested`] so the
     /// user always has an escape hatch.
     PlacementRejected { window_id: WindowId },
+
+    /// A complete normalized observation batch. It is authoritative for the
+    /// observed windows: missing entries are removed, and `Exclude` results
+    /// do not enter the managed inventory.
+    WindowsObserved { windows: Vec<Window> },
+
+    /// Replaces the ordered user rules; built-ins remain the low-priority
+    /// fallback rules. Every currently observed window is re-evaluated.
+    RulesChanged { rules: Vec<Rule> },
 }
 
 /// Applies one event to `state`. Must never panic -- a single bad event
@@ -361,6 +423,8 @@ fn apply(state: &mut EngineState, event: Event) {
             migrate_orphaned_windows(state, &displays);
             state.displays = displays;
             state.resolved_config = select_resolved_config(&state.config_set, &state.displays);
+            state.automatic_tiling_active = state.resolved_config.automatic_tiling_enabled;
+            reconcile_balanced_grids(state);
             state.revision += 1;
         }
 
@@ -394,6 +458,11 @@ fn apply(state: &mut EngineState, event: Event) {
             };
             placement.display_id = previous_display_id;
             placement.bounds = previous_bounds;
+            state.effects.push(EngineEffect::PlaceWindow {
+                window_id,
+                display_id: previous_display_id,
+                bounds: previous_bounds,
+            });
             state.revision += 1;
         }
 
@@ -566,7 +635,9 @@ fn apply(state: &mut EngineState, event: Event) {
             }
             tracing::info!("resolved config changed");
             state.resolved_config = select_resolved_config(&config_set, &state.displays);
+            state.automatic_tiling_active = state.resolved_config.automatic_tiling_enabled;
             state.config_set = config_set;
+            reconcile_balanced_grids(state);
             state.revision += 1;
         }
 
@@ -606,7 +677,10 @@ fn apply(state: &mut EngineState, event: Event) {
                 });
             }
             if registered > 0 {
-                tracing::info!(registered, "startup reconciliation registered existing windows");
+                tracing::info!(
+                    registered,
+                    "startup reconciliation registered existing windows"
+                );
                 state.revision += 1;
             } else {
                 tracing::debug!("startup reconciliation: no new windows to register");
@@ -626,8 +700,7 @@ fn apply(state: &mut EngineState, event: Event) {
             if topology_fingerprint(&displays) != topology_fingerprint(&state.displays) {
                 migrate_orphaned_windows(state, &displays);
                 state.displays = displays;
-                state.resolved_config =
-                    select_resolved_config(&state.config_set, &state.displays);
+                state.resolved_config = select_resolved_config(&state.config_set, &state.displays);
             }
             // Step 2: bulk-register any newly observed windows.
             let mut registered = 0usize;
@@ -643,38 +716,193 @@ fn apply(state: &mut EngineState, event: Event) {
                     }
                 });
             }
-            tracing::info!(
-                registered,
-                "wake reconciliation complete"
-            );
+            tracing::info!(registered, "wake reconciliation complete");
             state.revision += 1;
         }
 
         // Feature 31 — per-window circuit breaker.
         Event::PlacementRejected { window_id } => {
-            let Some(placement) = state.windows.get_mut(&window_id) else {
+            let Some(rejection_count) = state.windows.get_mut(&window_id).map(|placement| {
+                placement.rejection_count = placement.rejection_count.saturating_add(1);
+                placement.rejection_count
+            }) else {
                 tracing::debug!(
                     ?window_id,
                     "placement rejection for an untracked window; ignoring"
                 );
                 return;
             };
-            placement.rejection_count = placement.rejection_count.saturating_add(1);
-            if placement.rejection_count == CIRCUIT_BREAKER_THRESHOLD {
+            if rejection_count == CIRCUIT_BREAKER_THRESHOLD {
                 tracing::warn!(
                     ?window_id,
                     threshold = CIRCUIT_BREAKER_THRESHOLD,
                     "circuit breaker opened: window repeatedly rejected placement; \
                      stopping automatic management until user resets with a zone-snap command"
                 );
+                if let Some(managed) = state.inventory.get_mut(&window_id) {
+                    managed.eligibility = EligibilityReason::CircuitOpen;
+                }
+                reconcile_balanced_grids(state);
                 state.revision += 1;
             } else {
                 tracing::debug!(
                     ?window_id,
-                    rejection_count = placement.rejection_count,
+                    rejection_count,
                     threshold = CIRCUIT_BREAKER_THRESHOLD,
                     "placement rejection recorded"
                 );
+            }
+        }
+
+        Event::WindowsObserved { windows } => {
+            state.observed_windows = windows
+                .iter()
+                .cloned()
+                .map(|window| (window.id, window))
+                .collect();
+            if replace_inventory_from_observations(state, windows) {
+                reconcile_balanced_grids(state);
+                state.revision += 1;
+            }
+        }
+
+        Event::RulesChanged { rules } => {
+            state.rules = rules;
+            let observed: Vec<Window> = state.observed_windows.values().cloned().collect();
+            replace_inventory_from_observations(state, observed);
+            reconcile_balanced_grids(state);
+            state.revision += 1;
+        }
+    }
+}
+
+fn eligibility_for(window: &Window, action: ManageAction, circuit_open: bool) -> EligibilityReason {
+    if action == ManageAction::Float {
+        return EligibilityReason::FloatingRule;
+    }
+    if !window.capabilities.is_tileable() {
+        return EligibilityReason::NotTileable;
+    }
+    if circuit_open {
+        return EligibilityReason::CircuitOpen;
+    }
+    match window.lifecycle {
+        WindowLifecycle::Active => EligibilityReason::Eligible,
+        WindowLifecycle::Minimized => EligibilityReason::Minimized,
+        WindowLifecycle::Maximized => EligibilityReason::Maximized,
+        WindowLifecycle::Fullscreen => EligibilityReason::Fullscreen,
+        WindowLifecycle::Hidden => EligibilityReason::Hidden,
+        WindowLifecycle::Cloaked => EligibilityReason::Cloaked,
+    }
+}
+
+/// Rebuilds the inspectable inventory from one normalized observation batch.
+/// The evaluator never logs the `Window`, protecting title/path metadata from
+/// diagnostics while still retaining it in engine-owned state for reloads.
+fn replace_inventory_from_observations(state: &mut EngineState, observed: Vec<Window>) -> bool {
+    let evaluator =
+        RuleEvaluator::new(state.rules.iter().cloned().chain(builtin_rules()).collect());
+    let mut next = HashMap::new();
+    for window in observed {
+        let action = evaluator.evaluate(&window).actions.manage;
+        if action == ManageAction::Exclude {
+            continue;
+        }
+        let circuit_open = state
+            .windows
+            .get(&window.id)
+            .is_some_and(WindowPlacement::circuit_open);
+        let eligibility = eligibility_for(&window, action, circuit_open);
+        state.windows.entry(window.id).or_insert(WindowPlacement {
+            display_id: window.display_id,
+            bounds: window.bounds,
+            previous_placement: None,
+            cycle_step: None,
+            rejection_count: 0,
+        });
+        next.insert(
+            window.id,
+            ManagedWindow {
+                window,
+                action,
+                eligibility,
+            },
+        );
+    }
+    if next == state.inventory {
+        false
+    } else {
+        state.inventory = next;
+        true
+    }
+}
+
+/// Updates visual order and emits one final Balanced-grid plan per affected
+/// display. It is intentionally a no-op in manual mode, leaving current
+/// bounds untouched on profile deactivation (ADR 0015).
+fn reconcile_balanced_grids(state: &mut EngineState) {
+    if !state.automatic_tiling_active || state.paused {
+        return;
+    }
+
+    for (display_id, order) in &mut state.visual_window_order {
+        order.retain(|id| {
+            state.inventory.get(id).is_some_and(|managed| {
+                managed.action == ManageAction::Tile && managed.window.display_id == *display_id
+            })
+        });
+    }
+    let mut candidates: Vec<_> = state
+        .inventory
+        .values()
+        .filter(|managed| managed.action == ManageAction::Tile)
+        .map(|managed| {
+            (
+                managed.window.display_id,
+                managed.window.id,
+                managed.window.bounds,
+            )
+        })
+        .collect();
+    candidates.sort_by_key(|(display, id, bounds)| (display.0, bounds.y, bounds.x, id.0));
+    for (display_id, window_id, _) in candidates {
+        let order = state.visual_window_order.entry(display_id).or_default();
+        if !order.contains(&window_id) {
+            order.push(window_id);
+        }
+    }
+
+    let plans: Vec<_> = state
+        .displays
+        .iter()
+        .map(|display| {
+            let ids = state
+                .visual_window_order
+                .get(&display.id)
+                .cloned()
+                .unwrap_or_default();
+            let active: Vec<_> = ids
+                .into_iter()
+                .filter(|id| {
+                    state.inventory.get(id).is_some_and(|managed| {
+                        managed.window.display_id == display.id
+                            && managed.action == ManageAction::Tile
+                            && managed.eligibility == EligibilityReason::Eligible
+                    })
+                })
+                .collect();
+            (display.id, display.work_area, active)
+        })
+        .collect();
+    for (display_id, work_area, active) in plans {
+        let cells = plan_balanced_grid(work_area, active.len());
+        for (window_id, raw_bounds) in active.into_iter().zip(cells) {
+            let bounds = apply_gaps(raw_bounds, work_area, state.resolved_config.gaps);
+            let unchanged = state.windows.get(&window_id).is_some_and(|placement| {
+                placement.display_id == display_id && placement.bounds == bounds
+            });
+            if !unchanged {
+                place_window(state, window_id, display_id, bounds, None);
             }
         }
     }
@@ -787,6 +1015,11 @@ fn place_window(
             rejection_count,
         },
     );
+    state.effects.push(EngineEffect::PlaceWindow {
+        window_id,
+        display_id,
+        bounds,
+    });
     state.revision += 1;
     true
 }
@@ -802,11 +1035,14 @@ fn migrate_orphaned_windows(state: &mut EngineState, new_displays: &[Display]) {
     if new_displays.is_empty() {
         // No surviving displays -- nothing sensible to migrate to.  Leave
         // windows untouched; they'll be reconciled when a display comes back.
-        tracing::warn!("all displays disappeared; deferring window migration until a display returns");
+        tracing::warn!(
+            "all displays disappeared; deferring window migration until a display returns"
+        );
         return;
     }
 
     let mut migrated = 0usize;
+    let mut effects = Vec::new();
     // Collect the set of display IDs that are *leaving* the topology.
     let vanished_ids: Vec<DisplayId> = state
         .displays
@@ -826,14 +1062,13 @@ fn migrate_orphaned_windows(state: &mut EngineState, new_displays: &[Display]) {
 
     // For each window on a vanished display, find the nearest surviving
     // display by comparing display center-points, then throw the window to it.
-    for placement in state.windows.values_mut() {
+    for (window_id, placement) in state.windows.iter_mut() {
         if !vanished_ids.contains(&placement.display_id) {
             continue;
         }
 
         // Find the old display's geometry.
-        let Some(old_display) = state.displays.iter().find(|d| d.id == placement.display_id)
-        else {
+        let Some(old_display) = state.displays.iter().find(|d| d.id == placement.display_id) else {
             continue;
         };
 
@@ -863,8 +1098,15 @@ fn migrate_orphaned_windows(state: &mut EngineState, new_displays: &[Display]) {
 
         placement.display_id = nearest.id;
         placement.bounds = new_bounds;
+        effects.push(EngineEffect::PlaceWindow {
+            window_id: *window_id,
+            display_id: nearest.id,
+            bounds: new_bounds,
+        });
         migrated += 1;
     }
+
+    state.effects.extend(effects);
 
     if migrated > 0 {
         tracing::info!(migrated, "window migration complete");
@@ -1005,14 +1247,21 @@ pub fn spawn_engine_with_capacity(
 ) -> EngineHandle {
     let (tx, rx) = sync_channel::<Message>(capacity);
     let initial_resolved_config = select_resolved_config(&initial_config_set, &initial_displays);
+    let initial_automatic_tiling_active = initial_resolved_config.automatic_tiling_enabled;
     let initial_state = EngineState {
         revision: 0,
         displays: initial_displays,
         windows: HashMap::new(),
+        inventory: HashMap::new(),
+        observed_windows: HashMap::new(),
+        rules: Vec::new(),
+        visual_window_order: HashMap::new(),
         focused_window: None,
         resolved_config: initial_resolved_config,
         config_set: initial_config_set,
         paused: false,
+        automatic_tiling_active: initial_automatic_tiling_active,
+        effects: Vec::new(),
     };
     let state = Arc::new(Mutex::new(initial_state.clone()));
 
@@ -1578,6 +1827,37 @@ mod tests {
         assert_eq!(
             placement.cycle_step,
             Some((HorizontalDirection::Left, CycleStep::Half))
+        );
+    }
+
+    #[test]
+    fn zone_snap_emits_one_platform_neutral_placement_effect() {
+        let mut state = EngineState {
+            displays: vec![display(1, "primary", 0)],
+            ..EngineState::default()
+        };
+        apply(
+            &mut state,
+            Event::WindowFocused {
+                window_id: WindowId(7),
+                display_id: DisplayId(1),
+                bounds: Rect::new(10, 10, 500, 500),
+            },
+        );
+        apply(
+            &mut state,
+            Event::ZoneSnapRequested {
+                direction: ZoneSnapDirection::Left,
+            },
+        );
+
+        assert_eq!(
+            state.effects,
+            vec![EngineEffect::PlaceWindow {
+                window_id: WindowId(7),
+                display_id: DisplayId(1),
+                bounds: Rect::new(0, 0, 960, 1080),
+            }]
         );
     }
 
@@ -2321,6 +2601,7 @@ mod tests {
             hotkeys,
             gaps: mosaix_domain::Gaps::default(),
             behavior: mosaix_config::BehaviorSection::default(),
+            automatic_tiling_enabled: false,
         }
     }
 
@@ -2337,9 +2618,170 @@ mod tests {
                 hotkeys: std::collections::BTreeMap::new(),
                 gaps,
                 behavior: mosaix_config::BehaviorSection::default(),
+                automatic_tiling_enabled: false,
             },
             profiles: Vec::new(),
         }
+    }
+
+    fn observed_window(
+        id: isize,
+        role: mosaix_domain::WindowRole,
+        lifecycle: WindowLifecycle,
+    ) -> Window {
+        Window {
+            id: WindowId(id),
+            process_id: 1,
+            application_id: mosaix_domain::ApplicationId("test".to_string()),
+            executable_path: None,
+            title: "non-sensitive-test-title".to_string(),
+            native_class: None,
+            role,
+            bounds: Rect::new(0, 0, 400, 300),
+            display_id: DisplayId(1),
+            capabilities: mosaix_domain::WindowCapabilities {
+                can_move: true,
+                can_resize: true,
+                can_minimize: true,
+                can_maximize: true,
+            },
+            lifecycle,
+        }
+    }
+
+    #[test]
+    fn observed_windows_publish_tile_float_and_exclude_rule_outcomes() {
+        let mut state = EngineState::default();
+        apply(
+            &mut state,
+            Event::WindowsObserved {
+                windows: vec![
+                    observed_window(
+                        1,
+                        mosaix_domain::WindowRole::Normal,
+                        WindowLifecycle::Active,
+                    ),
+                    observed_window(
+                        2,
+                        mosaix_domain::WindowRole::Dialog,
+                        WindowLifecycle::Active,
+                    ),
+                    observed_window(3, mosaix_domain::WindowRole::Popup, WindowLifecycle::Active),
+                ],
+            },
+        );
+
+        assert_eq!(state.inventory.len(), 2);
+        assert_eq!(state.inventory[&WindowId(1)].action, ManageAction::Tile);
+        assert_eq!(
+            state.inventory[&WindowId(1)].eligibility,
+            EligibilityReason::Eligible
+        );
+        assert_eq!(state.inventory[&WindowId(2)].action, ManageAction::Float);
+        assert_eq!(
+            state.inventory[&WindowId(2)].eligibility,
+            EligibilityReason::FloatingRule
+        );
+        assert!(!state.inventory.contains_key(&WindowId(3)));
+    }
+
+    #[test]
+    fn active_profile_reflows_eligible_inventory_into_balanced_grid_effects() {
+        let mut state = EngineState {
+            displays: vec![display(1, "primary", 0)],
+            automatic_tiling_active: true,
+            ..EngineState::default()
+        };
+        let mut left = observed_window(
+            1,
+            mosaix_domain::WindowRole::Normal,
+            WindowLifecycle::Active,
+        );
+        left.bounds = Rect::new(100, 200, 400, 300);
+        let mut right = observed_window(
+            2,
+            mosaix_domain::WindowRole::Normal,
+            WindowLifecycle::Active,
+        );
+        right.bounds = Rect::new(800, 200, 400, 300);
+
+        apply(
+            &mut state,
+            Event::WindowsObserved {
+                windows: vec![right, left],
+            },
+        );
+
+        assert_eq!(
+            state.visual_window_order[&DisplayId(1)],
+            vec![WindowId(1), WindowId(2)]
+        );
+        assert_eq!(
+            state.effects,
+            vec![
+                EngineEffect::PlaceWindow {
+                    window_id: WindowId(1),
+                    display_id: DisplayId(1),
+                    bounds: Rect::new(0, 0, 960, 1080)
+                },
+                EngineEffect::PlaceWindow {
+                    window_id: WindowId(2),
+                    display_id: DisplayId(1),
+                    bounds: Rect::new(960, 0, 960, 1080)
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn temporary_lifecycle_ineligibility_keeps_visual_order_and_reflows_once() {
+        let mut state = EngineState {
+            displays: vec![display(1, "primary", 0)],
+            automatic_tiling_active: true,
+            ..EngineState::default()
+        };
+        let windows = vec![
+            observed_window(
+                1,
+                mosaix_domain::WindowRole::Normal,
+                WindowLifecycle::Active,
+            ),
+            observed_window(
+                2,
+                mosaix_domain::WindowRole::Normal,
+                WindowLifecycle::Active,
+            ),
+            observed_window(
+                3,
+                mosaix_domain::WindowRole::Normal,
+                WindowLifecycle::Active,
+            ),
+        ];
+        apply(
+            &mut state,
+            Event::WindowsObserved {
+                windows: windows.clone(),
+            },
+        );
+        state.effects.clear();
+
+        let mut minimized = windows.clone();
+        minimized[1].lifecycle = WindowLifecycle::Minimized;
+        apply(&mut state, Event::WindowsObserved { windows: minimized });
+
+        assert_eq!(
+            state.visual_window_order[&DisplayId(1)],
+            vec![WindowId(1), WindowId(2), WindowId(3)]
+        );
+        assert_eq!(
+            state.inventory[&WindowId(2)].eligibility,
+            EligibilityReason::Minimized
+        );
+        assert_eq!(
+            state.effects.len(),
+            2,
+            "only the two active members receive the settled plan"
+        );
     }
 
     #[test]
@@ -2802,11 +3244,11 @@ mod tests {
     #[test]
     fn startup_reconciliation_with_empty_list_is_a_noop() {
         let mut state = EngineState::default();
-        apply(
-            &mut state,
-            Event::StartupReconciliation { windows: vec![] },
+        apply(&mut state, Event::StartupReconciliation { windows: vec![] });
+        assert_eq!(
+            state.revision, 0,
+            "empty reconciliation must not bump the revision"
         );
-        assert_eq!(state.revision, 0, "empty reconciliation must not bump the revision");
         assert!(state.windows.is_empty());
     }
 
@@ -2870,10 +3312,7 @@ mod tests {
         // Topology fingerprints differ when the display list changes, so even an
         // empty list is processed (the fingerprint of [] != fingerprint of [MON-A]).
         // But migration must gracefully handle the empty-display case.
-        apply(
-            &mut state,
-            Event::DisplayTopologyChanged(vec![]),
-        );
+        apply(&mut state, Event::DisplayTopologyChanged(vec![]));
 
         assert_eq!(
             state.windows.get(&WindowId(1)).unwrap().bounds,
@@ -2912,7 +3351,11 @@ mod tests {
             },
         );
 
-        assert_eq!(state.displays.len(), 2, "topology must include the new display");
+        assert_eq!(
+            state.displays.len(),
+            2,
+            "topology must include the new display"
+        );
         assert!(
             state.windows.contains_key(&WindowId(99)),
             "new window observed after wake must be registered"
@@ -2941,13 +3384,20 @@ mod tests {
                 bounds: Rect::new(0, 0, 960, 1080),
             },
         );
-        apply(&mut state, Event::PlacementRejected { window_id: WindowId(1) });
-        apply(&mut state, Event::PlacementRejected { window_id: WindowId(1) });
-
-        assert_eq!(
-            state.windows.get(&WindowId(1)).unwrap().rejection_count,
-            2
+        apply(
+            &mut state,
+            Event::PlacementRejected {
+                window_id: WindowId(1),
+            },
         );
+        apply(
+            &mut state,
+            Event::PlacementRejected {
+                window_id: WindowId(1),
+            },
+        );
+
+        assert_eq!(state.windows.get(&WindowId(1)).unwrap().rejection_count, 2);
         // Not yet at threshold; circuit must still be closed.
         assert!(
             !state.windows.get(&WindowId(1)).unwrap().circuit_open(),
@@ -2972,7 +3422,12 @@ mod tests {
         );
         // Drive to threshold.
         for _ in 0..CIRCUIT_BREAKER_THRESHOLD {
-            apply(&mut state, Event::PlacementRejected { window_id: WindowId(1) });
+            apply(
+                &mut state,
+                Event::PlacementRejected {
+                    window_id: WindowId(1),
+                },
+            );
         }
 
         assert!(
@@ -3026,7 +3481,12 @@ mod tests {
         );
         // Open the circuit.
         for _ in 0..CIRCUIT_BREAKER_THRESHOLD {
-            apply(&mut state, Event::PlacementRejected { window_id: WindowId(1) });
+            apply(
+                &mut state,
+                Event::PlacementRejected {
+                    window_id: WindowId(1),
+                },
+            );
         }
         assert!(state.windows.get(&WindowId(1)).unwrap().circuit_open());
 
@@ -3076,8 +3536,18 @@ mod tests {
 
         // Open circuit on window 1 and 3, but not 2.
         for _ in 0..CIRCUIT_BREAKER_THRESHOLD {
-            apply(&mut state, Event::PlacementRejected { window_id: WindowId(1) });
-            apply(&mut state, Event::PlacementRejected { window_id: WindowId(3) });
+            apply(
+                &mut state,
+                Event::PlacementRejected {
+                    window_id: WindowId(1),
+                },
+            );
+            apply(
+                &mut state,
+                Event::PlacementRejected {
+                    window_id: WindowId(3),
+                },
+            );
         }
 
         assert_eq!(

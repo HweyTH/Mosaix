@@ -23,13 +23,13 @@ use windows::Win32::UI::Shell::{
     NOTIFYICONDATAW, NOTIFY_ICON_MESSAGE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreateIconIndirect, CreatePopupMenu, DefWindowProcW, DestroyIcon, DestroyMenu,
-    DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW, GetSystemMetrics, LoadIconW,
-    PostMessageW, PostThreadMessageW, RegisterClassW, RegisterWindowMessageW, SetForegroundWindow,
-    SetMenuDefaultItem, TrackPopupMenu, TranslateMessage, CreateWindowExW, HICON, ICONINFO, MSG,
-    SM_CXSMICON, SM_CYSMICON, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RIGHTBUTTON, WINDOW_EX_STYLE,
-    WM_APP, WM_COMMAND, WM_DESTROY, WM_LBUTTONUP, WM_NULL, WM_QUIT, WM_RBUTTONUP, WNDCLASSW,
-    WS_OVERLAPPED, IDI_APPLICATION, MF_SEPARATOR, MF_STRING, TPM_RETURNCMD,
+    AppendMenuW, CreateIconIndirect, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon,
+    DestroyMenu, DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW, GetSystemMetrics,
+    LoadIconW, PostMessageW, PostThreadMessageW, RegisterClassW, RegisterWindowMessageW,
+    SetForegroundWindow, SetMenuDefaultItem, TrackPopupMenu, TranslateMessage, HICON, ICONINFO,
+    IDI_APPLICATION, MF_SEPARATOR, MF_STRING, MSG, SM_CXSMICON, SM_CYSMICON, TPM_BOTTOMALIGN,
+    TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, WINDOW_EX_STYLE, WM_APP, WM_COMMAND, WM_DESTROY,
+    WM_LBUTTONUP, WM_NULL, WM_QUIT, WM_RBUTTONUP, WNDCLASSW, WS_OVERLAPPED,
 };
 
 use crate::{Result, WindowError};
@@ -203,8 +203,18 @@ fn show_context_menu(hwnd: HWND) {
     let quit_label: Vec<u16> = "&Quit\0".encode_utf16().collect();
 
     unsafe {
-        let _ = AppendMenuW(menu, MF_STRING, IDM_TOGGLE_PAUSE, PCWSTR(pause_label.as_ptr()));
-        let _ = AppendMenuW(menu, MF_STRING, IDM_OPEN_CONFIG, PCWSTR(config_label.as_ptr()));
+        let _ = AppendMenuW(
+            menu,
+            MF_STRING,
+            IDM_TOGGLE_PAUSE,
+            PCWSTR(pause_label.as_ptr()),
+        );
+        let _ = AppendMenuW(
+            menu,
+            MF_STRING,
+            IDM_OPEN_CONFIG,
+            PCWSTR(config_label.as_ptr()),
+        );
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         let _ = AppendMenuW(menu, MF_STRING, IDM_QUIT, PCWSTR(quit_label.as_ptr()));
         let _ = SetMenuDefaultItem(menu, IDM_TOGGLE_PAUSE as u32, 0);

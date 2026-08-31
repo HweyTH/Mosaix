@@ -140,6 +140,14 @@ impl<'de> Deserialize<'de> for KeyCombo {
 #[serde(deny_unknown_fields)]
 pub struct BehaviorSection {}
 
+/// Automatic-tiling activation is intentionally available only to a
+/// topology profile (ADR 0010), never base config.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AutomaticTilingSection {
+    pub enabled: bool,
+}
+
 /// Base config: `config.toml`'s full schema (CONTEXT.md "Base config").
 /// Applies whenever the current display topology matches no saved profile.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -180,6 +188,7 @@ pub struct ProfileConfig {
     pub gaps: GapsOverride,
     #[serde(default)]
     pub behavior: BehaviorSection,
+    pub automatic_tiling: Option<AutomaticTilingSection>,
 }
 
 /// The merged result of base config plus (optionally) one profile
@@ -197,6 +206,7 @@ pub struct ResolvedConfig {
     pub hotkeys: BTreeMap<Command, KeyCombo>,
     pub gaps: Gaps,
     pub behavior: BehaviorSection,
+    pub automatic_tiling_enabled: bool,
 }
 
 /// One profile's resolved settings, paired with the `fingerprint` it's
@@ -300,6 +310,19 @@ mod tests {
         assert_eq!(
             KeyCombo::parse("CTRL+ALT+LEFT").unwrap(),
             KeyCombo::parse("ctrl+alt+left").unwrap()
+        );
+    }
+
+    #[test]
+    fn a_profile_can_enable_automatic_tiling_but_base_config_cannot() {
+        let profile: ProfileConfig =
+            toml::from_str("fingerprint = \"display\"\n[automatic_tiling]\nenabled = true\n")
+                .unwrap();
+        assert_eq!(profile.automatic_tiling.unwrap().enabled, true);
+
+        assert!(
+            toml::from_str::<BaseConfig>("version = 1\n[automatic_tiling]\nenabled = true\n")
+                .is_err()
         );
     }
 }

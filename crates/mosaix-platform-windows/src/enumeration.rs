@@ -16,8 +16,7 @@ use tracing::{debug, trace};
 use windows::Win32::Foundation::{BOOL, HWND, LPARAM, TRUE};
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetWindow, GW_OWNER, WS_CAPTION, WS_CHILD, WS_DLGFRAME, WS_EX_APPWINDOW,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP,
-    WS_THICKFRAME,
+    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_THICKFRAME,
 };
 
 use crate::win32_helpers;
@@ -26,15 +25,15 @@ use crate::win32_helpers;
 ///
 /// These are well-known Windows shell and system surfaces.
 const BLOCKED_CLASSES: &[&str] = &[
-    "Progman",                          // Desktop program manager
-    "WorkerW",                          // Desktop icon container
-    "Shell_TrayWnd",                    // Primary taskbar
-    "Shell_SecondaryTrayWnd",           // Secondary monitor taskbars
-    "Windows.UI.Core.CoreWindow",       // UWP core windows (Start, Search, etc.)
-    "ForegroundStaging",                // DWM staging surface
-    "MultitaskingViewFrame",            // Task View
+    "Progman",                               // Desktop program manager
+    "WorkerW",                               // Desktop icon container
+    "Shell_TrayWnd",                         // Primary taskbar
+    "Shell_SecondaryTrayWnd",                // Secondary monitor taskbars
+    "Windows.UI.Core.CoreWindow",            // UWP core windows (Start, Search, etc.)
+    "ForegroundStaging",                     // DWM staging surface
+    "MultitaskingViewFrame",                 // Task View
     "Windows.Internal.Shell.TabProxyWindow", // Edge tab proxy
-    "Xaml_WindowedPopupClass",          // XAML popup windows
+    "Xaml_WindowedPopupClass",               // XAML popup windows
 ];
 
 /// Enumerate all top-level window handles via `EnumWindows`.
@@ -114,9 +113,7 @@ pub fn is_manageable_window(hwnd: HWND) -> bool {
 
     // WS_EX_TOOLWINDOW windows are excluded UNLESS they also have WS_EX_APPWINDOW
     // (WS_EX_APPWINDOW overrides and forces taskbar presence)
-    if ex_style & WS_EX_TOOLWINDOW.0 as u32 != 0
-        && ex_style & WS_EX_APPWINDOW.0 as u32 == 0
-    {
+    if ex_style & WS_EX_TOOLWINDOW.0 as u32 != 0 && ex_style & WS_EX_APPWINDOW.0 as u32 == 0 {
         trace!(?hwnd, "rejected: WS_EX_TOOLWINDOW without WS_EX_APPWINDOW");
         return false;
     }
@@ -296,7 +293,10 @@ fn determine_lifecycle(hwnd: HWND) -> WindowLifecycle {
 /// Returns a list of `Window` structs for all manageable windows.
 pub fn enumerate_windows() -> anyhow::Result<Vec<Window>> {
     let all_hwnds = enumerate_all_hwnds()?;
-    let manageable_count = all_hwnds.iter().filter(|h| is_manageable_window(**h)).count();
+    let manageable_count = all_hwnds
+        .iter()
+        .filter(|h| is_manageable_window(**h))
+        .count();
     debug!(
         total = all_hwnds.len(),
         manageable = manageable_count,

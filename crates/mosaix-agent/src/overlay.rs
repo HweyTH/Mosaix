@@ -115,9 +115,7 @@ fn run(
                         mode = Mode::Dragging { window_id: id };
                     }
                     Ok(OverlayRequest::DragEnded { window_id: ended }) => {
-                        if let Some((display_id, bounds)) =
-                            zone_under_cursor(&state_reader)
-                        {
+                        if let Some((display_id, bounds)) = zone_under_cursor(&state_reader) {
                             if ended == window_id {
                                 if events
                                     .send(Event::WindowPlaced {
@@ -127,9 +125,7 @@ fn run(
                                     })
                                     .is_err()
                                 {
-                                    tracing::warn!(
-                                        "reducer stopped; overlay controller exiting"
-                                    );
+                                    tracing::warn!("reducer stopped; overlay controller exiting");
                                     break;
                                 }
                             }
@@ -140,8 +136,7 @@ fn run(
                     // Flash requests during drag are dropped — drag owns the overlay.
                     Ok(OverlayRequest::FlashAfterSnap { .. }) => {}
                     Err(mpsc::RecvTimeoutError::Timeout) => {
-                        if let Some((_display_id, bounds)) = zone_under_cursor(&state_reader)
-                        {
+                        if let Some((_display_id, bounds)) = zone_under_cursor(&state_reader) {
                             overlay.show(bounds);
                         } else {
                             overlay.hide();

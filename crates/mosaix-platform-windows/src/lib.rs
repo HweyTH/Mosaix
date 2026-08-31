@@ -24,12 +24,12 @@ pub mod hotkeys;
 pub mod overlay;
 #[cfg(windows)]
 pub mod shutdown;
+#[cfg(all(windows, test))]
+mod test_support;
 #[cfg(windows)]
 pub mod tray;
 #[cfg(windows)]
 pub mod win32_helpers;
-#[cfg(all(windows, test))]
-mod test_support;
 
 #[cfg(windows)]
 pub use adapter::WindowsPlatformAdapter;
@@ -260,7 +260,10 @@ mod tests {
     fn window_display_id_resolves_a_real_window_and_rejects_an_invalid_handle() {
         let hwnd = create_test_window();
 
-        assert!(window_display_id(hwnd).is_some(), "a real, on-screen window should resolve to a display");
+        assert!(
+            window_display_id(hwnd).is_some(),
+            "a real, on-screen window should resolve to a display"
+        );
 
         let invalid = HWND(std::ptr::null_mut());
         assert_eq!(window_display_id(invalid), None);

@@ -181,24 +181,13 @@ fn main() {
                 Vec::new()
             }
         };
-        let placements: Vec<_> = windows
-            .iter()
-            .filter_map(|window| {
-                let handle = mosaix_platform_windows::window_handle_from_id(window.id);
-                let (display_id, bounds) =
-                    mosaix_platform_windows::observed_window_state(handle)?;
-                Some((window.id, display_id, bounds))
-            })
-            .collect();
         tracing::info!(
-            window_count = placements.len(),
-            "sending startup reconciliation with pre-existing windows"
+            window_count = windows.len(),
+            "sending normalized startup window observations"
         );
         if engine
             .events()
-            .send(mosaix_engine::Event::StartupReconciliation {
-                windows: placements,
-            })
+            .send(mosaix_engine::Event::WindowsObserved { windows })
             .is_err()
         {
             tracing::error!("reducer stopped before startup reconciliation could be sent");
@@ -324,24 +313,20 @@ fn main() {
     // Feature 34 — snap preview overlay. Started before the hotkey and
     // event-hook forwarders so both can feed it. Failure degrades to no
     // overlay rather than blocking the rest of the agent.
-    let (overlay_tx, overlay_controller) =
-        match mosaix_platform_windows::start_preview_overlay() {
-            Ok(preview) => {
-                let (tx, join_handle) = overlay::start_overlay_controller(
-                    engine.state_reader(),
-                    engine.events(),
-                    preview,
-                );
-                (Some(tx), Some(join_handle))
-            }
-            Err(err) => {
-                tracing::error!(
-                    %err,
-                    "failed to start snap preview overlay; drag/hotkey previews will be unavailable"
-                );
-                (None, None)
-            }
-        };
+    let (overlay_tx, overlay_controller) = match mosaix_platform_windows::start_preview_overlay() {
+        Ok(preview) => {
+            let (tx, join_handle) =
+                overlay::start_overlay_controller(engine.state_reader(), engine.events(), preview);
+            (Some(tx), Some(join_handle))
+        }
+        Err(err) => {
+            tracing::error!(
+                %err,
+                "failed to start snap preview overlay; drag/hotkey previews will be unavailable"
+            );
+            (None, None)
+        }
+    };
 
     let event_hooks_and_forwarder = match mosaix_platform_windows::start_event_hooks() {
         Ok((hooks, raw_events)) => {
@@ -352,6 +337,26 @@ fn main() {
                 // start/end feed the snap-preview drag controller (Feature 34).
                 for event in raw_events {
                     match event {
+                        mosaix_platform_windows::RawEvent::WindowCreated(_)
+                        | mosaix_platform_windows::RawEvent::WindowDestroyed(_) => {
+                            // Hooks are hints; re-enumerate a complete
+                            // normalized batch so creation and destruction
+                            // update the engine-owned inventory together.
+                            let windows = match mosaix_platform_windows::enumerate_windows() {
+                                Ok(windows) => windows,
+                                Err(err) => {
+                                    tracing::debug!(%err, "could not refresh inventory after lifecycle event");
+                                    continue;
+                                }
+                            };
+                            if events
+                                .send(mosaix_engine::Event::WindowsObserved { windows })
+                                .is_err()
+                            {
+                                tracing::warn!("reducer stopped; lifecycle forwarder exiting");
+                                break;
+                            }
+                        }
                         mosaix_platform_windows::RawEvent::Focused(handle) => {
                             let window_id = mosaix_platform_windows::window_id_from_handle(handle);
                             let Some((display_id, bounds)) =
@@ -414,7 +419,6 @@ fn main() {
                                 let _ = tx.send(overlay::OverlayRequest::DragEnded { window_id });
                             }
                         }
-                        _ => {}
                     }
                 }
             });
@@ -501,12 +505,10 @@ fn main() {
         })
     };
 
-    // Polls committed engine state for placements that haven't reached the
-    // real window yet, and applies them via `SetWindowPos` (architecture
-    // doc section 6's Diff -> Executor stage). Nothing else in this binary
-    // ever calls `move_resize_window`, and the reducer deliberately never
-    // touches the OS itself -- without this, a snap hotkey updates
-    // `EngineState` but the window on screen never moves.
+    // Applies the engine's ordered, platform-neutral effect stream via
+    // `SetWindowPos`. The reducer never touches the OS; this is the sole
+    // Windows execution boundary and reports rejections back as normalized
+    // engine events.
     //
     // Feature 31 — after each `SetWindowPos` call, the executor waits
     // briefly and re-reads the window's actual bounds.  If they differ
@@ -515,17 +517,17 @@ fn main() {
     const PLACEMENT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
     /// How long to wait after a `SetWindowPos` before re-reading the
     /// window's actual bounds to detect rejection (Feature 31).
-    const REJECTION_SETTLE_MILLIS: u64 = 100;
+    const REJECTION_SETTLE_MILLIS: u64 = 500;
     /// Absolute pixel tolerance for rejection detection — if the observed
     /// bounds differ from the target by more than this in *any* axis, the
     /// placement is considered rejected.
-    const REJECTION_TOLERANCE_PX: i32 = 10;
+    const REJECTION_TOLERANCE_PX: i32 = 2;
     let (executor_stop_tx, executor_stop_rx) = std::sync::mpsc::channel::<()>();
     let executor_forwarder = {
         let state_reader = engine.state_reader();
         let rejection_events = engine.events();
         std::thread::spawn(move || {
-            let mut previous = std::collections::HashMap::new();
+            let mut next_effect = 0usize;
             loop {
                 let snapshot = state_reader.snapshot();
                 if snapshot.paused {
@@ -534,28 +536,26 @@ fn main() {
                         Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                     }
                 }
-                let current = snapshot.windows;
-                for (window_id, _display_id, bounds) in
-                    mosaix_engine::diff_placements(&previous, &current)
-                {
+                for effect in snapshot.effects.iter().skip(next_effect) {
+                    let mosaix_engine::EngineEffect::PlaceWindow {
+                        window_id, bounds, ..
+                    } = *effect;
                     if let Err(err) =
                         mosaix_platform_windows::move_resize_window_by_id(window_id, bounds)
                     {
                         tracing::warn!(?window_id, %err, "failed to apply computed placement to the real window");
 
-                        // Feature 32 — if the window is elevated we cannot
-                        // manage it at all; emit a PlacementRejected to open
-                        // the circuit breaker quickly rather than retrying.
+                        // Any failed platform call is a placement rejection;
+                        // elevation is only useful extra diagnostics.
                         let handle = mosaix_platform_windows::window_handle_from_id(window_id);
                         if mosaix_platform_windows::is_window_elevated(handle) {
                             tracing::warn!(
                                 ?window_id,
                                 "window is elevated (Administrator); emitting PlacementRejected"
                             );
-                            let _ = rejection_events.send(
-                                mosaix_engine::Event::PlacementRejected { window_id },
-                            );
                         }
+                        let _ = rejection_events
+                            .send(mosaix_engine::Event::PlacementRejected { window_id });
                         continue;
                     }
 
@@ -585,13 +585,12 @@ fn main() {
                                 ?actual_bounds,
                                 "placement rejected: actual bounds differ from target"
                             );
-                            let _ = rejection_events.send(
-                                mosaix_engine::Event::PlacementRejected { window_id },
-                            );
+                            let _ = rejection_events
+                                .send(mosaix_engine::Event::PlacementRejected { window_id });
                         }
                     }
                 }
-                previous = current;
+                next_effect = snapshot.effects.len();
 
                 match executor_stop_rx.recv_timeout(PLACEMENT_POLL_INTERVAL) {
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
@@ -619,8 +618,7 @@ fn main() {
             // from main so console quit unblocks without hanging.
             let (tray_stop_tx, tray_stop_rx) = std::sync::mpsc::channel::<()>();
             let forwarder = std::thread::spawn(move || {
-                const TRAY_STATUS_POLL: std::time::Duration =
-                    std::time::Duration::from_millis(250);
+                const TRAY_STATUS_POLL: std::time::Duration = std::time::Duration::from_millis(250);
                 let mut last_paused = state_reader.snapshot().paused;
                 tray.set_paused(last_paused);
                 loop {
@@ -645,9 +643,8 @@ fn main() {
                         Ok(mosaix_platform_windows::TrayEvent::OpenConfig) => {
                             match &config_dir_for_tray {
                                 Some(dir) => {
-                                    if let Err(err) = std::process::Command::new("explorer")
-                                        .arg(dir)
-                                        .spawn()
+                                    if let Err(err) =
+                                        std::process::Command::new("explorer").arg(dir).spawn()
                                     {
                                         tracing::error!(
                                             %err,

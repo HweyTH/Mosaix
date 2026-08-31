@@ -100,7 +100,10 @@ mod tests {
         let mut rescaled = a.clone();
         rescaled.scale_factor = 1.5;
 
-        assert_ne!(topology_fingerprint(&[a]), topology_fingerprint(&[rescaled]));
+        assert_ne!(
+            topology_fingerprint(&[a]),
+            topology_fingerprint(&[rescaled])
+        );
     }
 
     #[test]
