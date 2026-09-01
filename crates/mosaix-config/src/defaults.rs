@@ -59,6 +59,7 @@ pub fn default_base_config() -> BaseConfig {
         hotkeys,
         gaps: Gaps::default(),
         behavior: BehaviorSection::default(),
+        focus_border: crate::schema::FocusBorderSection::default(),
     }
 }
 
@@ -107,6 +108,9 @@ mod tests {
             Some(&arrow_combo("DOWN"))
         );
         assert_eq!(base.gaps, Gaps::default());
+        assert!(base.focus_border.enabled);
+        assert_eq!(base.focus_border.color, crate::schema::RgbaColor::default());
+        assert_eq!(base.focus_border.thickness, 2);
         assert_eq!(
             base.hotkeys.get(&Command::Rearrange),
             Some(&arrow_combo("R"))

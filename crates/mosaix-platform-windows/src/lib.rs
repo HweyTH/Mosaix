@@ -19,6 +19,8 @@ pub mod enumeration;
 #[cfg(windows)]
 pub mod events;
 #[cfg(windows)]
+pub mod focus_border;
+#[cfg(windows)]
 pub mod hotkeys;
 #[cfg(windows)]
 pub mod overlay;
@@ -40,6 +42,8 @@ pub use enumeration::enumerate_windows;
 #[cfg(windows)]
 pub use events::{start_event_hooks, EventHooks, RawEvent, WindowHandle};
 #[cfg(windows)]
+pub use focus_border::{start_focus_border, FocusBorder, FocusBorderStyle};
+#[cfg(windows)]
 pub use hotkeys::{
     start_hotkeys, HotkeyBinding, HotkeyFired, HotkeyRegistrationResult, HotkeyRegistrations,
 };
@@ -48,7 +52,7 @@ pub use overlay::{start_preview_overlay, PreviewOverlay};
 #[cfg(windows)]
 pub use shutdown::register_shutdown_signal;
 #[cfg(windows)]
-pub use tray::{start_tray, TrayEvent, TrayHandle};
+pub use tray::{start_tray, TrayEvent, TrayHandle, TrayStatus};
 
 #[cfg(windows)]
 use mosaix_domain::{DisplayId, Rect, WindowId};

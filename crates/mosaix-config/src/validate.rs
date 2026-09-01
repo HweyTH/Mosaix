@@ -64,6 +64,9 @@ pub enum ValidationError {
         first_file: String,
         second_file: String,
     },
+
+    #[error("{file}: focus-border thickness must be between 1 and 16 logical pixels, got {found}")]
+    InvalidFocusBorderThickness { file: String, found: u16 },
 }
 
 /// Field-level merges `profile` (if any) over `base`: any field the profile
@@ -75,6 +78,7 @@ pub fn merge(base: &BaseConfig, profile: Option<&ProfileConfig>) -> ResolvedConf
     let mut gaps = base.gaps;
     let behavior = base.behavior.clone();
     let mut automatic_tiling_enabled = false;
+    let mut focus_border = base.focus_border;
 
     if let Some(profile) = profile {
         for (command, combo) in &profile.hotkeys {
@@ -89,6 +93,15 @@ pub fn merge(base: &BaseConfig, profile: Option<&ProfileConfig>) -> ResolvedConf
         automatic_tiling_enabled = profile
             .automatic_tiling
             .is_some_and(|tiling| tiling.enabled);
+        if let Some(enabled) = profile.focus_border.enabled {
+            focus_border.enabled = enabled;
+        }
+        if let Some(color) = profile.focus_border.color {
+            focus_border.color = color;
+        }
+        if let Some(thickness) = profile.focus_border.thickness {
+            focus_border.thickness = thickness;
+        }
     }
 
     ResolvedConfig {
@@ -96,6 +109,7 @@ pub fn merge(base: &BaseConfig, profile: Option<&ProfileConfig>) -> ResolvedConf
         gaps,
         behavior,
         automatic_tiling_enabled,
+        focus_border,
     }
 }
 
@@ -183,6 +197,12 @@ pub fn validate(candidate: &CandidateConfig) -> Result<ResolvedConfigSet, Vec<Va
     };
 
     let base_resolved = merge(&base, None);
+    if !(1..=16).contains(&base_resolved.focus_border.thickness) {
+        errors.push(ValidationError::InvalidFocusBorderThickness {
+            file: "config.toml".to_owned(),
+            found: base_resolved.focus_border.thickness,
+        });
+    }
     if let Some(err) = duplicate_binding("config.toml", &base_resolved) {
         errors.push(err);
     }
@@ -190,6 +210,13 @@ pub fn validate(candidate: &CandidateConfig) -> Result<ResolvedConfigSet, Vec<Va
     let mut resolved_profiles = Vec::new();
     for (file_name, profile) in &profiles {
         let resolved = merge(&base, Some(profile));
+        if !(1..=16).contains(&resolved.focus_border.thickness) {
+            errors.push(ValidationError::InvalidFocusBorderThickness {
+                file: (*file_name).to_owned(),
+                found: resolved.focus_border.thickness,
+            });
+            continue;
+        }
         if let Some(err) = duplicate_binding(file_name, &resolved) {
             errors.push(err);
         } else {
@@ -311,6 +338,52 @@ outer = 20
     }
 
     #[test]
+    fn profile_can_override_focus_border_fields_independently() {
+        let profile = r#"
+fingerprint = "MON-A"
+
+[focus_border]
+enabled = false
+thickness = 4
+
+[focus_border.color]
+red = 240
+green = 80
+blue = 120
+alpha = 200
+"#;
+        let candidate = CandidateConfig {
+            base: VALID_BASE.to_owned(),
+            profiles: vec![CandidateProfile {
+                file_name: "office.toml".to_owned(),
+                contents: profile.to_owned(),
+            }],
+        };
+
+        let resolved = validate(&candidate).unwrap().profiles.remove(0).config;
+
+        assert!(!resolved.focus_border.enabled);
+        assert_eq!(resolved.focus_border.thickness, 4);
+        assert_eq!(resolved.focus_border.color.red, 240);
+        assert_eq!(resolved.focus_border.color.alpha, 200);
+    }
+
+    #[test]
+    fn focus_border_thickness_outside_the_supported_range_is_rejected() {
+        let bad = format!("{VALID_BASE}\n[focus_border]\nthickness = 0\n");
+
+        let errors = validate(&base_only(&bad)).unwrap_err();
+
+        assert_eq!(
+            errors,
+            vec![ValidationError::InvalidFocusBorderThickness {
+                file: "config.toml".to_owned(),
+                found: 0,
+            }]
+        );
+    }
+
+    #[test]
     fn invalid_toml_syntax_is_rejected() {
         let errors = validate(&base_only("version = 1\n[hotkeys\n")).unwrap_err();
 
@@ -410,6 +483,7 @@ snap-right = "ctrl+alt+left"
                 gaps: base.gaps,
                 behavior: base.behavior.clone(),
                 automatic_tiling_enabled: false,
+                focus_border: base.focus_border,
             }
         );
     }

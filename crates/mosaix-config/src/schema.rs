@@ -160,6 +160,52 @@ pub struct AutomaticTilingSection {
     pub enabled: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RgbaColor {
+    pub red: u8,
+    pub green: u8,
+    pub blue: u8,
+    pub alpha: u8,
+}
+
+impl Default for RgbaColor {
+    fn default() -> Self {
+        Self {
+            red: 0,
+            green: 120,
+            blue: 215,
+            alpha: 255,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FocusBorderSection {
+    pub enabled: bool,
+    pub color: RgbaColor,
+    pub thickness: u16,
+}
+
+impl Default for FocusBorderSection {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            color: RgbaColor::default(),
+            thickness: 2,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FocusBorderOverride {
+    pub enabled: Option<bool>,
+    pub color: Option<RgbaColor>,
+    pub thickness: Option<u16>,
+}
+
 /// Base config: `config.toml`'s full schema (CONTEXT.md "Base config").
 /// Applies whenever the current display topology matches no saved profile.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -172,6 +218,8 @@ pub struct BaseConfig {
     pub gaps: Gaps,
     #[serde(default)]
     pub behavior: BehaviorSection,
+    #[serde(default)]
+    pub focus_border: FocusBorderSection,
 }
 
 /// A sparse `outer`/`inner` override, letting a profile override just one
@@ -201,6 +249,8 @@ pub struct ProfileConfig {
     #[serde(default)]
     pub behavior: BehaviorSection,
     pub automatic_tiling: Option<AutomaticTilingSection>,
+    #[serde(default)]
+    pub focus_border: FocusBorderOverride,
 }
 
 /// The merged result of base config plus (optionally) one profile
@@ -219,6 +269,7 @@ pub struct ResolvedConfig {
     pub gaps: Gaps,
     pub behavior: BehaviorSection,
     pub automatic_tiling_enabled: bool,
+    pub focus_border: FocusBorderSection,
 }
 
 /// One profile's resolved settings, paired with the `fingerprint` it's

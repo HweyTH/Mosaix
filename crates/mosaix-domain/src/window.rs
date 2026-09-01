@@ -94,6 +94,10 @@ pub struct Window {
     pub display_id: DisplayId,
     /// What the platform allows us to do with this window.
     pub capabilities: WindowCapabilities,
+    /// Whether the owning process has a higher integrity level than Mosaix.
+    /// Elevated windows remain observable for diagnostics and rules, but are
+    /// ineligible for placement because UIPI can reject the native call.
+    pub elevated: bool,
     /// Current lifecycle state.
     pub lifecycle: WindowLifecycle,
 }

@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 mosaix-engine = { path = "../mosaix-engine" }
 mosaix-domain = { path = "../mosaix-domain" }
+mosaix-rules = { path = "../mosaix-rules" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
