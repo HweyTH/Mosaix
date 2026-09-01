@@ -55,5 +55,9 @@ export function createTauriDesktopBridge(
       invokeCommand("save_and_apply_layout", { draft: toNormalizedDraft(draft) }) as Promise<CommandReceipt>,
     setAppearance: (appearance: Appearance) =>
       invokeCommand("set_appearance", { appearance }) as Promise<void>,
+    loadAutomaticTilingSettings: () =>
+      invokeCommand("load_automatic_tiling_settings") as ReturnType<DesktopBridge["loadAutomaticTilingSettings"]>,
+    saveAutomaticTilingSettings: (settings) =>
+      invokeCommand("save_automatic_tiling_settings", { settings }) as ReturnType<DesktopBridge["saveAutomaticTilingSettings"]>,
   };
 }

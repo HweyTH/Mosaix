@@ -25,12 +25,28 @@ const snapshot: EditorSnapshot = {
   },
 };
 
+const tilingSettings = {
+  topologyFingerprint: "DISPLAY-A@0,0 2560x1440 scale=1",
+  matchedProfile: false,
+  enabled: false,
+  outerGap: 8,
+  innerGap: 6,
+  focusBorderEnabled: true,
+  focusBorderColor: "#0078D7FF",
+  focusBorderThickness: 2,
+};
+
 function bridge(): DesktopBridge {
   return {
     loadEditorSnapshot: vi.fn().mockResolvedValue(structuredClone(snapshot)),
     previewLayout: vi.fn().mockResolvedValue({ revision: 1, status: "previewing" }),
     saveAndApplyLayout: vi.fn().mockResolvedValue({ revision: 2, status: "applied" }),
     setAppearance: vi.fn().mockResolvedValue(undefined),
+    loadAutomaticTilingSettings: vi.fn().mockResolvedValue(structuredClone(tilingSettings)),
+    saveAutomaticTilingSettings: vi.fn().mockImplementation(async (settings) => ({
+      ...settings,
+      matchedProfile: true,
+    })),
   };
 }
 
@@ -131,6 +147,30 @@ describe("layout editor", () => {
     expect(root.querySelectorAll("[data-zone]")).toHaveLength(4);
     root.querySelector<HTMLElement>("[data-command='delete']")!.click();
     expect(root.querySelectorAll("[data-zone]")).toHaveLength(3);
+  });
+
+  it("edits and saves the matched topology automatic-tiling surface", async () => {
+    const root = document.createElement("div");
+    const desktop = bridge();
+    document.body.append(root);
+    await mountLayoutEditor(root, desktop);
+
+    expect(root.querySelector("[data-topology-fingerprint]")?.textContent).toContain("DISPLAY-A");
+    root.querySelector<HTMLInputElement>("[data-auto-tiling]")!.click();
+    const outer = root.querySelector<HTMLInputElement>("[data-outer-gap]")!;
+    outer.value = "14";
+    outer.dispatchEvent(new Event("change", { bubbles: true }));
+    const thickness = root.querySelector<HTMLInputElement>("[data-border-thickness]")!;
+    thickness.value = "4";
+    thickness.dispatchEvent(new Event("change", { bubbles: true }));
+    root.querySelector<HTMLElement>("[data-save-tiling]")!.click();
+    await Promise.resolve();
+
+    expect(desktop.saveAutomaticTilingSettings).toHaveBeenCalledWith(expect.objectContaining({
+      enabled: true,
+      outerGap: 14,
+      focusBorderThickness: 4,
+    }));
   });
 
   it("undoes inspector edits and does not expose inactive canvas tools", async () => {

@@ -17,7 +17,9 @@ use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use thiserror::Error;
 
 use crate::defaults::default_config_content;
-use crate::schema::ResolvedConfigSet;
+use crate::schema::{
+    AutomaticTilingSection, FocusBorderOverride, GapsOverride, ProfileConfig, ResolvedConfigSet,
+};
 use crate::validate::{validate, CandidateConfig, CandidateProfile, ValidationError};
 
 /// Debounce window for coalescing raw filesystem events into one
@@ -45,6 +47,17 @@ pub enum ConfigIoError {
         #[source]
         source: notify::Error,
     },
+
+    #[error("updated config directory failed validation: {0}")]
+    Validation(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct ProfileSettingsUpdate {
+    pub fingerprint: String,
+    pub automatic_tiling_enabled: bool,
+    pub gaps: GapsOverride,
+    pub focus_border: FocusBorderOverride,
 }
 
 fn io_error(path: &Path, source: std::io::Error) -> ConfigIoError {
@@ -86,6 +99,112 @@ fn read_candidate(dir: &Path) -> Result<CandidateConfig, ConfigIoError> {
     }
 
     Ok(CandidateConfig { base, profiles })
+}
+
+fn profile_file_name(fingerprint: &str) -> String {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    fingerprint.hash(&mut hasher);
+    format!("topology-{:016x}.toml", hasher.finish())
+}
+
+#[cfg(windows)]
+fn replace_file(temp: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+    let source: Vec<u16> = temp.as_os_str().encode_wide().chain(Some(0)).collect();
+    let target: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    unsafe {
+        MoveFileExW(
+            PCWSTR(source.as_ptr()),
+            PCWSTR(target.as_ptr()),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    }
+    .map_err(|_| std::io::Error::last_os_error())
+}
+
+#[cfg(not(windows))]
+fn replace_file(temp: &Path, destination: &Path) -> std::io::Result<()> {
+    fs::rename(temp, destination)
+}
+
+/// Validates a complete candidate directory before atomically replacing the
+/// one topology profile edited by Settings. Existing hotkeys and unrelated
+/// profiles are preserved byte-for-byte.
+pub fn save_profile_settings(
+    dir: &Path,
+    update: ProfileSettingsUpdate,
+) -> Result<ResolvedConfigSet, ConfigIoError> {
+    ensure_default_config(dir)?;
+    let mut candidate = read_candidate(dir)?;
+    let mut destination_name = None;
+    let mut updated_profile = None;
+
+    for profile in &candidate.profiles {
+        let parsed: ProfileConfig = toml::from_str(&profile.contents).map_err(|error| {
+            ConfigIoError::Validation(format!("{}: {error}", profile.file_name))
+        })?;
+        if parsed.fingerprint == update.fingerprint {
+            destination_name = Some(profile.file_name.clone());
+            updated_profile = Some(parsed);
+            break;
+        }
+    }
+
+    let mut profile = updated_profile.unwrap_or(ProfileConfig {
+        fingerprint: update.fingerprint.clone(),
+        hotkeys: Default::default(),
+        gaps: GapsOverride::default(),
+        behavior: Default::default(),
+        automatic_tiling: None,
+        focus_border: FocusBorderOverride::default(),
+    });
+    profile.automatic_tiling = Some(AutomaticTilingSection {
+        enabled: update.automatic_tiling_enabled,
+    });
+    profile.gaps = update.gaps;
+    profile.focus_border = update.focus_border;
+    let contents = toml::to_string_pretty(&profile)
+        .map_err(|error| ConfigIoError::Validation(error.to_string()))?;
+    let file_name = destination_name.unwrap_or_else(|| profile_file_name(&update.fingerprint));
+
+    if let Some(candidate_profile) = candidate
+        .profiles
+        .iter_mut()
+        .find(|candidate| candidate.file_name == file_name)
+    {
+        candidate_profile.contents = contents.clone();
+    } else {
+        candidate.profiles.push(CandidateProfile {
+            file_name: file_name.clone(),
+            contents: contents.clone(),
+        });
+    }
+    let resolved = validate(&candidate).map_err(|errors| {
+        ConfigIoError::Validation(
+            errors
+                .into_iter()
+                .map(|error| error.to_string())
+                .collect::<Vec<_>>()
+                .join("; "),
+        )
+    })?;
+
+    let destination = dir.join(PROFILES_DIR_NAME).join(&file_name);
+    let temp = dir
+        .join(PROFILES_DIR_NAME)
+        .join(format!(".{file_name}.mosaix-tmp"));
+    fs::write(&temp, contents).map_err(|error| io_error(&temp, error))?;
+    replace_file(&temp, &destination).map_err(|error| io_error(&destination, error))?;
+    Ok(resolved)
 }
 
 /// Ensures `dir` (and its `profiles/` subdirectory) exist and that

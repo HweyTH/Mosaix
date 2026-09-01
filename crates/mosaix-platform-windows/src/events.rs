@@ -235,6 +235,7 @@ mod tests {
     use crate::test_support::{create_test_window, wait_for};
     use mosaix_domain::Rect;
     use std::time::Duration;
+    use windows::Win32::UI::Accessibility::NotifyWinEvent;
     use windows::Win32::UI::WindowsAndMessaging::DestroyWindow;
 
     #[test]
@@ -275,6 +276,75 @@ mod tests {
             "expected WindowDestroyed after DestroyWindow"
         );
 
+        hooks.stop();
+    }
+
+    #[test]
+    fn accepts_foreground_system_events_without_object_identifiers() {
+        let (tx, rx) = mpsc::channel();
+        EVENT_SENDER.with(|sender| *sender.borrow_mut() = Some(tx));
+        let hwnd = create_test_window();
+        let handle = WindowHandle::from(hwnd);
+
+        unsafe {
+            win_event_proc(
+                HWINEVENTHOOK::default(),
+                EVENT_SYSTEM_FOREGROUND,
+                hwnd,
+                0,
+                0,
+                0,
+                0,
+            );
+        }
+
+        assert!(
+            wait_for(
+                &rx,
+                |event| matches!(event, RawEvent::Focused(found) if *found == handle),
+                Duration::from_secs(2),
+            ),
+            "expected a foreground system event without object identifiers to be accepted"
+        );
+
+        unsafe { DestroyWindow(hwnd) }.expect("cleanup should succeed");
+        EVENT_SENDER.with(|sender| *sender.borrow_mut() = None);
+    }
+
+    #[test]
+    fn observes_native_move_resize_start_and_end_events() {
+        let (hooks, rx) = start_event_hooks().expect("hooks should register");
+        let hwnd = create_test_window();
+        let handle = WindowHandle::from(hwnd);
+
+        unsafe {
+            NotifyWinEvent(
+                EVENT_SYSTEM_MOVESIZESTART,
+                hwnd,
+                OBJID_WINDOW.0,
+                CHILDID_SELF,
+            );
+            NotifyWinEvent(EVENT_SYSTEM_MOVESIZEEND, hwnd, OBJID_WINDOW.0, CHILDID_SELF);
+        }
+
+        assert!(
+            wait_for(
+                &rx,
+                |event| matches!(event, RawEvent::MoveResizeStart(found) if *found == handle),
+                Duration::from_secs(2),
+            ),
+            "expected MoveResizeStart from the native accessibility event"
+        );
+        assert!(
+            wait_for(
+                &rx,
+                |event| matches!(event, RawEvent::MoveResizeEnd(found) if *found == handle),
+                Duration::from_secs(2),
+            ),
+            "expected MoveResizeEnd from the native accessibility event"
+        );
+
+        unsafe { DestroyWindow(hwnd) }.expect("cleanup should succeed");
         hooks.stop();
     }
 }

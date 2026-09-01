@@ -14,7 +14,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use mosaix_config::{
-    ensure_default_config, fallback_config, load, watch, Command, ConfigEvent, KeyCombo,
+    ensure_default_config, fallback_config, load, save_profile_settings, watch, Command,
+    ConfigEvent, FocusBorderOverride, GapsOverride, KeyCombo, ProfileSettingsUpdate, RgbaColor,
 };
 
 /// A fresh, empty directory under the system temp dir, unique to this test
@@ -30,6 +31,47 @@ fn temp_dir(label: &str) -> PathBuf {
     ));
     fs::create_dir_all(&dir).expect("failed to create test temp directory");
     dir
+}
+
+#[test]
+fn settings_atomically_create_and_replace_the_matching_topology_profile() {
+    let dir = temp_dir("settings-profile");
+    ensure_default_config(&dir).unwrap();
+    let update = |enabled, outer, thickness| ProfileSettingsUpdate {
+        fingerprint: "DISPLAY-A@0,0 1920x1080 scale=1".to_owned(),
+        automatic_tiling_enabled: enabled,
+        gaps: GapsOverride {
+            outer: Some(outer),
+            inner: Some(6),
+        },
+        focus_border: FocusBorderOverride {
+            enabled: Some(true),
+            color: Some(RgbaColor {
+                red: 20,
+                green: 130,
+                blue: 220,
+                alpha: 240,
+            }),
+            thickness: Some(thickness),
+        },
+    };
+
+    save_profile_settings(&dir, update(true, 12, 3)).unwrap();
+    let replaced = save_profile_settings(&dir, update(false, 18, 5)).unwrap();
+
+    assert_eq!(replaced.profiles.len(), 1);
+    let profile = &replaced.profiles[0].config;
+    assert!(!profile.automatic_tiling_enabled);
+    assert_eq!(profile.gaps.outer, 18);
+    assert_eq!(profile.gaps.inner, 6);
+    assert_eq!(profile.focus_border.thickness, 5);
+    assert_eq!(
+        fs::read_dir(dir.join("profiles")).unwrap().count(),
+        1,
+        "updating the same fingerprint must replace, not duplicate, its profile"
+    );
+
+    cleanup(&dir);
 }
 
 fn cleanup(dir: &Path) {

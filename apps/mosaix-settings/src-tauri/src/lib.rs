@@ -10,6 +10,8 @@ pub fn run() {
             commands::preview_layout,
             commands::save_and_apply_layout,
             commands::set_appearance,
+            commands::load_automatic_tiling_settings,
+            commands::save_automatic_tiling_settings,
         ])
         .run(tauri::generate_context!())
         .expect("failed to run the Mosaix settings application");
