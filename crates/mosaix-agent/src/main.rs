@@ -298,7 +298,9 @@ fn main() {
                             })
                             .is_err()
                         {
-                            tracing::error!("reducer stopped before the initial focus could be sent");
+                            tracing::error!(
+                                "reducer stopped before the initial focus could be sent"
+                            );
                         }
                     }
                     None => tracing::debug!(
@@ -459,10 +461,39 @@ fn main() {
                     {
                         state.focused_window.and_then(|window_id| {
                             let managed = state.inventory.get(&window_id)?;
+                            // The inventory keeps minimized, hidden, and
+                            // cloaked windows -- they are temporarily
+                            // ineligible, not unmanaged -- so membership
+                            // alone would leave a border on bare desktop
+                            // after a minimize. Maximized and full-screen
+                            // are ineligible for a cell but plainly visible.
+                            if !matches!(
+                                managed.window.lifecycle,
+                                mosaix_domain::WindowLifecycle::Active
+                                    | mosaix_domain::WindowLifecycle::Maximized
+                                    | mosaix_domain::WindowLifecycle::Fullscreen
+                            ) {
+                                return None;
+                            }
+                            // The engine defers placement for a window being
+                            // dragged (ADR 0016), so anything drawn now would
+                            // trail it under the cursor until the drop.
+                            if state
+                                .interactive_placement
+                                .is_some_and(|session| session.window_id == window_id)
+                            {
+                                return None;
+                            }
+                            // `observed_bounds`, not `bounds`: the latter is
+                            // the placement Mosaix last *intended*, kept stale
+                            // on purpose so the engine can detect an external
+                            // move by comparing the two (ADR 0001). Drawing
+                            // from it leaves the border behind any window
+                            // something else repositioned.
                             let bounds = state
                                 .windows
                                 .get(&window_id)
-                                .map(|placement| placement.bounds)
+                                .map(|placement| placement.observed_bounds)
                                 .unwrap_or(managed.window.bounds);
                             let config = state.resolved_config.focus_border;
                             let scale = state

@@ -254,6 +254,7 @@ mod tests {
             WindowPlacement {
                 display_id: DisplayId(1),
                 bounds: Rect::new(0, 0, 100, 100),
+                observed_bounds: Rect::new(0, 0, 100, 100),
                 previous_placement: None,
                 cycle_step: None,
                 rejection_count: CIRCUIT_BREAKER_THRESHOLD,
