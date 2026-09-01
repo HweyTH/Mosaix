@@ -276,6 +276,39 @@ fn main() {
         {
             tracing::error!("reducer stopped before startup reconciliation could be sent");
         }
+
+        // The engine otherwise only learns about focus from a
+        // foreground-*change* notification, so a freshly started agent has
+        // no focus anchor until the user next switches windows -- leaving
+        // directional focus/swap silent no-ops and the Focus border hidden
+        // while automatic tiling is already active.  Seed it from whatever
+        // owns the foreground right now, as an ordinary observation.
+        match mosaix_platform_windows::foreground_window_handle() {
+            Some(handle) => {
+                let window_id = mosaix_platform_windows::window_id_from_handle(handle);
+                match mosaix_platform_windows::observed_window_state(handle) {
+                    Some((display_id, bounds)) => {
+                        tracing::info!(?window_id, "seeding the initial focused window");
+                        if engine
+                            .events()
+                            .send(mosaix_engine::Event::WindowFocused {
+                                window_id,
+                                display_id,
+                                bounds,
+                            })
+                            .is_err()
+                        {
+                            tracing::error!("reducer stopped before the initial focus could be sent");
+                        }
+                    }
+                    None => tracing::debug!(
+                        ?window_id,
+                        "could not read bounds/display for the foreground window; not seeding focus"
+                    ),
+                }
+            }
+            None => tracing::debug!("no window owns the foreground at startup; not seeding focus"),
+        }
     }
 
     let ipc_server = match mosaix_ipc::IpcServer::start(engine.events(), engine.state_reader()) {
