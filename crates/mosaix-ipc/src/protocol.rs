@@ -29,6 +29,15 @@ pub enum IpcRequest {
     Pause,
     Resume,
     TogglePause,
+    Rearrange,
+    ToggleAutomaticTiling,
+    ToggleFloating,
+    FocusUp,
+    FocusDown,
+    SwapLeft,
+    SwapRight,
+    SwapUp,
+    SwapDown,
     GetPauseState,
 }
 
@@ -80,6 +89,15 @@ mod tests {
             IpcRequest::Pause,
             IpcRequest::Resume,
             IpcRequest::TogglePause,
+            IpcRequest::Rearrange,
+            IpcRequest::ToggleAutomaticTiling,
+            IpcRequest::ToggleFloating,
+            IpcRequest::FocusUp,
+            IpcRequest::FocusDown,
+            IpcRequest::SwapLeft,
+            IpcRequest::SwapRight,
+            IpcRequest::SwapUp,
+            IpcRequest::SwapDown,
             IpcRequest::GetPauseState,
         ];
         for request in requests {

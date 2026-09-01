@@ -76,6 +76,12 @@ fn run(
                     }
                 }
                 Ok(OverlayRequest::DragStarted { window_id }) => {
+                    if events
+                        .send(Event::InteractivePlacementStarted { window_id })
+                        .is_err()
+                    {
+                        break;
+                    }
                     mode = Mode::Dragging { window_id };
                 }
                 Ok(OverlayRequest::DragEnded { .. }) => {
@@ -98,6 +104,12 @@ fn run(
                     Ok(OverlayRequest::DragStarted { window_id }) => {
                         // Drag takes precedence over an in-progress flash.
                         overlay.hide();
+                        if events
+                            .send(Event::InteractivePlacementStarted { window_id })
+                            .is_err()
+                        {
+                            break;
+                        }
                         mode = Mode::Dragging { window_id };
                     }
                     Ok(OverlayRequest::DragEnded { .. }) => {}
@@ -112,9 +124,16 @@ fn run(
             Mode::Dragging { window_id } => {
                 match rx.recv_timeout(DRAG_POLL_INTERVAL) {
                     Ok(OverlayRequest::DragStarted { window_id: id }) => {
+                        if events
+                            .send(Event::InteractivePlacementStarted { window_id: id })
+                            .is_err()
+                        {
+                            break;
+                        }
                         mode = Mode::Dragging { window_id: id };
                     }
                     Ok(OverlayRequest::DragEnded { window_id: ended }) => {
+                        let mut committed_manual_placement = false;
                         if let Some((display_id, bounds)) = zone_under_cursor(&state_reader) {
                             if ended == window_id {
                                 if events
@@ -128,7 +147,17 @@ fn run(
                                     tracing::warn!("reducer stopped; overlay controller exiting");
                                     break;
                                 }
+                                committed_manual_placement = true;
                             }
+                        }
+                        if events
+                            .send(Event::InteractivePlacementEnded {
+                                window_id: ended,
+                                committed_manual_placement,
+                            })
+                            .is_err()
+                        {
+                            break;
                         }
                         overlay.hide();
                         mode = Mode::Idle;

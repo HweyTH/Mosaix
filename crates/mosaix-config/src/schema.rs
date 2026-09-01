@@ -29,6 +29,18 @@ pub enum Command {
     SnapRight,
     SnapTop,
     SnapBottom,
+    Rearrange,
+    ToggleAutomaticTiling,
+    ToggleFloating,
+    FocusLeft,
+    FocusRight,
+    FocusUp,
+    FocusDown,
+    SwapLeft,
+    SwapRight,
+    SwapUp,
+    SwapDown,
+    TogglePause,
 }
 
 /// A parsed hotkey combination: a set of modifiers plus a key name.
@@ -318,7 +330,7 @@ mod tests {
         let profile: ProfileConfig =
             toml::from_str("fingerprint = \"display\"\n[automatic_tiling]\nenabled = true\n")
                 .unwrap();
-        assert_eq!(profile.automatic_tiling.unwrap().enabled, true);
+        assert!(profile.automatic_tiling.unwrap().enabled);
 
         assert!(
             toml::from_str::<BaseConfig>("version = 1\n[automatic_tiling]\nenabled = true\n")

@@ -64,19 +64,88 @@ fn start_hotkeys_and_forward(
                 );
                 continue;
             };
-            let direction = hotkeys::direction_for_command(command);
             let pre_revision = state_reader.snapshot().revision;
-            if events
-                .send(mosaix_engine::Event::ZoneSnapRequested { direction })
-                .is_err()
-            {
+            let event = match command {
+                mosaix_config::Command::Rearrange => mosaix_engine::Event::RearrangeRequested,
+                mosaix_config::Command::ToggleAutomaticTiling => {
+                    mosaix_engine::Event::ToggleAutomaticTilingRequested
+                }
+                mosaix_config::Command::ToggleFloating => {
+                    mosaix_engine::Event::ToggleFloatingRequested
+                }
+                mosaix_config::Command::FocusLeft => {
+                    mosaix_engine::Event::DirectionalFocusRequested {
+                        direction: mosaix_engine::CardinalDirection::Left,
+                    }
+                }
+                mosaix_config::Command::FocusRight => {
+                    mosaix_engine::Event::DirectionalFocusRequested {
+                        direction: mosaix_engine::CardinalDirection::Right,
+                    }
+                }
+                mosaix_config::Command::FocusUp => {
+                    mosaix_engine::Event::DirectionalFocusRequested {
+                        direction: mosaix_engine::CardinalDirection::Up,
+                    }
+                }
+                mosaix_config::Command::FocusDown => {
+                    mosaix_engine::Event::DirectionalFocusRequested {
+                        direction: mosaix_engine::CardinalDirection::Down,
+                    }
+                }
+                mosaix_config::Command::SwapLeft => {
+                    mosaix_engine::Event::DirectionalSwapRequested {
+                        direction: mosaix_engine::CardinalDirection::Left,
+                    }
+                }
+                mosaix_config::Command::SwapRight => {
+                    mosaix_engine::Event::DirectionalSwapRequested {
+                        direction: mosaix_engine::CardinalDirection::Right,
+                    }
+                }
+                mosaix_config::Command::SwapUp => mosaix_engine::Event::DirectionalSwapRequested {
+                    direction: mosaix_engine::CardinalDirection::Up,
+                },
+                mosaix_config::Command::SwapDown => {
+                    mosaix_engine::Event::DirectionalSwapRequested {
+                        direction: mosaix_engine::CardinalDirection::Down,
+                    }
+                }
+                mosaix_config::Command::TogglePause => {
+                    if state_reader.snapshot().paused {
+                        mosaix_engine::Event::ResumeRequested
+                    } else {
+                        mosaix_engine::Event::PauseRequested
+                    }
+                }
+                command => mosaix_engine::Event::ZoneSnapRequested {
+                    direction: hotkeys::direction_for_command(command),
+                },
+            };
+            if events.send(event).is_err() {
                 tracing::warn!("reducer stopped; hotkey forwarder exiting");
                 break;
             }
-            if let Some(tx) = &overlay_tx {
-                let _ = tx.send(overlay::OverlayRequest::FlashAfterSnap {
-                    revision: pre_revision,
-                });
+            if !matches!(
+                command,
+                mosaix_config::Command::Rearrange
+                    | mosaix_config::Command::ToggleAutomaticTiling
+                    | mosaix_config::Command::ToggleFloating
+                    | mosaix_config::Command::FocusLeft
+                    | mosaix_config::Command::FocusRight
+                    | mosaix_config::Command::FocusUp
+                    | mosaix_config::Command::FocusDown
+                    | mosaix_config::Command::SwapLeft
+                    | mosaix_config::Command::SwapRight
+                    | mosaix_config::Command::SwapUp
+                    | mosaix_config::Command::SwapDown
+                    | mosaix_config::Command::TogglePause
+            ) {
+                if let Some(tx) = &overlay_tx {
+                    let _ = tx.send(overlay::OverlayRequest::FlashAfterSnap {
+                        revision: pre_revision,
+                    });
+                }
             }
         }
     });
@@ -406,17 +475,25 @@ fn main() {
                             }
                         }
                         mosaix_platform_windows::RawEvent::MoveResizeStart(handle) => {
+                            let window_id = mosaix_platform_windows::window_id_from_handle(handle);
                             if let Some(tx) = &overlay_tx {
-                                let window_id =
-                                    mosaix_platform_windows::window_id_from_handle(handle);
                                 let _ = tx.send(overlay::OverlayRequest::DragStarted { window_id });
+                            } else {
+                                let _ = events.send(
+                                    mosaix_engine::Event::InteractivePlacementStarted { window_id },
+                                );
                             }
                         }
                         mosaix_platform_windows::RawEvent::MoveResizeEnd(handle) => {
+                            let window_id = mosaix_platform_windows::window_id_from_handle(handle);
                             if let Some(tx) = &overlay_tx {
-                                let window_id =
-                                    mosaix_platform_windows::window_id_from_handle(handle);
                                 let _ = tx.send(overlay::OverlayRequest::DragEnded { window_id });
+                            } else {
+                                let _ =
+                                    events.send(mosaix_engine::Event::InteractivePlacementEnded {
+                                        window_id,
+                                        committed_manual_placement: false,
+                                    });
                             }
                         }
                     }
@@ -436,7 +513,8 @@ fn main() {
     // superseded by ADR 0005). The hotkey-rebind poller further down keeps
     // this in sync with `EngineState`'s resolved config for the rest of the
     // agent's lifetime.
-    let last_registered_hotkeys = engine.state_reader().snapshot().resolved_config.hotkeys;
+    let last_registered_hotkeys =
+        hotkeys::runtime_hotkeys(&engine.state_reader().snapshot().resolved_config);
     let initial_hotkey_registration = match start_hotkeys_and_forward(
         hotkeys::bindings_from_resolved(&last_registered_hotkeys),
         engine.events(),
@@ -473,7 +551,8 @@ fn main() {
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                 }
 
-                let current_hotkeys = state_reader.snapshot().resolved_config.hotkeys;
+                let current_hotkeys =
+                    hotkeys::runtime_hotkeys(&state_reader.snapshot().resolved_config);
                 if mosaix_config::diff_bindings(&previous_hotkeys, &current_hotkeys).is_empty() {
                     continue;
                 }
@@ -539,7 +618,16 @@ fn main() {
                 for effect in snapshot.effects.iter().skip(next_effect) {
                     let mosaix_engine::EngineEffect::PlaceWindow {
                         window_id, bounds, ..
-                    } = *effect;
+                    } = *effect
+                    else {
+                        if let mosaix_engine::EngineEffect::FocusWindow { window_id } = *effect {
+                            if let Err(err) = mosaix_platform_windows::focus_window_by_id(window_id)
+                            {
+                                tracing::warn!(?window_id, %err, "failed to focus directional neighbor");
+                            }
+                        }
+                        continue;
+                    };
                     if let Err(err) =
                         mosaix_platform_windows::move_resize_window_by_id(window_id, bounds)
                     {
