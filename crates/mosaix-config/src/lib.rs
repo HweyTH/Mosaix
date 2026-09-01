@@ -30,7 +30,9 @@ pub use io::{
     ensure_default_config, load, watch, ConfigEvent, ConfigIoError, ConfigWatcher, DEBOUNCE_WINDOW,
 };
 pub use schema::{
-    BaseConfig, BehaviorSection, Command, GapsOverride, KeyCombo, ProfileConfig, ResolvedConfig,
-    ResolvedConfigSet, ResolvedProfile, CURRENT_VERSION,
+    BaseConfig, BehaviorSection, Command, FocusBorderOverride, FocusBorderSection, GapsOverride,
+    KeyCombo, ProfileConfig, ResolvedConfig, ResolvedConfigSet, ResolvedProfile, Rgb,
+    CURRENT_VERSION, DEFAULT_BORDER_COLOR, DEFAULT_BORDER_THICKNESS, MAX_BORDER_THICKNESS,
+    MIN_BORDER_THICKNESS,
 };
 pub use validate::{merge, validate, CandidateConfig, CandidateProfile, ValidationError};

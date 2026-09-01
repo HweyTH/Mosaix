@@ -18,6 +18,10 @@
 //! 0007).
 
 #[cfg(windows)]
+mod focus_border;
+#[cfg(windows)]
+mod focus_border_controller;
+#[cfg(windows)]
 mod hotkeys;
 #[cfg(windows)]
 mod overlay;
@@ -396,6 +400,29 @@ fn main() {
             (None, None)
         }
     };
+
+    // Focus border (CONTEXT.md "Focus border"). A second overlay window
+    // rather than another mode of the preview controller: it is persistent,
+    // and the preview's modes deliberately preempt each other. It needs no
+    // feed from the forwarders below -- it watches engine state directly --
+    // so its sender stays main's alone. Failure degrades to no border.
+    let (focus_border_tx, focus_border_controller) =
+        match mosaix_platform_windows::start_focus_border_overlay() {
+            Ok(border) => {
+                let (tx, join_handle) = focus_border_controller::start_focus_border_controller(
+                    engine.state_reader(),
+                    border,
+                );
+                (Some(tx), Some(join_handle))
+            }
+            Err(err) => {
+                tracing::error!(
+                    %err,
+                    "failed to start focus border overlay; the focused window will not be outlined"
+                );
+                (None, None)
+            }
+        };
 
     let event_hooks_and_forwarder = match mosaix_platform_windows::start_event_hooks() {
         Ok((hooks, raw_events)) => {
@@ -823,6 +850,13 @@ fn main() {
     // is a shutdown that never completes rather than a graceful one.
     drop(overlay_tx);
     if let Some(join_handle) = overlay_controller {
+        let _ = join_handle.join();
+    }
+
+    // No clones of this one exist, so dropping main's sender is enough to
+    // end the controller's poll loop.
+    drop(focus_border_tx);
+    if let Some(join_handle) = focus_border_controller {
         let _ = join_handle.join();
     }
 

@@ -19,6 +19,8 @@ pub mod enumeration;
 #[cfg(windows)]
 pub mod events;
 #[cfg(windows)]
+pub mod focus_border;
+#[cfg(windows)]
 pub mod hotkeys;
 #[cfg(windows)]
 pub mod overlay;
@@ -39,6 +41,8 @@ pub use display::{enumerate_displays, watch_display_topology, DisplayWatcher, To
 pub use enumeration::enumerate_windows;
 #[cfg(windows)]
 pub use events::{start_event_hooks, EventHooks, RawEvent, WindowHandle};
+#[cfg(windows)]
+pub use focus_border::{start_focus_border_overlay, BorderPlacement, FocusBorderOverlay};
 #[cfg(windows)]
 pub use hotkeys::{
     start_hotkeys, HotkeyBinding, HotkeyFired, HotkeyRegistrationResult, HotkeyRegistrations,

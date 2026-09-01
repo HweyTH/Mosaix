@@ -3042,6 +3042,7 @@ mod tests {
             gaps: mosaix_domain::Gaps::default(),
             behavior: mosaix_config::BehaviorSection::default(),
             automatic_tiling_enabled: false,
+            focus_border: mosaix_config::FocusBorderSection::default(),
         }
     }
 
@@ -3059,6 +3060,7 @@ mod tests {
                 gaps,
                 behavior: mosaix_config::BehaviorSection::default(),
                 automatic_tiling_enabled: false,
+                focus_border: mosaix_config::FocusBorderSection::default(),
             },
             profiles: Vec::new(),
         }

@@ -152,6 +152,105 @@ impl<'de> Deserialize<'de> for KeyCombo {
 #[serde(deny_unknown_fields)]
 pub struct BehaviorSection {}
 
+/// An opaque 24-bit RGB color, parsed from the `#RRGGBB` strings config
+/// files carry. Kept as a plain triple so the platform layer can consume it
+/// without depending on this crate.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Rgb {
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+}
+
+impl Rgb {
+    pub const fn new(r: u8, g: u8, b: u8) -> Self {
+        Self { r, g, b }
+    }
+
+    /// Parses `#RRGGBB` or `RRGGBB`, case-insensitively. Shorthand `#RGB` is
+    /// deliberately unsupported -- accepting it would mean two spellings of
+    /// the same color in config files for no gain.
+    pub fn parse(raw: &str) -> Option<Self> {
+        let digits = raw.strip_prefix('#').unwrap_or(raw);
+        if digits.len() != 6 || !digits.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        Some(Self::new(
+            u8::from_str_radix(&digits[0..2], 16).ok()?,
+            u8::from_str_radix(&digits[2..4], 16).ok()?,
+            u8::from_str_radix(&digits[4..6], 16).ok()?,
+        ))
+    }
+}
+
+/// The smallest and largest focus-border thickness [`crate::validate`]
+/// accepts, in physical pixels. The upper bound exists so a typo'd
+/// thickness can't paint over the window it is supposed to outline.
+pub const MIN_BORDER_THICKNESS: i32 = 1;
+pub const MAX_BORDER_THICKNESS: i32 = 40;
+
+/// The `[focus_border]` table (CONTEXT.md "Focus border"). Enabled state,
+/// color, and thickness are the whole first-release customization surface.
+///
+/// `color` stays a `String` here rather than a parsed [`Rgb`] so merging
+/// stays infallible and mirrors how `Gaps` flows through as plain data;
+/// [`crate::validate`] rejects a candidate whose color doesn't parse, so
+/// nothing downstream sees an unparseable one.
+/// Every field defaults independently, so a config that sets only `color`
+/// still gets the default `enabled` and `thickness` rather than failing to
+/// parse -- the same field-level-over-section-level treatment ADR 0004
+/// gives gaps and hotkeys.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FocusBorderSection {
+    #[serde(default = "default_border_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_border_color")]
+    pub color: String,
+    #[serde(default = "default_border_thickness")]
+    pub thickness: i32,
+}
+
+/// Windows' own accent blue -- the same hue the snap preview overlay
+/// paints, so the two overlays read as one system.
+pub const DEFAULT_BORDER_COLOR: &str = "#0078D7";
+/// Thick enough to read at a glance across a grid, thin enough not to eat
+/// the window's own edge pixels.
+pub const DEFAULT_BORDER_THICKNESS: i32 = 3;
+
+fn default_border_enabled() -> bool {
+    true
+}
+
+fn default_border_color() -> String {
+    DEFAULT_BORDER_COLOR.to_string()
+}
+
+fn default_border_thickness() -> i32 {
+    DEFAULT_BORDER_THICKNESS
+}
+
+impl Default for FocusBorderSection {
+    fn default() -> Self {
+        Self {
+            enabled: default_border_enabled(),
+            color: default_border_color(),
+            thickness: default_border_thickness(),
+        }
+    }
+}
+
+/// A sparse `[focus_border]` override, letting a profile override one leaf
+/// field while inheriting the others from base config (field-level merge,
+/// ADR 0004) -- the same shape [`GapsOverride`] has.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FocusBorderOverride {
+    pub enabled: Option<bool>,
+    pub color: Option<String>,
+    pub thickness: Option<i32>,
+}
+
 /// Automatic-tiling activation is intentionally available only to a
 /// topology profile (ADR 0010), never base config.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -172,6 +271,8 @@ pub struct BaseConfig {
     pub gaps: Gaps,
     #[serde(default)]
     pub behavior: BehaviorSection,
+    #[serde(default)]
+    pub focus_border: FocusBorderSection,
 }
 
 /// A sparse `outer`/`inner` override, letting a profile override just one
@@ -201,6 +302,8 @@ pub struct ProfileConfig {
     #[serde(default)]
     pub behavior: BehaviorSection,
     pub automatic_tiling: Option<AutomaticTilingSection>,
+    #[serde(default)]
+    pub focus_border: FocusBorderOverride,
 }
 
 /// The merged result of base config plus (optionally) one profile
@@ -219,6 +322,7 @@ pub struct ResolvedConfig {
     pub gaps: Gaps,
     pub behavior: BehaviorSection,
     pub automatic_tiling_enabled: bool,
+    pub focus_border: FocusBorderSection,
 }
 
 /// One profile's resolved settings, paired with the `fingerprint` it's
@@ -250,6 +354,64 @@ pub struct ResolvedConfigSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn base_config_defaults_the_focus_border_section_when_the_table_is_absent() {
+        let base: BaseConfig = toml::from_str("version = 1\n").unwrap();
+
+        assert_eq!(base.focus_border, FocusBorderSection::default());
+        assert!(base.focus_border.enabled);
+        assert_eq!(base.focus_border.color, "#0078D7");
+        assert_eq!(base.focus_border.thickness, 3);
+    }
+
+    #[test]
+    fn base_config_parses_a_focus_border_table() {
+        let base: BaseConfig = toml::from_str(
+            "version = 1\n[focus_border]\nenabled = false\ncolor = \"#FF8800\"\nthickness = 5\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            base.focus_border,
+            FocusBorderSection {
+                enabled: false,
+                color: "#FF8800".to_string(),
+                thickness: 5,
+            }
+        );
+    }
+
+    #[test]
+    fn profile_focus_border_override_leaves_unset_fields_none() {
+        let profile: ProfileConfig =
+            toml::from_str("fingerprint = \"display\"\n[focus_border]\nthickness = 6\n").unwrap();
+
+        assert_eq!(
+            profile.focus_border,
+            FocusBorderOverride {
+                enabled: None,
+                color: None,
+                thickness: Some(6),
+            }
+        );
+    }
+
+    #[test]
+    fn rgb_parses_six_digit_hex_with_or_without_a_leading_hash() {
+        assert_eq!(Rgb::parse("#0078D7"), Some(Rgb::new(0x00, 0x78, 0xD7)));
+        assert_eq!(Rgb::parse("0078d7"), Some(Rgb::new(0x00, 0x78, 0xD7)));
+        assert_eq!(Rgb::parse("#FFFFFF"), Some(Rgb::new(255, 255, 255)));
+    }
+
+    #[test]
+    fn rgb_rejects_malformed_hex() {
+        assert_eq!(Rgb::parse(""), None);
+        assert_eq!(Rgb::parse("#FFF"), None, "shorthand hex is not supported");
+        assert_eq!(Rgb::parse("#0078D7A"), None);
+        assert_eq!(Rgb::parse("#00 8D7"), None);
+        assert_eq!(Rgb::parse("rebeccapurple"), None);
+    }
 
     #[test]
     fn key_combo_parses_modifiers_and_key_case_insensitively() {

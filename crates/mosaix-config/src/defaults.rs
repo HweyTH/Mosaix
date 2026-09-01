@@ -11,7 +11,8 @@ use std::collections::BTreeMap;
 use mosaix_domain::Gaps;
 
 use crate::schema::{
-    BaseConfig, BehaviorSection, Command, KeyCombo, ResolvedConfig, CURRENT_VERSION,
+    BaseConfig, BehaviorSection, Command, FocusBorderSection, KeyCombo, ResolvedConfig,
+    CURRENT_VERSION,
 };
 use crate::validate::merge;
 
@@ -59,6 +60,7 @@ pub fn default_base_config() -> BaseConfig {
         hotkeys,
         gaps: Gaps::default(),
         behavior: BehaviorSection::default(),
+        focus_border: FocusBorderSection::default(),
     }
 }
 
