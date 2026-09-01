@@ -72,8 +72,8 @@ button { color: inherit; }
 
 .brand-block { position: absolute; z-index: 5; left: 28px; top: 24px; display: grid; grid-template-columns: 24px 1fr; grid-template-rows: 17px 12px; column-gap: 11px; }
 .brand-mark { grid-row: 1 / 3; width: 24px; height: 24px; display: grid; grid-template: repeat(2, 1fr) / repeat(2, 1fr); gap: 2px; transform: rotate(4deg); }
-.brand-mark i { border-radius: 2px; background: var(--accent); }
-.brand-mark i:nth-child(2), .brand-mark i:nth-child(3) { opacity: .5; }
+.brand-mark i { border-radius: 2px; background: var(--accent); opacity: .45; }
+.brand-mark i:nth-child(2) { opacity: 1; transform: translate(2px, -2px); }
 .brand-name { align-self: center; font-size: 17px; font-weight: 750; line-height: 1; letter-spacing: -.45px; }
 .brand-block small { align-self: end; color: var(--muted-2); font-size: 8px; font-weight: 700; letter-spacing: .15em; text-transform: uppercase; }
 
