@@ -18,10 +18,6 @@
 //! 0007).
 
 #[cfg(windows)]
-mod focus_border;
-#[cfg(windows)]
-mod focus_border_controller;
-#[cfg(windows)]
 mod hotkeys;
 #[cfg(windows)]
 mod overlay;
@@ -157,6 +153,21 @@ fn start_hotkeys_and_forward(
 }
 
 #[cfg(windows)]
+fn retry_empty_topology(mut displays: Vec<mosaix_domain::Display>) -> Vec<mosaix_domain::Display> {
+    const RETRIES: usize = 3;
+    const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
+    for attempt in 1..=RETRIES {
+        if !displays.is_empty() {
+            break;
+        }
+        tracing::warn!(attempt, "empty topology observation; retrying enumeration");
+        std::thread::sleep(RETRY_DELAY);
+        displays = mosaix_platform_windows::enumerate_displays().unwrap_or_default();
+    }
+    displays
+}
+
+#[cfg(windows)]
 fn main() {
     // Must happen before any window/monitor query.
     mosaix_platform_windows::enable_per_monitor_dpi_awareness()
@@ -265,6 +276,41 @@ fn main() {
         {
             tracing::error!("reducer stopped before startup reconciliation could be sent");
         }
+
+        // The engine otherwise only learns about focus from a
+        // foreground-*change* notification, so a freshly started agent has
+        // no focus anchor until the user next switches windows -- leaving
+        // directional focus/swap silent no-ops and the Focus border hidden
+        // while automatic tiling is already active.  Seed it from whatever
+        // owns the foreground right now, as an ordinary observation.
+        match mosaix_platform_windows::foreground_window_handle() {
+            Some(handle) => {
+                let window_id = mosaix_platform_windows::window_id_from_handle(handle);
+                match mosaix_platform_windows::observed_window_state(handle) {
+                    Some((display_id, bounds)) => {
+                        tracing::info!(?window_id, "seeding the initial focused window");
+                        if engine
+                            .events()
+                            .send(mosaix_engine::Event::WindowFocused {
+                                window_id,
+                                display_id,
+                                bounds,
+                            })
+                            .is_err()
+                        {
+                            tracing::error!(
+                                "reducer stopped before the initial focus could be sent"
+                            );
+                        }
+                    }
+                    None => tracing::debug!(
+                        ?window_id,
+                        "could not read bounds/display for the foreground window; not seeding focus"
+                    ),
+                }
+            }
+            None => tracing::debug!("no window owns the foreground at startup; not seeding focus"),
+        }
     }
 
     let ipc_server = match mosaix_ipc::IpcServer::start(engine.events(), engine.state_reader()) {
@@ -317,6 +363,7 @@ fn main() {
                 for event in topology_events {
                     match event {
                         mosaix_platform_windows::TopologyEvent::Changed(displays) => {
+                            let displays = retry_empty_topology(displays);
                             if events
                                 .send(mosaix_engine::Event::DisplayTopologyChanged(displays))
                                 .is_err()
@@ -334,32 +381,23 @@ fn main() {
                         // windows here because the platform layer's hidden
                         // window only sees display events, not window events.
                         mosaix_platform_windows::TopologyEvent::WakeFromSleep(displays) => {
+                            let displays = retry_empty_topology(displays);
                             let windows = match mosaix_platform_windows::enumerate_windows() {
-                                Ok(w) => w,
+                                Ok(w) => Some(w),
                                 Err(err) => {
-                                    tracing::error!(%err, "failed to enumerate windows after wake; sending display-only reconciliation");
-                                    Vec::new()
+                                    tracing::error!(%err, "failed to enumerate windows after wake; retaining the last window inventory");
+                                    None
                                 }
                             };
-                            let placements: Vec<_> = windows
-                                .iter()
-                                .filter_map(|window| {
-                                    let handle =
-                                        mosaix_platform_windows::window_handle_from_id(window.id);
-                                    let (display_id, bounds) =
-                                        mosaix_platform_windows::observed_window_state(handle)?;
-                                    Some((window.id, display_id, bounds))
-                                })
-                                .collect();
                             tracing::info!(
                                 display_count = displays.len(),
-                                window_count = placements.len(),
+                                window_count = windows.as_ref().map_or(0, Vec::len),
                                 "forwarding wake reconciliation to engine"
                             );
                             if events
                                 .send(mosaix_engine::Event::WakeReconciliation {
                                     displays,
-                                    windows: placements,
+                                    windows,
                                 })
                                 .is_err()
                             {
@@ -401,33 +439,133 @@ fn main() {
         }
     };
 
-    // Focus border (CONTEXT.md "Focus border"). A second overlay window
-    // rather than another mode of the preview controller: it is persistent,
-    // and the preview's modes deliberately preempt each other. It needs no
-    // feed from the forwarders below -- it watches engine state directly --
-    // so its sender stays main's alone. Failure degrades to no border.
-    let (focus_border_tx, focus_border_controller) =
-        match mosaix_platform_windows::start_focus_border_overlay() {
-            Ok(border) => {
-                let (tx, join_handle) = focus_border_controller::start_focus_border_controller(
-                    engine.state_reader(),
-                    border,
-                );
-                (Some(tx), Some(join_handle))
-            }
-            Err(err) => {
-                tracing::error!(
-                    %err,
-                    "failed to start focus border overlay; the focused window will not be outlined"
-                );
-                (None, None)
-            }
-        };
+    let focus_border_and_controller = match mosaix_platform_windows::start_focus_border() {
+        Ok(border) => {
+            let state_reader = engine.state_reader();
+            let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+            let controller = std::thread::spawn(move || {
+                const POLL: std::time::Duration = std::time::Duration::from_millis(50);
+                let mut last_visible: Option<(
+                    mosaix_domain::Rect,
+                    mosaix_platform_windows::FocusBorderStyle,
+                )> = None;
+                loop {
+                    match stop_rx.recv_timeout(POLL) {
+                        Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    }
+                    let state = state_reader.snapshot();
+                    let desired = if state.automatic_tiling_active
+                        && !state.paused
+                        && state.resolved_config.focus_border.enabled
+                    {
+                        state.focused_window.and_then(|window_id| {
+                            let managed = state.inventory.get(&window_id)?;
+                            // The inventory keeps minimized, hidden, and
+                            // cloaked windows -- they are temporarily
+                            // ineligible, not unmanaged -- so membership
+                            // alone would leave a border on bare desktop
+                            // after a minimize. Maximized and full-screen
+                            // are ineligible for a cell but plainly visible.
+                            if !matches!(
+                                managed.window.lifecycle,
+                                mosaix_domain::WindowLifecycle::Active
+                                    | mosaix_domain::WindowLifecycle::Maximized
+                                    | mosaix_domain::WindowLifecycle::Fullscreen
+                            ) {
+                                return None;
+                            }
+                            // The engine defers placement for a window being
+                            // dragged (ADR 0016), so anything drawn now would
+                            // trail it under the cursor until the drop.
+                            if state
+                                .interactive_placement
+                                .is_some_and(|session| session.window_id == window_id)
+                            {
+                                return None;
+                            }
+                            // `observed_bounds`, not `bounds`: the latter is
+                            // the placement Mosaix last *intended*, kept stale
+                            // on purpose so the engine can detect an external
+                            // move by comparing the two (ADR 0001). Drawing
+                            // from it leaves the border behind any window
+                            // something else repositioned.
+                            let bounds = state
+                                .windows
+                                .get(&window_id)
+                                .map(|placement| placement.observed_bounds)
+                                .unwrap_or(managed.window.bounds);
+                            let config = state.resolved_config.focus_border;
+                            let scale = state
+                                .displays
+                                .iter()
+                                .find(|display| display.id == managed.window.display_id)
+                                .map_or(1.0, |display| display.scale_factor);
+                            Some((
+                                bounds,
+                                mosaix_platform_windows::FocusBorderStyle {
+                                    red: config.color.red,
+                                    green: config.color.green,
+                                    blue: config.color.blue,
+                                    alpha: config.color.alpha,
+                                    thickness: (f64::from(config.thickness) * scale)
+                                        .round()
+                                        .clamp(1.0, f64::from(u16::MAX))
+                                        as u16,
+                                },
+                            ))
+                        })
+                    } else {
+                        None
+                    };
+                    if desired == last_visible {
+                        continue;
+                    }
+                    if let Some((bounds, style)) = desired {
+                        border.show(bounds, style);
+                    } else {
+                        border.hide();
+                    }
+                    last_visible = desired;
+                }
+                border.stop();
+            });
+            Some((stop_tx, controller))
+        }
+        Err(err) => {
+            tracing::error!(%err, "failed to start focus border; automatic tiling will continue without focus decoration");
+            None
+        }
+    };
 
     let event_hooks_and_forwarder = match mosaix_platform_windows::start_event_hooks() {
         Ok((hooks, raw_events)) => {
             let events = engine.events();
             let overlay_tx = overlay_tx.clone();
+            let (inventory_refresh_tx, inventory_refresh_rx) = std::sync::mpsc::sync_channel(1);
+            let inventory_events = events.clone();
+            let inventory_refresher = std::thread::spawn(move || {
+                const SETTLE: std::time::Duration = std::time::Duration::from_millis(50);
+                loop {
+                    if inventory_refresh_rx.recv().is_err() {
+                        break;
+                    }
+                    while inventory_refresh_rx.recv_timeout(SETTLE).is_ok() {}
+                    let windows = match mosaix_platform_windows::enumerate_windows() {
+                        Ok(windows) => windows,
+                        Err(err) => {
+                            tracing::debug!(%err, "could not refresh normalized window inventory");
+                            continue;
+                        }
+                    };
+                    if inventory_events
+                        .send(mosaix_engine::Event::WindowsObserved { windows })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            });
             let forwarder = std::thread::spawn(move || {
                 // Focus and location changes feed the engine; move/resize
                 // start/end feed the snap-preview drag controller (Feature 34).
@@ -435,23 +573,10 @@ fn main() {
                     match event {
                         mosaix_platform_windows::RawEvent::WindowCreated(_)
                         | mosaix_platform_windows::RawEvent::WindowDestroyed(_) => {
-                            // Hooks are hints; re-enumerate a complete
-                            // normalized batch so creation and destruction
-                            // update the engine-owned inventory together.
-                            let windows = match mosaix_platform_windows::enumerate_windows() {
-                                Ok(windows) => windows,
-                                Err(err) => {
-                                    tracing::debug!(%err, "could not refresh inventory after lifecycle event");
-                                    continue;
-                                }
-                            };
-                            if events
-                                .send(mosaix_engine::Event::WindowsObserved { windows })
-                                .is_err()
-                            {
-                                tracing::warn!("reducer stopped; lifecycle forwarder exiting");
-                                break;
-                            }
+                            // Coalesce noisy lifecycle bursts into one complete
+                            // authoritative observation and therefore one final
+                            // grid plan.
+                            let _ = inventory_refresh_tx.try_send(());
                         }
                         mosaix_platform_windows::RawEvent::Focused(handle) => {
                             let window_id = mosaix_platform_windows::window_id_from_handle(handle);
@@ -500,6 +625,7 @@ fn main() {
                                 );
                                 break;
                             }
+                            let _ = inventory_refresh_tx.try_send(());
                         }
                         mosaix_platform_windows::RawEvent::MoveResizeStart(handle) => {
                             let window_id = mosaix_platform_windows::window_id_from_handle(handle);
@@ -526,7 +652,7 @@ fn main() {
                     }
                 }
             });
-            Some((hooks, forwarder))
+            Some((hooks, forwarder, inventory_refresher))
         }
         Err(err) => {
             tracing::error!(%err, "failed to start OS event hooks; the agent will not observe focus changes");
@@ -647,11 +773,29 @@ fn main() {
                         window_id, bounds, ..
                     } = *effect
                     else {
-                        if let mosaix_engine::EngineEffect::FocusWindow { window_id } = *effect {
-                            if let Err(err) = mosaix_platform_windows::focus_window_by_id(window_id)
-                            {
-                                tracing::warn!(?window_id, %err, "failed to focus directional neighbor");
+                        match *effect {
+                            mosaix_engine::EngineEffect::FocusWindow { window_id } => {
+                                if let Err(err) =
+                                    mosaix_platform_windows::focus_window_by_id(window_id)
+                                {
+                                    tracing::warn!(?window_id, %err, "failed to focus directional neighbor");
+                                }
                             }
+                            mosaix_engine::EngineEffect::ReconcileWindows => {
+                                match mosaix_platform_windows::enumerate_windows() {
+                                    Ok(windows) => {
+                                        let _ = rejection_events.send(
+                                            mosaix_engine::Event::RearrangeReconciliationComplete {
+                                                windows,
+                                            },
+                                        );
+                                    }
+                                    Err(err) => {
+                                        tracing::warn!(%err, "rearrange could not enumerate windows");
+                                    }
+                                }
+                            }
+                            mosaix_engine::EngineEffect::PlaceWindow { .. } => unreachable!(),
                         }
                         continue;
                     };
@@ -702,7 +846,13 @@ fn main() {
                             );
                             let _ = rejection_events
                                 .send(mosaix_engine::Event::PlacementRejected { window_id });
+                        } else {
+                            let _ = rejection_events
+                                .send(mosaix_engine::Event::PlacementAccepted { window_id });
                         }
+                    } else {
+                        let _ = rejection_events
+                            .send(mosaix_engine::Event::PlacementRejected { window_id });
                     }
                 }
                 next_effect = snapshot.effects.len();
@@ -727,15 +877,24 @@ fn main() {
             let quit_tx = quit_tx.clone();
             let config_dir_for_tray = config_dir.clone();
             let tray_for_status = engine.state_reader();
-            // Status updates need the handle; share via a channel of bools
-            // that the forwarder pushes and a tiny status thread applies —
-            // simpler: keep handle in the forwarder and use a stop channel
-            // from main so console quit unblocks without hanging.
             let (tray_stop_tx, tray_stop_rx) = std::sync::mpsc::channel::<()>();
             let forwarder = std::thread::spawn(move || {
                 const TRAY_STATUS_POLL: std::time::Duration = std::time::Duration::from_millis(250);
-                let mut last_paused = state_reader.snapshot().paused;
-                tray.set_paused(last_paused);
+                let status_for = |state: &mosaix_engine::EngineState| {
+                    if state.paused {
+                        mosaix_platform_windows::TrayStatus::Paused
+                    } else if state.automatic_tiling_suspended {
+                        mosaix_platform_windows::TrayStatus::Suspended
+                    } else if state.automatic_tiling_active && state.circuit_breaker_count() > 0 {
+                        mosaix_platform_windows::TrayStatus::Degraded
+                    } else if state.automatic_tiling_active {
+                        mosaix_platform_windows::TrayStatus::Active
+                    } else {
+                        mosaix_platform_windows::TrayStatus::Manual
+                    }
+                };
+                let mut last_status = status_for(&state_reader.snapshot());
+                tray.set_status(last_status);
                 loop {
                     // Prefer an explicit stop from main (console quit path).
                     match tray_stop_rx.try_recv() {
@@ -780,10 +939,10 @@ fn main() {
                             break;
                         }
                         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                            let paused = tray_for_status.snapshot().paused;
-                            if paused != last_paused {
-                                tray.set_paused(paused);
-                                last_paused = paused;
+                            let status = status_for(&tray_for_status.snapshot());
+                            if status != last_status {
+                                tray.set_status(status);
+                                last_status = status;
                             }
                         }
                         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
@@ -826,6 +985,10 @@ fn main() {
         let _ = tray_stop_tx.send(());
         let _ = forwarder.join();
     }
+    if let Some((stop_tx, controller)) = focus_border_and_controller {
+        let _ = stop_tx.send(());
+        let _ = controller.join();
+    }
     if let Some((watcher, forwarder)) = watcher_and_forwarder {
         watcher.stop();
         let _ = forwarder.join();
@@ -834,9 +997,10 @@ fn main() {
         watcher.stop();
         let _ = forwarder.join();
     }
-    if let Some((hooks, forwarder)) = event_hooks_and_forwarder {
+    if let Some((hooks, forwarder, inventory_refresher)) = event_hooks_and_forwarder {
         hooks.stop();
         let _ = forwarder.join();
+        let _ = inventory_refresher.join();
     }
     let _ = hotkey_rebind_stop_tx.send(());
     let _ = hotkey_rebind_forwarder.join();
@@ -850,13 +1014,6 @@ fn main() {
     // is a shutdown that never completes rather than a graceful one.
     drop(overlay_tx);
     if let Some(join_handle) = overlay_controller {
-        let _ = join_handle.join();
-    }
-
-    // No clones of this one exist, so dropping main's sender is enough to
-    // end the controller's poll loop.
-    drop(focus_border_tx);
-    if let Some(join_handle) = focus_border_controller {
         let _ = join_handle.join();
     }
 

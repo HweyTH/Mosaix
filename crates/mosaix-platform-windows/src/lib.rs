@@ -42,7 +42,7 @@ pub use enumeration::enumerate_windows;
 #[cfg(windows)]
 pub use events::{start_event_hooks, EventHooks, RawEvent, WindowHandle};
 #[cfg(windows)]
-pub use focus_border::{start_focus_border_overlay, BorderPlacement, FocusBorderOverlay};
+pub use focus_border::{start_focus_border, FocusBorder, FocusBorderStyle};
 #[cfg(windows)]
 pub use hotkeys::{
     start_hotkeys, HotkeyBinding, HotkeyFired, HotkeyRegistrationResult, HotkeyRegistrations,
@@ -52,7 +52,7 @@ pub use overlay::{start_preview_overlay, PreviewOverlay};
 #[cfg(windows)]
 pub use shutdown::register_shutdown_signal;
 #[cfg(windows)]
-pub use tray::{start_tray, TrayEvent, TrayHandle};
+pub use tray::{start_tray, TrayEvent, TrayHandle, TrayStatus};
 
 #[cfg(windows)]
 use mosaix_domain::{DisplayId, Rect, WindowId};
@@ -66,8 +66,8 @@ use windows::Win32::UI::HiDpi::{
 };
 #[cfg(windows)]
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetCursorPos, GetWindowRect, IsWindow, SetForegroundWindow, SetWindowPos, SWP_NOACTIVATE,
-    SWP_NOZORDER,
+    GetCursorPos, GetForegroundWindow, GetWindowRect, IsWindow, SetForegroundWindow, SetWindowPos,
+    SWP_NOACTIVATE, SWP_NOZORDER,
 };
 
 #[cfg(windows)]
@@ -227,6 +227,35 @@ pub fn observed_window_state(handle: WindowHandle) -> Option<(DisplayId, Rect)> 
     Some((display_id, bounds))
 }
 
+/// Narrows a raw foreground `HWND` to a [`WindowHandle`], or `None` when
+/// nothing owns the foreground -- `GetForegroundWindow` legitimately
+/// returns a null handle when the foreground belongs to another desktop or
+/// is being switched. Split out from [`foreground_window_handle`] so the
+/// null guard is exercised without depending on which window happens to be
+/// foreground while the tests run.
+#[cfg(windows)]
+fn foreground_handle_from_hwnd(hwnd: HWND) -> Option<WindowHandle> {
+    if hwnd.0.is_null() {
+        None
+    } else {
+        Some(WindowHandle::from(hwnd))
+    }
+}
+
+/// The window that currently owns the foreground.
+///
+/// `EngineState::focused_window` is otherwise only ever written from a
+/// foreground-*change* notification, so without this the engine has no
+/// focus anchor between agent startup and whenever the user next switches
+/// windows -- which leaves directional focus/swap as silent no-ops and the
+/// Focus border hidden even though automatic tiling is active (spec #11
+/// user stories 39 and 43). `mosaix-agent` reads it once during startup
+/// reconciliation and feeds it in as an ordinary `Event::WindowFocused`.
+#[cfg(windows)]
+pub fn foreground_window_handle() -> Option<WindowHandle> {
+    foreground_handle_from_hwnd(unsafe { GetForegroundWindow() })
+}
+
 /// Returns `true` if the window's owning process is running elevated (as
 /// Administrator) or if the token cannot be inspected (which implies an
 /// elevated or protected process that Mosaix cannot manage regardless).
@@ -301,6 +330,24 @@ mod tests {
 
         assert_eq!(bounds, target);
         assert_eq!(Some(display_id), window_display_id(hwnd));
+
+        unsafe { DestroyWindow(hwnd) }.expect("cleanup should succeed");
+    }
+
+    #[test]
+    fn foreground_handle_narrows_a_real_window_and_rejects_a_null_foreground() {
+        let hwnd = create_test_window();
+
+        assert_eq!(
+            foreground_handle_from_hwnd(hwnd),
+            Some(WindowHandle::from(hwnd)),
+            "a real foreground window must become the engine's focus anchor"
+        );
+        assert_eq!(
+            foreground_handle_from_hwnd(HWND(std::ptr::null_mut())),
+            None,
+            "no window owning the foreground must not be reported as focused"
+        );
 
         unsafe { DestroyWindow(hwnd) }.expect("cleanup should succeed");
     }

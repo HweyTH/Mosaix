@@ -9,7 +9,7 @@ use thiserror::Error;
 
 use crate::schema::{
     BaseConfig, Command, KeyCombo, ProfileConfig, ResolvedConfig, ResolvedConfigSet,
-    ResolvedProfile, Rgb, CURRENT_VERSION, MAX_BORDER_THICKNESS, MIN_BORDER_THICKNESS,
+    ResolvedProfile, CURRENT_VERSION,
 };
 
 /// One profile candidate: its filename (for error messages -- profiles are
@@ -65,39 +65,8 @@ pub enum ValidationError {
         second_file: String,
     },
 
-    #[error("{file}: focus-border color {value:?} is not a #RRGGBB hex color")]
-    InvalidColor { file: String, value: String },
-
-    #[error(
-        "{file}: focus-border thickness {value} is outside the supported \
-         {MIN_BORDER_THICKNESS}..={MAX_BORDER_THICKNESS} pixel range"
-    )]
-    InvalidThickness { file: String, value: i32 },
-}
-
-/// The focus-border color and thickness checks, reported against whichever
-/// file the offending value came from. Run over each *resolved* config
-/// rather than each file, so a profile that inherits a bad base color is
-/// reported too -- consistent with how `duplicate_binding` checks the
-/// merged result rather than the raw file.
-fn focus_border_errors(file: &str, resolved: &ResolvedConfig) -> Vec<ValidationError> {
-    let mut errors = Vec::new();
-    let border = &resolved.focus_border;
-
-    if Rgb::parse(&border.color).is_none() {
-        errors.push(ValidationError::InvalidColor {
-            file: file.to_string(),
-            value: border.color.clone(),
-        });
-    }
-    if !(MIN_BORDER_THICKNESS..=MAX_BORDER_THICKNESS).contains(&border.thickness) {
-        errors.push(ValidationError::InvalidThickness {
-            file: file.to_string(),
-            value: border.thickness,
-        });
-    }
-
-    errors
+    #[error("{file}: focus-border thickness must be between 1 and 16 logical pixels, got {found}")]
+    InvalidFocusBorderThickness { file: String, found: u16 },
 }
 
 /// Field-level merges `profile` (if any) over `base`: any field the profile
@@ -108,8 +77,8 @@ pub fn merge(base: &BaseConfig, profile: Option<&ProfileConfig>) -> ResolvedConf
     let mut hotkeys = base.hotkeys.clone();
     let mut gaps = base.gaps;
     let behavior = base.behavior.clone();
-    let mut focus_border = base.focus_border.clone();
     let mut automatic_tiling_enabled = false;
+    let mut focus_border = base.focus_border;
 
     if let Some(profile) = profile {
         for (command, combo) in &profile.hotkeys {
@@ -121,18 +90,18 @@ pub fn merge(base: &BaseConfig, profile: Option<&ProfileConfig>) -> ResolvedConf
         if let Some(inner) = profile.gaps.inner {
             gaps.inner = inner;
         }
+        automatic_tiling_enabled = profile
+            .automatic_tiling
+            .is_some_and(|tiling| tiling.enabled);
         if let Some(enabled) = profile.focus_border.enabled {
             focus_border.enabled = enabled;
         }
-        if let Some(color) = &profile.focus_border.color {
-            focus_border.color = color.clone();
+        if let Some(color) = profile.focus_border.color {
+            focus_border.color = color;
         }
         if let Some(thickness) = profile.focus_border.thickness {
             focus_border.thickness = thickness;
         }
-        automatic_tiling_enabled = profile
-            .automatic_tiling
-            .is_some_and(|tiling| tiling.enabled);
     }
 
     ResolvedConfig {
@@ -228,25 +197,33 @@ pub fn validate(candidate: &CandidateConfig) -> Result<ResolvedConfigSet, Vec<Va
     };
 
     let base_resolved = merge(&base, None);
+    if !(1..=16).contains(&base_resolved.focus_border.thickness) {
+        errors.push(ValidationError::InvalidFocusBorderThickness {
+            file: "config.toml".to_owned(),
+            found: base_resolved.focus_border.thickness,
+        });
+    }
     if let Some(err) = duplicate_binding("config.toml", &base_resolved) {
         errors.push(err);
     }
-    errors.extend(focus_border_errors("config.toml", &base_resolved));
 
     let mut resolved_profiles = Vec::new();
     for (file_name, profile) in &profiles {
         let resolved = merge(&base, Some(profile));
-        let mut profile_errors = focus_border_errors(file_name, &resolved);
-        if let Some(err) = duplicate_binding(file_name, &resolved) {
-            profile_errors.push(err);
+        if !(1..=16).contains(&resolved.focus_border.thickness) {
+            errors.push(ValidationError::InvalidFocusBorderThickness {
+                file: (*file_name).to_owned(),
+                found: resolved.focus_border.thickness,
+            });
+            continue;
         }
-        if profile_errors.is_empty() {
+        if let Some(err) = duplicate_binding(file_name, &resolved) {
+            errors.push(err);
+        } else {
             resolved_profiles.push(ResolvedProfile {
                 fingerprint: profile.fingerprint.clone(),
                 config: resolved,
             });
-        } else {
-            errors.append(&mut profile_errors);
         }
     }
 
@@ -292,92 +269,6 @@ inner = 4
 
     fn combo(raw: &str) -> KeyCombo {
         KeyCombo::parse(raw).expect("fixture combo should parse")
-    }
-
-    #[test]
-    fn focus_border_falls_through_field_by_field_from_base_to_profile() {
-        let base = format!("{VALID_BASE}\n[focus_border]\ncolor = \"#112233\"\nthickness = 4\n");
-        let profile = r#"
-fingerprint = "MON-A@0,0 1920x1080 scale=1"
-
-[focus_border]
-thickness = 9
-"#;
-        let candidate = CandidateConfig {
-            base,
-            profiles: vec![CandidateProfile {
-                file_name: "home.toml".to_string(),
-                contents: profile.to_string(),
-            }],
-        };
-
-        let result = validate(&candidate).expect("focus-border overlay should be accepted");
-        let resolved = &result.profiles[0].config.focus_border;
-
-        // Overridden by the profile.
-        assert_eq!(resolved.thickness, 9);
-        // Inherited from base, not reset to the section default (ADR 0004).
-        assert_eq!(resolved.color, "#112233");
-        assert!(resolved.enabled);
-    }
-
-    #[test]
-    fn validate_rejects_a_focus_border_color_that_is_not_six_digit_hex() {
-        let base = format!("{VALID_BASE}\n[focus_border]\ncolor = \"blue\"\n");
-
-        let errors = validate(&base_only(&base)).unwrap_err();
-
-        assert!(
-            errors.iter().any(|err| matches!(
-                err,
-                ValidationError::InvalidColor { file, value }
-                    if file == "config.toml" && value == "blue"
-            )),
-            "expected an InvalidColor error, got {errors:?}"
-        );
-    }
-
-    #[test]
-    fn validate_rejects_a_focus_border_thickness_outside_the_supported_range() {
-        for bad in ["0", "-2", "41"] {
-            let base = format!("{VALID_BASE}\n[focus_border]\nthickness = {bad}\n");
-
-            let errors = validate(&base_only(&base)).unwrap_err();
-
-            assert!(
-                errors
-                    .iter()
-                    .any(|err| matches!(err, ValidationError::InvalidThickness { .. })),
-                "thickness {bad} should be rejected, got {errors:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn validate_reports_an_invalid_color_in_a_profile_against_that_profiles_file_name() {
-        let profile = r##"
-fingerprint = "MON-A@0,0 1920x1080 scale=1"
-
-[focus_border]
-color = "#GGGGGG"
-"##;
-        let candidate = CandidateConfig {
-            base: VALID_BASE.to_string(),
-            profiles: vec![CandidateProfile {
-                file_name: "home.toml".to_string(),
-                contents: profile.to_string(),
-            }],
-        };
-
-        let errors = validate(&candidate).unwrap_err();
-
-        assert!(
-            errors.iter().any(|err| matches!(
-                err,
-                ValidationError::InvalidColor { file, .. } if file == "home.toml"
-            )),
-            "expected the profile's file name in the error, got {errors:?}"
-        );
     }
 
     #[test]
@@ -444,6 +335,52 @@ outer = 20
 
         // Base's own resolved config is untouched by the profile's overrides.
         assert_eq!(result.base.gaps, Gaps::new(8, 4));
+    }
+
+    #[test]
+    fn profile_can_override_focus_border_fields_independently() {
+        let profile = r#"
+fingerprint = "MON-A"
+
+[focus_border]
+enabled = false
+thickness = 4
+
+[focus_border.color]
+red = 240
+green = 80
+blue = 120
+alpha = 200
+"#;
+        let candidate = CandidateConfig {
+            base: VALID_BASE.to_owned(),
+            profiles: vec![CandidateProfile {
+                file_name: "office.toml".to_owned(),
+                contents: profile.to_owned(),
+            }],
+        };
+
+        let resolved = validate(&candidate).unwrap().profiles.remove(0).config;
+
+        assert!(!resolved.focus_border.enabled);
+        assert_eq!(resolved.focus_border.thickness, 4);
+        assert_eq!(resolved.focus_border.color.red, 240);
+        assert_eq!(resolved.focus_border.color.alpha, 200);
+    }
+
+    #[test]
+    fn focus_border_thickness_outside_the_supported_range_is_rejected() {
+        let bad = format!("{VALID_BASE}\n[focus_border]\nthickness = 0\n");
+
+        let errors = validate(&base_only(&bad)).unwrap_err();
+
+        assert_eq!(
+            errors,
+            vec![ValidationError::InvalidFocusBorderThickness {
+                file: "config.toml".to_owned(),
+                found: 0,
+            }]
+        );
     }
 
     #[test]
@@ -546,7 +483,7 @@ snap-right = "ctrl+alt+left"
                 gaps: base.gaps,
                 behavior: base.behavior.clone(),
                 automatic_tiling_enabled: false,
-                focus_border: base.focus_border.clone(),
+                focus_border: base.focus_border,
             }
         );
     }

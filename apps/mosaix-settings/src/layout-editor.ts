@@ -31,11 +31,24 @@ export interface CommandReceipt {
   status: "previewing" | "applied";
 }
 
+export interface AutomaticTilingSettings {
+  topologyFingerprint: string;
+  matchedProfile: boolean;
+  enabled: boolean;
+  outerGap: number;
+  innerGap: number;
+  focusBorderEnabled: boolean;
+  focusBorderColor: string;
+  focusBorderThickness: number;
+}
+
 export interface DesktopBridge {
   loadEditorSnapshot(): Promise<EditorSnapshot>;
   previewLayout(draft: LayoutDraft): Promise<CommandReceipt>;
   saveAndApplyLayout(draft: LayoutDraft): Promise<CommandReceipt>;
   setAppearance(appearance: Appearance): Promise<void>;
+  loadAutomaticTilingSettings(): Promise<AutomaticTilingSettings>;
+  saveAutomaticTilingSettings(settings: AutomaticTilingSettings): Promise<AutomaticTilingSettings>;
 }
 
 function escapeHtml(value: string): string {
@@ -62,7 +75,11 @@ function renderZones(snapshot: EditorSnapshot, selectedZoneId: number): string {
 }
 
 export async function mountLayoutEditor(root: HTMLElement, bridge: DesktopBridge): Promise<void> {
-  const snapshot = await bridge.loadEditorSnapshot();
+  const [snapshot, initialTilingSettings] = await Promise.all([
+    bridge.loadEditorSnapshot(),
+    bridge.loadAutomaticTilingSettings(),
+  ]);
+  let tilingSettings = initialTilingSettings;
   let selectedZoneId = snapshot.draft.zones[0]?.id ?? 0;
   let commandStatus = "Ready";
   const history: LayoutDraft[] = [];
@@ -100,6 +117,18 @@ export async function mountLayoutEditor(root: HTMLElement, bridge: DesktopBridge
           </div>
           <div class="monitor-foot"><span></span><i></i><span></span></div>
         </section>
+        <aside class="tiling-settings" aria-label="Automatic tiling settings">
+          <div class="panel-title">AUTOMATIC TILING</div>
+          <p><small>Current topology</small><br><code data-topology-fingerprint>${escapeHtml(tilingSettings.topologyFingerprint)}</code></p>
+          <p data-profile-status>${tilingSettings.matchedProfile ? "Matched topology profile" : "No profile yet — saving creates one"}</p>
+          <label class="toggle-line"><span>Balanced grid<small>Enable for this whole topology</small></span><input data-auto-tiling type="checkbox" ${tilingSettings.enabled ? "checked" : ""} /></label>
+          <label class="field"><span>Outer gap</span><input data-outer-gap type="number" min="0" max="256" value="${tilingSettings.outerGap}" /></label>
+          <label class="field"><span>Inner gap</span><input data-inner-gap type="number" min="0" max="256" value="${tilingSettings.innerGap}" /></label>
+          <label class="toggle-line"><span>Focus border</span><input data-border-enabled type="checkbox" ${tilingSettings.focusBorderEnabled ? "checked" : ""} /></label>
+          <label class="field"><span>RGBA color</span><input data-border-color value="${escapeHtml(tilingSettings.focusBorderColor)}" pattern="#[0-9A-Fa-f]{8}" /></label>
+          <label class="field"><span>Thickness</span><input data-border-thickness type="number" min="1" max="16" value="${tilingSettings.focusBorderThickness}" /></label>
+          <button class="primary-button" data-save-tiling>Save tiling settings</button>
+        </aside>
         ${selectedZone ? `
           <aside class="properties" aria-label="Zone properties">
             <div class="panel-title">ZONE ${String(selectedZone.id).padStart(2, "0")}</div>
@@ -126,6 +155,35 @@ export async function mountLayoutEditor(root: HTMLElement, bridge: DesktopBridge
     root.querySelectorAll<HTMLElement>("[data-zone]").forEach((zone) => {
       zone.addEventListener("click", () => {
         selectedZoneId = Number(zone.dataset.zone);
+        render();
+      });
+    });
+    root.querySelector<HTMLInputElement>("[data-auto-tiling]")?.addEventListener("change", (event) => {
+      tilingSettings.enabled = (event.currentTarget as HTMLInputElement).checked;
+    });
+    root.querySelector<HTMLInputElement>("[data-outer-gap]")?.addEventListener("change", (event) => {
+      tilingSettings.outerGap = Number((event.currentTarget as HTMLInputElement).value);
+    });
+    root.querySelector<HTMLInputElement>("[data-inner-gap]")?.addEventListener("change", (event) => {
+      tilingSettings.innerGap = Number((event.currentTarget as HTMLInputElement).value);
+    });
+    root.querySelector<HTMLInputElement>("[data-border-enabled]")?.addEventListener("change", (event) => {
+      tilingSettings.focusBorderEnabled = (event.currentTarget as HTMLInputElement).checked;
+    });
+    root.querySelector<HTMLInputElement>("[data-border-color]")?.addEventListener("change", (event) => {
+      tilingSettings.focusBorderColor = (event.currentTarget as HTMLInputElement).value;
+    });
+    root.querySelector<HTMLInputElement>("[data-border-thickness]")?.addEventListener("change", (event) => {
+      tilingSettings.focusBorderThickness = Number((event.currentTarget as HTMLInputElement).value);
+    });
+    root.querySelector<HTMLElement>("[data-save-tiling]")?.addEventListener("click", () => {
+      commandStatus = "Saving tiling settings…";
+      void bridge.saveAutomaticTilingSettings(structuredClone(tilingSettings)).then((saved) => {
+        tilingSettings = saved;
+        commandStatus = "Automatic tiling settings saved";
+        render();
+      }).catch((error: unknown) => {
+        commandStatus = `Tiling settings failed · ${String(error)}`;
         render();
       });
     });

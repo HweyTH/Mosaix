@@ -11,8 +11,7 @@ use std::collections::BTreeMap;
 use mosaix_domain::Gaps;
 
 use crate::schema::{
-    BaseConfig, BehaviorSection, Command, FocusBorderSection, KeyCombo, ResolvedConfig,
-    CURRENT_VERSION,
+    BaseConfig, BehaviorSection, Command, KeyCombo, ResolvedConfig, CURRENT_VERSION,
 };
 use crate::validate::merge;
 
@@ -60,7 +59,7 @@ pub fn default_base_config() -> BaseConfig {
         hotkeys,
         gaps: Gaps::default(),
         behavior: BehaviorSection::default(),
-        focus_border: FocusBorderSection::default(),
+        focus_border: crate::schema::FocusBorderSection::default(),
     }
 }
 
@@ -109,6 +108,9 @@ mod tests {
             Some(&arrow_combo("DOWN"))
         );
         assert_eq!(base.gaps, Gaps::default());
+        assert!(base.focus_border.enabled);
+        assert_eq!(base.focus_border.color, crate::schema::RgbaColor::default());
+        assert_eq!(base.focus_border.thickness, 2);
         assert_eq!(
             base.hotkeys.get(&Command::Rearrange),
             Some(&arrow_combo("R"))

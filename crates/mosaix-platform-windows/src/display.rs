@@ -402,4 +402,28 @@ mod tests {
 
         watcher.stop();
     }
+
+    #[test]
+    fn topology_watcher_translates_resume_power_broadcast() {
+        let (watcher, rx) = watch_display_topology().expect("watcher should start");
+
+        unsafe {
+            let _ = PostMessageW(watcher.hwnd(), WM_POWERBROADCAST, WPARAM(0x0012), LPARAM(0));
+        }
+
+        let event = rx
+            .recv_timeout(std::time::Duration::from_secs(4))
+            .expect("expected a wake event after PBT_APMRESUMEAUTOMATIC");
+        match event {
+            TopologyEvent::WakeFromSleep(displays) => assert!(
+                !displays.is_empty(),
+                "wake translation should carry a fresh usable topology"
+            ),
+            TopologyEvent::Changed(_) => {
+                panic!("expected WakeFromSleep after a resume power broadcast")
+            }
+        }
+
+        watcher.stop();
+    }
 }

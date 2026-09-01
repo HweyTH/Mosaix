@@ -35,7 +35,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use crate::{Result, WindowError};
 
 const WM_TRAYICON: u32 = WM_APP + 50;
-const WM_SET_PAUSED: u32 = WM_APP + 51;
+const WM_SET_STATUS: u32 = WM_APP + 51;
 
 const TRAY_UID: u32 = 1;
 const IDM_TOGGLE_PAUSE: usize = 1001;
@@ -50,20 +50,43 @@ pub enum TrayEvent {
     Quit,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(usize)]
+pub enum TrayStatus {
+    Manual = 0,
+    Active = 1,
+    Degraded = 2,
+    Suspended = 3,
+    Paused = 4,
+}
+
+impl TrayStatus {
+    fn from_usize(value: usize) -> Self {
+        match value {
+            1 => Self::Active,
+            2 => Self::Degraded,
+            3 => Self::Suspended,
+            4 => Self::Paused,
+            _ => Self::Manual,
+        }
+    }
+}
+
 thread_local! {
     static TRAY_SENDER: RefCell<Option<Sender<TrayEvent>>> = const { RefCell::new(None) };
-    static TRAY_PAUSED: RefCell<bool> = const { RefCell::new(false) };
-    static TRAY_ICON_RUNNING: RefCell<Option<HICON>> = const { RefCell::new(None) };
-    static TRAY_ICON_PAUSED: RefCell<Option<HICON>> = const { RefCell::new(None) };
+    static TRAY_STATUS: RefCell<TrayStatus> = const { RefCell::new(TrayStatus::Manual) };
+    static TRAY_ICONS: RefCell<[Option<HICON>; 5]> = const { RefCell::new([None; 5]) };
     static TRAY_HWND: RefCell<Option<HWND>> = const { RefCell::new(None) };
     static TASKBAR_CREATED_MSG: RefCell<u32> = const { RefCell::new(0) };
 }
 
-fn tip_for(paused: bool) -> [u16; 128] {
-    let text = if paused {
-        "Mosaix — Paused"
-    } else {
-        "Mosaix — Running"
+fn tip_for(status: TrayStatus) -> [u16; 128] {
+    let text = match status {
+        TrayStatus::Manual => "Mosaix — Manual",
+        TrayStatus::Active => "Mosaix — Automatic tiling active",
+        TrayStatus::Degraded => "Mosaix — Automatic tiling degraded",
+        TrayStatus::Suspended => "Mosaix — Automatic tiling suspended",
+        TrayStatus::Paused => "Mosaix — Paused",
     };
     let mut buf = [0u16; 128];
     for (i, c) in text.encode_utf16().take(127).enumerate() {
@@ -72,40 +95,39 @@ fn tip_for(paused: bool) -> [u16; 128] {
     buf
 }
 
-fn current_icon(paused: bool) -> HICON {
-    if paused {
-        TRAY_ICON_PAUSED.with(|c| c.borrow().unwrap_or_else(stock_icon))
-    } else {
-        TRAY_ICON_RUNNING.with(|c| c.borrow().unwrap_or_else(stock_icon))
-    }
+fn current_icon(status: TrayStatus) -> HICON {
+    TRAY_ICONS.with(|icons| icons.borrow()[status as usize].unwrap_or_else(stock_icon))
 }
 
 fn stock_icon() -> HICON {
     unsafe { LoadIconW(None, IDI_APPLICATION) }.unwrap_or(HICON(std::ptr::null_mut()))
 }
 
-fn notify_data(hwnd: HWND, paused: bool) -> NOTIFYICONDATAW {
-    let mut data = NOTIFYICONDATAW::default();
-    data.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
-    data.hWnd = hwnd;
-    data.uID = TRAY_UID;
-    data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
-    data.uCallbackMessage = WM_TRAYICON;
-    data.hIcon = current_icon(paused);
-    data.szTip = tip_for(paused);
-    data
+fn notify_data(hwnd: HWND, status: TrayStatus) -> NOTIFYICONDATAW {
+    NOTIFYICONDATAW {
+        cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+        hWnd: hwnd,
+        uID: TRAY_UID,
+        uFlags: NIF_MESSAGE | NIF_ICON | NIF_TIP,
+        uCallbackMessage: WM_TRAYICON,
+        hIcon: current_icon(status),
+        szTip: tip_for(status),
+        ..Default::default()
+    }
 }
 
-fn add_or_modify(hwnd: HWND, paused: bool, message: NOTIFY_ICON_MESSAGE) {
-    let data = notify_data(hwnd, paused);
+fn add_or_modify(hwnd: HWND, status: TrayStatus, message: NOTIFY_ICON_MESSAGE) {
+    let data = notify_data(hwnd, status);
     let _ = unsafe { Shell_NotifyIconW(message, &data) };
 }
 
 fn delete_icon(hwnd: HWND) {
-    let mut data = NOTIFYICONDATAW::default();
-    data.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
-    data.hWnd = hwnd;
-    data.uID = TRAY_UID;
+    let data = NOTIFYICONDATAW {
+        cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+        hWnd: hwnd,
+        uID: TRAY_UID,
+        ..Default::default()
+    };
     let _ = unsafe { Shell_NotifyIconW(NIM_DELETE, &data) };
 }
 
@@ -188,7 +210,7 @@ fn create_status_icon(color: COLORREF) -> Option<HICON> {
 }
 
 fn show_context_menu(hwnd: HWND) {
-    let paused = TRAY_PAUSED.with(|c| *c.borrow());
+    let paused = TRAY_STATUS.with(|c| *c.borrow() == TrayStatus::Paused);
     let menu = match unsafe { CreatePopupMenu() } {
         Ok(m) => m,
         Err(_) => return,
@@ -265,8 +287,8 @@ unsafe extern "system" fn tray_wndproc(
 ) -> LRESULT {
     let taskbar_created = TASKBAR_CREATED_MSG.with(|c| *c.borrow());
     if taskbar_created != 0 && msg == taskbar_created {
-        let paused = TRAY_PAUSED.with(|c| *c.borrow());
-        add_or_modify(hwnd, paused, NIM_ADD);
+        let status = TRAY_STATUS.with(|c| *c.borrow());
+        add_or_modify(hwnd, status, NIM_ADD);
         return LRESULT(0);
     }
 
@@ -278,10 +300,10 @@ unsafe extern "system" fn tray_wndproc(
             }
             LRESULT(0)
         }
-        WM_SET_PAUSED => {
-            let paused = wparam.0 != 0;
-            TRAY_PAUSED.with(|c| *c.borrow_mut() = paused);
-            add_or_modify(hwnd, paused, NIM_MODIFY);
+        WM_SET_STATUS => {
+            let status = TrayStatus::from_usize(wparam.0);
+            TRAY_STATUS.with(|cell| *cell.borrow_mut() = status);
+            add_or_modify(hwnd, status, NIM_MODIFY);
             LRESULT(0)
         }
         WM_COMMAND => {
@@ -353,20 +375,23 @@ pub struct TrayHandle {
 }
 
 impl TrayHandle {
-    /// Updates the tray icon and tooltip to reflect `paused`.
-    pub fn set_paused(&self, paused: bool) {
+    pub fn set_status(&self, status: TrayStatus) {
         if self.stopped.load(Ordering::Relaxed) {
             return;
         }
         let hwnd = HWND(self.hwnd as *mut _);
         unsafe {
-            let _ = PostMessageW(
-                hwnd,
-                WM_SET_PAUSED,
-                WPARAM(if paused { 1 } else { 0 }),
-                LPARAM(0),
-            );
+            let _ = PostMessageW(hwnd, WM_SET_STATUS, WPARAM(status as usize), LPARAM(0));
         }
+    }
+
+    /// Compatibility helper for callers that only know global pause state.
+    pub fn set_paused(&self, paused: bool) {
+        self.set_status(if paused {
+            TrayStatus::Paused
+        } else {
+            TrayStatus::Manual
+        });
     }
 
     /// Stops the tray thread and waits for it to exit.
@@ -403,11 +428,17 @@ pub fn start_tray() -> Result<(TrayHandle, Receiver<TrayEvent>)> {
     let join_handle = thread::spawn(move || {
         TRAY_SENDER.with(|s| *s.borrow_mut() = Some(tx));
 
-        // Accent blue (BGR) for running; muted gray for paused.
-        let running = create_status_icon(COLORREF(0x00_D7_78_00));
-        let paused_icon = create_status_icon(COLORREF(0x00_80_80_80));
-        TRAY_ICON_RUNNING.with(|c| *c.borrow_mut() = running);
-        TRAY_ICON_PAUSED.with(|c| *c.borrow_mut() = paused_icon);
+        // BGR colors: gray manual, blue active, orange degraded, gold
+        // suspended, and muted red paused.
+        TRAY_ICONS.with(|icons| {
+            *icons.borrow_mut() = [
+                create_status_icon(COLORREF(0x00_80_80_80)),
+                create_status_icon(COLORREF(0x00_D7_78_00)),
+                create_status_icon(COLORREF(0x00_00_78_E8)),
+                create_status_icon(COLORREF(0x00_00_B8_D8)),
+                create_status_icon(COLORREF(0x00_55_55_C0)),
+            ];
+        });
 
         let taskbar_msg = unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) };
         TASKBAR_CREATED_MSG.with(|c| *c.borrow_mut() = taskbar_msg);
@@ -420,7 +451,7 @@ pub fn start_tray() -> Result<(TrayHandle, Receiver<TrayEvent>)> {
             }
         };
         TRAY_HWND.with(|c| *c.borrow_mut() = Some(hwnd));
-        add_or_modify(hwnd, false, NIM_ADD);
+        add_or_modify(hwnd, TrayStatus::Manual, NIM_ADD);
 
         let thread_id = unsafe { GetCurrentThreadId() };
         let _ = ready_tx.send(Ok((thread_id, hwnd.0 as isize)));
@@ -441,17 +472,12 @@ pub fn start_tray() -> Result<(TrayHandle, Receiver<TrayEvent>)> {
         unsafe {
             let _ = DestroyWindow(hwnd);
         }
-        TRAY_ICON_RUNNING.with(|c| {
-            if let Some(icon) = c.borrow_mut().take() {
-                if !icon.is_invalid() {
-                    let _ = unsafe { DestroyIcon(icon) };
-                }
-            }
-        });
-        TRAY_ICON_PAUSED.with(|c| {
-            if let Some(icon) = c.borrow_mut().take() {
-                if !icon.is_invalid() {
-                    let _ = unsafe { DestroyIcon(icon) };
+        TRAY_ICONS.with(|icons| {
+            for icon in icons.borrow_mut().iter_mut() {
+                if let Some(icon) = icon.take() {
+                    if !icon.is_invalid() {
+                        let _ = unsafe { DestroyIcon(icon) };
+                    }
                 }
             }
         });

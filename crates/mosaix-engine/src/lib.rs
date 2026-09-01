@@ -76,6 +76,8 @@ pub enum EngineEffect {
     FocusWindow {
         window_id: WindowId,
     },
+    /// Requests a fresh native display/window observation before recovery.
+    ReconcileWindows,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,6 +96,7 @@ pub enum EligibilityReason {
     Eligible,
     FloatingRule,
     NotTileable,
+    Elevated,
     Minimized,
     Maximized,
     Fullscreen,
@@ -460,7 +463,7 @@ pub enum Event {
     ///      doesn't know about yet.
     WakeReconciliation {
         displays: Vec<Display>,
-        windows: Vec<(WindowId, DisplayId, Rect)>,
+        windows: Option<Vec<Window>>,
     },
 
     /// The platform reported that the `SetWindowPos` call for `window_id`
@@ -476,10 +479,21 @@ pub enum Event {
         window_id: WindowId,
     },
 
+    /// Confirms a placement settled within tolerance and therefore breaks a
+    /// rejection streak without changing the committed geometry.
+    PlacementAccepted {
+        window_id: WindowId,
+    },
+
     /// Clears every open placement circuit once and performs one fresh Grid
     /// reflow. The agent performs its native display/window enumeration before
     /// sending this recovery request.
     RearrangeRequested,
+
+    /// Native observations collected in response to [`EngineEffect::ReconcileWindows`].
+    RearrangeReconciliationComplete {
+        windows: Vec<Window>,
+    },
 
     /// A complete normalized observation batch. It is authoritative for the
     /// observed windows: missing entries are removed, and `Exclude` results
@@ -505,10 +519,12 @@ fn apply(state: &mut EngineState, event: Event) {
                 tracing::warn!("empty display observation; retaining last usable topology");
                 return;
             }
-            if topology_fingerprint(&displays) == topology_fingerprint(&state.displays) {
-                tracing::debug!("display topology event was not a real change; ignoring");
+            if displays == state.displays {
+                tracing::debug!("display topology snapshot was unchanged; ignoring");
                 return;
             }
+            let topology_identity_changed =
+                topology_fingerprint(&displays) != topology_fingerprint(&state.displays);
             tracing::info!(display_count = displays.len(), "display topology changed");
             // Feature 30 — display hotplug: migrate windows whose previous
             // display is no longer present in the new topology to the nearest
@@ -518,9 +534,11 @@ fn apply(state: &mut EngineState, event: Event) {
             state.deferred_reflow_displays.clear();
             migrate_orphaned_windows(state, &displays);
             state.displays = displays;
-            state.resolved_config = select_resolved_config(&state.config_set, &state.displays);
-            state.automatic_tiling_suspended = false;
-            state.automatic_tiling_active = state.resolved_config.automatic_tiling_enabled;
+            if topology_identity_changed {
+                state.resolved_config = select_resolved_config(&state.config_set, &state.displays);
+                state.automatic_tiling_suspended = false;
+                state.automatic_tiling_active = state.resolved_config.automatic_tiling_enabled;
+            }
             reconcile_balanced_grids(state);
             state.revision += 1;
         }
@@ -771,6 +789,9 @@ fn apply(state: &mut EngineState, event: Event) {
             }
             tracing::info!("resolved config changed");
             state.resolved_config = select_resolved_config(&config_set, &state.displays);
+            if !state.resolved_config.automatic_tiling_enabled {
+                state.automatic_tiling_suspended = false;
+            }
             state.automatic_tiling_active =
                 state.resolved_config.automatic_tiling_enabled && !state.automatic_tiling_suspended;
             state.config_set = config_set;
@@ -795,6 +816,7 @@ fn apply(state: &mut EngineState, event: Event) {
             }
             tracing::info!("window management resumed");
             state.paused = false;
+            reconcile_balanced_grids(state);
             state.revision += 1;
         }
 
@@ -962,7 +984,7 @@ fn apply(state: &mut EngineState, event: Event) {
         Event::WakeReconciliation { displays, windows } => {
             tracing::info!(
                 display_count = displays.len(),
-                window_count = windows.len(),
+                window_count = windows.as_ref().map_or(0, Vec::len),
                 "wake reconciliation starting"
             );
             // Step 1: migrate orphaned windows using the old topology before
@@ -977,22 +999,15 @@ fn apply(state: &mut EngineState, event: Event) {
                 state.automatic_tiling_suspended = false;
                 state.automatic_tiling_active = state.resolved_config.automatic_tiling_enabled;
             }
-            // Step 2: bulk-register any newly observed windows.
-            let mut registered = 0usize;
-            for (window_id, display_id, bounds) in windows {
-                state.windows.entry(window_id).or_insert_with(|| {
-                    registered += 1;
-                    WindowPlacement {
-                        display_id,
-                        bounds,
-                        observed_bounds: bounds,
-                        previous_placement: None,
-                        cycle_step: None,
-                        rejection_count: 0,
-                    }
-                });
+            if let Some(windows) = windows {
+                state.observed_windows = windows
+                    .iter()
+                    .cloned()
+                    .map(|window| (window.id, window))
+                    .collect();
+                replace_inventory_from_observations(state, windows);
             }
-            tracing::info!(registered, "wake reconciliation complete");
+            tracing::info!("wake reconciliation complete");
             reconcile_balanced_grids(state);
             state.revision += 1;
         }
@@ -1031,7 +1046,32 @@ fn apply(state: &mut EngineState, event: Event) {
             }
         }
 
+        Event::PlacementAccepted { window_id } => {
+            let Some(placement) = state.windows.get_mut(&window_id) else {
+                return;
+            };
+            if placement.rejection_count == 0 {
+                return;
+            }
+            placement.rejection_count = 0;
+            if let Some(managed) = state.inventory.get_mut(&window_id) {
+                managed.eligibility = eligibility_for(&managed.window, managed.action, false);
+            }
+            state.revision += 1;
+        }
+
         Event::RearrangeRequested => {
+            state.effects.push(EngineEffect::ReconcileWindows);
+            state.revision += 1;
+        }
+
+        Event::RearrangeReconciliationComplete { windows } => {
+            state.observed_windows = windows
+                .iter()
+                .cloned()
+                .map(|window| (window.id, window))
+                .collect();
+            replace_inventory_from_observations(state, windows);
             let mut reset = 0usize;
             for placement in state.windows.values_mut() {
                 if placement.circuit_open() {
@@ -1050,6 +1090,18 @@ fn apply(state: &mut EngineState, event: Event) {
         }
 
         Event::WindowsObserved { windows } => {
+            if state.automatic_tiling_active {
+                for window in &windows {
+                    let was_tiled_and_normal =
+                        state.inventory.get(&window.id).is_some_and(|managed| {
+                            managed.action == ManageAction::Tile
+                                && managed.window.lifecycle != WindowLifecycle::Maximized
+                        });
+                    if was_tiled_and_normal && window.lifecycle == WindowLifecycle::Maximized {
+                        state.session_floating.insert(window.id);
+                    }
+                }
+            }
             state.observed_windows = windows
                 .iter()
                 .cloned()
@@ -1077,6 +1129,9 @@ fn eligibility_for(window: &Window, action: ManageAction, circuit_open: bool) ->
     }
     if !window.capabilities.is_tileable() {
         return EligibilityReason::NotTileable;
+    }
+    if window.elevated {
+        return EligibilityReason::Elevated;
     }
     if circuit_open {
         return EligibilityReason::CircuitOpen;
@@ -1207,12 +1262,20 @@ fn replace_inventory_from_observations(state: &mut EngineState, observed: Vec<Wi
             },
         );
     }
-    if next == state.inventory {
-        false
-    } else {
-        state.inventory = next;
-        true
+    let inventory_changed = next != state.inventory;
+    let managed_ids: HashSet<_> = next.keys().copied().collect();
+    let placements_changed = state.windows.keys().any(|id| !managed_ids.contains(id));
+    state.windows.retain(|id, _| managed_ids.contains(id));
+    state.session_floating.retain(|id| managed_ids.contains(id));
+    state.session_tiled.retain(|id| managed_ids.contains(id));
+    if state
+        .focused_window
+        .is_some_and(|id| !managed_ids.contains(&id))
+    {
+        state.focused_window = None;
     }
+    state.inventory = next;
+    inventory_changed || placements_changed
 }
 
 /// Updates visual order and emits one final Balanced-grid plan per affected
@@ -1795,6 +1858,31 @@ mod tests {
 
         assert_eq!(state.revision, 2);
         assert_eq!(state.displays.len(), 2);
+    }
+
+    #[test]
+    fn work_area_change_reflows_without_clearing_tiling_suspension() {
+        let mut state = EngineState {
+            displays: vec![display(1, "primary", 0)],
+            resolved_config: ResolvedConfig {
+                automatic_tiling_enabled: true,
+                ..ResolvedConfig::default()
+            },
+            automatic_tiling_suspended: true,
+            automatic_tiling_active: false,
+            ..EngineState::default()
+        };
+        let mut changed = state.displays[0].clone();
+        changed.work_area = Rect::new(0, 40, 1920, 1040);
+
+        apply(
+            &mut state,
+            Event::DisplayTopologyChanged(vec![changed.clone()]),
+        );
+
+        assert_eq!(state.displays, vec![changed]);
+        assert!(state.automatic_tiling_suspended);
+        assert!(!state.automatic_tiling_active);
     }
 
     #[test]
@@ -3087,6 +3175,7 @@ mod tests {
                 can_minimize: true,
                 can_maximize: true,
             },
+            elevated: false,
             lifecycle,
         }
     }
@@ -3125,6 +3214,29 @@ mod tests {
             EligibilityReason::FloatingRule
         );
         assert!(!state.inventory.contains_key(&WindowId(3)));
+    }
+
+    #[test]
+    fn elevated_windows_remain_in_inventory_with_an_ineligible_reason() {
+        let mut state = EngineState::default();
+        let mut elevated = observed_window(
+            8,
+            mosaix_domain::WindowRole::Normal,
+            WindowLifecycle::Active,
+        );
+        elevated.elevated = true;
+
+        apply(
+            &mut state,
+            Event::WindowsObserved {
+                windows: vec![elevated],
+            },
+        );
+
+        assert_eq!(
+            state.inventory[&WindowId(8)].eligibility,
+            EligibilityReason::Elevated
+        );
     }
 
     #[test]
@@ -3526,8 +3638,10 @@ mod tests {
 
     #[test]
     fn apply_resume_clears_paused_and_bumps_revision() {
-        let mut state = EngineState::default();
-        state.paused = true;
+        let mut state = EngineState {
+            paused: true,
+            ..Default::default()
+        };
         apply(&mut state, Event::ResumeRequested);
         assert!(!state.paused);
         assert_eq!(state.revision, 1);
@@ -3543,9 +3657,11 @@ mod tests {
 
     #[test]
     fn apply_zone_snap_is_suppressed_while_paused() {
-        let mut state = EngineState::default();
-        state.paused = true;
-        state.focused_window = Some(WindowId(1));
+        let mut state = EngineState {
+            paused: true,
+            focused_window: Some(WindowId(1)),
+            ..Default::default()
+        };
         apply(
             &mut state,
             Event::ZoneSnapRequested {
@@ -3557,8 +3673,10 @@ mod tests {
 
     #[test]
     fn apply_window_placed_is_suppressed_while_paused() {
-        let mut state = EngineState::default();
-        state.paused = true;
+        let mut state = EngineState {
+            paused: true,
+            ..Default::default()
+        };
         apply(
             &mut state,
             Event::WindowPlaced {
@@ -3572,8 +3690,10 @@ mod tests {
 
     #[test]
     fn apply_throw_is_suppressed_while_paused() {
-        let mut state = EngineState::default();
-        state.paused = true;
+        let mut state = EngineState {
+            paused: true,
+            ..Default::default()
+        };
         apply(
             &mut state,
             Event::WindowThrowToDisplayRequested {
@@ -3586,8 +3706,10 @@ mod tests {
 
     #[test]
     fn apply_display_topology_still_processes_while_paused() {
-        let mut state = EngineState::default();
-        state.paused = true;
+        let mut state = EngineState {
+            paused: true,
+            ..Default::default()
+        };
         apply(
             &mut state,
             Event::DisplayTopologyChanged(vec![display(1, "MON-A", 0)]),
@@ -3597,8 +3719,10 @@ mod tests {
 
     #[test]
     fn apply_focus_still_processes_while_paused() {
-        let mut state = EngineState::default();
-        state.paused = true;
+        let mut state = EngineState {
+            paused: true,
+            ..Default::default()
+        };
         apply(
             &mut state,
             Event::WindowFocused {
@@ -3653,8 +3777,10 @@ mod tests {
 
     #[test]
     fn apply_config_still_processes_while_paused() {
-        let mut state = EngineState::default();
-        state.paused = true;
+        let mut state = EngineState {
+            paused: true,
+            ..Default::default()
+        };
         let config_set = ResolvedConfigSet {
             base: ResolvedConfig::default(),
             profiles: vec![],
@@ -3824,15 +3950,25 @@ mod tests {
 
         // After wake: a new display appears and a new window opened while asleep.
         let new_displays = vec![display(1, "MON-A", 0), display(2, "MON-B", 1920)];
-        let new_windows = vec![
-            (WindowId(1), DisplayId(1), Rect::new(0, 0, 960, 1080)), // already tracked
-            (WindowId(99), DisplayId(2), Rect::new(1920, 0, 960, 1080)), // new
-        ];
+        let mut first = observed_window(
+            1,
+            mosaix_domain::WindowRole::Normal,
+            WindowLifecycle::Active,
+        );
+        first.bounds = Rect::new(0, 0, 960, 1080);
+        let mut second = observed_window(
+            99,
+            mosaix_domain::WindowRole::Normal,
+            WindowLifecycle::Active,
+        );
+        second.display_id = DisplayId(2);
+        second.bounds = Rect::new(1920, 0, 960, 1080);
+        let new_windows = vec![first, second];
         apply(
             &mut state,
             Event::WakeReconciliation {
                 displays: new_displays,
-                windows: new_windows,
+                windows: Some(new_windows),
             },
         );
 
@@ -3888,6 +4024,31 @@ mod tests {
             !state.windows.get(&WindowId(1)).unwrap().circuit_open(),
             "circuit must not open before threshold is reached"
         );
+    }
+
+    #[test]
+    fn accepted_placement_breaks_a_rejection_streak() {
+        let mut state = EngineState::default();
+        state.windows.insert(
+            WindowId(1),
+            WindowPlacement {
+                display_id: DisplayId(1),
+                bounds: Rect::new(0, 0, 100, 100),
+                observed_bounds: Rect::new(0, 0, 100, 100),
+                previous_placement: None,
+                cycle_step: None,
+                rejection_count: 2,
+            },
+        );
+
+        apply(
+            &mut state,
+            Event::PlacementAccepted {
+                window_id: WindowId(1),
+            },
+        );
+
+        assert_eq!(state.windows[&WindowId(1)].rejection_count, 0);
     }
 
     #[test]
@@ -4077,6 +4238,26 @@ mod tests {
         state.effects.clear();
 
         apply(&mut state, Event::RearrangeRequested);
+
+        assert_eq!(state.effects, vec![EngineEffect::ReconcileWindows]);
+        state.effects.clear();
+        apply(
+            &mut state,
+            Event::RearrangeReconciliationComplete {
+                windows: vec![
+                    observed_window(
+                        1,
+                        mosaix_domain::WindowRole::Normal,
+                        WindowLifecycle::Active,
+                    ),
+                    observed_window(
+                        2,
+                        mosaix_domain::WindowRole::Normal,
+                        WindowLifecycle::Active,
+                    ),
+                ],
+            },
+        );
 
         assert_eq!(state.circuit_breaker_count(), 0);
         assert_eq!(
@@ -4312,6 +4493,118 @@ mod tests {
 
         assert_eq!(state.effects.len(), 2);
         assert!(state.interactive_placement.is_none());
+    }
+
+    #[test]
+    fn explicit_maximize_session_floats_until_the_user_toggles_it_back() {
+        let mut state = EngineState {
+            displays: vec![display(1, "primary", 0)],
+            automatic_tiling_active: true,
+            ..EngineState::default()
+        };
+        let active = observed_window(
+            1,
+            mosaix_domain::WindowRole::Normal,
+            WindowLifecycle::Active,
+        );
+        apply(
+            &mut state,
+            Event::WindowsObserved {
+                windows: vec![active.clone()],
+            },
+        );
+
+        let mut maximized = active.clone();
+        maximized.lifecycle = WindowLifecycle::Maximized;
+        apply(
+            &mut state,
+            Event::WindowsObserved {
+                windows: vec![maximized],
+            },
+        );
+        assert!(state.session_floating.contains(&WindowId(1)));
+        assert_eq!(
+            state.inventory[&WindowId(1)].eligibility,
+            EligibilityReason::SessionFloating
+        );
+
+        apply(
+            &mut state,
+            Event::WindowsObserved {
+                windows: vec![active],
+            },
+        );
+        assert_eq!(
+            state.inventory[&WindowId(1)].eligibility,
+            EligibilityReason::SessionFloating,
+            "restoring a maximized window must not silently return it to the grid"
+        );
+    }
+
+    #[test]
+    fn authoritative_observation_removes_closed_windows_and_session_state() {
+        let mut state = EngineState {
+            displays: vec![display(1, "primary", 0)],
+            automatic_tiling_active: true,
+            ..EngineState::default()
+        };
+        apply(
+            &mut state,
+            Event::WindowsObserved {
+                windows: vec![observed_window(
+                    1,
+                    mosaix_domain::WindowRole::Normal,
+                    WindowLifecycle::Active,
+                )],
+            },
+        );
+        state.focused_window = Some(WindowId(1));
+        state.session_floating.insert(WindowId(1));
+
+        apply(
+            &mut state,
+            Event::WindowsObserved {
+                windows: Vec::new(),
+            },
+        );
+
+        assert!(!state.inventory.contains_key(&WindowId(1)));
+        assert!(!state.windows.contains_key(&WindowId(1)));
+        assert!(!state.session_floating.contains(&WindowId(1)));
+        assert_eq!(state.focused_window, None);
+        assert!(state.visual_window_order[&DisplayId(1)].is_empty());
+    }
+
+    #[test]
+    fn resuming_global_pause_reflows_the_current_active_set() {
+        let mut state = EngineState {
+            displays: vec![display(1, "primary", 0)],
+            automatic_tiling_active: true,
+            paused: true,
+            ..EngineState::default()
+        };
+        apply(
+            &mut state,
+            Event::WindowsObserved {
+                windows: vec![observed_window(
+                    1,
+                    mosaix_domain::WindowRole::Normal,
+                    WindowLifecycle::Active,
+                )],
+            },
+        );
+        assert!(state.effects.is_empty());
+
+        apply(&mut state, Event::ResumeRequested);
+
+        assert_eq!(
+            state.effects,
+            vec![EngineEffect::PlaceWindow {
+                window_id: WindowId(1),
+                display_id: DisplayId(1),
+                bounds: Rect::new(0, 0, 1920, 1080),
+            }]
+        );
     }
 
     #[test]

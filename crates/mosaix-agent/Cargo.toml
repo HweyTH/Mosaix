@@ -21,9 +21,6 @@ mosaix-domain = { path = "../mosaix-domain" }
 mosaix-layout = { path = "../mosaix-layout" }
 mosaix-platform-windows = { path = "../mosaix-platform-windows" }
 
-[target.'cfg(windows)'.dev-dependencies]
-mosaix-rules = { path = "../mosaix-rules" }
-
 [target.'cfg(windows)'.dependencies.windows]
 version = "0.58"
 features = ["Win32_UI_Input_KeyboardAndMouse"]
