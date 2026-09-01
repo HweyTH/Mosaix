@@ -220,6 +220,21 @@ impl EngineState {
 pub struct WindowPlacement {
     pub display_id: DisplayId,
     pub bounds: Rect,
+    /// Where the OS last reported this window, as opposed to [`bounds`], the
+    /// placement Mosaix last *intended* (architecture doc section 8.3's
+    /// expected-vs-actual distinction).
+    ///
+    /// The two agree whenever Mosaix owns the window's position, and
+    /// diverge the moment anything else moves it -- an app repositioning
+    /// its own window, a native OS snap, a session-floating window dragged
+    /// by the user. `bounds` deliberately keeps holding the intent, because
+    /// comparing the two is exactly how [`Event::WindowBoundsObserved`]
+    /// detects an external move and resets cycle state (ADR 0001); readers
+    /// that want to know where the window actually *is* -- drawing on or
+    /// around it, say -- want this field instead.
+    ///
+    /// [`bounds`]: Self::bounds
+    pub observed_bounds: Rect,
     pub previous_placement: Option<(DisplayId, Rect)>,
     /// The horizontal zone command and step that produced this placement,
     /// if it came from [`Event::ZoneSnapRequested`] with a left/right
@@ -626,6 +641,7 @@ fn apply(state: &mut EngineState, event: Event) {
             state.windows.entry(window_id).or_insert(WindowPlacement {
                 display_id,
                 bounds,
+                observed_bounds: bounds,
                 previous_placement: None,
                 cycle_step: None,
                 rejection_count: 0,
@@ -722,11 +738,19 @@ fn apply(state: &mut EngineState, event: Event) {
                 );
                 return;
             };
+            // `observed_bounds` tracks reality even when it agrees with the
+            // intended placement, so it is written before the correlation
+            // check below returns.
+            let moved = placement.observed_bounds != bounds;
+            placement.observed_bounds = bounds;
             if placement.display_id == display_id && placement.bounds == bounds {
                 tracing::debug!(
                     ?window_id,
                     "observed bounds match the last placement transaction; cycle state unaffected"
                 );
+                if moved {
+                    state.revision += 1;
+                }
                 return;
             }
             if placement.cycle_step.take().is_some() {
@@ -734,6 +758,8 @@ fn apply(state: &mut EngineState, event: Event) {
                     ?window_id,
                     "observed bounds don't match the last placement transaction; cycle step reset"
                 );
+                state.revision += 1;
+            } else if moved {
                 state.revision += 1;
             }
         }
@@ -914,6 +940,7 @@ fn apply(state: &mut EngineState, event: Event) {
                     WindowPlacement {
                         display_id,
                         bounds,
+                        observed_bounds: bounds,
                         previous_placement: None,
                         cycle_step: None,
                         rejection_count: 0,
@@ -958,6 +985,7 @@ fn apply(state: &mut EngineState, event: Event) {
                     WindowPlacement {
                         display_id,
                         bounds,
+                        observed_bounds: bounds,
                         previous_placement: None,
                         cycle_step: None,
                         rejection_count: 0,
@@ -1165,6 +1193,7 @@ fn replace_inventory_from_observations(state: &mut EngineState, observed: Vec<Wi
         state.windows.entry(window.id).or_insert(WindowPlacement {
             display_id: window.display_id,
             bounds: window.bounds,
+            observed_bounds: window.bounds,
             previous_placement: None,
             cycle_step: None,
             rejection_count: 0,
@@ -1370,6 +1399,9 @@ fn place_window(
         WindowPlacement {
             display_id,
             bounds,
+            // Assume the placement lands; `WindowBoundsObserved` corrects
+            // this the moment the OS says otherwise.
+            observed_bounds: bounds,
             previous_placement,
             cycle_step,
             rejection_count,
@@ -1600,6 +1632,20 @@ impl StateReader {
             .lock()
             .expect("engine state mutex poisoned")
             .clone()
+    }
+
+    /// Just the current revision, without cloning the whole state.
+    ///
+    /// [`snapshot`](Self::snapshot) deep-clones every window, display, and
+    /// rule, which is far too costly for a reader that polls to find out
+    /// *whether* anything changed. Such readers -- the focus-border
+    /// controller is the first -- watch this and take a snapshot only when
+    /// it advances.
+    pub fn revision(&self) -> u64 {
+        self.state
+            .lock()
+            .expect("engine state mutex poisoned")
+            .revision
     }
 }
 
@@ -2941,7 +2987,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_bounds_observed_mismatch_with_no_cycle_step_does_not_bump_the_revision() {
+    fn apply_bounds_observed_mismatch_with_no_cycle_step_records_the_move() {
         let mut state = EngineState::default();
         apply(
             &mut state,
@@ -2969,8 +3015,19 @@ mod tests {
         let placement = state.windows.get(&WindowId(1)).unwrap();
         assert_eq!(placement.cycle_step, None);
         assert_eq!(
-            state.revision, revision_before,
-            "resetting an already-None cycle step is not a real change, so must not bump the revision"
+            placement.bounds,
+            Rect::new(0, 0, 1920, 1080),
+            "the intended placement is unchanged by an observation"
+        );
+        assert_eq!(
+            placement.observed_bounds,
+            Rect::new(100, 100, 400, 400),
+            "but where the window actually is must be recorded"
+        );
+        assert!(
+            state.revision > revision_before,
+            "the window really moved, so watchers of the revision -- the focus \
+             border among them -- must be able to notice"
         );
     }
 
@@ -3342,6 +3399,7 @@ mod tests {
             WindowPlacement {
                 display_id: DisplayId(1),
                 bounds: Rect::new(0, 0, 960, 1080),
+                observed_bounds: Rect::new(0, 0, 960, 1080),
                 previous_placement: None,
                 cycle_step: None,
                 rejection_count: 0,
@@ -3356,6 +3414,7 @@ mod tests {
         let unchanged = WindowPlacement {
             display_id: DisplayId(1),
             bounds: Rect::new(0, 0, 960, 1080),
+            observed_bounds: Rect::new(0, 0, 960, 1080),
             previous_placement: None,
             cycle_step: None,
             rejection_count: 0,
@@ -3547,6 +3606,47 @@ mod tests {
             },
         );
         assert_eq!(state.revision, 1);
+    }
+
+    #[test]
+    fn bounds_observed_updates_observed_bounds_but_leaves_the_intended_placement() {
+        let mut state = EngineState::default();
+        apply(
+            &mut state,
+            Event::WindowFocused {
+                window_id: WindowId(1),
+                display_id: DisplayId(1),
+                bounds: Rect::new(0, 0, 100, 100),
+            },
+        );
+        let revision_before = state.revision;
+
+        // Something other than Mosaix moved the window.
+        apply(
+            &mut state,
+            Event::WindowBoundsObserved {
+                window_id: WindowId(1),
+                display_id: DisplayId(1),
+                bounds: Rect::new(400, 300, 100, 100),
+            },
+        );
+
+        let placement = state.windows.get(&WindowId(1)).unwrap();
+        assert_eq!(
+            placement.observed_bounds,
+            Rect::new(400, 300, 100, 100),
+            "observed bounds must track where the window actually is"
+        );
+        assert_eq!(
+            placement.bounds,
+            Rect::new(0, 0, 100, 100),
+            "the intended placement stays put -- comparing the two is how an \
+             external move is detected (ADR 0001)"
+        );
+        assert!(
+            state.revision > revision_before,
+            "readers watching the revision must be able to notice the move"
+        );
     }
 
     #[test]
@@ -4220,6 +4320,7 @@ mod tests {
         let open_circuit = WindowPlacement {
             display_id: DisplayId(1),
             bounds: Rect::new(0, 0, 100, 100),
+            observed_bounds: Rect::new(0, 0, 100, 100),
             previous_placement: None,
             cycle_step: None,
             rejection_count: CIRCUIT_BREAKER_THRESHOLD,
@@ -4227,6 +4328,7 @@ mod tests {
         let healthy = WindowPlacement {
             display_id: DisplayId(1),
             bounds: Rect::new(100, 100, 200, 200),
+            observed_bounds: Rect::new(100, 100, 200, 200),
             previous_placement: None,
             cycle_step: None,
             rejection_count: 0,
