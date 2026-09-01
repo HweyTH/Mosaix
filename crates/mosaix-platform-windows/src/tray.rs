@@ -97,8 +97,8 @@ fn notify_data(hwnd: HWND, paused: bool) -> NOTIFYICONDATAW {
 }
 
 fn add_or_modify(hwnd: HWND, paused: bool, message: NOTIFY_ICON_MESSAGE) {
-    let mut data = notify_data(hwnd, paused);
-    let _ = unsafe { Shell_NotifyIconW(message, &mut data) };
+    let data = notify_data(hwnd, paused);
+    let _ = unsafe { Shell_NotifyIconW(message, &data) };
 }
 
 fn delete_icon(hwnd: HWND) {
@@ -106,7 +106,7 @@ fn delete_icon(hwnd: HWND) {
     data.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
     data.hWnd = hwnd;
     data.uID = TRAY_UID;
-    let _ = unsafe { Shell_NotifyIconW(NIM_DELETE, &mut data) };
+    let _ = unsafe { Shell_NotifyIconW(NIM_DELETE, &data) };
 }
 
 /// Builds a 16×16 (or SM_CXSMICON) solid-color icon. Returns `None` on any
@@ -286,7 +286,7 @@ unsafe extern "system" fn tray_wndproc(
         }
         WM_COMMAND => {
             // Defensive: some paths deliver menu commands via WM_COMMAND.
-            let id = wparam.0 as usize & 0xFFFF;
+            let id = wparam.0 & 0xFFFF;
             let event = match id {
                 IDM_TOGGLE_PAUSE => Some(TrayEvent::TogglePause),
                 IDM_OPEN_CONFIG => Some(TrayEvent::OpenConfig),

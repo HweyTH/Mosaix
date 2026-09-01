@@ -10,6 +10,7 @@ mod tests {
     use mosaix_platform_windows::WindowsPlatformAdapter;
 
     #[test]
+    #[ignore = "requires an interactive Windows desktop"]
     fn enumerate_returns_windows() {
         let adapter = WindowsPlatformAdapter::new();
         let windows = adapter

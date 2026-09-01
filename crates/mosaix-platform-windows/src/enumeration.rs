@@ -97,13 +97,13 @@ pub fn is_manageable_window(hwnd: HWND) -> bool {
     let style = win32_helpers::get_window_style(hwnd);
 
     // Must have a caption (title bar) — this is the primary signal for a "normal" window
-    if style & WS_CAPTION.0 as u32 != WS_CAPTION.0 as u32 {
+    if style & WS_CAPTION.0 != WS_CAPTION.0 {
         trace!(?hwnd, style, "rejected: no WS_CAPTION");
         return false;
     }
 
     // Must not be a child window
-    if style & WS_CHILD.0 as u32 != 0 {
+    if style & WS_CHILD.0 != 0 {
         trace!(?hwnd, "rejected: WS_CHILD");
         return false;
     }
@@ -113,13 +113,13 @@ pub fn is_manageable_window(hwnd: HWND) -> bool {
 
     // WS_EX_TOOLWINDOW windows are excluded UNLESS they also have WS_EX_APPWINDOW
     // (WS_EX_APPWINDOW overrides and forces taskbar presence)
-    if ex_style & WS_EX_TOOLWINDOW.0 as u32 != 0 && ex_style & WS_EX_APPWINDOW.0 as u32 == 0 {
+    if ex_style & WS_EX_TOOLWINDOW.0 != 0 && ex_style & WS_EX_APPWINDOW.0 == 0 {
         trace!(?hwnd, "rejected: WS_EX_TOOLWINDOW without WS_EX_APPWINDOW");
         return false;
     }
 
     // WS_EX_NOACTIVATE windows cannot receive user focus
-    if ex_style & WS_EX_NOACTIVATE.0 as u32 != 0 {
+    if ex_style & WS_EX_NOACTIVATE.0 != 0 {
         trace!(?hwnd, "rejected: WS_EX_NOACTIVATE");
         return false;
     }
@@ -242,18 +242,18 @@ pub fn build_window_info(hwnd: HWND) -> Window {
 
 /// Infer the semantic window role from Win32 style flags.
 fn classify_role(style: u32, ex_style: u32) -> WindowRole {
-    if ex_style & WS_EX_TOOLWINDOW.0 as u32 != 0 {
+    if ex_style & WS_EX_TOOLWINDOW.0 != 0 {
         return WindowRole::ToolWindow;
     }
-    if style & WS_POPUP.0 as u32 != 0 {
+    if style & WS_POPUP.0 != 0 {
         // Popup with caption is often a dialog
-        if style & WS_DLGFRAME.0 as u32 != 0 {
+        if style & WS_DLGFRAME.0 != 0 {
             return WindowRole::Dialog;
         }
         return WindowRole::Popup;
     }
     // WS_DLGFRAME without WS_THICKFRAME suggests a dialog
-    if style & WS_DLGFRAME.0 as u32 != 0 && style & WS_THICKFRAME.0 as u32 == 0 {
+    if style & WS_DLGFRAME.0 != 0 && style & WS_THICKFRAME.0 == 0 {
         return WindowRole::Dialog;
     }
     WindowRole::Normal
@@ -263,11 +263,11 @@ fn classify_role(style: u32, ex_style: u32) -> WindowRole {
 fn extract_capabilities(style: u32) -> WindowCapabilities {
     WindowCapabilities {
         // A window with a caption can generally be moved
-        can_move: style & WS_CAPTION.0 as u32 != 0,
+        can_move: style & WS_CAPTION.0 != 0,
         // WS_THICKFRAME (sizing border) means resizable
-        can_resize: style & WS_THICKFRAME.0 as u32 != 0,
-        can_minimize: style & WS_MINIMIZEBOX.0 as u32 != 0,
-        can_maximize: style & WS_MAXIMIZEBOX.0 as u32 != 0,
+        can_resize: style & WS_THICKFRAME.0 != 0,
+        can_minimize: style & WS_MINIMIZEBOX.0 != 0,
+        can_maximize: style & WS_MAXIMIZEBOX.0 != 0,
     }
 }
 
@@ -336,26 +336,25 @@ mod tests {
     #[test]
     fn role_classification() {
         // Normal window: WS_OVERLAPPEDWINDOW style
-        let normal_style = (WS_CAPTION.0 | WS_THICKFRAME.0) as u32;
+        let normal_style = WS_CAPTION.0 | WS_THICKFRAME.0;
         assert_eq!(classify_role(normal_style, 0), WindowRole::Normal);
 
         // Tool window
-        let tool_ex = WS_EX_TOOLWINDOW.0 as u32;
+        let tool_ex = WS_EX_TOOLWINDOW.0;
         assert_eq!(classify_role(normal_style, tool_ex), WindowRole::ToolWindow);
 
         // Dialog (popup + dlgframe)
-        let dialog_style = (WS_POPUP.0 | WS_DLGFRAME.0) as u32;
+        let dialog_style = WS_POPUP.0 | WS_DLGFRAME.0;
         assert_eq!(classify_role(dialog_style, 0), WindowRole::Dialog);
 
         // Pure popup
-        let popup_style = WS_POPUP.0 as u32;
+        let popup_style = WS_POPUP.0;
         assert_eq!(classify_role(popup_style, 0), WindowRole::Popup);
     }
 
     #[test]
     fn capability_extraction() {
-        let full_style =
-            (WS_CAPTION.0 | WS_THICKFRAME.0 | WS_MINIMIZEBOX.0 | WS_MAXIMIZEBOX.0) as u32;
+        let full_style = WS_CAPTION.0 | WS_THICKFRAME.0 | WS_MINIMIZEBOX.0 | WS_MAXIMIZEBOX.0;
         let caps = extract_capabilities(full_style);
         assert!(caps.can_move);
         assert!(caps.can_resize);
@@ -364,7 +363,7 @@ mod tests {
         assert!(caps.is_tileable());
 
         // No thick frame → not resizable
-        let no_resize = (WS_CAPTION.0 | WS_MINIMIZEBOX.0) as u32;
+        let no_resize = WS_CAPTION.0 | WS_MINIMIZEBOX.0;
         let caps2 = extract_capabilities(no_resize);
         assert!(caps2.can_move);
         assert!(!caps2.can_resize);
