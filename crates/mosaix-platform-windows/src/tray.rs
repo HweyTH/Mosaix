@@ -23,13 +23,13 @@ use windows::Win32::UI::Shell::{
     NOTIFYICONDATAW, NOTIFY_ICON_MESSAGE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreateIconIndirect, CreatePopupMenu, DefWindowProcW, DestroyIcon, DestroyMenu,
-    DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW, GetSystemMetrics, LoadIconW,
-    PostMessageW, PostThreadMessageW, RegisterClassW, RegisterWindowMessageW, SetForegroundWindow,
-    SetMenuDefaultItem, TrackPopupMenu, TranslateMessage, CreateWindowExW, HICON, ICONINFO, MSG,
-    SM_CXSMICON, SM_CYSMICON, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RIGHTBUTTON, WINDOW_EX_STYLE,
-    WM_APP, WM_COMMAND, WM_DESTROY, WM_LBUTTONUP, WM_NULL, WM_QUIT, WM_RBUTTONUP, WNDCLASSW,
-    WS_OVERLAPPED, IDI_APPLICATION, MF_SEPARATOR, MF_STRING, TPM_RETURNCMD,
+    AppendMenuW, CreateIconIndirect, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon,
+    DestroyMenu, DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW, GetSystemMetrics,
+    LoadIconW, PostMessageW, PostThreadMessageW, RegisterClassW, RegisterWindowMessageW,
+    SetForegroundWindow, SetMenuDefaultItem, TrackPopupMenu, TranslateMessage, HICON, ICONINFO,
+    IDI_APPLICATION, MF_SEPARATOR, MF_STRING, MSG, SM_CXSMICON, SM_CYSMICON, TPM_BOTTOMALIGN,
+    TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, WINDOW_EX_STYLE, WM_APP, WM_COMMAND, WM_DESTROY,
+    WM_LBUTTONUP, WM_NULL, WM_QUIT, WM_RBUTTONUP, WNDCLASSW, WS_OVERLAPPED,
 };
 
 use crate::{Result, WindowError};
@@ -97,8 +97,8 @@ fn notify_data(hwnd: HWND, paused: bool) -> NOTIFYICONDATAW {
 }
 
 fn add_or_modify(hwnd: HWND, paused: bool, message: NOTIFY_ICON_MESSAGE) {
-    let mut data = notify_data(hwnd, paused);
-    let _ = unsafe { Shell_NotifyIconW(message, &mut data) };
+    let data = notify_data(hwnd, paused);
+    let _ = unsafe { Shell_NotifyIconW(message, &data) };
 }
 
 fn delete_icon(hwnd: HWND) {
@@ -106,7 +106,7 @@ fn delete_icon(hwnd: HWND) {
     data.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
     data.hWnd = hwnd;
     data.uID = TRAY_UID;
-    let _ = unsafe { Shell_NotifyIconW(NIM_DELETE, &mut data) };
+    let _ = unsafe { Shell_NotifyIconW(NIM_DELETE, &data) };
 }
 
 /// Builds a 16×16 (or SM_CXSMICON) solid-color icon. Returns `None` on any
@@ -203,8 +203,18 @@ fn show_context_menu(hwnd: HWND) {
     let quit_label: Vec<u16> = "&Quit\0".encode_utf16().collect();
 
     unsafe {
-        let _ = AppendMenuW(menu, MF_STRING, IDM_TOGGLE_PAUSE, PCWSTR(pause_label.as_ptr()));
-        let _ = AppendMenuW(menu, MF_STRING, IDM_OPEN_CONFIG, PCWSTR(config_label.as_ptr()));
+        let _ = AppendMenuW(
+            menu,
+            MF_STRING,
+            IDM_TOGGLE_PAUSE,
+            PCWSTR(pause_label.as_ptr()),
+        );
+        let _ = AppendMenuW(
+            menu,
+            MF_STRING,
+            IDM_OPEN_CONFIG,
+            PCWSTR(config_label.as_ptr()),
+        );
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         let _ = AppendMenuW(menu, MF_STRING, IDM_QUIT, PCWSTR(quit_label.as_ptr()));
         let _ = SetMenuDefaultItem(menu, IDM_TOGGLE_PAUSE as u32, 0);
@@ -276,7 +286,7 @@ unsafe extern "system" fn tray_wndproc(
         }
         WM_COMMAND => {
             // Defensive: some paths deliver menu commands via WM_COMMAND.
-            let id = wparam.0 as usize & 0xFFFF;
+            let id = wparam.0 & 0xFFFF;
             let event = match id {
                 IDM_TOGGLE_PAUSE => Some(TrayEvent::TogglePause),
                 IDM_OPEN_CONFIG => Some(TrayEvent::OpenConfig),

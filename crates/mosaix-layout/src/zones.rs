@@ -85,11 +85,7 @@ pub fn half_zone_at_edge(
     edge_threshold: i32,
 ) -> Option<HalfZone> {
     let (x, y) = point;
-    if x < work_area.x
-        || y < work_area.y
-        || x >= work_area.right()
-        || y >= work_area.bottom()
-    {
+    if x < work_area.x || y < work_area.y || x >= work_area.right() || y >= work_area.bottom() {
         return None;
     }
 
@@ -235,14 +231,28 @@ impl CycleStep {
 /// [`CycleStep::TwoThirds`] (CONTEXT.md "Zone cycle"). Delegates to
 /// [`snap_to_half`]/[`snap_to_third`], so it inherits their container-offset
 /// handling and gapless thirds.
-pub fn resolve_zone_cycle(container: Rect, direction: HorizontalDirection, step: CycleStep) -> Rect {
+pub fn resolve_zone_cycle(
+    container: Rect,
+    direction: HorizontalDirection,
+    step: CycleStep,
+) -> Rect {
     match (direction, step) {
         (HorizontalDirection::Left, CycleStep::Half) => snap_to_half(container, HalfZone::LeftHalf),
-        (HorizontalDirection::Right, CycleStep::Half) => snap_to_half(container, HalfZone::RightHalf),
-        (HorizontalDirection::Left, CycleStep::Third) => snap_to_third(container, ThirdZone::LeftThird),
-        (HorizontalDirection::Right, CycleStep::Third) => snap_to_third(container, ThirdZone::RightThird),
-        (HorizontalDirection::Left, CycleStep::TwoThirds) => snap_to_third(container, ThirdZone::LeftTwoThirds),
-        (HorizontalDirection::Right, CycleStep::TwoThirds) => snap_to_third(container, ThirdZone::RightTwoThirds),
+        (HorizontalDirection::Right, CycleStep::Half) => {
+            snap_to_half(container, HalfZone::RightHalf)
+        }
+        (HorizontalDirection::Left, CycleStep::Third) => {
+            snap_to_third(container, ThirdZone::LeftThird)
+        }
+        (HorizontalDirection::Right, CycleStep::Third) => {
+            snap_to_third(container, ThirdZone::RightThird)
+        }
+        (HorizontalDirection::Left, CycleStep::TwoThirds) => {
+            snap_to_third(container, ThirdZone::LeftTwoThirds)
+        }
+        (HorizontalDirection::Right, CycleStep::TwoThirds) => {
+            snap_to_third(container, ThirdZone::RightTwoThirds)
+        }
     }
 }
 
@@ -760,12 +770,16 @@ mod tests {
     }
 
     #[test]
-    fn resolve_zone_cycle_left_and_right_steps_are_gapless_and_cover_the_container_on_a_non_multiple_of_three_width() {
+    fn resolve_zone_cycle_left_and_right_steps_are_gapless_and_cover_the_container_on_a_non_multiple_of_three_width(
+    ) {
         let container = Rect::new(0, 0, 100, 50);
         let left_third = resolve_zone_cycle(container, HorizontalDirection::Left, CycleStep::Third);
-        let left_two_thirds = resolve_zone_cycle(container, HorizontalDirection::Left, CycleStep::TwoThirds);
-        let right_third = resolve_zone_cycle(container, HorizontalDirection::Right, CycleStep::Third);
-        let right_two_thirds = resolve_zone_cycle(container, HorizontalDirection::Right, CycleStep::TwoThirds);
+        let left_two_thirds =
+            resolve_zone_cycle(container, HorizontalDirection::Left, CycleStep::TwoThirds);
+        let right_third =
+            resolve_zone_cycle(container, HorizontalDirection::Right, CycleStep::Third);
+        let right_two_thirds =
+            resolve_zone_cycle(container, HorizontalDirection::Right, CycleStep::TwoThirds);
 
         assert_eq!(left_third.x, container.x);
         assert_eq!(left_two_thirds.x, container.x);
@@ -855,15 +869,9 @@ mod tests {
     #[test]
     fn apply_gaps_with_zero_outer_and_inner_gaps_is_a_no_op() {
         let raw_zone = snap_to_half(WORK_AREA, HalfZone::LeftHalf);
-        assert_eq!(
-            apply_gaps(raw_zone, WORK_AREA, Gaps::new(0, 0)),
-            raw_zone
-        );
+        assert_eq!(apply_gaps(raw_zone, WORK_AREA, Gaps::new(0, 0)), raw_zone);
 
         let maximized = maximize_to_work_area(WORK_AREA);
-        assert_eq!(
-            apply_gaps(maximized, WORK_AREA, Gaps::new(0, 0)),
-            maximized
-        );
+        assert_eq!(apply_gaps(maximized, WORK_AREA, Gaps::new(0, 0)), maximized);
     }
 }

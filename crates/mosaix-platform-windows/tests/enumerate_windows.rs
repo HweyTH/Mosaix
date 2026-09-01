@@ -10,6 +10,7 @@ mod tests {
     use mosaix_platform_windows::WindowsPlatformAdapter;
 
     #[test]
+    #[ignore = "requires an interactive Windows desktop"]
     fn enumerate_returns_windows() {
         let adapter = WindowsPlatformAdapter::new();
         let windows = adapter
@@ -23,7 +24,10 @@ mod tests {
             "expected at least one manageable window on an interactive desktop"
         );
 
-        println!("\n=== Enumerated {} manageable windows ===\n", windows.len());
+        println!(
+            "\n=== Enumerated {} manageable windows ===\n",
+            windows.len()
+        );
         println!(
             "{:<8} {:<8} {:<30} {:<30} {:<12} {:<20} {:<10}",
             "HWND", "PID", "Title", "Class", "Role", "Bounds", "Lifecycle"
@@ -76,11 +80,7 @@ mod tests {
             );
 
             // Process ID should be nonzero
-            assert_ne!(
-                w.process_id, 0,
-                "window {:#x} has zero process ID",
-                w.id.0,
-            );
+            assert_ne!(w.process_id, 0, "window {:#x} has zero process ID", w.id.0,);
         }
     }
 

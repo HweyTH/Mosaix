@@ -67,8 +67,15 @@ mod tests {
         // process and this is the only test that touches it.
         let _ = SHUTDOWN_SENDER.set(tx);
 
-        assert_eq!(unsafe { ctrl_handler(0xDEAD_BEEF) }, BOOL(0), "unrecognized event should not be handled");
-        assert!(rx.try_recv().is_err(), "unrecognized event must not signal shutdown");
+        assert_eq!(
+            unsafe { ctrl_handler(0xDEAD_BEEF) },
+            BOOL(0),
+            "unrecognized event should not be handled"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "unrecognized event must not signal shutdown"
+        );
 
         assert_eq!(unsafe { ctrl_handler(CTRL_C_EVENT) }, BOOL(1));
         assert!(rx.try_recv().is_ok(), "CTRL_C_EVENT must signal shutdown");

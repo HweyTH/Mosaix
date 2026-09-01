@@ -12,7 +12,7 @@
 
 use std::collections::BTreeMap;
 
-use mosaix_config::{Command, KeyCombo};
+use mosaix_config::{Command, KeyCombo, ResolvedConfig};
 use mosaix_engine::ZoneSnapDirection;
 use mosaix_platform_windows::HotkeyBinding;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -29,6 +29,20 @@ pub fn direction_for_command(command: Command) -> ZoneSnapDirection {
         Command::SnapRight => ZoneSnapDirection::Right,
         Command::SnapTop => ZoneSnapDirection::Top,
         Command::SnapBottom => ZoneSnapDirection::Bottom,
+        Command::Rearrange => unreachable!("rearrange is not a zone-snap command"),
+        Command::ToggleAutomaticTiling => {
+            unreachable!("tiling toggle is not a zone-snap command")
+        }
+        Command::ToggleFloating => unreachable!("floating toggle is not a zone-snap command"),
+        Command::FocusLeft
+        | Command::FocusRight
+        | Command::FocusUp
+        | Command::FocusDown
+        | Command::SwapLeft
+        | Command::SwapRight
+        | Command::SwapUp
+        | Command::SwapDown
+        | Command::TogglePause => unreachable!("tiling command is not a zone-snap command"),
     }
 }
 
@@ -43,6 +57,18 @@ fn hotkey_id(command: Command) -> i32 {
         Command::SnapRight => 2,
         Command::SnapTop => 3,
         Command::SnapBottom => 4,
+        Command::Rearrange => 5,
+        Command::ToggleAutomaticTiling => 6,
+        Command::ToggleFloating => 7,
+        Command::FocusLeft => 8,
+        Command::FocusDown => 9,
+        Command::FocusUp => 10,
+        Command::FocusRight => 11,
+        Command::SwapLeft => 12,
+        Command::SwapDown => 13,
+        Command::SwapUp => 14,
+        Command::SwapRight => 15,
+        Command::TogglePause => 16,
     }
 }
 
@@ -56,6 +82,18 @@ pub fn command_for_hotkey_id(id: i32) -> Option<Command> {
         2 => Some(Command::SnapRight),
         3 => Some(Command::SnapTop),
         4 => Some(Command::SnapBottom),
+        5 => Some(Command::Rearrange),
+        6 => Some(Command::ToggleAutomaticTiling),
+        7 => Some(Command::ToggleFloating),
+        8 => Some(Command::FocusLeft),
+        9 => Some(Command::FocusDown),
+        10 => Some(Command::FocusUp),
+        11 => Some(Command::FocusRight),
+        12 => Some(Command::SwapLeft),
+        13 => Some(Command::SwapDown),
+        14 => Some(Command::SwapUp),
+        15 => Some(Command::SwapRight),
+        16 => Some(Command::TogglePause),
         _ => None,
     }
 }
@@ -148,6 +186,25 @@ pub fn bindings_from_resolved(hotkeys: &BTreeMap<Command, KeyCombo>) -> Vec<Hotk
         .collect()
 }
 
+pub fn runtime_hotkeys(config: &ResolvedConfig) -> BTreeMap<Command, KeyCombo> {
+    config
+        .hotkeys
+        .iter()
+        .filter(|(command, _)| {
+            config.automatic_tiling_enabled
+                || matches!(
+                    command,
+                    Command::SnapLeft
+                        | Command::SnapRight
+                        | Command::SnapTop
+                        | Command::SnapBottom
+                        | Command::TogglePause
+                )
+        })
+        .map(|(command, combo)| (*command, combo.clone()))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -216,8 +273,34 @@ mod tests {
             Command::SnapRight,
             Command::SnapTop,
             Command::SnapBottom,
+            Command::Rearrange,
+            Command::ToggleAutomaticTiling,
+            Command::ToggleFloating,
+            Command::FocusLeft,
+            Command::FocusDown,
+            Command::FocusUp,
+            Command::FocusRight,
+            Command::SwapLeft,
+            Command::SwapDown,
+            Command::SwapUp,
+            Command::SwapRight,
+            Command::TogglePause,
         ] {
             assert_eq!(command_for_hotkey_id(hotkey_id(command)), Some(command));
         }
+    }
+
+    #[test]
+    fn manual_topology_does_not_register_automatic_tiling_commands() {
+        let mut config = mosaix_config::fallback_config();
+        let hotkeys = runtime_hotkeys(&config);
+
+        assert!(hotkeys.contains_key(&Command::SnapLeft));
+        assert!(hotkeys.contains_key(&Command::TogglePause));
+        assert!(!hotkeys.contains_key(&Command::FocusLeft));
+        assert!(!hotkeys.contains_key(&Command::ToggleAutomaticTiling));
+
+        config.automatic_tiling_enabled = true;
+        assert!(runtime_hotkeys(&config).contains_key(&Command::FocusLeft));
     }
 }

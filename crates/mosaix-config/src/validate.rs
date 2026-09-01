@@ -74,6 +74,7 @@ pub fn merge(base: &BaseConfig, profile: Option<&ProfileConfig>) -> ResolvedConf
     let mut hotkeys = base.hotkeys.clone();
     let mut gaps = base.gaps;
     let behavior = base.behavior.clone();
+    let mut automatic_tiling_enabled = false;
 
     if let Some(profile) = profile {
         for (command, combo) in &profile.hotkeys {
@@ -85,12 +86,16 @@ pub fn merge(base: &BaseConfig, profile: Option<&ProfileConfig>) -> ResolvedConf
         if let Some(inner) = profile.gaps.inner {
             gaps.inner = inner;
         }
+        automatic_tiling_enabled = profile
+            .automatic_tiling
+            .is_some_and(|tiling| tiling.enabled);
     }
 
     ResolvedConfig {
         hotkeys,
         gaps,
         behavior,
+        automatic_tiling_enabled,
     }
 }
 
@@ -404,6 +409,7 @@ snap-right = "ctrl+alt+left"
                 hotkeys: base.hotkeys.clone(),
                 gaps: base.gaps,
                 behavior: base.behavior.clone(),
+                automatic_tiling_enabled: false,
             }
         );
     }

@@ -27,7 +27,11 @@ pub enum DisplayDirection {
 ///
 /// Returns `None` if `current` isn't among `displays`, or if there's only
 /// one display -- nothing to cycle to.
-pub fn cycle_display(displays: &[Display], current: DisplayId, direction: DisplayDirection) -> Option<DisplayId> {
+pub fn cycle_display(
+    displays: &[Display],
+    current: DisplayId,
+    direction: DisplayDirection,
+) -> Option<DisplayId> {
     if displays.len() < 2 {
         return None;
     }
@@ -153,15 +157,27 @@ mod tests {
         let c = display(3, Rect::new(3840, 0, 1920, 1080));
         let displays = [a, b, c];
 
-        assert_eq!(cycle_display(&displays, DisplayId(1), DisplayDirection::Next), Some(DisplayId(2)));
-        assert_eq!(cycle_display(&displays, DisplayId(2), DisplayDirection::Next), Some(DisplayId(3)));
-        assert_eq!(cycle_display(&displays, DisplayId(3), DisplayDirection::Next), Some(DisplayId(1)));
+        assert_eq!(
+            cycle_display(&displays, DisplayId(1), DisplayDirection::Next),
+            Some(DisplayId(2))
+        );
+        assert_eq!(
+            cycle_display(&displays, DisplayId(2), DisplayDirection::Next),
+            Some(DisplayId(3))
+        );
+        assert_eq!(
+            cycle_display(&displays, DisplayId(3), DisplayDirection::Next),
+            Some(DisplayId(1))
+        );
     }
 
     #[test]
     fn cycle_display_returns_none_for_a_single_display() {
         let only = display(1, Rect::new(0, 0, 1920, 1080));
-        assert_eq!(cycle_display(&[only], DisplayId(1), DisplayDirection::Next), None);
+        assert_eq!(
+            cycle_display(&[only], DisplayId(1), DisplayDirection::Next),
+            None
+        );
     }
 
     #[test]
@@ -195,7 +211,10 @@ mod tests {
         // 25% in from the top-left, 50% of the container on each axis.
         let bounds = Rect::new(480, 270, 960, 540);
 
-        assert_eq!(throw_preserving_ratio(bounds, from, to), Rect::new(2400, 270, 960, 540));
+        assert_eq!(
+            throw_preserving_ratio(bounds, from, to),
+            Rect::new(2400, 270, 960, 540)
+        );
     }
 
     #[test]
@@ -217,6 +236,9 @@ mod tests {
         let to = Rect::new(0, 0, 1920, 1080);
         let right_half_on_from = Rect::new(-960, 40, 960, 1040);
 
-        assert_eq!(throw_preserving_ratio(right_half_on_from, from, to), Rect::new(960, 0, 960, 1080));
+        assert_eq!(
+            throw_preserving_ratio(right_half_on_from, from, to),
+            Rect::new(960, 0, 960, 1080)
+        );
     }
 }

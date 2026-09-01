@@ -24,12 +24,12 @@ pub mod hotkeys;
 pub mod overlay;
 #[cfg(windows)]
 pub mod shutdown;
+#[cfg(all(windows, test))]
+mod test_support;
 #[cfg(windows)]
 pub mod tray;
 #[cfg(windows)]
 pub mod win32_helpers;
-#[cfg(all(windows, test))]
-mod test_support;
 
 #[cfg(windows)]
 pub use adapter::WindowsPlatformAdapter;
@@ -62,7 +62,8 @@ use windows::Win32::UI::HiDpi::{
 };
 #[cfg(windows)]
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetCursorPos, GetWindowRect, IsWindow, SetWindowPos, SWP_NOACTIVATE, SWP_NOZORDER,
+    GetCursorPos, GetWindowRect, IsWindow, SetForegroundWindow, SetWindowPos, SWP_NOACTIVATE,
+    SWP_NOZORDER,
 };
 
 #[cfg(windows)]
@@ -158,6 +159,20 @@ pub fn move_resize_window(hwnd: HWND, bounds: Rect) -> Result<()> {
 #[cfg(windows)]
 pub fn move_resize_window_by_id(window_id: WindowId, bounds: Rect) -> Result<()> {
     move_resize_window(HWND::from(WindowHandle(window_id.0)), bounds)
+}
+
+/// Activates the managed window selected by directional focus.
+#[cfg(windows)]
+pub fn focus_window_by_id(window_id: WindowId) -> Result<()> {
+    let hwnd = HWND::from(WindowHandle(window_id.0));
+    if !unsafe { IsWindow(hwnd) }.as_bool() {
+        return Err(WindowError::InvalidWindow);
+    }
+    if unsafe { SetForegroundWindow(hwnd) }.as_bool() {
+        Ok(())
+    } else {
+        Err(WindowError::Win32(windows::core::Error::from_win32()))
+    }
 }
 
 /// Reads a top-level window's current position and size in physical-pixel
@@ -260,7 +275,10 @@ mod tests {
     fn window_display_id_resolves_a_real_window_and_rejects_an_invalid_handle() {
         let hwnd = create_test_window();
 
-        assert!(window_display_id(hwnd).is_some(), "a real, on-screen window should resolve to a display");
+        assert!(
+            window_display_id(hwnd).is_some(),
+            "a real, on-screen window should resolve to a display"
+        );
 
         let invalid = HWND(std::ptr::null_mut());
         assert_eq!(window_display_id(invalid), None);
