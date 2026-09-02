@@ -272,7 +272,7 @@ export async function mountLayoutEditor(root: HTMLElement, bridge: DesktopBridge
     root.querySelector<HTMLElement>("[data-save-apply]")?.addEventListener("click", () => {
       commandStatus = "Applying…";
       void bridge.saveAndApplyLayout(structuredClone(snapshot.draft)).then((receipt) => {
-        commandStatus = `Saved · revision ${receipt.revision}`;
+        commandStatus = `Applied · revision ${receipt.revision}`;
         render();
       }).catch((error: unknown) => {
         commandStatus = `Apply failed · ${String(error)}`;

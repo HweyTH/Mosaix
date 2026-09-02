@@ -2,6 +2,8 @@ use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 
+use crate::agent::{self, AgentError, AgentTransport};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Appearance {
@@ -49,6 +51,9 @@ pub struct EditorSnapshot {
 #[serde(rename_all = "lowercase")]
 pub enum CommandStatus {
     Previewing,
+    /// The agent confirmed it applied the layout. Never reported for a
+    /// request the agent did not answer.
+    Applied,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -61,6 +66,23 @@ pub struct CommandReceipt {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EditorCommandError {
     AgentUnavailable,
+    /// The agent answered and refused. Carries the agent's own reason
+    /// rather than a generic failure, because the reason is the only
+    /// thing the user can act on.
+    AgentRejected {
+        reason: String,
+    },
+    /// The agent speaks a different protocol version. Distinct from a
+    /// rejection so the user is told to update rather than left debugging
+    /// a feature that cannot work.
+    AgentVersionMismatch {
+        server_version: u32,
+    },
+    /// The connection itself failed in a way that is neither an absent
+    /// agent nor an answer from one.
+    AgentTransportFailed {
+        detail: String,
+    },
     EmptyLayout,
     DuplicateZoneId {
         zone_id: u32,
@@ -78,8 +100,18 @@ impl std::fmt::Display for EditorCommandError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::AgentUnavailable => formatter.write_str(
-                "the Mosaix agent IPC transport is not available yet; the draft was not saved or applied",
+                "the Mosaix agent is not running; the layout was not applied",
             ),
+            Self::AgentRejected { reason } => {
+                write!(formatter, "the Mosaix agent rejected the change: {reason}")
+            }
+            Self::AgentVersionMismatch { server_version } => write!(
+                formatter,
+                "the Mosaix agent speaks protocol v{server_version}; update Mosaix so the agent and settings match"
+            ),
+            Self::AgentTransportFailed { detail } => {
+                write!(formatter, "could not reach the Mosaix agent: {detail}")
+            }
             Self::EmptyLayout => formatter.write_str("a layout must contain at least one zone"),
             Self::DuplicateZoneId { zone_id } => {
                 write!(formatter, "zone {zone_id} appears more than once")
@@ -104,11 +136,23 @@ pub struct EditorSession {
     snapshot: EditorSnapshot,
     preview: Option<LayoutDraft>,
     revision: u64,
+    /// The connection to the agent, held for this session's lifetime.
+    agent: Box<dyn AgentTransport>,
 }
 
 impl Default for EditorSession {
     fn default() -> Self {
+        Self::with_agent(agent::connect())
+    }
+}
+
+impl EditorSession {
+    /// A session talking to `agent`. The connection is opened by the
+    /// caller and held here, so the agent sees one connection per settings
+    /// window rather than one per request (ADR 0021).
+    pub fn with_agent(agent: Box<dyn AgentTransport>) -> Self {
         Self {
+            agent,
             snapshot: EditorSnapshot {
                 appearance: Appearance::Dark,
                 display: DisplaySummary {
@@ -152,9 +196,7 @@ impl Default for EditorSession {
             revision: 0,
         }
     }
-}
 
-impl EditorSession {
     pub fn load(&self) -> EditorSnapshot {
         self.snapshot.clone()
     }
@@ -169,13 +211,45 @@ impl EditorSession {
         })
     }
 
+    /// Asks the agent to apply the saved layout `draft` names, and reports
+    /// success only if the agent confirms it. The editor performs no
+    /// placement and writes no configuration file of its own -- the agent
+    /// is the authority for both.
+    ///
+    /// Only the *name* crosses the transport today, so this applies
+    /// whichever saved layout configuration holds under that name, not the
+    /// cells currently drawn on screen. Persisting a drawn layout back to
+    /// configuration -- which is what makes the two the same thing -- is
+    /// issue #37. The draft is still validated first, so an unusable
+    /// drawing is refused here rather than saved by a later ticket's code
+    /// path.
     pub fn apply(&mut self, draft: LayoutDraft) -> Result<CommandReceipt, EditorCommandError> {
         validate_draft(&draft)?;
-        Err(EditorCommandError::AgentUnavailable)
+        self.agent
+            .apply_saved_layout(&draft.name)
+            .map_err(EditorCommandError::from)?;
+        self.revision += 1;
+        Ok(CommandReceipt {
+            revision: self.revision,
+            status: CommandStatus::Applied,
+        })
     }
 
     pub fn set_appearance(&mut self, appearance: Appearance) {
         self.snapshot.appearance = appearance;
+    }
+}
+
+impl From<AgentError> for EditorCommandError {
+    fn from(error: AgentError) -> Self {
+        match error {
+            AgentError::Unavailable => Self::AgentUnavailable,
+            AgentError::Rejected { reason } => Self::AgentRejected { reason },
+            AgentError::VersionMismatch { server_version } => {
+                Self::AgentVersionMismatch { server_version }
+            }
+            AgentError::Transport { detail } => Self::AgentTransportFailed { detail },
+        }
     }
 }
 
@@ -224,23 +298,150 @@ fn validate_draft(draft: &LayoutDraft) -> Result<(), EditorCommandError> {
 mod tests {
     use super::*;
 
+    use std::sync::{Arc, Mutex};
+
+    /// An agent that answers with whatever the test scripted. The session
+    /// owns its transport, so what the agent was asked is recorded through
+    /// a handle the test keeps rather than read back off the fake.
+    #[derive(Debug)]
+    struct FakeAgent {
+        outcome: Option<Result<(), AgentError>>,
+        applied: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl FakeAgent {
+        fn answering(outcome: Result<(), AgentError>) -> Self {
+            Self {
+                outcome: Some(outcome),
+                applied: Arc::default(),
+            }
+        }
+
+        /// A fake with no scripted answer: reaching it is a test failure.
+        fn never_asked() -> Self {
+            Self {
+                outcome: None,
+                applied: Arc::default(),
+            }
+        }
+    }
+
+    impl AgentTransport for FakeAgent {
+        fn apply_saved_layout(&mut self, name: &str) -> Result<(), AgentError> {
+            self.applied.lock().unwrap().push(name.to_owned());
+            self.outcome
+                .clone()
+                .expect("the test scripted no answer for this request")
+        }
+    }
+
+    fn session_with(outcome: Result<(), AgentError>) -> EditorSession {
+        EditorSession::with_agent(Box::new(FakeAgent::answering(outcome)))
+    }
+
     #[test]
-    fn editor_session_previews_locally_but_does_not_claim_an_agent_apply() {
-        let mut session = EditorSession::default();
+    fn editor_session_previews_locally_without_involving_the_agent() {
+        // The fake has no scripted answer, so a preview that reached the
+        // agent would panic rather than pass.
+        let mut session = EditorSession::with_agent(Box::new(FakeAgent::never_asked()));
         let mut draft = session.load().draft;
         draft.gap = 20;
 
-        assert_eq!(session.preview(draft.clone()).unwrap().revision, 1);
-        assert_eq!(
-            session.apply(draft),
-            Err(EditorCommandError::AgentUnavailable)
-        );
+        let receipt = session.preview(draft).unwrap();
+
+        assert_eq!(receipt.revision, 1);
+        assert_eq!(receipt.status, CommandStatus::Previewing);
         assert_eq!(session.load().draft.gap, 12);
     }
 
     #[test]
+    fn a_confirmed_apply_is_reported_as_applied() {
+        let mut session = session_with(Ok(()));
+        let draft = session.load().draft;
+
+        let receipt = session.apply(draft).expect("a confirmed apply succeeds");
+
+        assert_eq!(receipt.status, CommandStatus::Applied);
+        assert_eq!(receipt.revision, 1);
+    }
+
+    #[test]
+    fn an_apply_asks_the_agent_for_the_drafts_own_layout_name() {
+        let agent = FakeAgent::answering(Ok(()));
+        let applied = Arc::clone(&agent.applied);
+        let mut session = EditorSession::with_agent(Box::new(agent));
+        let mut draft = session.load().draft;
+        draft.name = "Writing".to_owned();
+
+        session.apply(draft).unwrap();
+
+        assert_eq!(*applied.lock().unwrap(), vec!["Writing".to_owned()]);
+    }
+
+    #[test]
+    fn a_rejected_apply_surfaces_the_agents_own_reason() {
+        let mut session = session_with(Err(AgentError::Rejected {
+            reason: "no managed window is focused, so there is no display to apply a layout to"
+                .to_owned(),
+        }));
+        let draft = session.load().draft;
+
+        let error = session.apply(draft).unwrap_err();
+
+        assert_eq!(
+            error,
+            EditorCommandError::AgentRejected {
+                reason: "no managed window is focused, so there is no display to apply a layout to"
+                    .to_owned(),
+            }
+        );
+        assert!(
+            error.to_string().contains("no managed window is focused"),
+            "the message a user sees must carry the agent's reason, got {error}"
+        );
+    }
+
+    #[test]
+    fn a_version_mismatch_is_reported_apart_from_a_rejection() {
+        let mut session = session_with(Err(AgentError::VersionMismatch { server_version: 1 }));
+        let draft = session.load().draft;
+
+        let error = session.apply(draft).unwrap_err();
+
+        assert_eq!(
+            error,
+            EditorCommandError::AgentVersionMismatch { server_version: 1 }
+        );
+        assert!(
+            error.to_string().contains("update"),
+            "a version mismatch must tell the user to update, got {error}"
+        );
+    }
+
+    #[test]
+    fn an_absent_agent_is_reported_as_unavailable_rather_than_as_a_success() {
+        let mut session = session_with(Err(AgentError::Unavailable));
+        let draft = session.load().draft;
+
+        assert_eq!(
+            session.apply(draft),
+            Err(EditorCommandError::AgentUnavailable)
+        );
+    }
+
+    #[test]
+    fn an_invalid_draft_is_rejected_before_the_agent_is_asked() {
+        // The fake has no scripted answer, so reaching it would panic.
+        let mut session = EditorSession::with_agent(Box::new(FakeAgent::never_asked()));
+        let mut draft = session.load().draft;
+        draft.zones.clear();
+
+        assert_eq!(session.apply(draft), Err(EditorCommandError::EmptyLayout));
+    }
+
+    #[test]
     fn editor_session_rejects_zones_outside_normalized_work_area() {
-        let mut session = EditorSession::default();
+        let mut session = session_with(Ok(()));
         let mut draft = session.load().draft;
         draft.zones[0].width = 1.01;
 
@@ -252,7 +453,7 @@ mod tests {
 
     #[test]
     fn editor_session_rejects_overlaps_when_the_draft_disallows_them() {
-        let mut session = EditorSession::default();
+        let mut session = session_with(Ok(()));
         let mut draft = session.load().draft;
         draft.allow_overlap = false;
         draft.zones.push(ZoneDraft {

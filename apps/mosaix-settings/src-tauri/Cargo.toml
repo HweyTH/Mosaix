@@ -23,3 +23,7 @@ tauri = { version = "2.11.5", features = [] }
 mosaix-config = { path = "../../../crates/mosaix-config" }
 mosaix-domain = { path = "../../../crates/mosaix-domain" }
 mosaix-platform-windows = { path = "../../../crates/mosaix-platform-windows" }
+tracing = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+mosaix-ipc = { path = "../../../crates/mosaix-ipc" }

@@ -108,3 +108,11 @@ _Avoid_: Preview (alone), ghost window, highlight
 **Focus border**:
 A persistent, click-through outline around the focused managed window, including tiled and floating windows, shown only while automatic tiling is active. Its only first-release customization is enabled state, color, and thickness; it is hidden in manual, suspended, and paused states. Also hidden whenever there is nothing to outline: a focused window that is minimized, hidden, or cloaked, and one currently in an interactive placement session, whose position is not yet settled. A maximized or full-screen window keeps its border. Follows where the window actually is rather than where Mosaix last placed it (ADR 0017), and is drawn by its own overlay, distinct from the snap preview.
 _Avoid_: Snap preview overlay, focus animation, window decoration
+
+**Saved layout**:
+A named set of zone rectangles for one display that a user can apply on demand, stored in configuration and overridable per display topology like any other config field (ADR 0004). It records *shape only*: applying it fills its cells with whichever managed windows exist, in visual window order, and never identifies a particular window (ADR 0018). Restoring a layout to specific windows by identity is deferred (issue #28).
+_Avoid_: Arrangement, scene, saved workspace. ARCHITECTURE.md uses "arrangement" in two senses -- "saved arrangements" (section 1) for this concept, and "the requested arrangement" (section 9.3) for a planner's current output -- so prefer "saved layout" for the stored artifact and leave "arrangement" to the planner sense.
+
+**Hotkey capture**:
+Reading a key combination by having the user press it in the settings hotkey editor, rather than typing it as text. Because `RegisterHotKey` is OS-arbitrated and gives Mosaix no way to swallow a keystroke (ADR 0002), capture requires the agent to unregister every binding for as long as the editor window is open, bounded by the editor's IPC connection so a crash re-registers (ADR 0021). The capture buffer itself is armed only while a single capture dialog is frontmost.
+_Avoid_: Capture (alone). "Capture" also names the deferred idea of recording the current on-screen arrangement as a saved layout (issue #28); say "hotkey capture" for this one and "capture-from-current" for that one.
