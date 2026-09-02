@@ -74,9 +74,14 @@ pub struct SavedLayoutView {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LayoutWriteReceipt {
-    /// The configuration file the agent wrote. Worth reporting because
-    /// with a profile matched it is not necessarily the file the user
-    /// would have guessed (ADR 0022).
+    /// The configuration file the agent wrote.
+    ///
+    /// Reported because with a profile matched it is not necessarily the
+    /// file a user would have guessed: the write goes to the layer that
+    /// supplies the layout (ADR 0022). ADR 0022 also wants the
+    /// destination shown *before* the save, with a control to redirect it
+    /// to base config; that needs per-layout provenance the agent does
+    /// not publish yet, and is issue #41.
     pub file: String,
 }
 
@@ -104,10 +109,11 @@ pub struct HotkeyBindingView {
     /// The saved layout a parameterized binding applies.
     pub layout: Option<String>,
     pub combo: String,
-    /// `base` or `profile`.
+    /// `base`, `profile`, or `unknown`.
     pub source: String,
-    /// The configuration file currently supplying this binding.
-    pub file: String,
+    /// The configuration file currently supplying this binding, absent
+    /// when the agent could not name it.
+    pub file: Option<String>,
 }
 
 /// Every binding in effect, plus the topology they are in effect for.
@@ -393,6 +399,8 @@ impl EditorSession {
         })
     }
 
+    /// Renames a saved layout. The write lands in whichever file
+    /// declares it, which the receipt names.
     pub fn rename(
         &mut self,
         from: &str,
@@ -405,6 +413,8 @@ impl EditorSession {
         })
     }
 
+    /// Copies a saved layout under a new name, beside the original --
+    /// a variant of a desk-specific layout stays desk-specific.
     pub fn duplicate(
         &mut self,
         from: &str,
@@ -417,6 +427,8 @@ impl EditorSession {
         })
     }
 
+    /// Removes a saved layout. A name both configuration layers declare
+    /// is refused by the agent rather than half-removed.
     pub fn delete(&mut self, name: &str) -> Result<LayoutWriteReceipt, EditorCommandError> {
         self.edit(LayoutEdit::Delete {
             name: name.to_owned(),
@@ -599,7 +611,7 @@ mod tests {
             layout: None,
             combo: combo.to_owned(),
             source: source.to_owned(),
-            file: file.to_owned(),
+            file: Some(file.to_owned()),
         }
     }
 
@@ -616,10 +628,11 @@ mod tests {
         let list = session.hotkeys().expect("the agent answered");
 
         assert_eq!(list.topology_fingerprint, "MON-A@0,0 1920x1080 scale=1");
-        assert_eq!(list.bindings[0].file, "config.toml");
+        assert_eq!(list.bindings[0].file.as_deref(), Some("config.toml"));
         assert_eq!(list.bindings[0].source, "base");
         assert_eq!(
-            list.bindings[1].file, "desk.toml",
+            list.bindings[1].file.as_deref(),
+            Some("desk.toml"),
             "a profile-supplied binding names the profile, which is where an edit would land"
         );
         assert_eq!(list.bindings[1].source, "profile");

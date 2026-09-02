@@ -59,37 +59,32 @@ pub struct HotkeyBindingSnapshot {
     /// The combination, in the spelling config files use
     /// (`ctrl+alt+left`).
     pub combo: String,
-    /// Which layer supplies this binding: `base` or `profile`.
+    /// Which layer supplies this binding: `base`, `profile`, or
+    /// `unknown` for a resolved config that recorded no source.
     pub source: String,
     /// The file that supplies it, and so the file a GUI edit of it would
     /// be written to (ADR 0022).
-    pub file: String,
-}
-
-fn layer_name(layer: ConfigLayer) -> &'static str {
-    match layer {
-        ConfigLayer::Base => "base",
-        ConfigLayer::Profile => "profile",
-    }
+    ///
+    /// `None` when this build cannot name it. A destination shown to a
+    /// user before a write has to be the real one or absent -- a
+    /// plausible-looking guess is the worst of the three.
+    pub file: Option<String>,
 }
 
 /// Every binding in `config`, paired with where it came from.
 ///
-/// A binding with no recorded source is reported as base-supplied rather
-/// than skipped: `merge` records one for every binding it resolves, so the
-/// only way to reach this is a `ResolvedConfig` built by hand, and hiding
-/// a real binding from the list would be worse than naming the wrong file
-/// for it.
+/// A binding with no recorded source is listed anyway rather than hidden:
+/// `merge` records one for every binding it resolves, so the only way to
+/// reach that is a `ResolvedConfig` built by hand, and dropping a real
+/// binding from the list a user reads instead of the TOML file would be
+/// worse than admitting where it came from is unknown.
 fn binding_snapshots(config: &ResolvedConfig) -> Vec<HotkeyBindingSnapshot> {
+    let base_file = || Some(mosaix_config::BASE_CONFIG_FILE_NAME.to_owned());
     config
         .hotkeys
         .iter()
         .map(|(command, combo)| {
-            let layer = config
-                .binding_sources
-                .get(command)
-                .copied()
-                .unwrap_or(ConfigLayer::Base);
+            let layer = config.binding_sources.get(command).copied();
             HotkeyBindingSnapshot {
                 command: command.to_string(),
                 layout: match command {
@@ -97,16 +92,23 @@ fn binding_snapshots(config: &ResolvedConfig) -> Vec<HotkeyBindingSnapshot> {
                     _ => None,
                 },
                 combo: combo.to_string(),
-                source: layer_name(layer).to_owned(),
-                file: match layer {
-                    ConfigLayer::Base => mosaix_config::BASE_CONFIG_FILE_NAME.to_owned(),
-                    // A profile-supplied binding always comes from a
-                    // resolved config `validate` produced, which is where
-                    // the filename is attached.
-                    ConfigLayer::Profile => config
-                        .profile_file
-                        .clone()
-                        .unwrap_or_else(|| "the matched profile".to_owned()),
+                source: match layer {
+                    Some(ConfigLayer::Base) => "base",
+                    Some(ConfigLayer::Profile) => "profile",
+                    None => "unknown",
+                }
+                .to_owned(),
+                file: match (layer, &config.profile_file) {
+                    (Some(ConfigLayer::Base), _) => base_file(),
+                    // `validate` attaches the filename to every resolved
+                    // profile, so this is `Some` for any config that came
+                    // through it.
+                    (Some(ConfigLayer::Profile), file) => file.clone(),
+                    // No recorded source. With no profile in play there is
+                    // only one file it could be; with one, naming either
+                    // would be a guess.
+                    (None, None) => base_file(),
+                    (None, Some(_)) => None,
                 },
             }
         })

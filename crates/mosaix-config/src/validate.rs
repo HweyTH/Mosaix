@@ -9,6 +9,7 @@ use thiserror::Error;
 
 use std::collections::BTreeMap;
 
+use crate::schema::layout_names_collide;
 use crate::schema::{
     BaseConfig, Command, ConfigLayer, KeyCombo, ProfileConfig, ResolvedConfig, ResolvedConfigSet,
     ResolvedProfile, SavedLayout, BASE_CONFIG_FILE_NAME, CURRENT_VERSION,
@@ -177,7 +178,7 @@ fn layout_errors(file: &str, layouts: &BTreeMap<String, SavedLayout>) -> Vec<Val
     let names: Vec<&String> = layouts.keys().collect();
     for i in 0..names.len() {
         for j in (i + 1)..names.len() {
-            if names[i].to_lowercase() == names[j].to_lowercase() {
+            if layout_names_collide(names[i], names[j]) {
                 errors.push(ValidationError::DuplicateLayoutName {
                     file: file.to_owned(),
                     first: names[i].clone(),

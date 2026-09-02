@@ -32,8 +32,9 @@ pub use io::{
     DEBOUNCE_WINDOW,
 };
 pub use schema::{
-    AutomaticTilingSection, BaseConfig, BehaviorSection, Command, ConfigLayer, FocusBorderOverride,
-    FocusBorderSection, GapsOverride, KeyCombo, ProfileConfig, ResolvedConfig, ResolvedConfigSet,
-    ResolvedProfile, RgbaColor, SavedLayout, BASE_CONFIG_FILE_NAME, CURRENT_VERSION,
+    layout_names_collide, AutomaticTilingSection, BaseConfig, BehaviorSection, Command,
+    ConfigLayer, FocusBorderOverride, FocusBorderSection, GapsOverride, KeyCombo, ProfileConfig,
+    ResolvedConfig, ResolvedConfigSet, ResolvedProfile, RgbaColor, SavedLayout,
+    BASE_CONFIG_FILE_NAME, CURRENT_VERSION,
 };
 pub use validate::{merge, validate, CandidateConfig, CandidateProfile, ValidationError};

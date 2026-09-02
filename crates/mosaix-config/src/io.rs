@@ -19,9 +19,10 @@ use thiserror::Error;
 use mosaix_domain::NormalizedRect;
 
 use crate::defaults::default_config_content;
+use crate::schema::layout_names_collide;
 use crate::schema::{
-    AutomaticTilingSection, BaseConfig, FocusBorderOverride, GapsOverride, ProfileConfig,
-    ResolvedConfigSet, SavedLayout, BASE_CONFIG_FILE_NAME as BASE_FILE_NAME,
+    AutomaticTilingSection, BaseConfig, ConfigLayer, FocusBorderOverride, GapsOverride,
+    ProfileConfig, ResolvedConfigSet, SavedLayout, BASE_CONFIG_FILE_NAME as BASE_FILE_NAME,
 };
 use crate::validate::{validate, CandidateConfig, CandidateProfile, ValidationError};
 
@@ -209,6 +210,21 @@ fn replace_file(temp: &Path, destination: &Path) -> std::io::Result<()> {
     fs::rename(temp, destination)
 }
 
+/// Writes `contents` to `destination` through a temp file and a rename, so
+/// a reader never sees a half-written configuration file and a failed
+/// write leaves the previous one intact.
+///
+/// Every configuration write this crate performs goes through here.
+fn write_atomically(destination: &Path, contents: &str) -> Result<(), ConfigIoError> {
+    let file_name = destination
+        .file_name()
+        .expect("a configuration destination always names a file")
+        .to_string_lossy();
+    let temp = destination.with_file_name(format!(".{file_name}.mosaix-tmp"));
+    fs::write(&temp, contents).map_err(|error| io_error(&temp, error))?;
+    replace_file(&temp, destination).map_err(|error| io_error(destination, error))
+}
+
 /// Validates a complete candidate directory before atomically replacing the
 /// one topology profile edited by Settings. Existing hotkeys and unrelated
 /// profiles are preserved byte-for-byte.
@@ -264,12 +280,7 @@ pub fn save_profile_settings(
     }
     let resolved = validate(&candidate).map_err(validation_message)?;
 
-    let destination = dir.join(PROFILES_DIR_NAME).join(&file_name);
-    let temp = dir
-        .join(PROFILES_DIR_NAME)
-        .join(format!(".{file_name}.mosaix-tmp"));
-    fs::write(&temp, contents).map_err(|error| io_error(&temp, error))?;
-    replace_file(&temp, &destination).map_err(|error| io_error(&destination, error))?;
+    write_atomically(&dir.join(PROFILES_DIR_NAME).join(&file_name), &contents)?;
     Ok(resolved)
 }
 
@@ -282,13 +293,12 @@ struct LayoutLayers {
 }
 
 impl LayoutLayers {
-    /// Whether the profile supplies `name`, `None` if no layer declares
-    /// it.
+    /// Which layer supplies `name`, `None` if no layer declares it.
     ///
     /// A name both layers declare has no single answer, and guessing would
     /// make a delete look like it failed when base config's copy
     /// reappeared -- so it is reported rather than resolved.
-    fn supplier(&self, name: &str) -> Result<Option<bool>, LayoutEditError> {
+    fn supplier(&self, name: &str) -> Result<Option<ConfigLayer>, LayoutEditError> {
         let in_base = self.base.layouts.contains_key(name);
         let profile = self
             .profile
@@ -300,8 +310,8 @@ impl LayoutLayers {
                 base_file: BASE_FILE_NAME.to_owned(),
                 profile_file: file.clone(),
             }),
-            (_, Some(_)) => Ok(Some(true)),
-            (true, None) => Ok(Some(false)),
+            (_, Some(_)) => Ok(Some(ConfigLayer::Profile)),
+            (true, None) => Ok(Some(ConfigLayer::Base)),
             (false, None) => Ok(None),
         }
     }
@@ -315,8 +325,8 @@ impl LayoutLayers {
         )
     }
 
-    fn cells(&self, name: &str, from_profile: bool) -> Vec<NormalizedRect> {
-        let layouts = if from_profile {
+    fn cells(&self, name: &str, layer: ConfigLayer) -> Vec<NormalizedRect> {
+        let layouts = if layer == ConfigLayer::Profile {
             self.profile
                 .as_ref()
                 .map(|(_, profile)| &profile.layouts)
@@ -364,7 +374,7 @@ fn check_new_name(layers: &LayoutLayers, name: &str) -> Result<(), LayoutEditErr
     }
     if layers
         .names()
-        .any(|existing| existing.to_lowercase() == name.to_lowercase())
+        .any(|existing| layout_names_collide(existing, name))
     {
         return Err(LayoutEditError::NameTaken {
             name: name.to_owned(),
@@ -376,7 +386,11 @@ fn check_new_name(layers: &LayoutLayers, name: &str) -> Result<(), LayoutEditErr
 /// Which layer an edit writes, the layout it takes out of that layer, and
 /// the one it leaves there. A rename is a removal and an addition in one
 /// file, which is why this is not two separate decisions.
-type EditPlan = (bool, Option<String>, Option<(String, Vec<NormalizedRect>)>);
+type EditPlan = (
+    ConfigLayer,
+    Option<String>,
+    Option<(String, Vec<NormalizedRect>)>,
+);
 
 fn plan_edit(layers: &LayoutLayers, edit: &LayoutEdit) -> Result<EditPlan, LayoutEditError> {
     let unknown = |name: &String| LayoutEditError::UnknownLayout { name: name.clone() };
@@ -389,34 +403,34 @@ fn plan_edit(layers: &LayoutLayers, edit: &LayoutEdit) -> Result<EditPlan, Layou
             // A layout that exists is rewritten where it lives; a new one
             // goes to base config, so it is available at every desk.
             Ok((
-                supplier.unwrap_or(false),
+                supplier.unwrap_or(ConfigLayer::Base),
                 None,
                 Some((name.clone(), cells.clone())),
             ))
         }
         LayoutEdit::Rename { from, to } => {
-            let from_profile = layers.supplier(from)?.ok_or_else(|| unknown(from))?;
+            let layer = layers.supplier(from)?.ok_or_else(|| unknown(from))?;
             // Renaming `writing` to `Writing` is a change of case, not a
             // collision with itself: the old name leaves in the same write.
-            if !from.eq_ignore_ascii_case(to) {
+            if !layout_names_collide(from, to) {
                 check_new_name(layers, to)?;
             } else if to.trim().is_empty() {
                 return Err(LayoutEditError::EmptyName);
             }
-            let cells = layers.cells(from, from_profile);
-            Ok((from_profile, Some(from.clone()), Some((to.clone(), cells))))
+            let cells = layers.cells(from, layer);
+            Ok((layer, Some(from.clone()), Some((to.clone(), cells))))
         }
         LayoutEdit::Duplicate { from, to } => {
-            let from_profile = layers.supplier(from)?.ok_or_else(|| unknown(from))?;
+            let layer = layers.supplier(from)?.ok_or_else(|| unknown(from))?;
             check_new_name(layers, to)?;
             // The copy lands beside its original, so a variant of a
             // desk-specific layout stays desk-specific.
-            let cells = layers.cells(from, from_profile);
-            Ok((from_profile, None, Some((to.clone(), cells))))
+            let cells = layers.cells(from, layer);
+            Ok((layer, None, Some((to.clone(), cells))))
         }
         LayoutEdit::Delete { name } => {
-            let from_profile = layers.supplier(name)?.ok_or_else(|| unknown(name))?;
-            Ok((from_profile, Some(name.clone()), None))
+            let layer = layers.supplier(name)?.ok_or_else(|| unknown(name))?;
+            Ok((layer, Some(name.clone()), None))
         }
     }
 }
@@ -439,7 +453,8 @@ pub fn edit_layouts(
     ensure_default_config(dir)?;
     let mut candidate = read_candidate(dir)?;
     let layers = parse_layers(&candidate, fingerprint)?;
-    let (into_profile, removed, added) = plan_edit(&layers, &edit)?;
+    let (layer, removed, added) = plan_edit(&layers, &edit)?;
+    let into_profile = layer == ConfigLayer::Profile;
 
     let (file_name, contents) = if into_profile {
         let (file_name, mut profile) = layers
@@ -471,9 +486,7 @@ pub fn edit_layouts(
     } else {
         dir.join(&file_name)
     };
-    let temp = destination.with_file_name(format!(".{file_name}.mosaix-tmp"));
-    fs::write(&temp, contents).map_err(|error| io_error(&temp, error))?;
-    replace_file(&temp, &destination).map_err(|error| io_error(&destination, error))?;
+    write_atomically(&destination, &contents)?;
 
     Ok(LayoutWrite {
         file: file_name,

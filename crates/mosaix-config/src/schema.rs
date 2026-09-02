@@ -554,6 +554,19 @@ pub enum ConfigLayer {
     Profile,
 }
 
+/// Whether two saved-layout names are the same layout to a user.
+///
+/// Case-insensitive, because whole-directory validation rejects two
+/// layouts whose names differ only by case: `writing` and `Writing` are
+/// two map entries but one layout, and a binding naming either would be
+/// ambiguous. The single definition matters -- validation and the
+/// pre-write check in [`crate::edit_layouts`] both ask this question, and
+/// answering it two different ways would let a name through one and not
+/// the other.
+pub fn layout_names_collide(first: &str, second: &str) -> bool {
+    first.to_lowercase() == second.to_lowercase()
+}
+
 /// The merged result of base config plus (optionally) one profile
 /// (CONTEXT.md "Resolved config") -- the actual settings in effect for one
 /// topology. What [`crate::merge`] produces and what

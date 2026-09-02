@@ -13,7 +13,7 @@ The initial desktop surface is the visual layout editor. Its locked design decis
 - Draft operations include selecting, naming, splitting, duplicating, deleting, undoing, gaps, and overlap policy.
 - Preview and Save & apply cross typed Tauri commands; the frontend does not edit configuration files.
 
-Preview validates the draft locally and draws it against the selected display's real work area. Everything that persists goes through the agent over a connection held for the window's lifetime: saving, renaming, duplicating and deleting a saved layout, and Save & apply, which saves the drawing before applying it. Each is reported only when the agent confirms it, along with the configuration file the write landed in -- with a topology profile matched, that is not necessarily the file a user would guess (ADR 0022).
+Preview validates the draft locally and draws it against the selected display's real work area. Everything that persists goes through the agent over a connection held for the window's lifetime: saving, renaming, duplicating and deleting a saved layout, and Save & apply, which saves the drawing before applying it. Each is reported only when the agent confirms it, along with the configuration file the write landed in -- with a topology profile matched, that is not necessarily the file a user would guess (ADR 0022). The destination is reported after the write; showing it beforehand with a control to redirect it to base config is issue #41.
 
 The left rail also lists every hotkey binding in effect and the file supplying it. Read-only for now; editing arrives with the capture dialog.
 

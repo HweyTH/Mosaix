@@ -20,15 +20,19 @@ export interface DisplaySummary {
   name: string;
   resolution: string;
   scalePercent: number;
-  /// The work area's pixel dimensions. The canvas is drawn at these
-  /// proportions, so a preview shows the shape the layout will really take.
+  /**
+   * The work area's pixel dimensions. The canvas is drawn at these
+   * proportions, so a preview shows the shape the layout will really take.
+   */
   workAreaWidth: number;
   workAreaHeight: number;
 }
 
 export interface EditorSnapshot {
   appearance: Appearance;
-  /// Every display a layout can be previewed against, primary first.
+  /**
+   * Every display a layout can be previewed against, primary first.
+   */
   displays: DisplaySummary[];
   draft: LayoutDraft;
 }
@@ -58,15 +62,18 @@ export interface AutomaticTilingSettings {
   focusBorderThickness: number;
 }
 
-/// One hotkey binding as the interface shows it. `file` is the
-/// configuration file that currently supplies it, and so the file an edit
-/// of it would be written to (ADR 0022).
+/**
+ * One hotkey binding as the interface shows it. `file` is the
+ * configuration file that currently supplies it, and so the file an edit
+ * of it would be written to (ADR 0022).
+ */
 export interface HotkeyBinding {
   command: string;
   layout: string | null;
   combo: string;
-  source: "base" | "profile";
-  file: string;
+  source: "base" | "profile" | "unknown";
+  /** Absent when the agent could not name the file supplying this binding. */
+  file: string | null;
 }
 
 export interface HotkeyList {
@@ -89,13 +96,15 @@ export interface DesktopBridge {
   saveAutomaticTilingSettings(settings: AutomaticTilingSettings): Promise<AutomaticTilingSettings>;
 }
 
-/// The label for a command's TOML path: `snap-left` becomes "Snap left",
-/// and `apply-layout.writing` becomes "Apply layout · writing".
-///
-/// Reads the path rather than carrying a table of pretty names, so a verb
-/// added to the schema shows up here without a second edit -- at the cost
-/// of a label that is only as good as the verb's spelling, which is the
-/// right trade for a list a user scans rather than reads.
+/**
+ * The label for a command's TOML path: `snap-left` becomes "Snap left",
+ * and `apply-layout.writing` becomes "Apply layout · writing".
+ *
+ * Reads the path rather than carrying a table of pretty names, so a verb
+ * added to the schema shows up here without a second edit -- at the cost
+ * of a label that is only as good as the verb's spelling, which is the
+ * right trade for a list a user scans rather than reads.
+ */
 export function bindingLabel(command: string): string {
   const [verb, ...rest] = command.split(".");
   const words = (verb ?? "").split("-").join(" ");
@@ -108,17 +117,19 @@ export interface WatchHandlers<T> {
   onError: (error: unknown) => void;
 }
 
-/// Calls `read` every `intervalMs`, reporting only when the answer has
-/// actually changed. Returns a function that stops it.
-///
-/// Polling rather than a push from the agent: the IPC protocol answers
-/// requests and never initiates, so a settings window that wants to notice
-/// a change made elsewhere -- docking a laptop, hand-editing a config file
-/// -- has to ask.
-///
-/// Reporting only changes is what keeps this from re-rendering every tick,
-/// and it applies to failures too, so an agent that is not running is
-/// reported once rather than twice a second.
+/**
+ * Calls `read` every `intervalMs`, reporting only when the answer has
+ * actually changed. Returns a function that stops it.
+ *
+ * Polling rather than a push from the agent: the IPC protocol answers
+ * requests and never initiates, so a settings window that wants to notice
+ * a change made elsewhere -- docking a laptop, hand-editing a config file
+ * -- has to ask.
+ *
+ * Reporting only changes is what keeps this from re-rendering every tick,
+ * and it applies to failures too, so an agent that is not running is
+ * reported once rather than twice a second.
+ */
 export function watchChanges<T>(
   read: () => Promise<T>,
   handlers: WatchHandlers<T>,
@@ -143,9 +154,11 @@ export function watchChanges<T>(
   return () => clearInterval(timer);
 }
 
-/// Watches the hotkey bindings. A topology change swaps the matched
-/// profile, and with it both the combinations on screen and the files
-/// behind them.
+/**
+ * Watches the hotkey bindings. A topology change swaps the matched
+ * profile, and with it both the combinations on screen and the files
+ * behind them.
+ */
 export function watchHotkeyBindings(
   bridge: Pick<DesktopBridge, "loadHotkeyBindings">,
   handlers: WatchHandlers<HotkeyList>,
@@ -154,14 +167,24 @@ export function watchHotkeyBindings(
   return watchChanges(() => bridge.loadHotkeyBindings(), handlers, intervalMs);
 }
 
-/// Watches the saved-layout set, so a layout added by hand in a
-/// configuration file appears without reopening the window.
+/**
+ * Watches the saved-layout set, so a layout added by hand in a
+ * configuration file appears without reopening the window.
+ */
 export function watchSavedLayouts(
   bridge: Pick<DesktopBridge, "loadSavedLayouts">,
   handlers: WatchHandlers<SavedLayout[]>,
   intervalMs = 2000,
 ): () => void {
   return watchChanges(() => bridge.loadSavedLayouts(), handlers, intervalMs);
+}
+
+/**
+ * The attribute name behind a `dataset` key: `layoutName` is written
+ * `data-layout-name`.
+ */
+function camelToDataAttribute(key: string): string {
+  return key.replace(/[A-Z]/g, (letter) => `-${letter.toLowerCase()}`);
 }
 
 function escapeHtml(value: string): string {
@@ -222,13 +245,21 @@ function renderBindings(hotkeys: HotkeyList | undefined, hotkeyError: string | u
         <li class="binding" data-binding="${escapeHtml(binding.command)}" data-source="${escapeHtml(binding.source)}">
           <span class="binding-command">${escapeHtml(bindingLabel(binding.command))}</span>
           <kbd>${escapeHtml(binding.combo)}</kbd>
-          <small class="binding-file">${binding.source === "profile" ? "profile · " : ""}${escapeHtml(binding.file)}</small>
+          <small class="binding-file">${binding.source === "profile" ? "profile · " : ""}${escapeHtml(binding.file ?? "source unknown")}</small>
         </li>`,
     )
     .join("")}</ul>`;
 }
 
-export async function mountLayoutEditor(root: HTMLElement, bridge: DesktopBridge): Promise<void> {
+/**
+ * Mounts the editor into `root`. Returns a function that stops the
+ * background reads it starts -- the window owns them for its lifetime, so
+ * only a test normally calls it.
+ */
+export async function mountLayoutEditor(
+  root: HTMLElement,
+  bridge: DesktopBridge,
+): Promise<() => void> {
   const [snapshot, initialTilingSettings] = await Promise.all([
     bridge.loadEditorSnapshot(),
     bridge.loadAutomaticTilingSettings(),
@@ -250,7 +281,27 @@ export async function mountLayoutEditor(root: HTMLElement, bridge: DesktopBridge
 
   const nextZoneId = (): number => Math.max(0, ...snapshot.draft.zones.map((zone) => zone.id)) + 1;
 
+  /**
+   * Which field had focus, and where the caret was, so a re-render driven
+   * by a watch tick does not interrupt someone typing.
+   */
+  const focusedField = (): { key: string; start: number | null } | undefined => {
+    const active = document.activeElement;
+    if (!(active instanceof HTMLInputElement)) return undefined;
+    const key = Object.keys(active.dataset)[0];
+    return key === undefined ? undefined : { key, start: active.selectionStart };
+  };
+
+  const restoreFocus = (field: { key: string; start: number | null } | undefined): void => {
+    if (field === undefined) return;
+    const input = root.querySelector<HTMLInputElement>(`[data-${camelToDataAttribute(field.key)}]`);
+    if (input === null) return;
+    input.focus();
+    if (field.start !== null) input.setSelectionRange(field.start, field.start);
+  };
+
   const render = (): void => {
+    const focused = focusedField();
     const selectedZone = snapshot.draft.zones.find((zone) => zone.id === selectedZoneId);
     // Never undefined: the session always offers at least a nominal
     // display, so the canvas has proportions to draw at.
@@ -342,12 +393,17 @@ export async function mountLayoutEditor(root: HTMLElement, bridge: DesktopBridge
       selectedDisplayIndex = Number((event.currentTarget as HTMLSelectElement).value);
       render();
     });
-    root.querySelector<HTMLInputElement>("[data-layout-name]")?.addEventListener("change", (event) => {
+    // `input`, not `change`: a watch tick can re-render the panel while the
+    // user is still typing, and a name only committed on blur would be
+    // thrown away with the old markup.
+    root.querySelector<HTMLInputElement>("[data-layout-name]")?.addEventListener("input", (event) => {
       snapshot.draft.name = (event.currentTarget as HTMLInputElement).value;
     });
-    /// Runs one configuration write and reports what the agent said. The
-    /// saved-layout list is re-read afterwards so the panel reflects the
-    /// write the agent actually made, rather than the one asked for.
+    /**
+     * Runs one configuration write and reports what the agent said. The
+     * saved-layout list is re-read afterwards so the panel reflects the
+     * write the agent actually made, rather than the one asked for.
+     */
     const write = (
       pending: string,
       done: (receipt: LayoutWriteReceipt) => string,
@@ -369,6 +425,21 @@ export async function mountLayoutEditor(root: HTMLElement, bridge: DesktopBridge
     };
     root.querySelector<HTMLElement>("[data-save-layout]")?.addEventListener("click", () => {
       const draft = structuredClone(snapshot.draft);
+      // Saving replaces the cells of a layout that already carries this
+      // name. That is what a user editing an open layout means, and the
+      // opposite of what a user naming a new drawing means -- so the
+      // second case is reported here rather than silently overwriting a
+      // layout they never opened.
+      const clash = layouts?.find(
+        (layout) =>
+          layout.name !== selectedLayout &&
+          layout.name.toLowerCase() === draft.name.trim().toLowerCase(),
+      );
+      if (clash !== undefined) {
+        commandStatus = `A saved layout named ${clash.name} already exists · open it to edit, or choose another name`;
+        render();
+        return;
+      }
       write(
         "Saving layout…",
         (receipt) => `Saved to ${receipt.file}`,
@@ -572,6 +643,8 @@ export async function mountLayoutEditor(root: HTMLElement, bridge: DesktopBridge
         });
       });
     });
+
+    restoreFocus(focused);
   };
 
   render();
@@ -580,7 +653,7 @@ export async function mountLayoutEditor(root: HTMLElement, bridge: DesktopBridge
   // so a layout added by hand in the file shows up here. Only the *list*
   // is replaced: the draft on the canvas is the user's in-progress work,
   // and the echo of the editor's own write must not discard it.
-  watchSavedLayouts(bridge, {
+  const stopLayoutWatch = watchSavedLayouts(bridge, {
     onChange: (list) => {
       layouts = list;
       layoutError = undefined;
@@ -591,7 +664,7 @@ export async function mountLayoutEditor(root: HTMLElement, bridge: DesktopBridge
       render();
     },
   });
-  watchHotkeyBindings(bridge, {
+  const stopHotkeyWatch = watchHotkeyBindings(bridge, {
     onChange: (list) => {
       hotkeys = list;
       hotkeyError = undefined;
@@ -602,4 +675,9 @@ export async function mountLayoutEditor(root: HTMLElement, bridge: DesktopBridge
       render();
     },
   });
+
+  return () => {
+    stopLayoutWatch();
+    stopHotkeyWatch();
+  };
 }

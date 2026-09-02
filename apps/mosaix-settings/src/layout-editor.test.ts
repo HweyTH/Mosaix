@@ -292,16 +292,77 @@ describe("saved layouts", () => {
     await mountLayoutEditor(root, desktop);
 
     const name = root.querySelector<HTMLInputElement>("[data-layout-name]")!;
-    name.value = "Writing";
-    name.dispatchEvent(new Event("change", { bubbles: true }));
+    name.value = "Drafting";
+    name.dispatchEvent(new Event("input", { bubbles: true }));
     root.querySelector<HTMLElement>("[data-save-layout]")!.click();
     await vi.waitFor(() =>
       expect(root.querySelector(".command-status")?.textContent).toContain("desk.toml"),
     );
 
     expect(desktop.saveLayout).toHaveBeenCalledWith(
-      expect.objectContaining({ name: "Writing", zones: expect.any(Array) }),
+      expect.objectContaining({ name: "Drafting", zones: expect.any(Array) }),
     );
+  });
+
+  it("reports a name already taken before saving over the layout that holds it", async () => {
+    // Saving replaces the cells under that name. That is right for a
+    // layout the user opened and wrong for a drawing they just named, so
+    // the second case has to be stopped before the write.
+    const root = document.createElement("div");
+    document.body.append(root);
+    const desktop = bridge();
+    await mountLayoutEditor(root, desktop);
+    await vi.waitFor(() => expect(root.querySelector(".library-item")).not.toBeNull());
+
+    const name = root.querySelector<HTMLInputElement>("[data-layout-name]")!;
+    name.value = "Writing";
+    name.dispatchEvent(new Event("input", { bubbles: true }));
+    root.querySelector<HTMLElement>("[data-save-layout]")!.click();
+
+    expect(root.querySelector(".command-status")?.textContent).toContain("already exists");
+    expect(desktop.saveLayout).not.toHaveBeenCalled();
+  });
+
+  it("saves over the layout it has open without complaining about its own name", async () => {
+    const root = document.createElement("div");
+    document.body.append(root);
+    const desktop = bridge();
+    await mountLayoutEditor(root, desktop);
+    await vi.waitFor(() => expect(root.querySelector("[data-open-layout]")).not.toBeNull());
+
+    root.querySelector<HTMLElement>("[data-open-layout]")!.click();
+    root.querySelector<HTMLElement>("[data-save-layout]")!.click();
+
+    await vi.waitFor(() => expect(desktop.saveLayout).toHaveBeenCalled());
+    expect(desktop.saveLayout).toHaveBeenCalledWith(
+      expect.objectContaining({ name: "writing" }),
+    );
+  });
+
+  it("keeps a half-typed layout name through a background refresh", async () => {
+    vi.useFakeTimers();
+    const root = document.createElement("div");
+    document.body.append(root);
+    const desktop = bridge();
+    desktop.loadSavedLayouts = vi
+      .fn()
+      .mockResolvedValueOnce(structuredClone(savedLayouts))
+      .mockResolvedValue([
+        ...structuredClone(savedLayouts),
+        { name: "hand written", cells: [{ id: 1, name: "Zone 1", x: 0, y: 0, width: 100, height: 100 }] },
+      ]);
+    await mountLayoutEditor(root, desktop);
+
+    const name = root.querySelector<HTMLInputElement>("[data-layout-name]")!;
+    name.focus();
+    name.value = "half typ";
+    name.dispatchEvent(new Event("input", { bubbles: true }));
+    await vi.advanceTimersByTimeAsync(2500);
+    vi.useRealTimers();
+
+    const refreshed = root.querySelector<HTMLInputElement>("[data-layout-name]")!;
+    expect(refreshed.value).toBe("half typ");
+    expect(document.activeElement).toBe(refreshed);
   });
 
   it("reports a rejected save as a failure carrying the agent's reason", async () => {
@@ -349,7 +410,7 @@ describe("saved layouts", () => {
     root.querySelector<HTMLElement>("[data-open-layout]")!.click();
     const name = root.querySelector<HTMLInputElement>("[data-layout-name]")!;
     name.value = "drafting";
-    name.dispatchEvent(new Event("change", { bubbles: true }));
+    name.dispatchEvent(new Event("input", { bubbles: true }));
     root.querySelector<HTMLElement>("[data-rename-layout]")!.click();
 
     await vi.waitFor(() =>

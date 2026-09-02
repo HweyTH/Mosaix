@@ -173,6 +173,7 @@ pub fn save_layout(
     session.save(draft).map_err(|error| error.to_string())
 }
 
+/// Renames a saved layout, in whichever file declares it.
 #[tauri::command]
 pub fn rename_layout(
     from: String,
@@ -185,6 +186,7 @@ pub fn rename_layout(
         .map_err(|error| error.to_string())
 }
 
+/// Copies a saved layout's cells to a new name, beside the original.
 #[tauri::command]
 pub fn duplicate_layout(
     from: String,
@@ -197,6 +199,7 @@ pub fn duplicate_layout(
         .map_err(|error| error.to_string())
 }
 
+/// Removes a saved layout from the file that declares it.
 #[tauri::command]
 pub fn delete_layout(
     name: String,

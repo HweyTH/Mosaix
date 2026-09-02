@@ -31,8 +31,10 @@ function fromNormalizedDraft(draft: LayoutDraft): LayoutDraft {
   };
 }
 
-/// A saved layout's cells arrive normalized, like an editor snapshot's --
-/// the canvas works in percentages, so both cross the bridge the same way.
+/**
+ * A saved layout's cells arrive normalized, like an editor snapshot's --
+ * the canvas works in percentages, so both cross the bridge the same way.
+ */
 function fromNormalizedLayout(layout: SavedLayout): SavedLayout {
   return {
     ...layout,
