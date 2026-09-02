@@ -240,10 +240,29 @@ pub fn handle_request(
             // would come of it. Asking first is what lets the caller be
             // told *why* nothing happened (ADR 0020).
             match mosaix_engine::plan_saved_layout(&state_reader.snapshot(), name) {
-                Ok(_) => send_event(
+                Ok(plan) => match send_event(
                     events,
                     Event::SavedLayoutApplyRequested { name: name.clone() },
-                ),
+                ) {
+                    // A layout with fewer cells than the display has
+                    // windows still applies; what it could not place is
+                    // counted back rather than dropped silently.
+                    //
+                    // These describe the *plan*, not the outcome. The
+                    // reducer re-reaches the verdict against its own
+                    // state, and a window whose circuit breaker is open
+                    // will not move even though a cell was assigned to it
+                    // -- so `cells_filled` counts cells that got a window,
+                    // and deliberately does not claim they all moved.
+                    IpcResponse::Ok { .. } => IpcResponse::Ok {
+                        data: Some(serde_json::json!({
+                            "layout": name,
+                            "cells_filled": plan.placements.len(),
+                            "unplaced": plan.unplaced,
+                        })),
+                    },
+                    other => other,
+                },
                 Err(rejection) => IpcResponse::Error {
                     message: rejection.to_string(),
                 },
@@ -353,6 +372,30 @@ mod tests {
         assert_eq!(json["saved_layouts"]["writing"]["cells"][0]["width"], 0.6);
     }
 
+    /// An ordinary tileable window on display 1, the shape every layout
+    /// test's inventory is built from.
+    fn managed_window(id: isize, bounds: Rect) -> Window {
+        Window {
+            id: WindowId(id),
+            process_id: 4,
+            application_id: ApplicationId("test".to_owned()),
+            executable_path: None,
+            title: "non-sensitive-test-title".to_owned(),
+            native_class: None,
+            role: WindowRole::Normal,
+            bounds,
+            display_id: DisplayId(1),
+            capabilities: WindowCapabilities {
+                can_move: true,
+                can_resize: true,
+                can_minimize: true,
+                can_maximize: true,
+            },
+            elevated: false,
+            lifecycle: WindowLifecycle::Active,
+        }
+    }
+
     /// An engine with one display, one managed window focused on it, and
     /// whatever saved layouts `layouts` declares.
     fn engine_with_layouts(
@@ -375,29 +418,10 @@ mod tests {
             profiles: Vec::new(),
         };
         let engine = mosaix_engine::spawn_engine(vec![display], config_set);
-        let window = Window {
-            id: WindowId(11),
-            process_id: 4,
-            application_id: ApplicationId("test".to_owned()),
-            executable_path: None,
-            title: "non-sensitive-test-title".to_owned(),
-            native_class: None,
-            role: WindowRole::Normal,
-            bounds: Rect::new(0, 0, 400, 300),
-            display_id: DisplayId(1),
-            capabilities: WindowCapabilities {
-                can_move: true,
-                can_resize: true,
-                can_minimize: true,
-                can_maximize: true,
-            },
-            elevated: false,
-            lifecycle: WindowLifecycle::Active,
-        };
         engine
             .events()
             .send(Event::WindowsObserved {
-                windows: vec![window],
+                windows: vec![managed_window(11, Rect::new(0, 0, 400, 300))],
             })
             .unwrap();
         engine
@@ -444,12 +468,65 @@ mod tests {
             &engine.state_reader(),
         );
 
-        assert_eq!(response, IpcResponse::Ok { data: None });
+        assert_eq!(
+            response,
+            IpcResponse::Ok {
+                data: Some(serde_json::json!({
+                    "layout": "half",
+                    "cells_filled": 1,
+                    "unplaced": 0,
+                })),
+            }
+        );
         wait_for_revision(&engine, before + 1);
         assert_eq!(
             engine.snapshot().windows[&window_id].bounds,
             Rect::new(0, 0, 960, 1080)
         );
+    }
+
+    #[test]
+    fn a_layout_with_fewer_cells_than_windows_answers_with_the_unplaced_count() {
+        let mut layouts = BTreeMap::new();
+        layouts.insert(
+            "solo".to_owned(),
+            SavedLayout {
+                cells: vec![mosaix_domain::NormalizedRect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 1.0,
+                    height: 1.0,
+                }],
+            },
+        );
+        let (engine, _) = engine_with_layouts(layouts);
+        // A second managed window on the same display, which the
+        // single-cell layout has nowhere to put.
+        let before = engine.state_reader().revision();
+        engine
+            .events()
+            .send(Event::WindowsObserved {
+                windows: vec![
+                    managed_window(11, Rect::new(0, 0, 400, 300)),
+                    managed_window(12, Rect::new(0, 400, 400, 300)),
+                ],
+            })
+            .unwrap();
+        wait_for_revision(&engine, before + 1);
+
+        let response = handle_request(
+            &IpcRequest::ApplyLayout {
+                name: "solo".to_owned(),
+            },
+            &engine.events(),
+            &engine.state_reader(),
+        );
+
+        let IpcResponse::Ok { data: Some(data) } = response else {
+            panic!("a window surplus is not a failure, got {response:?}");
+        };
+        assert_eq!(data["cells_filled"], 1);
+        assert_eq!(data["unplaced"], 1);
     }
 
     #[test]

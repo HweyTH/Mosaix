@@ -561,6 +561,30 @@ impl std::fmt::Display for SavedLayoutRejection {
     }
 }
 
+/// What applying a saved layout would do to the target display right now.
+///
+/// Counts rarely match, and neither mismatch is a failure. Surplus cells
+/// simply go unfilled, which needs no reporting -- an empty cell is
+/// visible. Surplus *windows* do need reporting: a window the layout had
+/// no cell for stays exactly where it is, and the user is owed the count
+/// rather than left to notice the omission (spec #29 user story 15).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SavedLayoutPlan {
+    /// The one display every placement lands on: the focused managed
+    /// window's (ADR 0020). A field rather than a column repeated down
+    /// `placements`, because a plan touching two displays is not a thing
+    /// this type can represent.
+    pub display_id: DisplayId,
+    /// Cell *i* of the layout paired with window *i* of the target
+    /// display's visual window order, gaps already applied. Stops at
+    /// whichever of the two lists runs out.
+    pub placements: Vec<(WindowId, Rect)>,
+    /// Managed windows on the target display the layout had no cell for.
+    /// Zero whenever the layout has at least as many cells as the display
+    /// has windows.
+    pub unplaced: usize,
+}
+
 /// The placements applying saved layout `name` would commit against
 /// `state` right now, or the reason it would change nothing.
 ///
@@ -569,14 +593,13 @@ impl std::fmt::Display for SavedLayoutRejection {
 /// with a reason, and an event sent into the queue can only answer with
 /// silence.
 ///
-/// Cell *i* of the layout receives window *i* of the target display's
-/// visual window order, and the result stops at whichever list runs out.
-/// Gaps, the automatic-tiling interaction, and reporting a window/cell
-/// count mismatch are issue #33's; this is the happy path only.
+/// Gaps are applied here, by the same [`apply_gaps`] post-processing step
+/// the balanced grid and every zone snap already run through, so
+/// [`resolve_saved_layout`] stays gap-unaware (ADR 0006).
 pub fn plan_saved_layout(
     state: &EngineState,
     name: &str,
-) -> Result<Vec<(WindowId, DisplayId, Rect)>, SavedLayoutRejection> {
+) -> Result<SavedLayoutPlan, SavedLayoutRejection> {
     if state.paused {
         return Err(SavedLayoutRejection::Paused);
     }
@@ -594,11 +617,24 @@ pub fn plan_saved_layout(
         return Err(SavedLayoutRejection::DisplayUnavailable { display_id });
     };
 
-    Ok(display_window_order(state, display_id)
-        .into_iter()
-        .zip(resolve_saved_layout(work_area, &layout.cells))
-        .map(|(window_id, bounds)| (window_id, display_id, bounds))
-        .collect())
+    let windows = display_window_order(state, display_id);
+    let cells = resolve_saved_layout(work_area, &layout.cells);
+    let unplaced = windows.len().saturating_sub(cells.len());
+
+    Ok(SavedLayoutPlan {
+        display_id,
+        placements: windows
+            .into_iter()
+            .zip(cells)
+            .map(|(window_id, raw_bounds)| {
+                (
+                    window_id,
+                    apply_gaps(raw_bounds, work_area, state.resolved_config.gaps),
+                )
+            })
+            .collect(),
+        unplaced,
+    })
 }
 
 /// `display_id`'s managed windows in visual window order (CONTEXT.md
@@ -1273,9 +1309,34 @@ fn apply(state: &mut EngineState, event: Event) {
             // whoever sent the event: state can have moved on between the
             // two, and a hotkey has no synchronous caller to ask at all.
             match plan_saved_layout(state, &name) {
-                Ok(placements) => {
-                    for (window_id, display_id, bounds) in placements {
-                        place_window(state, window_id, display_id, bounds, None);
+                Ok(plan) => {
+                    if plan.unplaced > 0 {
+                        tracing::info!(
+                            layout = %name,
+                            unplaced = plan.unplaced,
+                            "saved layout has fewer cells than the display has windows; \
+                             the surplus windows were left where they are"
+                        );
+                    }
+                    // Only windows the placement actually reached are
+                    // taken out of the tiling set: a window whose circuit
+                    // breaker suppressed its placement was not moved, so
+                    // floating it would drop it from the grid for nothing.
+                    let mut placed = Vec::new();
+                    for (window_id, bounds) in plan.placements {
+                        if place_window(state, window_id, plan.display_id, bounds, None) {
+                            placed.push(window_id);
+                        }
+                    }
+                    // Applying a layout is an explicit placement, so it
+                    // session-floats what it placed exactly as a zone snap
+                    // does, and the rest of the tiling set reflows around
+                    // the result in one pass (ADR 0011).
+                    if state.automatic_tiling_active && !placed.is_empty() {
+                        for window_id in placed {
+                            set_session_floating(state, window_id, true);
+                        }
+                        reconcile_balanced_grids(state);
                     }
                 }
                 Err(rejection) => {
@@ -5160,6 +5221,341 @@ mod tests {
             },
         );
         assert!(placements(&state).is_empty());
+    }
+
+    /// [`state_with_saved_layout`] plus gaps, for the ADR 0006
+    /// post-processing step.
+    fn state_with_saved_layout_and_gaps(
+        name: &str,
+        cells: &[(f64, f64, f64, f64)],
+        gaps: mosaix_domain::Gaps,
+    ) -> EngineState {
+        let mut state = state_with_saved_layout(name, cells);
+        state.resolved_config.gaps = gaps;
+        state
+    }
+
+    /// [`state_with_saved_layout`] with automatic tiling running, so an
+    /// applied layout has an active tiling set to be pulled out of.
+    fn tiling_state_with_saved_layout(name: &str, cells: &[(f64, f64, f64, f64)]) -> EngineState {
+        let mut state = state_with_saved_layout(name, cells);
+        state.resolved_config.automatic_tiling_enabled = true;
+        state.automatic_tiling_active = true;
+        state
+    }
+
+    #[test]
+    fn gaps_inset_a_restored_layouts_rectangles_the_same_way_they_inset_the_grid() {
+        let mut state = state_with_saved_layout_and_gaps(
+            "writing",
+            &[(0.0, 0.0, 0.5, 1.0), (0.5, 0.0, 0.5, 1.0)],
+            mosaix_domain::Gaps::new(10, 4),
+        );
+        apply(
+            &mut state,
+            Event::WindowsObserved {
+                windows: vec![
+                    window_at(1, 1, Rect::new(0, 0, 400, 300)),
+                    window_at(2, 1, Rect::new(900, 0, 400, 300)),
+                ],
+            },
+        );
+        state.focused_window = Some(WindowId(1));
+        state.effects.clear();
+
+        apply(
+            &mut state,
+            Event::SavedLayoutApplyRequested {
+                name: "writing".to_owned(),
+            },
+        );
+
+        // Outer gap on the three work-area edges each cell touches, inner
+        // gap on the seam between them -- byte for byte what `apply_gaps`
+        // does to a two-cell balanced grid on this display.
+        let work_area = state.displays[0].work_area;
+        let expected: Vec<Rect> = plan_balanced_grid(work_area, 2)
+            .into_iter()
+            .map(|raw| apply_gaps(raw, work_area, mosaix_domain::Gaps::new(10, 4)))
+            .collect();
+        assert_eq!(
+            placements(&state),
+            vec![
+                (WindowId(1), DisplayId(1), expected[0]),
+                (WindowId(2), DisplayId(1), expected[1]),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_cells_to_rectangles_function_itself_stays_gap_unaware() {
+        let work_area = Rect::new(0, 0, 1920, 1080);
+        let cells = [mosaix_domain::NormalizedRect {
+            x: 0.0,
+            y: 0.0,
+            width: 0.5,
+            height: 1.0,
+        }];
+
+        // Same input, and gaps live in `resolved_config`, nowhere this
+        // call can see -- so the ungapped rectangle is the only thing it
+        // can produce (ADR 0006).
+        assert_eq!(
+            resolve_saved_layout(work_area, &cells),
+            vec![Rect::new(0, 0, 960, 1080)]
+        );
+    }
+
+    #[test]
+    fn applying_a_layout_under_automatic_tiling_session_floats_what_it_placed() {
+        let mut state = tiling_state_with_saved_layout(
+            "writing",
+            &[(0.0, 0.0, 0.6, 1.0), (0.6, 0.0, 0.4, 1.0)],
+        );
+        apply(
+            &mut state,
+            Event::WindowsObserved {
+                windows: vec![
+                    window_at(1, 1, Rect::new(0, 0, 400, 300)),
+                    window_at(2, 1, Rect::new(900, 0, 400, 300)),
+                ],
+            },
+        );
+        state.focused_window = Some(WindowId(1));
+        state.effects.clear();
+
+        apply(
+            &mut state,
+            Event::SavedLayoutApplyRequested {
+                name: "writing".to_owned(),
+            },
+        );
+
+        assert!(state.session_floating.contains(&WindowId(1)));
+        assert!(state.session_floating.contains(&WindowId(2)));
+        assert_eq!(
+            state.inventory[&WindowId(1)].eligibility,
+            EligibilityReason::SessionFloating
+        );
+        assert_eq!(
+            placements(&state),
+            vec![
+                (WindowId(1), DisplayId(1), Rect::new(0, 0, 1152, 1080)),
+                (WindowId(2), DisplayId(1), Rect::new(1152, 0, 768, 1080)),
+            ],
+            "the reflow that follows must not overwrite the cells just committed"
+        );
+    }
+
+    #[test]
+    fn the_remaining_tiling_set_reflows_around_a_layout_in_one_pass() {
+        // A one-cell layout on a three-window display: window 1 takes the
+        // cell and floats, and 2 and 3 -- still tiled -- must end up
+        // sharing the whole work area as a two-window grid.
+        let mut state = tiling_state_with_saved_layout("solo", &[(0.0, 0.0, 0.5, 1.0)]);
+        apply(
+            &mut state,
+            Event::WindowsObserved {
+                windows: vec![
+                    window_at(1, 1, Rect::new(0, 0, 400, 300)),
+                    window_at(2, 1, Rect::new(0, 400, 400, 300)),
+                    window_at(3, 1, Rect::new(0, 800, 400, 300)),
+                ],
+            },
+        );
+        state.focused_window = Some(WindowId(1));
+        state.effects.clear();
+
+        apply(
+            &mut state,
+            Event::SavedLayoutApplyRequested {
+                name: "solo".to_owned(),
+            },
+        );
+
+        let committed = placements(&state);
+        assert_eq!(
+            committed
+                .iter()
+                .filter(|(window_id, _, _)| *window_id == WindowId(2))
+                .count(),
+            1,
+            "the reflow around the layout must be a single pass, got {committed:?}"
+        );
+        let grid = plan_balanced_grid(state.displays[0].work_area, 2);
+        assert_eq!(
+            state.windows[&WindowId(2)].bounds,
+            grid[0],
+            "the still-tiled windows reflow as a two-window grid"
+        );
+        assert_eq!(state.windows[&WindowId(3)].bounds, grid[1]);
+        assert_eq!(
+            state.windows[&WindowId(1)].bounds,
+            Rect::new(0, 0, 960, 1080),
+            "the window the layout placed keeps its cell"
+        );
+    }
+
+    #[test]
+    fn toggle_floating_returns_a_layout_placed_window_to_the_tiling_set() {
+        let mut state = tiling_state_with_saved_layout("solo", &[(0.0, 0.0, 0.5, 1.0)]);
+        apply(
+            &mut state,
+            Event::WindowsObserved {
+                windows: vec![
+                    window_at(1, 1, Rect::new(0, 0, 400, 300)),
+                    window_at(2, 1, Rect::new(0, 400, 400, 300)),
+                ],
+            },
+        );
+        state.focused_window = Some(WindowId(1));
+        apply(
+            &mut state,
+            Event::SavedLayoutApplyRequested {
+                name: "solo".to_owned(),
+            },
+        );
+        assert!(state.session_floating.contains(&WindowId(1)));
+        state.effects.clear();
+
+        apply(&mut state, Event::ToggleFloatingRequested);
+
+        assert!(!state.session_floating.contains(&WindowId(1)));
+        assert_eq!(
+            state.inventory[&WindowId(1)].eligibility,
+            EligibilityReason::Eligible
+        );
+        let grid = plan_balanced_grid(state.displays[0].work_area, 2);
+        assert_eq!(state.windows[&WindowId(1)].bounds, grid[0]);
+        assert_eq!(state.windows[&WindowId(2)].bounds, grid[1]);
+    }
+
+    #[test]
+    fn applying_a_layout_with_tiling_off_floats_nothing() {
+        let mut state = state_with_saved_layout("solo", &[(0.0, 0.0, 0.5, 1.0)]);
+        apply(
+            &mut state,
+            Event::WindowsObserved {
+                windows: vec![window_at(1, 1, Rect::new(0, 0, 400, 300))],
+            },
+        );
+        state.focused_window = Some(WindowId(1));
+
+        apply(
+            &mut state,
+            Event::SavedLayoutApplyRequested {
+                name: "solo".to_owned(),
+            },
+        );
+
+        assert!(
+            state.session_floating.is_empty(),
+            "with no grid to be pulled out of, there is nothing to float"
+        );
+    }
+
+    #[test]
+    fn more_cells_than_windows_reports_nothing_unplaced_and_succeeds() {
+        let mut state = state_with_saved_layout(
+            "three-up",
+            &[
+                (0.0, 0.0, 0.34, 1.0),
+                (0.34, 0.0, 0.33, 1.0),
+                (0.67, 0.0, 0.33, 1.0),
+            ],
+        );
+        apply(
+            &mut state,
+            Event::WindowsObserved {
+                windows: vec![window_at(1, 1, Rect::new(0, 0, 400, 300))],
+            },
+        );
+        state.focused_window = Some(WindowId(1));
+
+        let plan =
+            plan_saved_layout(&state, "three-up").expect("a surplus of cells is not a failure");
+
+        assert_eq!(plan.placements.len(), 1);
+        assert_eq!(plan.unplaced, 0, "empty cells are not unplaced windows");
+    }
+
+    #[test]
+    fn more_windows_than_cells_reports_how_many_it_could_not_place() {
+        let mut state = state_with_saved_layout("single", &[(0.0, 0.0, 1.0, 1.0)]);
+        apply(
+            &mut state,
+            Event::WindowsObserved {
+                windows: vec![
+                    window_at(1, 1, Rect::new(0, 0, 400, 300)),
+                    window_at(2, 1, Rect::new(0, 400, 400, 300)),
+                    window_at(3, 1, Rect::new(0, 800, 400, 300)),
+                ],
+            },
+        );
+        state.focused_window = Some(WindowId(1));
+        state.effects.clear();
+
+        let plan =
+            plan_saved_layout(&state, "single").expect("a surplus of windows is not a failure");
+        assert_eq!(plan.placements.len(), 1);
+        assert_eq!(plan.unplaced, 2);
+
+        apply(
+            &mut state,
+            Event::SavedLayoutApplyRequested {
+                name: "single".to_owned(),
+            },
+        );
+
+        // The two it could not place are left exactly where they were,
+        // not dropped, shrunk, or stacked somewhere.
+        assert_eq!(placements(&state).len(), 1);
+        assert_eq!(
+            state.inventory[&WindowId(2)].window.bounds,
+            Rect::new(0, 400, 400, 300)
+        );
+        assert_eq!(
+            state.inventory[&WindowId(3)].window.bounds,
+            Rect::new(0, 800, 400, 300)
+        );
+    }
+
+    #[test]
+    fn an_open_circuit_breaker_suppresses_a_layout_placement_without_floating_the_window() {
+        let mut state =
+            tiling_state_with_saved_layout("pair", &[(0.0, 0.0, 0.5, 1.0), (0.5, 0.0, 0.5, 1.0)]);
+        apply(
+            &mut state,
+            Event::WindowsObserved {
+                windows: vec![
+                    window_at(1, 1, Rect::new(0, 0, 400, 300)),
+                    window_at(2, 1, Rect::new(0, 400, 400, 300)),
+                ],
+            },
+        );
+        state.focused_window = Some(WindowId(1));
+        state.windows.get_mut(&WindowId(2)).unwrap().rejection_count = CIRCUIT_BREAKER_THRESHOLD;
+        state.effects.clear();
+
+        apply(
+            &mut state,
+            Event::SavedLayoutApplyRequested {
+                name: "pair".to_owned(),
+            },
+        );
+
+        let committed = placements(&state);
+        assert!(
+            committed
+                .iter()
+                .all(|(window_id, _, _)| *window_id != WindowId(2)),
+            "an open circuit still suppresses the placement, got {committed:?}"
+        );
+        assert!(
+            !state.session_floating.contains(&WindowId(2)),
+            "a window that was never moved must not be pulled out of the tiling set"
+        );
+        assert!(state.session_floating.contains(&WindowId(1)));
     }
 
     #[test]
