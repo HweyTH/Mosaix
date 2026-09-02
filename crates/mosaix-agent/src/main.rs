@@ -36,6 +36,7 @@ mod overlay;
 #[cfg(windows)]
 fn start_hotkeys_and_forward(
     bindings: Vec<mosaix_platform_windows::HotkeyBinding>,
+    mut registry: hotkeys::HotkeyRegistry,
     events: mosaix_engine::EventSender,
     state_reader: mosaix_engine::StateReader,
     overlay_tx: Option<std::sync::mpsc::Sender<overlay::OverlayRequest>>,
@@ -46,7 +47,10 @@ fn start_hotkeys_and_forward(
     let (registrations, hotkey_events) = mosaix_platform_windows::start_hotkeys(bindings)?;
     for result in &registrations.results {
         if let Err(err) = &result.outcome {
-            let command = hotkeys::command_for_hotkey_id(result.id);
+            // A binding the OS refused holds no registry entry, so its id
+            // resolves to nothing rather than to a command that never
+            // actually got a hotkey.
+            let command = registry.forget(result.id);
             tracing::error!(
                 hotkey_id = result.id,
                 ?command,
@@ -57,7 +61,7 @@ fn start_hotkeys_and_forward(
     }
     let forwarder = std::thread::spawn(move || {
         for fired in hotkey_events {
-            let Some(command) = hotkeys::command_for_hotkey_id(fired.id) else {
+            let Some(command) = registry.command_for(fired.id) else {
                 tracing::warn!(
                     hotkey_id = fired.id,
                     "hotkey fired for an unknown id; ignoring"
@@ -668,8 +672,11 @@ fn main() {
     // agent's lifetime.
     let last_registered_hotkeys =
         hotkeys::runtime_hotkeys(&engine.state_reader().snapshot().resolved_config);
+    let (initial_bindings, initial_registry) =
+        hotkeys::bindings_from_resolved(&last_registered_hotkeys);
     let initial_hotkey_registration = match start_hotkeys_and_forward(
-        hotkeys::bindings_from_resolved(&last_registered_hotkeys),
+        initial_bindings,
+        initial_registry,
         engine.events(),
         engine.state_reader(),
         overlay_tx.clone(),
@@ -715,8 +722,12 @@ fn main() {
                     registrations.stop();
                     let _ = forwarder.join();
                 }
+                // A fresh registry every time: an id the previous
+                // registration owned cannot survive into this one.
+                let (bindings, registry) = hotkeys::bindings_from_resolved(&current_hotkeys);
                 current_registration = match start_hotkeys_and_forward(
-                    hotkeys::bindings_from_resolved(&current_hotkeys),
+                    bindings,
+                    registry,
                     events.clone(),
                     state_reader.clone(),
                     overlay_tx.clone(),

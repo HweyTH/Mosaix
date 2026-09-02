@@ -46,55 +46,38 @@ pub fn direction_for_command(command: Command) -> ZoneSnapDirection {
     }
 }
 
-/// A stable `RegisterHotKey` id for `command`. Fixed per command (not
-/// assigned by position in the resolved map) so a re-registration after a
-/// rebind keeps mapping the same command to the same id even though the
-/// set of bound commands, and the order `BTreeMap` iterates them in, can
-/// change across a hot-edit or profile switch.
-fn hotkey_id(command: Command) -> i32 {
-    match command {
-        Command::SnapLeft => 1,
-        Command::SnapRight => 2,
-        Command::SnapTop => 3,
-        Command::SnapBottom => 4,
-        Command::Rearrange => 5,
-        Command::ToggleAutomaticTiling => 6,
-        Command::ToggleFloating => 7,
-        Command::FocusLeft => 8,
-        Command::FocusDown => 9,
-        Command::FocusUp => 10,
-        Command::FocusRight => 11,
-        Command::SwapLeft => 12,
-        Command::SwapDown => 13,
-        Command::SwapUp => 14,
-        Command::SwapRight => 15,
-        Command::TogglePause => 16,
-    }
+/// The `RegisterHotKey` ids allocated for one registration pass, mapped
+/// back to the commands they fire.
+///
+/// Ids used to come from a static command-to-integer match and its hand-
+/// written inverse. That bijection cannot survive a command that carries a
+/// layout name, because layout names are user-created and unbounded (ADR
+/// 0019), so ids are now allocated as bindings are built and the reverse
+/// lookup reads this registry.
+///
+/// A registry belongs to exactly one registration. Re-registering --
+/// which is what a profile switch or a config reload already does --
+/// builds a fresh one, so a stale id can never resolve to a command that
+/// is no longer bound.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct HotkeyRegistry {
+    commands: BTreeMap<i32, Command>,
 }
 
-/// The command a fired hotkey `id` belongs to, `None` if `id` doesn't
-/// belong to this table. Every id [`bindings_from_resolved`] registers
-/// comes from [`hotkey_id`], so in practice this only returns `None` for a
-/// stray `WM_HOTKEY` this process didn't itself register.
-pub fn command_for_hotkey_id(id: i32) -> Option<Command> {
-    match id {
-        1 => Some(Command::SnapLeft),
-        2 => Some(Command::SnapRight),
-        3 => Some(Command::SnapTop),
-        4 => Some(Command::SnapBottom),
-        5 => Some(Command::Rearrange),
-        6 => Some(Command::ToggleAutomaticTiling),
-        7 => Some(Command::ToggleFloating),
-        8 => Some(Command::FocusLeft),
-        9 => Some(Command::FocusDown),
-        10 => Some(Command::FocusUp),
-        11 => Some(Command::FocusRight),
-        12 => Some(Command::SwapLeft),
-        13 => Some(Command::SwapDown),
-        14 => Some(Command::SwapUp),
-        15 => Some(Command::SwapRight),
-        16 => Some(Command::TogglePause),
-        _ => None,
+impl HotkeyRegistry {
+    /// The command hotkey `id` belongs to, `None` if this registry never
+    /// allocated `id` or the binding that owned it failed to register.
+    /// Callers log the `None` case: it means a `WM_HOTKEY` arrived for a
+    /// binding this registration doesn't own.
+    pub fn command_for(&self, id: i32) -> Option<Command> {
+        self.commands.get(&id).copied()
+    }
+
+    /// Drops `id`'s entry, so a binding the OS refused holds none and its
+    /// id resolves to nothing rather than to the command it would have
+    /// fired.
+    pub fn forget(&mut self, id: i32) -> Option<Command> {
+        self.commands.remove(&id)
     }
 }
 
@@ -160,30 +143,38 @@ fn vk_from_key_name(key: &str) -> Option<u32> {
 }
 
 /// Translates a resolved config's hotkey bindings into the platform
-/// bindings [`mosaix_platform_windows::start_hotkeys`] should register. A
+/// bindings [`mosaix_platform_windows::start_hotkeys`] should register,
+/// paired with the [`HotkeyRegistry`] resolving the ids it allocated. A
 /// command whose key name doesn't translate to a known virtual-key code is
 /// skipped (and logged) rather than failing the whole set -- the same
 /// partial-success posture ADR 0002 already applies to OS-level
-/// registration conflicts.
-pub fn bindings_from_resolved(hotkeys: &BTreeMap<Command, KeyCombo>) -> Vec<HotkeyBinding> {
-    hotkeys
-        .iter()
-        .filter_map(|(command, combo)| match vk_from_key_name(&combo.key) {
-            Some(vk) => Some(HotkeyBinding {
-                id: hotkey_id(*command),
-                modifiers: modifiers_from_combo(combo),
-                vk,
-            }),
-            None => {
-                tracing::error!(
-                    ?command,
-                    key = %combo.key,
-                    "resolved hotkey binding names an unrecognized key; this command will have no hotkey"
-                );
-                None
-            }
-        })
-        .collect()
+/// registration conflicts -- and consumes no id.
+pub fn bindings_from_resolved(
+    hotkeys: &BTreeMap<Command, KeyCombo>,
+) -> (Vec<HotkeyBinding>, HotkeyRegistry) {
+    let mut bindings = Vec::new();
+    let mut registry = HotkeyRegistry::default();
+    for (command, combo) in hotkeys {
+        let Some(vk) = vk_from_key_name(&combo.key) else {
+            tracing::error!(
+                ?command,
+                key = %combo.key,
+                "resolved hotkey binding names an unrecognized key; this command will have no hotkey"
+            );
+            continue;
+        };
+        // Ids start at 1 because `RegisterHotKey` treats 0 as a valid but
+        // unremarkable id, and a zero default is exactly the value a bug
+        // elsewhere would produce.
+        let id = bindings.len() as i32 + 1;
+        bindings.push(HotkeyBinding {
+            id,
+            modifiers: modifiers_from_combo(combo),
+            vk,
+        });
+        registry.commands.insert(id, *command);
+    }
+    (bindings, registry)
 }
 
 pub fn runtime_hotkeys(config: &ResolvedConfig) -> BTreeMap<Command, KeyCombo> {
@@ -222,11 +213,14 @@ mod tests {
             (Command::SnapBottom, combo("ctrl+alt+down")),
         ]);
 
-        let mut bindings = bindings_from_resolved(&hotkeys);
+        let (mut bindings, registry) = bindings_from_resolved(&hotkeys);
         bindings.sort_by_key(|binding| binding.id);
 
         assert_eq!(bindings.len(), 4);
-        assert_eq!(bindings[0].id, hotkey_id(Command::SnapLeft));
+        assert_eq!(
+            registry.command_for(bindings[0].id),
+            Some(Command::SnapLeft)
+        );
         assert_eq!(bindings[0].vk, VK_LEFT.0 as u32);
         assert_eq!(
             bindings[0].modifiers,
@@ -241,7 +235,7 @@ mod tests {
             (Command::SnapRight, combo("win+f5")),
         ]);
 
-        let mut bindings = bindings_from_resolved(&hotkeys);
+        let (mut bindings, _registry) = bindings_from_resolved(&hotkeys);
         bindings.sort_by_key(|binding| binding.id);
 
         assert_eq!(bindings[0].vk, b'A' as u32);
@@ -260,15 +254,17 @@ mod tests {
             (Command::SnapRight, combo("ctrl+alt+nonsense")),
         ]);
 
-        let bindings = bindings_from_resolved(&hotkeys);
+        let (bindings, registry) = bindings_from_resolved(&hotkeys);
 
         assert_eq!(bindings.len(), 1);
-        assert_eq!(bindings[0].id, hotkey_id(Command::SnapLeft));
+        assert_eq!(
+            registry.command_for(bindings[0].id),
+            Some(Command::SnapLeft)
+        );
     }
 
-    #[test]
-    fn hotkey_id_and_command_for_hotkey_id_round_trip_for_every_command() {
-        for command in [
+    fn every_command() -> [Command; 16] {
+        [
             Command::SnapLeft,
             Command::SnapRight,
             Command::SnapTop,
@@ -285,9 +281,66 @@ mod tests {
             Command::SwapUp,
             Command::SwapRight,
             Command::TogglePause,
-        ] {
-            assert_eq!(command_for_hotkey_id(hotkey_id(command)), Some(command));
+        ]
+    }
+
+    #[test]
+    fn every_registered_binding_resolves_back_to_its_own_command() {
+        let hotkeys: BTreeMap<Command, KeyCombo> = every_command()
+            .into_iter()
+            .enumerate()
+            .map(|(index, command)| (command, combo(&format!("ctrl+alt+f{}", index + 1))))
+            .collect();
+
+        let (bindings, registry) = bindings_from_resolved(&hotkeys);
+
+        assert_eq!(bindings.len(), every_command().len());
+        for (binding, (command, _)) in bindings.iter().zip(&hotkeys) {
+            assert_eq!(registry.command_for(binding.id), Some(*command));
         }
+    }
+
+    #[test]
+    fn an_id_outside_the_registry_resolves_to_nothing() {
+        let hotkeys = BTreeMap::from([(Command::SnapLeft, combo("ctrl+alt+left"))]);
+
+        let (bindings, registry) = bindings_from_resolved(&hotkeys);
+
+        assert_eq!(registry.command_for(bindings[0].id + 1), None);
+        assert_eq!(registry.command_for(0), None);
+    }
+
+    #[test]
+    fn a_forgotten_binding_no_longer_resolves() {
+        let hotkeys = BTreeMap::from([
+            (Command::SnapLeft, combo("ctrl+alt+left")),
+            (Command::SnapRight, combo("ctrl+alt+right")),
+        ]);
+
+        let (bindings, mut registry) = bindings_from_resolved(&hotkeys);
+        assert_eq!(registry.forget(bindings[0].id), Some(Command::SnapLeft));
+
+        assert_eq!(registry.command_for(bindings[0].id), None);
+        assert_eq!(
+            registry.command_for(bindings[1].id),
+            Some(Command::SnapRight)
+        );
+    }
+
+    #[test]
+    fn re_registering_a_smaller_binding_set_leaves_no_stale_id() {
+        let (_, before) = bindings_from_resolved(&BTreeMap::from([
+            (Command::SnapLeft, combo("ctrl+alt+left")),
+            (Command::SnapRight, combo("ctrl+alt+right")),
+        ]));
+        let (_, after) =
+            bindings_from_resolved(&BTreeMap::from([(Command::SnapTop, combo("ctrl+alt+up"))]));
+
+        assert_eq!(before.command_for(2), Some(Command::SnapRight));
+        // The id the profile switch dropped resolves to nothing rather
+        // than to the command the previous registration bound it to.
+        assert_eq!(after.command_for(2), None);
+        assert_eq!(after.command_for(1), Some(Command::SnapTop));
     }
 
     #[test]
