@@ -11,7 +11,7 @@ use std::fmt;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use mosaix_domain::Gaps;
+use mosaix_domain::{Gaps, NormalizedRect};
 
 /// The `version` value this build of `mosaix-config` understands. Any other
 /// value (including a missing field, which fails to parse rather than
@@ -206,6 +206,26 @@ pub struct FocusBorderOverride {
     pub thickness: Option<u16>,
 }
 
+/// A saved layout: shape only, never window identity (ADR 0018).
+/// Applying one lays its `cells` over a display's work area and fills them
+/// with whichever managed windows are there, in visual window order.
+///
+/// Cells are [`NormalizedRect`]s -- fractions of a display's work area,
+/// the same form zones already use, and the form that type's own docs call
+/// the persisted-zone format. Reusing it rather than declaring a
+/// config-local twin follows [`Gaps`], which this schema also takes
+/// straight from `mosaix-domain`.
+///
+/// A table rather than a bare cell list so the array-of-tables spelling
+/// (`[[layouts.writing.cells]]`) is available to a hand-editing user, and
+/// so later tickets have somewhere to put per-layout settings.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SavedLayout {
+    #[serde(default)]
+    pub cells: Vec<NormalizedRect>,
+}
+
 /// Base config: `config.toml`'s full schema (CONTEXT.md "Base config").
 /// Applies whenever the current display topology matches no saved profile.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -220,6 +240,11 @@ pub struct BaseConfig {
     pub behavior: BehaviorSection,
     #[serde(default)]
     pub focus_border: FocusBorderSection,
+    /// Named saved layouts, keyed by the name a binding or a CLI command
+    /// refers to. Serialized last because TOML puts every table after the
+    /// scalar fields of the table containing it.
+    #[serde(default)]
+    pub layouts: BTreeMap<String, SavedLayout>,
 }
 
 /// A sparse `outer`/`inner` override, letting a profile override just one
@@ -270,6 +295,7 @@ pub struct ResolvedConfig {
     pub behavior: BehaviorSection,
     pub automatic_tiling_enabled: bool,
     pub focus_border: FocusBorderSection,
+    pub layouts: BTreeMap<String, SavedLayout>,
 }
 
 /// One profile's resolved settings, paired with the `fingerprint` it's

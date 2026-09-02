@@ -33,6 +33,6 @@ pub use io::{
 pub use schema::{
     AutomaticTilingSection, BaseConfig, BehaviorSection, Command, FocusBorderOverride,
     FocusBorderSection, GapsOverride, KeyCombo, ProfileConfig, ResolvedConfig, ResolvedConfigSet,
-    ResolvedProfile, RgbaColor, CURRENT_VERSION,
+    ResolvedProfile, RgbaColor, SavedLayout, CURRENT_VERSION,
 };
 pub use validate::{merge, validate, CandidateConfig, CandidateProfile, ValidationError};

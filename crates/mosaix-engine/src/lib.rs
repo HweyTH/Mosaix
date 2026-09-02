@@ -45,8 +45,9 @@ use mosaix_domain::{
     topology_fingerprint, Display, DisplayId, Rect, Window, WindowId, WindowLifecycle,
 };
 use mosaix_layout::{
-    apply_gaps, cycle_display, plan_balanced_grid, resolve_zone_cycle, snap_to_half,
-    throw_preserving_ratio, CycleStep, DisplayDirection, HalfZone, HorizontalDirection,
+    apply_gaps, cycle_display, plan_balanced_grid, resolve_saved_layout, resolve_zone_cycle,
+    snap_to_half, throw_preserving_ratio, CycleStep, DisplayDirection, HalfZone,
+    HorizontalDirection,
 };
 use mosaix_rules::{builtin_rules, ManageAction, Rule, RuleEvaluator};
 
@@ -507,6 +508,152 @@ pub enum Event {
     RulesChanged {
         rules: Vec<Rule>,
     },
+
+    /// Apply the saved layout called `name` (CONTEXT.md "Saved layout") to
+    /// the display of the focused managed window (ADR 0020), filling its
+    /// cells from that display's managed windows in visual window order.
+    ///
+    /// Carries no display id: like the directional commands, it resolves
+    /// its target at apply time. Every way it can change nothing is a
+    /// [`SavedLayoutRejection`] rather than a silent no-op, and
+    /// [`plan_saved_layout`] is where that verdict is reached -- a
+    /// synchronous caller asks it first so it can report the reason
+    /// instead of firing this event into the queue and hearing nothing
+    /// back.
+    SavedLayoutApplyRequested {
+        name: String,
+    },
+}
+
+/// Why applying a saved layout changes nothing. Every variant names
+/// something the user can act on: a layout command never silently does
+/// nothing, and never falls back to another display (ADR 0020).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SavedLayoutRejection {
+    /// Window management is paused, as it is for every other placement.
+    Paused,
+    /// No saved layout carries this name in the resolved config.
+    UnknownLayout { name: String },
+    /// Focus rests on the desktop, on an excluded window, or nowhere, so
+    /// there is no display to target.
+    NoFocusedManagedWindow,
+    /// The focused window's display left the topology between the command
+    /// being issued and being applied.
+    DisplayUnavailable { display_id: DisplayId },
+}
+
+impl std::fmt::Display for SavedLayoutRejection {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Paused => formatter.write_str("window management is paused"),
+            Self::UnknownLayout { name } => {
+                write!(formatter, "no saved layout named {name:?}")
+            }
+            Self::NoFocusedManagedWindow => formatter.write_str(
+                "no managed window is focused, so there is no display to apply a layout to",
+            ),
+            Self::DisplayUnavailable { display_id } => write!(
+                formatter,
+                "the focused window's display {} is no longer connected",
+                display_id.0
+            ),
+        }
+    }
+}
+
+/// The placements applying saved layout `name` would commit against
+/// `state` right now, or the reason it would change nothing.
+///
+/// Pure over `state` so the reducer and a synchronous caller reach the
+/// same verdict from the same state: the IPC handler has to answer the CLI
+/// with a reason, and an event sent into the queue can only answer with
+/// silence.
+///
+/// Cell *i* of the layout receives window *i* of the target display's
+/// visual window order, and the result stops at whichever list runs out.
+/// Gaps, the automatic-tiling interaction, and reporting a window/cell
+/// count mismatch are issue #33's; this is the happy path only.
+pub fn plan_saved_layout(
+    state: &EngineState,
+    name: &str,
+) -> Result<Vec<(WindowId, DisplayId, Rect)>, SavedLayoutRejection> {
+    if state.paused {
+        return Err(SavedLayoutRejection::Paused);
+    }
+    let Some(layout) = state.resolved_config.layouts.get(name) else {
+        return Err(SavedLayoutRejection::UnknownLayout {
+            name: name.to_owned(),
+        });
+    };
+    let display_id = state
+        .focused_window
+        .and_then(|window_id| state.inventory.get(&window_id))
+        .map(|managed| managed.window.display_id)
+        .ok_or(SavedLayoutRejection::NoFocusedManagedWindow)?;
+    let Some(work_area) = work_area_of(&state.displays, display_id) else {
+        return Err(SavedLayoutRejection::DisplayUnavailable { display_id });
+    };
+
+    Ok(display_window_order(state, display_id)
+        .into_iter()
+        .zip(resolve_saved_layout(work_area, &layout.cells))
+        .map(|(window_id, bounds)| (window_id, display_id, bounds))
+        .collect())
+}
+
+/// `display_id`'s managed windows in visual window order (CONTEXT.md
+/// "Visual window order"): whatever order the engine already recorded for
+/// that display, then any managed window that order doesn't mention,
+/// seeded top-to-bottom then left-to-right with the native window id
+/// breaking final ties -- the same seeding [`reconcile_balanced_grids`]
+/// performs.
+///
+/// A recorded order wins over the geometric seeding even when it disagrees
+/// with where the windows currently sit, and even after automatic tiling
+/// has been switched off. That is the point of the concept: the order is
+/// *stable*, changed deliberately by directional swap and by nothing else,
+/// so a layout applied twice puts the same window in the same cell. The
+/// recorded order only ever exists once tiling has run, so in a
+/// manual-only session the seeding half is the whole answer.
+///
+/// Two things differ from [`reconcile_balanced_grids`]' membership, both
+/// deliberately. A window with nothing on screen to place -- minimized,
+/// hidden, cloaked, full-screen -- is skipped rather than handed a cell.
+/// And a `Float` window *is* handed one: applying a saved layout is an
+/// explicit user command, and an explicit command places a managed window
+/// whatever its automatic-tiling eligibility, exactly as a zone snap
+/// places whichever window is focused.
+fn display_window_order(state: &EngineState, display_id: DisplayId) -> Vec<WindowId> {
+    let placeable = |window_id: &WindowId| {
+        state.inventory.get(window_id).is_some_and(|managed| {
+            managed.window.display_id == display_id
+                && matches!(
+                    managed.window.lifecycle,
+                    WindowLifecycle::Active | WindowLifecycle::Maximized
+                )
+        })
+    };
+
+    let mut ordered: Vec<WindowId> = state
+        .visual_window_order
+        .get(&display_id)
+        .map(|order| order.iter().copied().filter(placeable).collect())
+        .unwrap_or_default();
+    let mut unordered: Vec<_> = state
+        .inventory
+        .values()
+        .filter(|managed| placeable(&managed.window.id) && !ordered.contains(&managed.window.id))
+        .map(|managed| {
+            (
+                managed.window.bounds.y,
+                managed.window.bounds.x,
+                managed.window.id,
+            )
+        })
+        .collect();
+    unordered.sort_by_key(|(y, x, window_id)| (*y, *x, window_id.0));
+    ordered.extend(unordered.into_iter().map(|(_, _, window_id)| window_id));
+    ordered
 }
 
 /// Applies one event to `state`. Must never panic -- a single bad event
@@ -1119,6 +1266,26 @@ fn apply(state: &mut EngineState, event: Event) {
             replace_inventory_from_observations(state, observed);
             reconcile_balanced_grids(state);
             state.revision += 1;
+        }
+
+        Event::SavedLayoutApplyRequested { name } => {
+            // The verdict is re-reached here rather than trusted from
+            // whoever sent the event: state can have moved on between the
+            // two, and a hotkey has no synchronous caller to ask at all.
+            match plan_saved_layout(state, &name) {
+                Ok(placements) => {
+                    for (window_id, display_id, bounds) in placements {
+                        place_window(state, window_id, display_id, bounds, None);
+                    }
+                }
+                Err(rejection) => {
+                    tracing::warn!(
+                        layout = %name,
+                        reason = %rejection,
+                        "saved layout not applied"
+                    );
+                }
+            }
         }
     }
 }
@@ -3131,6 +3298,7 @@ mod tests {
             behavior: mosaix_config::BehaviorSection::default(),
             automatic_tiling_enabled: false,
             focus_border: mosaix_config::FocusBorderSection::default(),
+            layouts: std::collections::BTreeMap::new(),
         }
     }
 
@@ -3149,6 +3317,7 @@ mod tests {
                 behavior: mosaix_config::BehaviorSection::default(),
                 automatic_tiling_enabled: false,
                 focus_border: mosaix_config::FocusBorderSection::default(),
+                layouts: std::collections::BTreeMap::new(),
             },
             profiles: Vec::new(),
         }
@@ -4646,6 +4815,370 @@ mod tests {
         assert!(
             ids.contains(&WindowId(2)),
             "healthy window with changed bounds must appear in the diff"
+        );
+    }
+
+    fn saved_layout(cells: &[(f64, f64, f64, f64)]) -> mosaix_config::SavedLayout {
+        mosaix_config::SavedLayout {
+            cells: cells
+                .iter()
+                .map(|(x, y, width, height)| mosaix_domain::NormalizedRect {
+                    x: *x,
+                    y: *y,
+                    width: *width,
+                    height: *height,
+                })
+                .collect(),
+        }
+    }
+
+    /// One 1920x1080 display at the origin carrying a saved layout under
+    /// `name`, with nothing observed and nothing focused yet.
+    fn state_with_saved_layout(name: &str, cells: &[(f64, f64, f64, f64)]) -> EngineState {
+        let mut layouts = std::collections::BTreeMap::new();
+        layouts.insert(name.to_owned(), saved_layout(cells));
+        EngineState {
+            displays: vec![display(1, "primary", 0)],
+            resolved_config: ResolvedConfig {
+                layouts,
+                ..ResolvedConfig::default()
+            },
+            ..EngineState::default()
+        }
+    }
+
+    fn window_at(id: isize, display_id: isize, bounds: Rect) -> Window {
+        let mut window = observed_window(
+            id,
+            mosaix_domain::WindowRole::Normal,
+            WindowLifecycle::Active,
+        );
+        window.display_id = DisplayId(display_id);
+        window.bounds = bounds;
+        window
+    }
+
+    fn placements(state: &EngineState) -> Vec<(WindowId, DisplayId, Rect)> {
+        state
+            .effects
+            .iter()
+            .filter_map(|effect| match effect {
+                EngineEffect::PlaceWindow {
+                    window_id,
+                    display_id,
+                    bounds,
+                } => Some((*window_id, *display_id, *bounds)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn applying_a_saved_layout_places_the_displays_windows_into_its_cells() {
+        let mut state =
+            state_with_saved_layout("writing", &[(0.0, 0.0, 0.6, 1.0), (0.6, 0.0, 0.4, 1.0)]);
+        apply(
+            &mut state,
+            Event::WindowsObserved {
+                windows: vec![
+                    window_at(1, 1, Rect::new(0, 0, 400, 300)),
+                    window_at(2, 1, Rect::new(900, 0, 400, 300)),
+                ],
+            },
+        );
+        state.focused_window = Some(WindowId(1));
+        state.effects.clear();
+
+        apply(
+            &mut state,
+            Event::SavedLayoutApplyRequested {
+                name: "writing".to_owned(),
+            },
+        );
+
+        assert_eq!(
+            placements(&state),
+            vec![
+                (WindowId(1), DisplayId(1), Rect::new(0, 0, 1152, 1080)),
+                (WindowId(2), DisplayId(1), Rect::new(1152, 0, 768, 1080)),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_saved_layout_fills_its_cells_in_visual_window_order() {
+        let mut state =
+            state_with_saved_layout("stack", &[(0.0, 0.0, 1.0, 0.5), (0.0, 0.5, 1.0, 0.5)]);
+        apply(
+            &mut state,
+            Event::WindowsObserved {
+                windows: vec![
+                    // Observed first, but sitting lower on screen, so
+                    // visual window order puts it in the second cell.
+                    window_at(9, 1, Rect::new(0, 600, 400, 300)),
+                    window_at(4, 1, Rect::new(0, 100, 400, 300)),
+                ],
+            },
+        );
+        state.focused_window = Some(WindowId(9));
+        state.effects.clear();
+
+        apply(
+            &mut state,
+            Event::SavedLayoutApplyRequested {
+                name: "stack".to_owned(),
+            },
+        );
+
+        assert_eq!(
+            placements(&state),
+            vec![
+                (WindowId(4), DisplayId(1), Rect::new(0, 0, 1920, 540)),
+                (WindowId(9), DisplayId(1), Rect::new(0, 540, 1920, 540)),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_saved_layout_targets_the_focused_windows_display_and_leaves_the_others_alone() {
+        let mut state = state_with_saved_layout("half", &[(0.0, 0.0, 0.5, 1.0)]);
+        state.displays.push(display(2, "secondary", 1920));
+        apply(
+            &mut state,
+            Event::WindowsObserved {
+                windows: vec![
+                    window_at(1, 1, Rect::new(0, 0, 400, 300)),
+                    window_at(2, 2, Rect::new(1920, 0, 400, 300)),
+                ],
+            },
+        );
+        state.focused_window = Some(WindowId(2));
+        state.effects.clear();
+
+        apply(
+            &mut state,
+            Event::SavedLayoutApplyRequested {
+                name: "half".to_owned(),
+            },
+        );
+
+        assert_eq!(
+            placements(&state),
+            vec![(WindowId(2), DisplayId(2), Rect::new(1920, 0, 960, 1080))],
+            "only the focused window's display is rearranged"
+        );
+    }
+
+    #[test]
+    fn applying_a_saved_layout_with_no_focused_managed_window_is_rejected_and_places_nothing() {
+        let mut state = state_with_saved_layout("half", &[(0.0, 0.0, 0.5, 1.0)]);
+        apply(
+            &mut state,
+            Event::WindowsObserved {
+                windows: vec![window_at(1, 1, Rect::new(0, 0, 400, 300))],
+            },
+        );
+        state.effects.clear();
+        let revision = state.revision;
+
+        assert_eq!(
+            plan_saved_layout(&state, "half"),
+            Err(SavedLayoutRejection::NoFocusedManagedWindow)
+        );
+
+        apply(
+            &mut state,
+            Event::SavedLayoutApplyRequested {
+                name: "half".to_owned(),
+            },
+        );
+
+        assert!(placements(&state).is_empty());
+        assert_eq!(
+            state.revision, revision,
+            "a rejected command commits nothing"
+        );
+    }
+
+    #[test]
+    fn focus_on_a_window_outside_the_managed_inventory_is_not_a_layout_target() {
+        let mut state = state_with_saved_layout("half", &[(0.0, 0.0, 0.5, 1.0)]);
+        apply(
+            &mut state,
+            Event::WindowsObserved {
+                windows: vec![window_at(1, 1, Rect::new(0, 0, 400, 300))],
+            },
+        );
+        // An excluded window -- a popup, say -- can hold OS focus without
+        // ever entering the managed inventory.
+        state.focused_window = Some(WindowId(77));
+
+        assert_eq!(
+            plan_saved_layout(&state, "half"),
+            Err(SavedLayoutRejection::NoFocusedManagedWindow)
+        );
+    }
+
+    #[test]
+    fn applying_an_unknown_saved_layout_is_rejected_naming_it() {
+        let mut state = state_with_saved_layout("writing", &[(0.0, 0.0, 1.0, 1.0)]);
+        apply(
+            &mut state,
+            Event::WindowsObserved {
+                windows: vec![window_at(1, 1, Rect::new(0, 0, 400, 300))],
+            },
+        );
+        state.focused_window = Some(WindowId(1));
+        state.effects.clear();
+
+        let rejection = plan_saved_layout(&state, "wrtiing").unwrap_err();
+
+        assert_eq!(
+            rejection,
+            SavedLayoutRejection::UnknownLayout {
+                name: "wrtiing".to_owned()
+            }
+        );
+        assert!(rejection.to_string().contains("wrtiing"));
+
+        apply(
+            &mut state,
+            Event::SavedLayoutApplyRequested {
+                name: "wrtiing".to_owned(),
+            },
+        );
+        assert!(placements(&state).is_empty());
+    }
+
+    #[test]
+    fn a_saved_layout_with_more_windows_than_cells_places_only_what_fits() {
+        let mut state = state_with_saved_layout("single", &[(0.0, 0.0, 1.0, 1.0)]);
+        apply(
+            &mut state,
+            Event::WindowsObserved {
+                windows: vec![
+                    window_at(1, 1, Rect::new(0, 0, 400, 300)),
+                    window_at(2, 1, Rect::new(0, 500, 400, 300)),
+                ],
+            },
+        );
+        state.focused_window = Some(WindowId(1));
+        state.effects.clear();
+
+        apply(
+            &mut state,
+            Event::SavedLayoutApplyRequested {
+                name: "single".to_owned(),
+            },
+        );
+
+        assert_eq!(
+            placements(&state),
+            vec![(WindowId(1), DisplayId(1), Rect::new(0, 0, 1920, 1080))]
+        );
+    }
+
+    #[test]
+    fn a_saved_layout_with_more_cells_than_windows_leaves_the_surplus_empty() {
+        let mut state = state_with_saved_layout(
+            "three-up",
+            &[
+                (0.0, 0.0, 0.34, 1.0),
+                (0.34, 0.0, 0.33, 1.0),
+                (0.67, 0.0, 0.33, 1.0),
+            ],
+        );
+        apply(
+            &mut state,
+            Event::WindowsObserved {
+                windows: vec![window_at(1, 1, Rect::new(0, 0, 400, 300))],
+            },
+        );
+        state.focused_window = Some(WindowId(1));
+        state.effects.clear();
+
+        apply(
+            &mut state,
+            Event::SavedLayoutApplyRequested {
+                name: "three-up".to_owned(),
+            },
+        );
+
+        assert_eq!(placements(&state).len(), 1);
+    }
+
+    #[test]
+    fn a_minimized_window_is_not_given_a_cell() {
+        let mut state =
+            state_with_saved_layout("pair", &[(0.0, 0.0, 0.5, 1.0), (0.5, 0.0, 0.5, 1.0)]);
+        let mut minimized = window_at(2, 1, Rect::new(0, 500, 400, 300));
+        minimized.lifecycle = WindowLifecycle::Minimized;
+        apply(
+            &mut state,
+            Event::WindowsObserved {
+                windows: vec![window_at(1, 1, Rect::new(0, 0, 400, 300)), minimized],
+            },
+        );
+        state.focused_window = Some(WindowId(1));
+        state.effects.clear();
+
+        apply(
+            &mut state,
+            Event::SavedLayoutApplyRequested {
+                name: "pair".to_owned(),
+            },
+        );
+
+        assert_eq!(
+            placements(&state),
+            vec![(WindowId(1), DisplayId(1), Rect::new(0, 0, 960, 1080))]
+        );
+    }
+
+    #[test]
+    fn applying_a_saved_layout_while_paused_is_rejected() {
+        let mut state = state_with_saved_layout("half", &[(0.0, 0.0, 0.5, 1.0)]);
+        apply(
+            &mut state,
+            Event::WindowsObserved {
+                windows: vec![window_at(1, 1, Rect::new(0, 0, 400, 300))],
+            },
+        );
+        state.focused_window = Some(WindowId(1));
+        apply(&mut state, Event::PauseRequested);
+        state.effects.clear();
+
+        assert_eq!(
+            plan_saved_layout(&state, "half"),
+            Err(SavedLayoutRejection::Paused)
+        );
+
+        apply(
+            &mut state,
+            Event::SavedLayoutApplyRequested {
+                name: "half".to_owned(),
+            },
+        );
+        assert!(placements(&state).is_empty());
+    }
+
+    #[test]
+    fn a_saved_layout_is_rejected_when_the_focused_windows_display_has_gone() {
+        let mut state = state_with_saved_layout("half", &[(0.0, 0.0, 0.5, 1.0)]);
+        apply(
+            &mut state,
+            Event::WindowsObserved {
+                windows: vec![window_at(1, 1, Rect::new(0, 0, 400, 300))],
+            },
+        );
+        state.focused_window = Some(WindowId(1));
+        state.displays.clear();
+
+        assert_eq!(
+            plan_saved_layout(&state, "half"),
+            Err(SavedLayoutRejection::DisplayUnavailable {
+                display_id: DisplayId(1)
+            })
         );
     }
 }

@@ -79,6 +79,9 @@ pub fn merge(base: &BaseConfig, profile: Option<&ProfileConfig>) -> ResolvedConf
     let behavior = base.behavior.clone();
     let mut automatic_tiling_enabled = false;
     let mut focus_border = base.focus_border;
+    // A profile cannot yet override the layout set; per-topology layout
+    // overrides are issue #36.
+    let layouts = base.layouts.clone();
 
     if let Some(profile) = profile {
         for (command, combo) in &profile.hotkeys {
@@ -110,6 +113,7 @@ pub fn merge(base: &BaseConfig, profile: Option<&ProfileConfig>) -> ResolvedConf
         behavior,
         automatic_tiling_enabled,
         focus_border,
+        layouts,
     }
 }
 
@@ -484,7 +488,72 @@ snap-right = "ctrl+alt+left"
                 behavior: base.behavior.clone(),
                 automatic_tiling_enabled: false,
                 focus_border: base.focus_border,
+                layouts: base.layouts.clone(),
             }
         );
+    }
+
+    #[test]
+    fn a_saved_layout_is_declared_as_a_named_list_of_normalized_cells() {
+        let base = format!(
+            "{VALID_BASE}
+             [[layouts.writing.cells]]
+             x = 0.0
+             y = 0.0
+             width = 0.6
+             height = 1.0
+             
+             [[layouts.writing.cells]]
+             x = 0.6
+             y = 0.0
+             width = 0.4
+             height = 1.0
+"
+        );
+
+        let resolved = validate(&base_only(&base))
+            .expect("a config declaring a saved layout should be accepted")
+            .base;
+
+        let layout = resolved.layouts.get("writing").expect("layout is named");
+        assert_eq!(layout.cells.len(), 2);
+        assert_eq!(layout.cells[0].width, 0.6);
+        assert_eq!(layout.cells[1].x, 0.6);
+    }
+
+    #[test]
+    fn a_saved_layout_round_trips_through_toml() {
+        let base: BaseConfig = toml::from_str(&format!(
+            "{VALID_BASE}
+[layouts.writing]
+cells = [{{ x = 0.0, y = 0.0, width = 0.5, height = 1.0 }}]
+"
+        ))
+        .expect("inline-table cells parse");
+
+        let reparsed: BaseConfig = toml::from_str(&toml::to_string_pretty(&base).unwrap()).unwrap();
+
+        assert_eq!(reparsed, base);
+    }
+
+    #[test]
+    fn a_misspelled_cell_field_is_rejected_rather_than_silently_defaulted() {
+        let base = format!(
+            "{VALID_BASE}\n[layouts.writing]\ncells = [{{ x = 0.0, y = 0.0, widht = 0.5, height = 1.0 }}]\n"
+        );
+
+        let errors = validate(&base_only(&base)).unwrap_err();
+
+        assert!(
+            matches!(errors[0], ValidationError::Parse { ref file, .. } if file == "config.toml"),
+            "a typo'd cell field must be reported against the file, got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn a_config_declaring_no_layouts_resolves_to_an_empty_set() {
+        let resolved = validate(&base_only(VALID_BASE)).unwrap().base;
+
+        assert!(resolved.layouts.is_empty());
     }
 }

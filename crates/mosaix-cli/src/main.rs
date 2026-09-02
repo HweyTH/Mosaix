@@ -33,11 +33,27 @@ enum Command {
     SwapRight,
     SwapUp,
     SwapDown,
+    /// Work with saved layouts.
+    Layout {
+        #[command(subcommand)]
+        action: LayoutAction,
+    },
     State {
         #[arg(long)]
         json: bool,
     },
     Ping,
+}
+
+#[derive(Debug, Subcommand)]
+enum LayoutAction {
+    /// Apply a saved layout to the focused window's display. Fails with
+    /// the agent's own reason if no managed window is focused or no layout
+    /// carries that name.
+    Apply {
+        /// The layout's name, as declared under `[layouts]` in config.
+        name: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -97,6 +113,9 @@ fn main() {
         Command::SwapRight => IpcRequest::SwapRight,
         Command::SwapUp => IpcRequest::SwapUp,
         Command::SwapDown => IpcRequest::SwapDown,
+        Command::Layout {
+            action: LayoutAction::Apply { name },
+        } => IpcRequest::ApplyLayout { name },
         Command::State { .. } => IpcRequest::GetState,
         Command::Ping => IpcRequest::Ping,
     };

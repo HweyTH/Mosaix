@@ -21,6 +21,8 @@
 //! deterministic edge-allocation algorithm" the doc requires so adjacent
 //! tiles neither overlap nor leave cumulative gaps.
 
+use serde::{Deserialize, Serialize};
+
 use crate::Rect;
 
 /// Rounds ties away from zero -- the one rounding rule every conversion in
@@ -81,7 +83,14 @@ impl Rect {
 /// width/height -- the persisted-zone format from architecture doc section
 /// 10, e.g. `{ "x": 0.0, "y": 0.0, "width": 0.5, "height": 1.0 }` for the
 /// left half of a display's work area.
-#[derive(Debug, Clone, Copy, PartialEq)]
+///
+/// Being the persisted form, this is the type a saved layout's cells are
+/// written and read as (`mosaix_config::SavedLayout`), the same way
+/// [`Gaps`](crate::Gaps) is the type a config file's `[gaps]` table is
+/// read as. `deny_unknown_fields` so a misspelled cell field is rejected
+/// where it is written rather than silently defaulting to zero.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NormalizedRect {
     pub x: f64,
     pub y: f64,

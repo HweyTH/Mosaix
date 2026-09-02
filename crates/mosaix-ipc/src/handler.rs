@@ -1,3 +1,6 @@
+use std::collections::BTreeMap;
+
+use mosaix_config::SavedLayout;
 use mosaix_engine::{
     EligibilityReason, EngineState, Event, EventSender, StateReader, ZoneSnapDirection,
 };
@@ -29,6 +32,10 @@ pub struct StateSnapshot {
     /// Sanitized authoritative inventory. Titles and executable paths never
     /// cross this diagnostics boundary.
     pub managed_windows: Vec<ManagedWindowSnapshot>,
+    /// The saved layouts the resolved config currently offers, by name
+    /// (CONTEXT.md "Saved layout"). Shape only -- a layout never names a
+    /// window, so there is nothing here to sanitize (ADR 0018).
+    pub saved_layouts: BTreeMap<String, SavedLayout>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -104,6 +111,7 @@ impl From<EngineState> for StateSnapshot {
             })
             .collect();
         managed_windows.sort_by_key(|window| window.window_id);
+        let saved_layouts = state.resolved_config.layouts.clone();
         Self {
             revision: state.revision,
             display_count: state.displays.len(),
@@ -117,6 +125,7 @@ impl From<EngineState> for StateSnapshot {
             circuit_breaker_count,
             degraded_windows,
             managed_windows,
+            saved_layouts,
         }
     }
 }
@@ -226,6 +235,20 @@ pub fn handle_request(
             let value = serde_json::json!({ "paused": state.paused });
             IpcResponse::Ok { data: Some(value) }
         }
+        IpcRequest::ApplyLayout { name } => {
+            // The reducer would reach the same verdict, but only a log
+            // would come of it. Asking first is what lets the caller be
+            // told *why* nothing happened (ADR 0020).
+            match mosaix_engine::plan_saved_layout(&state_reader.snapshot(), name) {
+                Ok(_) => send_event(
+                    events,
+                    Event::SavedLayoutApplyRequested { name: name.clone() },
+                ),
+                Err(rejection) => IpcResponse::Error {
+                    message: rejection.to_string(),
+                },
+            }
+        }
     }
 }
 
@@ -306,5 +329,177 @@ mod tests {
         let encoded = json.to_string();
         assert!(!encoded.contains("Sensitive document title"));
         assert!(!encoded.contains("private.exe"));
+    }
+
+    #[test]
+    fn state_snapshot_publishes_the_saved_layouts_by_name() {
+        let mut layouts = BTreeMap::new();
+        layouts.insert(
+            "writing".to_owned(),
+            SavedLayout {
+                cells: vec![mosaix_domain::NormalizedRect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 0.6,
+                    height: 1.0,
+                }],
+            },
+        );
+        let mut state = EngineState::default();
+        state.resolved_config.layouts = layouts;
+
+        let json = serde_json::to_value(StateSnapshot::from(state)).unwrap();
+
+        assert_eq!(json["saved_layouts"]["writing"]["cells"][0]["width"], 0.6);
+    }
+
+    /// An engine with one display, one managed window focused on it, and
+    /// whatever saved layouts `layouts` declares.
+    fn engine_with_layouts(
+        layouts: BTreeMap<String, SavedLayout>,
+    ) -> (mosaix_engine::EngineHandle, WindowId) {
+        let display = mosaix_domain::Display {
+            id: DisplayId(1),
+            stable_fingerprint: "MON-A".to_owned(),
+            full_bounds: Rect::new(0, 0, 1920, 1080),
+            work_area: Rect::new(0, 0, 1920, 1080),
+            scale_factor: 1.0,
+            rotation: mosaix_domain::Rotation::Landscape,
+            is_primary: true,
+        };
+        let config_set = mosaix_config::ResolvedConfigSet {
+            base: mosaix_config::ResolvedConfig {
+                layouts,
+                ..mosaix_config::ResolvedConfig::default()
+            },
+            profiles: Vec::new(),
+        };
+        let engine = mosaix_engine::spawn_engine(vec![display], config_set);
+        let window = Window {
+            id: WindowId(11),
+            process_id: 4,
+            application_id: ApplicationId("test".to_owned()),
+            executable_path: None,
+            title: "non-sensitive-test-title".to_owned(),
+            native_class: None,
+            role: WindowRole::Normal,
+            bounds: Rect::new(0, 0, 400, 300),
+            display_id: DisplayId(1),
+            capabilities: WindowCapabilities {
+                can_move: true,
+                can_resize: true,
+                can_minimize: true,
+                can_maximize: true,
+            },
+            elevated: false,
+            lifecycle: WindowLifecycle::Active,
+        };
+        engine
+            .events()
+            .send(Event::WindowsObserved {
+                windows: vec![window],
+            })
+            .unwrap();
+        engine
+            .events()
+            .send(Event::WindowFocused {
+                window_id: WindowId(11),
+                display_id: DisplayId(1),
+                bounds: Rect::new(0, 0, 400, 300),
+            })
+            .unwrap();
+        wait_for_revision(&engine, 2);
+        (engine, WindowId(11))
+    }
+
+    fn wait_for_revision(engine: &mosaix_engine::EngineHandle, at_least: u64) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while engine.state_reader().revision() < at_least && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn applying_a_declared_layout_is_accepted_and_reaches_the_reducer() {
+        let mut layouts = BTreeMap::new();
+        layouts.insert(
+            "half".to_owned(),
+            SavedLayout {
+                cells: vec![mosaix_domain::NormalizedRect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 0.5,
+                    height: 1.0,
+                }],
+            },
+        );
+        let (engine, window_id) = engine_with_layouts(layouts);
+        let before = engine.state_reader().revision();
+
+        let response = handle_request(
+            &IpcRequest::ApplyLayout {
+                name: "half".to_owned(),
+            },
+            &engine.events(),
+            &engine.state_reader(),
+        );
+
+        assert_eq!(response, IpcResponse::Ok { data: None });
+        wait_for_revision(&engine, before + 1);
+        assert_eq!(
+            engine.snapshot().windows[&window_id].bounds,
+            Rect::new(0, 0, 960, 1080)
+        );
+    }
+
+    #[test]
+    fn applying_an_undeclared_layout_answers_with_the_reason_naming_it() {
+        let (engine, _) = engine_with_layouts(BTreeMap::new());
+
+        let response = handle_request(
+            &IpcRequest::ApplyLayout {
+                name: "writing".to_owned(),
+            },
+            &engine.events(),
+            &engine.state_reader(),
+        );
+
+        let IpcResponse::Error { message } = response else {
+            panic!("an undeclared layout must be rejected, got {response:?}");
+        };
+        assert!(
+            message.contains("writing"),
+            "the rejection must name the layout, got {message:?}"
+        );
+    }
+
+    #[test]
+    fn applying_a_layout_with_nothing_focused_answers_with_that_reason() {
+        let mut layouts = BTreeMap::new();
+        layouts.insert("half".to_owned(), SavedLayout::default());
+        let config_set = mosaix_config::ResolvedConfigSet {
+            base: mosaix_config::ResolvedConfig {
+                layouts,
+                ..mosaix_config::ResolvedConfig::default()
+            },
+            profiles: Vec::new(),
+        };
+        let engine = mosaix_engine::spawn_engine(Vec::new(), config_set);
+
+        let response = handle_request(
+            &IpcRequest::ApplyLayout {
+                name: "half".to_owned(),
+            },
+            &engine.events(),
+            &engine.state_reader(),
+        );
+
+        let IpcResponse::Error { message } = response else {
+            panic!("no focused managed window must be rejected, got {response:?}");
+        };
+        assert!(
+            message.contains("focused"),
+            "the rejection must say what was missing, got {message:?}"
+        );
     }
 }
