@@ -7,9 +7,11 @@
 
 use thiserror::Error;
 
+use std::collections::BTreeMap;
+
 use crate::schema::{
     BaseConfig, Command, KeyCombo, ProfileConfig, ResolvedConfig, ResolvedConfigSet,
-    ResolvedProfile, CURRENT_VERSION,
+    ResolvedProfile, SavedLayout, CURRENT_VERSION,
 };
 
 /// One profile candidate: its filename (for error messages -- profiles are
@@ -46,9 +48,7 @@ pub enum ValidationError {
         expected: u32,
     },
 
-    #[error(
-        "{file}: duplicate hotkey binding {combo:?} is bound to both {first:?} and {second:?}"
-    )]
+    #[error("{file}: duplicate hotkey binding {combo:?} is bound to both {first} and {second}")]
     DuplicateBinding {
         file: String,
         combo: String,
@@ -67,6 +67,127 @@ pub enum ValidationError {
 
     #[error("{file}: focus-border thickness must be between 1 and 16 logical pixels, got {found}")]
     InvalidFocusBorderThickness { file: String, found: u16 },
+
+    #[error("{file}: a saved layout's name may not be empty or whitespace-only")]
+    EmptyLayoutName { file: String },
+
+    #[error(
+        "{file}: saved layouts {first:?} and {second:?} differ only by case; \
+         two layouts may not share a name"
+    )]
+    DuplicateLayoutName {
+        file: String,
+        first: String,
+        second: String,
+    },
+
+    #[error("{file}: saved layout {layout:?} declares no cells")]
+    EmptyLayout { file: String, layout: String },
+
+    #[error(
+        "{file}: saved layout {layout:?} cell {index} falls outside a display work area; \
+         every cell edge must lie within the normalized 0.0-1.0 range"
+    )]
+    CellOutOfRange {
+        file: String,
+        layout: String,
+        index: usize,
+    },
+
+    #[error(
+        "{file}: saved layout {layout:?} cell {index} has no width or no height, \
+         so it would resize a window to nothing"
+    )]
+    DegenerateCell {
+        file: String,
+        layout: String,
+        index: usize,
+    },
+
+    #[error("{file}: hotkey {binding:?} applies saved layout {layout:?}, which is not declared")]
+    UnknownLayoutBinding {
+        file: String,
+        binding: String,
+        layout: String,
+    },
+}
+
+/// How far past 1.0 a cell edge may land before it counts as outside the
+/// work area.
+///
+/// Cells are written as decimal fractions, and a user splitting a display
+/// three ways writes `0.34`/`0.33`/`0.33` -- whose binary sum can exceed
+/// 1.0 in the last bits. Rejecting that would be rejecting arithmetic, not
+/// a mistake, so the bound is generous enough to swallow rounding and far
+/// too tight to admit a real typo.
+const NORMALIZED_TOLERANCE: f64 = 1e-9;
+
+/// Every rule a saved layout must satisfy, checked against the file the
+/// layouts are *defined* in rather than a merged result -- a name and a
+/// cell list belong to whoever wrote them (ADR 0019).
+///
+/// Returns every violation found rather than the first, matching how
+/// [`validate`] reports a whole directory: one pass should show a user
+/// everything they need to fix.
+fn layout_errors(file: &str, layouts: &BTreeMap<String, SavedLayout>) -> Vec<ValidationError> {
+    let mut errors = Vec::new();
+
+    for (name, layout) in layouts {
+        if name.trim().is_empty() {
+            errors.push(ValidationError::EmptyLayoutName {
+                file: file.to_owned(),
+            });
+        }
+        if layout.cells.is_empty() {
+            errors.push(ValidationError::EmptyLayout {
+                file: file.to_owned(),
+                layout: name.clone(),
+            });
+        }
+        for (index, cell) in layout.cells.iter().enumerate() {
+            let within =
+                |value: f64| (-NORMALIZED_TOLERANCE..=1.0 + NORMALIZED_TOLERANCE).contains(&value);
+            if !(within(cell.x)
+                && within(cell.y)
+                && within(cell.x + cell.width)
+                && within(cell.y + cell.height))
+            {
+                errors.push(ValidationError::CellOutOfRange {
+                    file: file.to_owned(),
+                    layout: name.clone(),
+                    index,
+                });
+            } else if !(cell.width > 0.0 && cell.height > 0.0) {
+                // In range but with nothing in it. Reported separately
+                // because "falls outside the work area" would be a lie
+                // about a zero-width cell sitting squarely inside it.
+                errors.push(ValidationError::DegenerateCell {
+                    file: file.to_owned(),
+                    layout: name.clone(),
+                    index,
+                });
+            }
+        }
+    }
+
+    // Exactly-equal names are already impossible -- TOML rejects a repeated
+    // key -- so the only collision left to catch is one of case. `writing`
+    // and `Writing` are two map entries but one layout to a user, and a
+    // binding naming either would be ambiguous.
+    let names: Vec<&String> = layouts.keys().collect();
+    for i in 0..names.len() {
+        for j in (i + 1)..names.len() {
+            if names[i].to_lowercase() == names[j].to_lowercase() {
+                errors.push(ValidationError::DuplicateLayoutName {
+                    file: file.to_owned(),
+                    first: names[i].clone(),
+                    second: names[j].clone(),
+                });
+            }
+        }
+    }
+
+    errors
 }
 
 /// Field-level merges `profile` (if any) over `base`: any field the profile
@@ -85,7 +206,7 @@ pub fn merge(base: &BaseConfig, profile: Option<&ProfileConfig>) -> ResolvedConf
 
     if let Some(profile) = profile {
         for (command, combo) in &profile.hotkeys {
-            hotkeys.insert(*command, combo.clone());
+            hotkeys.insert(command.clone(), combo.clone());
         }
         if let Some(outer) = profile.gaps.outer {
             gaps.outer = outer;
@@ -151,13 +272,38 @@ fn duplicate_binding(file: &str, resolved: &ResolvedConfig) -> Option<Validation
                 return Some(ValidationError::DuplicateBinding {
                     file: file.to_string(),
                     combo: entries[i].1.to_string(),
-                    first: *entries[i].0,
-                    second: *entries[j].0,
+                    first: entries[i].0.clone(),
+                    second: entries[j].0.clone(),
                 });
             }
         }
     }
     None
+}
+
+/// Every hotkey in `resolved` bound to a saved layout that `resolved` does
+/// not declare, as a validation error naming the file, the binding, and
+/// the layout (ADR 0019).
+///
+/// Runs against the merged result rather than one file's own text, because
+/// a profile can bind a layout base config declares, or shadow a binding
+/// base config made -- what a keypress would actually reach is only
+/// visible after the merge.
+fn unknown_layout_bindings(file: &str, resolved: &ResolvedConfig) -> Vec<ValidationError> {
+    resolved
+        .hotkeys
+        .iter()
+        .filter_map(|(command, combo)| match command {
+            Command::ApplyLayout { name } if !resolved.layouts.contains_key(name) => {
+                Some(ValidationError::UnknownLayoutBinding {
+                    file: file.to_owned(),
+                    binding: combo.to_string(),
+                    layout: name.clone(),
+                })
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 /// Validates a whole candidate config directory atomically (ADR 0007): if
@@ -200,6 +346,8 @@ pub fn validate(candidate: &CandidateConfig) -> Result<ResolvedConfigSet, Vec<Va
         return Err(errors);
     };
 
+    errors.extend(layout_errors("config.toml", &base.layouts));
+
     let base_resolved = merge(&base, None);
     if !(1..=16).contains(&base_resolved.focus_border.thickness) {
         errors.push(ValidationError::InvalidFocusBorderThickness {
@@ -210,6 +358,7 @@ pub fn validate(candidate: &CandidateConfig) -> Result<ResolvedConfigSet, Vec<Va
     if let Some(err) = duplicate_binding("config.toml", &base_resolved) {
         errors.push(err);
     }
+    errors.extend(unknown_layout_bindings("config.toml", &base_resolved));
 
     let mut resolved_profiles = Vec::new();
     for (file_name, profile) in &profiles {
@@ -221,8 +370,11 @@ pub fn validate(candidate: &CandidateConfig) -> Result<ResolvedConfigSet, Vec<Va
             });
             continue;
         }
-        if let Some(err) = duplicate_binding(file_name, &resolved) {
-            errors.push(err);
+        let referential = unknown_layout_bindings(file_name, &resolved);
+        let duplicate = duplicate_binding(file_name, &resolved);
+        if duplicate.is_some() || !referential.is_empty() {
+            errors.extend(duplicate);
+            errors.extend(referential);
         } else {
             resolved_profiles.push(ResolvedProfile {
                 fingerprint: profile.fingerprint.clone(),
@@ -547,6 +699,445 @@ cells = [{{ x = 0.0, y = 0.0, width = 0.5, height = 1.0 }}]
         assert!(
             matches!(errors[0], ValidationError::Parse { ref file, .. } if file == "config.toml"),
             "a typo'd cell field must be reported against the file, got {errors:?}"
+        );
+    }
+
+    /// A base config declaring the saved layout `writing`, so a binding to
+    /// it is referentially sound.
+    const BASE_WITH_WRITING: &str = r#"
+version = 1
+
+[hotkeys]
+snap-left = "ctrl+alt+left"
+
+[layouts.writing]
+cells = [{ x = 0.0, y = 0.0, width = 1.0, height = 1.0 }]
+
+[layouts.coding]
+cells = [{ x = 0.0, y = 0.0, width = 1.0, height = 1.0 }]
+"#;
+
+    #[test]
+    fn a_binding_to_a_declared_layout_is_accepted() {
+        let base =
+            format!("{BASE_WITH_WRITING}\n[hotkeys.apply-layout]\nwriting = \"ctrl+alt+1\"\n");
+
+        let resolved = validate(&base_only(&base))
+            .expect("a binding naming a declared layout is sound")
+            .base;
+
+        assert_eq!(
+            resolved.hotkeys.get(&Command::ApplyLayout {
+                name: "writing".to_owned()
+            }),
+            Some(&combo("ctrl+alt+1"))
+        );
+    }
+
+    #[test]
+    fn a_binding_naming_a_layout_that_does_not_exist_is_rejected() {
+        let base =
+            format!("{BASE_WITH_WRITING}\n[hotkeys.apply-layout]\nwrtiing = \"ctrl+alt+1\"\n");
+
+        let errors = validate(&base_only(&base)).unwrap_err();
+
+        assert!(
+            errors.contains(&ValidationError::UnknownLayoutBinding {
+                file: "config.toml".to_owned(),
+                binding: "ctrl+alt+1".to_owned(),
+                layout: "wrtiing".to_owned(),
+            }),
+            "got {errors:?}"
+        );
+        // File, binding, and missing layout all in the one message the
+        // user sees (ADR 0019).
+        let message = errors[0].to_string();
+        assert!(message.contains("config.toml"), "{message}");
+        assert!(message.contains("ctrl+alt+1"), "{message}");
+        assert!(message.contains("wrtiing"), "{message}");
+    }
+
+    #[test]
+    fn a_profiles_binding_to_a_layout_that_does_not_exist_is_rejected_naming_the_profile() {
+        let candidate = CandidateConfig {
+            base: BASE_WITH_WRITING.to_owned(),
+            profiles: vec![CandidateProfile {
+                file_name: "office.toml".to_owned(),
+                contents:
+                    "fingerprint = \"MON-A\"\n[hotkeys.apply-layout]\nwrtiing = \"ctrl+alt+1\"\n"
+                        .to_owned(),
+            }],
+        };
+
+        let errors = validate(&candidate).unwrap_err();
+
+        assert!(
+            errors.contains(&ValidationError::UnknownLayoutBinding {
+                file: "office.toml".to_owned(),
+                binding: "ctrl+alt+1".to_owned(),
+                layout: "wrtiing".to_owned(),
+            }),
+            "got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn a_layout_binding_is_checked_against_the_merged_layout_set() {
+        // Base declares the layout; only the profile binds it. Checking
+        // either file alone would miss that this is sound.
+        let candidate = CandidateConfig {
+            base: BASE_WITH_WRITING.to_owned(),
+            profiles: vec![CandidateProfile {
+                file_name: "office.toml".to_owned(),
+                contents:
+                    "fingerprint = \"MON-A\"\n[hotkeys.apply-layout]\nwriting = \"ctrl+alt+1\"\n"
+                        .to_owned(),
+            }],
+        };
+
+        let result = validate(&candidate).expect("base declares what the profile binds");
+
+        assert!(result.profiles[0]
+            .config
+            .hotkeys
+            .contains_key(&Command::ApplyLayout {
+                name: "writing".to_owned()
+            }));
+    }
+
+    #[test]
+    fn bindings_of_two_different_layouts_are_not_a_duplicate() {
+        let base = format!(
+            "{BASE_WITH_WRITING}\n\
+             [hotkeys.apply-layout]\n\
+             writing = \"ctrl+alt+1\"\n\
+             coding = \"ctrl+alt+2\"\n"
+        );
+
+        let resolved = validate(&base_only(&base))
+            .expect("two layouts on two combos is two bindings, not a collision")
+            .base;
+
+        assert_eq!(resolved.hotkeys.len(), 3);
+    }
+
+    #[test]
+    fn a_profile_rebinding_a_layout_is_an_override_not_a_duplicate() {
+        // Base and a profile both binding `apply-layout.writing` is the
+        // ordinary field-level merge every other binding gets (ADR 0004),
+        // not a collision -- the profile's combo simply wins for its
+        // topology, exactly as it would for `snap-left`.
+        let candidate = CandidateConfig {
+            base: format!(
+                "{BASE_WITH_WRITING}\n[hotkeys.apply-layout]\nwriting = \"ctrl+alt+1\"\n"
+            ),
+            profiles: vec![CandidateProfile {
+                file_name: "office.toml".to_owned(),
+                contents:
+                    "fingerprint = \"MON-A\"\n[hotkeys.apply-layout]\nwriting = \"ctrl+alt+2\"\n"
+                        .to_owned(),
+            }],
+        };
+
+        let result = validate(&candidate).expect("a profile override is not a duplicate");
+
+        let binding = Command::ApplyLayout {
+            name: "writing".to_owned(),
+        };
+        assert_eq!(
+            result.base.hotkeys.get(&binding),
+            Some(&combo("ctrl+alt+1"))
+        );
+        assert_eq!(
+            result.profiles[0].config.hotkeys.get(&binding),
+            Some(&combo("ctrl+alt+2")),
+            "the profile's combo wins for its own topology"
+        );
+    }
+
+    #[test]
+    fn binding_the_same_layout_to_two_combos_in_one_file_is_rejected_where_it_is_written() {
+        // One layout is one key of one map, so two combos for it cannot
+        // both survive. TOML catches the repeated key first, which is the
+        // earliest and most precise place to catch it -- the alternative
+        // is a silent last-wins, which ADR 0019 rules out.
+        let base = format!(
+            "{BASE_WITH_WRITING}\n\
+             [hotkeys.apply-layout]\n\
+             writing = \"ctrl+alt+1\"\n\
+             writing = \"ctrl+alt+2\"\n"
+        );
+
+        let errors = validate(&base_only(&base)).unwrap_err();
+
+        assert!(
+            matches!(errors[0], ValidationError::Parse { ref file, .. } if file == "config.toml"),
+            "got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn a_layout_binding_colliding_with_a_verb_is_a_duplicate_naming_both() {
+        let base =
+            format!("{BASE_WITH_WRITING}\n[hotkeys.apply-layout]\nwriting = \"ctrl+alt+left\"\n");
+
+        let errors = validate(&base_only(&base)).unwrap_err();
+
+        assert_eq!(
+            errors,
+            vec![ValidationError::DuplicateBinding {
+                file: "config.toml".to_owned(),
+                combo: "ctrl+alt+left".to_owned(),
+                first: Command::SnapLeft,
+                second: Command::ApplyLayout {
+                    name: "writing".to_owned()
+                },
+            }]
+        );
+        assert!(
+            errors[0].to_string().contains("apply-layout.writing"),
+            "the payload must appear in the message, got {}",
+            errors[0]
+        );
+    }
+
+    #[test]
+    fn duplicate_detection_still_runs_after_base_and_profile_are_merged() {
+        // Neither file collides on its own: base binds snap-left, the
+        // profile binds a layout, and only the merged set has both on
+        // ctrl+alt+1.
+        let candidate = CandidateConfig {
+            base: BASE_WITH_WRITING.replace(
+                "snap-left = \"ctrl+alt+left\"",
+                "snap-left = \"ctrl+alt+1\"",
+            ),
+            profiles: vec![CandidateProfile {
+                file_name: "office.toml".to_owned(),
+                contents:
+                    "fingerprint = \"MON-A\"\n[hotkeys.apply-layout]\nwriting = \"ctrl+alt+1\"\n"
+                        .to_owned(),
+            }],
+        };
+
+        let errors = validate(&candidate).unwrap_err();
+
+        assert!(
+            errors.iter().any(|error| matches!(
+                error,
+                ValidationError::DuplicateBinding { file, .. } if file == "office.toml"
+            )),
+            "got {errors:?}"
+        );
+    }
+
+    /// `VALID_BASE` with `layouts` appended -- every layout rule test
+    /// differs only in what it declares there.
+    fn base_with_layouts(layouts: &str) -> CandidateConfig {
+        base_only(&format!("{VALID_BASE}\n{layouts}"))
+    }
+
+    #[test]
+    fn an_empty_layout_name_is_rejected_naming_the_file() {
+        let errors = validate(&base_with_layouts(
+            "[layouts.\"\"]\ncells = [{ x = 0.0, y = 0.0, width = 1.0, height = 1.0 }]\n",
+        ))
+        .unwrap_err();
+
+        assert!(
+            errors.contains(&ValidationError::EmptyLayoutName {
+                file: "config.toml".to_owned(),
+            }),
+            "got {errors:?}"
+        );
+        assert!(errors[0].to_string().contains("config.toml"));
+    }
+
+    #[test]
+    fn a_whitespace_only_layout_name_is_rejected() {
+        let errors = validate(&base_with_layouts(
+            "[layouts.\"   \"]\ncells = [{ x = 0.0, y = 0.0, width = 1.0, height = 1.0 }]\n",
+        ))
+        .unwrap_err();
+
+        assert!(
+            errors.contains(&ValidationError::EmptyLayoutName {
+                file: "config.toml".to_owned(),
+            }),
+            "got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn two_layout_names_differing_only_by_case_are_rejected() {
+        let errors = validate(&base_with_layouts(
+            "[layouts.writing]\ncells = [{ x = 0.0, y = 0.0, width = 1.0, height = 1.0 }]\n\
+             [layouts.Writing]\ncells = [{ x = 0.0, y = 0.0, width = 1.0, height = 1.0 }]\n",
+        ))
+        .unwrap_err();
+
+        assert!(
+            errors.contains(&ValidationError::DuplicateLayoutName {
+                file: "config.toml".to_owned(),
+                first: "Writing".to_owned(),
+                second: "writing".to_owned(),
+            }),
+            "got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn two_layouts_with_genuinely_different_names_are_accepted() {
+        let resolved = validate(&base_with_layouts(
+            "[layouts.writing]\ncells = [{ x = 0.0, y = 0.0, width = 1.0, height = 1.0 }]\n\
+             [layouts.coding]\ncells = [{ x = 0.0, y = 0.0, width = 1.0, height = 1.0 }]\n",
+        ))
+        .expect("two distinct names are not a collision")
+        .base;
+
+        assert_eq!(resolved.layouts.len(), 2);
+    }
+
+    #[test]
+    fn a_layout_with_an_empty_cell_list_is_rejected() {
+        let errors = validate(&base_with_layouts("[layouts.writing]\ncells = []\n")).unwrap_err();
+
+        assert!(
+            errors.contains(&ValidationError::EmptyLayout {
+                file: "config.toml".to_owned(),
+                layout: "writing".to_owned(),
+            }),
+            "got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn a_layout_declaring_no_cells_at_all_is_rejected_the_same_way() {
+        // `cells` defaults to empty rather than failing to parse, so an
+        // omitted list must reach the same rule as an explicitly empty one.
+        let errors = validate(&base_with_layouts("[layouts.writing]\n")).unwrap_err();
+
+        assert!(
+            errors.contains(&ValidationError::EmptyLayout {
+                file: "config.toml".to_owned(),
+                layout: "writing".to_owned(),
+            }),
+            "got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn a_cell_running_past_the_right_edge_of_the_work_area_is_rejected() {
+        let errors = validate(&base_with_layouts(
+            "[layouts.writing]\ncells = [{ x = 0.6, y = 0.0, width = 0.5, height = 1.0 }]\n",
+        ))
+        .unwrap_err();
+
+        assert!(
+            errors.contains(&ValidationError::CellOutOfRange {
+                file: "config.toml".to_owned(),
+                layout: "writing".to_owned(),
+                index: 0,
+            }),
+            "got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn a_negative_cell_origin_is_rejected() {
+        let errors = validate(&base_with_layouts(
+            "[layouts.writing]\ncells = [{ x = -0.1, y = 0.0, width = 0.5, height = 1.0 }]\n",
+        ))
+        .unwrap_err();
+
+        assert!(
+            errors.contains(&ValidationError::CellOutOfRange {
+                file: "config.toml".to_owned(),
+                layout: "writing".to_owned(),
+                index: 0,
+            }),
+            "got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn a_zero_width_cell_is_rejected_as_degenerate_not_as_out_of_range() {
+        let errors = validate(&base_with_layouts(
+            "[layouts.writing]\ncells = [{ x = 0.5, y = 0.0, width = 0.0, height = 1.0 }]\n",
+        ))
+        .unwrap_err();
+
+        assert!(
+            errors.contains(&ValidationError::DegenerateCell {
+                file: "config.toml".to_owned(),
+                layout: "writing".to_owned(),
+                index: 0,
+            }),
+            "got {errors:?}"
+        );
+        // The cell sits squarely inside the work area, so the
+        // out-of-range wording would be a lie about it.
+        assert!(
+            !errors[0].to_string().contains("outside"),
+            "got {}",
+            errors[0]
+        );
+    }
+
+    #[test]
+    fn the_offending_cell_is_named_by_its_position_in_the_list() {
+        let errors = validate(&base_with_layouts(
+            "[layouts.writing]\ncells = [\n\
+               { x = 0.0, y = 0.0, width = 0.5, height = 1.0 },\n\
+               { x = 0.5, y = 0.0, width = 0.5, height = 1.0 },\n\
+               { x = 0.5, y = 0.0, width = 0.9, height = 1.0 },\n\
+             ]\n",
+        ))
+        .unwrap_err();
+
+        assert!(
+            errors.contains(&ValidationError::CellOutOfRange {
+                file: "config.toml".to_owned(),
+                layout: "writing".to_owned(),
+                index: 2,
+            }),
+            "got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn a_three_way_split_written_as_decimals_is_not_rejected_for_binary_rounding() {
+        // 0.34 + 0.33 + 0.33 sums past 1.0 in binary. That is arithmetic,
+        // not a user error, and must survive the range check.
+        validate(&base_with_layouts(
+            "[layouts.thirds]\ncells = [\n\
+               { x = 0.0, y = 0.0, width = 0.34, height = 1.0 },\n\
+               { x = 0.34, y = 0.0, width = 0.33, height = 1.0 },\n\
+               { x = 0.67, y = 0.0, width = 0.33, height = 1.0 },\n\
+             ]\n",
+        ))
+        .expect("a decimal three-way split is a valid layout");
+    }
+
+    #[test]
+    fn a_layout_covering_the_whole_work_area_is_accepted_at_the_boundary() {
+        validate(&base_with_layouts(
+            "[layouts.full]\ncells = [{ x = 0.0, y = 0.0, width = 1.0, height = 1.0 }]\n",
+        ))
+        .expect("edges exactly on the boundary are inside it");
+    }
+
+    #[test]
+    fn every_layout_problem_in_one_file_is_reported_together() {
+        let errors = validate(&base_with_layouts(
+            "[layouts.writing]\ncells = []\n\
+             [layouts.coding]\ncells = [{ x = 0.0, y = 0.0, width = 2.0, height = 1.0 }]\n",
+        ))
+        .unwrap_err();
+
+        assert_eq!(
+            errors.len(),
+            2,
+            "one pass should show the user everything, got {errors:?}"
         );
     }
 

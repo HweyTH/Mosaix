@@ -96,6 +96,20 @@ inner = 4
 
 const INVALID_EDIT: &str = "version = 1\n[hotkeys\n";
 
+/// A file that parses cleanly and is still invalid: the layout `writing`
+/// has a cell running off the right of the work area. Distinct from
+/// `INVALID_EDIT`, which fails at the TOML layer -- this one only fails
+/// once `validate` applies the saved-layout rules.
+const INVALID_LAYOUT_EDIT: &str = r#"
+version = 1
+
+[hotkeys]
+snap-left = "ctrl+alt+left"
+
+[layouts.writing]
+cells = [{ x = 0.6, y = 0.0, width = 0.9, height = 1.0 }]
+"#;
+
 #[test]
 fn first_run_against_an_empty_directory_writes_a_working_default_config() {
     let dir = temp_dir("default-generation");
@@ -197,6 +211,68 @@ fn an_invalid_edit_is_rejected_and_a_later_fix_recovers() {
         .expect("expected a config event after the fix");
     match event {
         ConfigEvent::Changed(set) => {
+            assert_eq!(
+                set.base.hotkeys.get(&Command::SnapLeft),
+                Some(&KeyCombo::parse("ctrl+shift+left").unwrap())
+            );
+        }
+        ConfigEvent::Rejected(errors) => panic!("expected the fix to be accepted, got: {errors:?}"),
+    }
+
+    watcher.stop();
+    cleanup(&dir);
+}
+
+#[test]
+fn a_malformed_saved_layout_is_rejected_and_the_previous_config_keeps_running() {
+    let dir = temp_dir("invalid-layout");
+    ensure_default_config(&dir).expect("should create the default config");
+
+    // The config in effect before the bad edit: the one the agent is
+    // already running on.
+    let before = load(&dir).unwrap().expect("the default config is valid");
+
+    let (watcher, events) = watch(dir.clone()).expect("watcher should start");
+
+    fs::write(dir.join("config.toml"), INVALID_LAYOUT_EDIT)
+        .expect("failed to write the broken layout");
+
+    let event = events
+        .recv_timeout(Duration::from_secs(5))
+        .expect("expected a config event after the debounced edit");
+    match event {
+        ConfigEvent::Rejected(errors) => {
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| error.to_string().contains("config.toml")),
+                "the rejection must name the file, got: {errors:?}"
+            );
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| error.to_string().contains("writing")),
+                "the rejection must name the layout, got: {errors:?}"
+            );
+        }
+        ConfigEvent::Changed(set) => {
+            panic!("a cell outside the work area must be rejected, got: {set:?}")
+        }
+    }
+
+    // A rejection is not a new resolved config, so nothing supersedes what
+    // the agent already holds -- and the watcher is still live enough to
+    // deliver the fix.
+    fs::write(dir.join("config.toml"), VALID_EDIT).expect("failed to write the fixed config");
+    let event = events
+        .recv_timeout(Duration::from_secs(5))
+        .expect("expected a config event after the fix");
+    match event {
+        ConfigEvent::Changed(set) => {
+            assert_ne!(
+                set.base.hotkeys, before.base.hotkeys,
+                "the fix should be a genuinely different config from the one that was running"
+            );
             assert_eq!(
                 set.base.hotkeys.get(&Command::SnapLeft),
                 Some(&KeyCombo::parse("ctrl+shift+left").unwrap())

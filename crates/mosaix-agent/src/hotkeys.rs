@@ -1,6 +1,7 @@
 //! Translating `mosaix-config`'s platform-neutral resolved hotkey bindings
-//! into `mosaix-platform-windows::HotkeyBinding`s to register, and mapping
-//! a fired hotkey id back to the zone-snap command it represents.
+//! into `mosaix-platform-windows::HotkeyBinding`s to register, mapping a
+//! fired hotkey id back to the command it represents, and turning that
+//! command into the engine event it asks for.
 //!
 //! Replaces this crate's former hardcoded `keybindings.rs` table (ADR
 //! 0003, superseded by ADR 0005): the resolved bindings themselves now
@@ -13,7 +14,7 @@
 use std::collections::BTreeMap;
 
 use mosaix_config::{Command, KeyCombo, ResolvedConfig};
-use mosaix_engine::ZoneSnapDirection;
+use mosaix_engine::{CardinalDirection, Event, ZoneSnapDirection};
 use mosaix_platform_windows::HotkeyBinding;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_WIN, VK_BACK, VK_DELETE, VK_DOWN,
@@ -21,28 +22,81 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_SPACE, VK_TAB, VK_UP,
 };
 
-/// The zone-snap direction `command` dispatches to when its hotkey fires --
-/// a 1:1 mirror of [`Command`]'s four variants (ADR 0005).
-pub fn direction_for_command(command: Command) -> ZoneSnapDirection {
+/// Whether `command` is one of the four zone snaps -- the only commands
+/// the snap-preview overlay has a single committed rectangle to flash.
+///
+/// Applying a saved layout is excluded deliberately: it commits a whole
+/// display's worth of rectangles at once, which is not the shape that
+/// overlay draws.
+pub fn is_zone_snap(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::SnapLeft | Command::SnapRight | Command::SnapTop | Command::SnapBottom
+    )
+}
+
+/// The engine event a fired hotkey turns into.
+///
+/// `paused` comes from the caller's snapshot, because `toggle-pause` is
+/// the one command whose meaning depends on current state rather than on
+/// the command alone.
+///
+/// Total over [`Command`] and free of engine or platform handles, so the
+/// mapping a keypress goes through is the thing under test rather than a
+/// branch buried in a thread that only exists on Windows. Every variant is
+/// matched explicitly so it stays that way as the enum grows.
+pub fn event_for_command(command: &Command, paused: bool) -> Event {
     match command {
-        Command::SnapLeft => ZoneSnapDirection::Left,
-        Command::SnapRight => ZoneSnapDirection::Right,
-        Command::SnapTop => ZoneSnapDirection::Top,
-        Command::SnapBottom => ZoneSnapDirection::Bottom,
-        Command::Rearrange => unreachable!("rearrange is not a zone-snap command"),
-        Command::ToggleAutomaticTiling => {
-            unreachable!("tiling toggle is not a zone-snap command")
+        Command::SnapLeft => Event::ZoneSnapRequested {
+            direction: ZoneSnapDirection::Left,
+        },
+        Command::SnapRight => Event::ZoneSnapRequested {
+            direction: ZoneSnapDirection::Right,
+        },
+        Command::SnapTop => Event::ZoneSnapRequested {
+            direction: ZoneSnapDirection::Top,
+        },
+        Command::SnapBottom => Event::ZoneSnapRequested {
+            direction: ZoneSnapDirection::Bottom,
+        },
+        Command::Rearrange => Event::RearrangeRequested,
+        Command::ToggleAutomaticTiling => Event::ToggleAutomaticTilingRequested,
+        Command::ToggleFloating => Event::ToggleFloatingRequested,
+        Command::FocusLeft => Event::DirectionalFocusRequested {
+            direction: CardinalDirection::Left,
+        },
+        Command::FocusRight => Event::DirectionalFocusRequested {
+            direction: CardinalDirection::Right,
+        },
+        Command::FocusUp => Event::DirectionalFocusRequested {
+            direction: CardinalDirection::Up,
+        },
+        Command::FocusDown => Event::DirectionalFocusRequested {
+            direction: CardinalDirection::Down,
+        },
+        Command::SwapLeft => Event::DirectionalSwapRequested {
+            direction: CardinalDirection::Left,
+        },
+        Command::SwapRight => Event::DirectionalSwapRequested {
+            direction: CardinalDirection::Right,
+        },
+        Command::SwapUp => Event::DirectionalSwapRequested {
+            direction: CardinalDirection::Up,
+        },
+        Command::SwapDown => Event::DirectionalSwapRequested {
+            direction: CardinalDirection::Down,
+        },
+        Command::TogglePause => {
+            if paused {
+                Event::ResumeRequested
+            } else {
+                Event::PauseRequested
+            }
         }
-        Command::ToggleFloating => unreachable!("floating toggle is not a zone-snap command"),
-        Command::FocusLeft
-        | Command::FocusRight
-        | Command::FocusUp
-        | Command::FocusDown
-        | Command::SwapLeft
-        | Command::SwapRight
-        | Command::SwapUp
-        | Command::SwapDown
-        | Command::TogglePause => unreachable!("tiling command is not a zone-snap command"),
+        // The layout name travels with the command from the registry, so
+        // a binding to a user-named layout needs nothing looked up here
+        // (ADR 0019).
+        Command::ApplyLayout { name } => Event::SavedLayoutApplyRequested { name: name.clone() },
     }
 }
 
@@ -70,7 +124,7 @@ impl HotkeyRegistry {
     /// Callers log the `None` case: it means a `WM_HOTKEY` arrived for a
     /// binding this registration doesn't own.
     pub fn command_for(&self, id: i32) -> Option<Command> {
-        self.commands.get(&id).copied()
+        self.commands.get(&id).cloned()
     }
 
     /// Drops `id`'s entry, so a binding the OS refused holds none and its
@@ -172,7 +226,7 @@ pub fn bindings_from_resolved(
             modifiers: modifiers_from_combo(combo),
             vk,
         });
-        registry.commands.insert(id, *command);
+        registry.commands.insert(id, command.clone());
     }
     (bindings, registry)
 }
@@ -190,9 +244,10 @@ pub fn runtime_hotkeys(config: &ResolvedConfig) -> BTreeMap<Command, KeyCombo> {
                         | Command::SnapTop
                         | Command::SnapBottom
                         | Command::TogglePause
+                        | Command::ApplyLayout { .. }
                 )
         })
-        .map(|(command, combo)| (*command, combo.clone()))
+        .map(|(command, combo)| (command.clone(), combo.clone()))
         .collect()
 }
 
@@ -296,7 +351,7 @@ mod tests {
 
         assert_eq!(bindings.len(), every_command().len());
         for (binding, (command, _)) in bindings.iter().zip(&hotkeys) {
-            assert_eq!(registry.command_for(binding.id), Some(*command));
+            assert_eq!(registry.command_for(binding.id).as_ref(), Some(command));
         }
     }
 
@@ -341,6 +396,168 @@ mod tests {
         // than to the command the previous registration bound it to.
         assert_eq!(after.command_for(2), None);
         assert_eq!(after.command_for(1), Some(Command::SnapTop));
+    }
+
+    /// `Event` carries observation batches and rule lists, so it is not
+    /// `PartialEq`. Its `Debug` output separates every variant and every
+    /// payload these tests turn on, which is enough to assert against.
+    fn dispatched(command: Command, paused: bool) -> String {
+        format!("{:?}", event_for_command(&command, paused))
+    }
+
+    fn rendered(event: Event) -> String {
+        format!("{event:?}")
+    }
+
+    #[test]
+    fn a_layout_hotkey_asks_the_engine_to_apply_that_named_layout() {
+        assert_eq!(
+            dispatched(
+                Command::ApplyLayout {
+                    name: "writing".to_owned()
+                },
+                false
+            ),
+            rendered(Event::SavedLayoutApplyRequested {
+                name: "writing".to_owned()
+            }),
+            "the layout name must reach the engine, which resolves the \
+             focused window's display for it (ADR 0020)"
+        );
+    }
+
+    #[test]
+    fn two_layout_hotkeys_ask_for_their_own_layouts() {
+        assert_ne!(
+            dispatched(
+                Command::ApplyLayout {
+                    name: "writing".to_owned()
+                },
+                false
+            ),
+            dispatched(
+                Command::ApplyLayout {
+                    name: "coding".to_owned()
+                },
+                false
+            )
+        );
+    }
+
+    #[test]
+    fn the_unit_verbs_keep_dispatching_where_they_did() {
+        assert_eq!(
+            dispatched(Command::SnapLeft, false),
+            rendered(Event::ZoneSnapRequested {
+                direction: ZoneSnapDirection::Left
+            })
+        );
+        assert_eq!(
+            dispatched(Command::SwapDown, false),
+            rendered(Event::DirectionalSwapRequested {
+                direction: CardinalDirection::Down
+            })
+        );
+        assert_eq!(
+            dispatched(Command::TogglePause, false),
+            rendered(Event::PauseRequested)
+        );
+        assert_eq!(
+            dispatched(Command::TogglePause, true),
+            rendered(Event::ResumeRequested)
+        );
+    }
+
+    #[test]
+    fn only_a_zone_snap_flashes_the_snap_preview_overlay() {
+        assert!(is_zone_snap(&Command::SnapTop));
+        assert!(!is_zone_snap(&Command::Rearrange));
+        assert!(!is_zone_snap(&Command::ApplyLayout {
+            name: "writing".to_owned()
+        }));
+    }
+
+    #[test]
+    fn a_layout_binding_gets_an_id_from_the_registry_like_any_other() {
+        let hotkeys = BTreeMap::from([
+            (Command::SnapLeft, combo("ctrl+alt+left")),
+            (
+                Command::ApplyLayout {
+                    name: "writing".to_owned(),
+                },
+                combo("ctrl+alt+1"),
+            ),
+            (
+                Command::ApplyLayout {
+                    name: "coding".to_owned(),
+                },
+                combo("ctrl+alt+2"),
+            ),
+        ]);
+
+        let (bindings, registry) = bindings_from_resolved(&hotkeys);
+
+        assert_eq!(bindings.len(), 3);
+        // No static match could produce these: the names are the user's.
+        let resolved: Vec<Option<Command>> = bindings
+            .iter()
+            .map(|binding| registry.command_for(binding.id))
+            .collect();
+        assert!(resolved.contains(&Some(Command::ApplyLayout {
+            name: "writing".to_owned(),
+        })));
+        assert!(resolved.contains(&Some(Command::ApplyLayout {
+            name: "coding".to_owned(),
+        })));
+    }
+
+    #[test]
+    fn re_registering_after_a_reload_repoints_a_layout_id_at_its_new_command() {
+        // The same combo, bound to a different layout after the user edits
+        // config. The id is reused, and must resolve to the new layout.
+        let (_, before) = bindings_from_resolved(&BTreeMap::from([(
+            Command::ApplyLayout {
+                name: "writing".to_owned(),
+            },
+            combo("ctrl+alt+1"),
+        )]));
+        let (bindings, after) = bindings_from_resolved(&BTreeMap::from([(
+            Command::ApplyLayout {
+                name: "coding".to_owned(),
+            },
+            combo("ctrl+alt+1"),
+        )]));
+
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(
+            before.command_for(bindings[0].id),
+            Some(Command::ApplyLayout {
+                name: "writing".to_owned(),
+            })
+        );
+        assert_eq!(
+            after.command_for(bindings[0].id),
+            Some(Command::ApplyLayout {
+                name: "coding".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn a_layout_binding_is_registered_whether_or_not_automatic_tiling_is_on() {
+        let mut config = mosaix_config::fallback_config();
+        let layout = Command::ApplyLayout {
+            name: "writing".to_owned(),
+        };
+        config.hotkeys.insert(layout.clone(), combo("ctrl+alt+1"));
+
+        assert!(
+            runtime_hotkeys(&config).contains_key(&layout),
+            "applying a layout is an explicit placement, available in manual mode"
+        );
+
+        config.automatic_tiling_enabled = true;
+        assert!(runtime_hotkeys(&config).contains_key(&layout));
     }
 
     #[test]

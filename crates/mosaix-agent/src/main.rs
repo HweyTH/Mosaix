@@ -68,83 +68,17 @@ fn start_hotkeys_and_forward(
                 );
                 continue;
             };
-            let pre_revision = state_reader.snapshot().revision;
-            let event = match command {
-                mosaix_config::Command::Rearrange => mosaix_engine::Event::RearrangeRequested,
-                mosaix_config::Command::ToggleAutomaticTiling => {
-                    mosaix_engine::Event::ToggleAutomaticTilingRequested
-                }
-                mosaix_config::Command::ToggleFloating => {
-                    mosaix_engine::Event::ToggleFloatingRequested
-                }
-                mosaix_config::Command::FocusLeft => {
-                    mosaix_engine::Event::DirectionalFocusRequested {
-                        direction: mosaix_engine::CardinalDirection::Left,
-                    }
-                }
-                mosaix_config::Command::FocusRight => {
-                    mosaix_engine::Event::DirectionalFocusRequested {
-                        direction: mosaix_engine::CardinalDirection::Right,
-                    }
-                }
-                mosaix_config::Command::FocusUp => {
-                    mosaix_engine::Event::DirectionalFocusRequested {
-                        direction: mosaix_engine::CardinalDirection::Up,
-                    }
-                }
-                mosaix_config::Command::FocusDown => {
-                    mosaix_engine::Event::DirectionalFocusRequested {
-                        direction: mosaix_engine::CardinalDirection::Down,
-                    }
-                }
-                mosaix_config::Command::SwapLeft => {
-                    mosaix_engine::Event::DirectionalSwapRequested {
-                        direction: mosaix_engine::CardinalDirection::Left,
-                    }
-                }
-                mosaix_config::Command::SwapRight => {
-                    mosaix_engine::Event::DirectionalSwapRequested {
-                        direction: mosaix_engine::CardinalDirection::Right,
-                    }
-                }
-                mosaix_config::Command::SwapUp => mosaix_engine::Event::DirectionalSwapRequested {
-                    direction: mosaix_engine::CardinalDirection::Up,
-                },
-                mosaix_config::Command::SwapDown => {
-                    mosaix_engine::Event::DirectionalSwapRequested {
-                        direction: mosaix_engine::CardinalDirection::Down,
-                    }
-                }
-                mosaix_config::Command::TogglePause => {
-                    if state_reader.snapshot().paused {
-                        mosaix_engine::Event::ResumeRequested
-                    } else {
-                        mosaix_engine::Event::PauseRequested
-                    }
-                }
-                command => mosaix_engine::Event::ZoneSnapRequested {
-                    direction: hotkeys::direction_for_command(command),
-                },
-            };
+            // One snapshot for both reads, so the revision the overlay
+            // flashes from and the pause state `toggle-pause` inverts
+            // describe the same instant.
+            let snapshot = state_reader.snapshot();
+            let pre_revision = snapshot.revision;
+            let event = hotkeys::event_for_command(&command, snapshot.paused);
             if events.send(event).is_err() {
                 tracing::warn!("reducer stopped; hotkey forwarder exiting");
                 break;
             }
-            if !matches!(
-                command,
-                mosaix_config::Command::Rearrange
-                    | mosaix_config::Command::ToggleAutomaticTiling
-                    | mosaix_config::Command::ToggleFloating
-                    | mosaix_config::Command::FocusLeft
-                    | mosaix_config::Command::FocusRight
-                    | mosaix_config::Command::FocusUp
-                    | mosaix_config::Command::FocusDown
-                    | mosaix_config::Command::SwapLeft
-                    | mosaix_config::Command::SwapRight
-                    | mosaix_config::Command::SwapUp
-                    | mosaix_config::Command::SwapDown
-                    | mosaix_config::Command::TogglePause
-            ) {
+            if hotkeys::is_zone_snap(&command) {
                 if let Some(tx) = &overlay_tx {
                     let _ = tx.send(overlay::OverlayRequest::FlashAfterSnap {
                         revision: pre_revision,
