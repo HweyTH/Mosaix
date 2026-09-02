@@ -510,6 +510,20 @@ pub struct ProfileConfig {
     pub automatic_tiling: Option<AutomaticTilingSection>,
     #[serde(default)]
     pub focus_border: FocusBorderOverride,
+    /// A sparse saved-layout override. A layout the profile declares
+    /// replaces base config's layout of that name; a layout it does not
+    /// mention falls through to base config, the same field-level merge
+    /// every other profile field gets (ADR 0004). There is no way to
+    /// *remove* a base layout from a profile, matching the rest of the
+    /// overlay: a profile adds and overrides, it never subtracts.
+    ///
+    /// Serialized last, and skipped entirely when empty, for the reason
+    /// base config's `layouts` is serialized last -- TOML puts every table
+    /// after the scalars of the table containing it, and a profile that
+    /// carries no layouts should not grow an empty `[layouts]` header when
+    /// the settings application rewrites it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub layouts: BTreeMap<String, SavedLayout>,
 }
 
 /// The merged result of base config plus (optionally) one profile

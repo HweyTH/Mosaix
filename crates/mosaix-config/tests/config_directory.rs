@@ -74,6 +74,53 @@ fn settings_atomically_create_and_replace_the_matching_topology_profile() {
     cleanup(&dir);
 }
 
+#[test]
+fn saving_tiling_settings_keeps_a_profiles_hand_written_layouts() {
+    // The settings application rewrites a whole profile file to change one
+    // setting, so anything it does not know about has to survive the round
+    // trip. A layouts table a user hand-wrote is exactly that.
+    let dir = temp_dir("profile-layouts");
+    ensure_default_config(&dir).unwrap();
+    let fingerprint = "DISPLAY-A@0,0 1920x1080 scale=1";
+    fs::write(
+        dir.join("profiles").join("desk.toml"),
+        format!(
+            "fingerprint = \"{fingerprint}\"\n\
+             [layouts.docked]\n\
+             cells = [{{ x = 0.0, y = 0.0, width = 0.5, height = 1.0 }}]\n"
+        ),
+    )
+    .unwrap();
+
+    let saved = save_profile_settings(
+        &dir,
+        ProfileSettingsUpdate {
+            fingerprint: fingerprint.to_owned(),
+            automatic_tiling_enabled: true,
+            gaps: GapsOverride {
+                outer: Some(8),
+                inner: Some(4),
+            },
+            focus_border: FocusBorderOverride::default(),
+        },
+    )
+    .unwrap();
+
+    let profile = &saved.profiles[0].config;
+    assert!(profile.automatic_tiling_enabled);
+    assert_eq!(
+        profile
+            .layouts
+            .get("docked")
+            .map(|layout| layout.cells.len()),
+        Some(1),
+        "the profile's layouts must survive a settings write, got {:?}",
+        profile.layouts.keys().collect::<Vec<_>>()
+    );
+
+    cleanup(&dir);
+}
+
 fn cleanup(dir: &Path) {
     let _ = fs::remove_dir_all(dir);
 }

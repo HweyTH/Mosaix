@@ -3640,6 +3640,59 @@ mod tests {
     }
 
     #[test]
+    fn moving_to_a_desk_with_a_profile_swaps_in_that_profiles_saved_layouts() {
+        // Per-topology saved layouts ride the same profile selection every
+        // other setting does, so a docked desk and a laptop alone can offer
+        // different layout sets with no restart and no new mechanism.
+        let mut state = EngineState::default();
+        let laptop = vec![display(1, "MON-A", 0)];
+        let desk = vec![display(1, "MON-A", 0), display(2, "MON-B", 1920)];
+        let mut docked_layouts = std::collections::BTreeMap::new();
+        docked_layouts.insert(
+            "docked".to_owned(),
+            mosaix_config::SavedLayout {
+                cells: vec![mosaix_domain::NormalizedRect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 1.0,
+                    height: 1.0,
+                }],
+            },
+        );
+        let mut base_layouts = std::collections::BTreeMap::new();
+        base_layouts.insert("writing".to_owned(), mosaix_config::SavedLayout::default());
+        let config_set = ResolvedConfigSet {
+            base: ResolvedConfig {
+                layouts: base_layouts,
+                ..ResolvedConfig::default()
+            },
+            profiles: vec![ResolvedProfile {
+                fingerprint: topology_fingerprint(&desk),
+                config: ResolvedConfig {
+                    layouts: docked_layouts,
+                    ..ResolvedConfig::default()
+                },
+            }],
+        };
+        apply(&mut state, Event::ConfigChanged(config_set));
+        apply(&mut state, Event::DisplayTopologyChanged(laptop));
+
+        assert_eq!(
+            state.resolved_config.layouts.keys().collect::<Vec<_>>(),
+            vec!["writing"],
+            "a topology matching no profile offers the base layouts"
+        );
+
+        apply(&mut state, Event::DisplayTopologyChanged(desk));
+
+        assert_eq!(
+            state.resolved_config.layouts.keys().collect::<Vec<_>>(),
+            vec!["docked"],
+            "docking makes the matched profile's layouts the ones on offer"
+        );
+    }
+
+    #[test]
     fn apply_topology_change_with_no_matching_profile_falls_back_to_base() {
         let mut state = EngineState::default();
         let base = resolved_config_with_left_binding("ctrl+alt+left");

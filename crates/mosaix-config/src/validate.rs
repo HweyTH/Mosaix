@@ -190,6 +190,35 @@ fn layout_errors(file: &str, layouts: &BTreeMap<String, SavedLayout>) -> Vec<Val
     errors
 }
 
+/// Layout names a profile declares that differ only by case from one base
+/// config declares, as validation errors against the profile's file.
+///
+/// An *exactly* equal name is not a collision but the point of a sparse
+/// override -- that is how a profile replaces a base layout. A name
+/// differing only by case is two map entries but one layout to a user, so
+/// a binding naming either would be ambiguous, which is the same reason
+/// [`layout_errors`] rejects the collision within a single file.
+fn cross_layer_layout_collisions(
+    file: &str,
+    base: &BTreeMap<String, SavedLayout>,
+    profile: &BTreeMap<String, SavedLayout>,
+) -> Vec<ValidationError> {
+    let mut errors = Vec::new();
+    for profile_name in profile.keys() {
+        for base_name in base.keys() {
+            if profile_name != base_name && profile_name.to_lowercase() == base_name.to_lowercase()
+            {
+                errors.push(ValidationError::DuplicateLayoutName {
+                    file: file.to_owned(),
+                    first: base_name.clone(),
+                    second: profile_name.clone(),
+                });
+            }
+        }
+    }
+    errors
+}
+
 /// Field-level merges `profile` (if any) over `base`: any field the profile
 /// doesn't set falls through to `base`'s value, any field it does set
 /// overrides it -- down to individual hotkey commands and individual
@@ -200,9 +229,7 @@ pub fn merge(base: &BaseConfig, profile: Option<&ProfileConfig>) -> ResolvedConf
     let behavior = base.behavior.clone();
     let mut automatic_tiling_enabled = false;
     let mut focus_border = base.focus_border;
-    // A profile cannot yet override the layout set; per-topology layout
-    // overrides are issue #36.
-    let layouts = base.layouts.clone();
+    let mut layouts = base.layouts.clone();
 
     if let Some(profile) = profile {
         for (command, combo) in &profile.hotkeys {
@@ -225,6 +252,11 @@ pub fn merge(base: &BaseConfig, profile: Option<&ProfileConfig>) -> ResolvedConf
         }
         if let Some(thickness) = profile.focus_border.thickness {
             focus_border.thickness = thickness;
+        }
+        // Keyed by name, so a profile overrides the layouts it names and
+        // leaves the rest of base config's set intact (ADR 0004).
+        for (name, layout) in &profile.layouts {
+            layouts.insert(name.clone(), layout.clone());
         }
     }
 
@@ -370,11 +402,22 @@ pub fn validate(candidate: &CandidateConfig) -> Result<ResolvedConfigSet, Vec<Va
             });
             continue;
         }
+        // The profile's own layout declarations are checked against the
+        // profile's file, matching how base config's are checked against
+        // config.toml -- a name and a cell list belong to whoever wrote
+        // them. Only the cross-layer name collision needs both sets.
+        let mut layout_problems = layout_errors(file_name, &profile.layouts);
+        layout_problems.extend(cross_layer_layout_collisions(
+            file_name,
+            &base.layouts,
+            &profile.layouts,
+        ));
         let referential = unknown_layout_bindings(file_name, &resolved);
         let duplicate = duplicate_binding(file_name, &resolved);
-        if duplicate.is_some() || !referential.is_empty() {
+        if duplicate.is_some() || !referential.is_empty() || !layout_problems.is_empty() {
             errors.extend(duplicate);
             errors.extend(referential);
+            errors.extend(layout_problems);
         } else {
             resolved_profiles.push(ResolvedProfile {
                 fingerprint: profile.fingerprint.clone(),
@@ -1146,5 +1189,199 @@ cells = [{ x = 0.0, y = 0.0, width = 1.0, height = 1.0 }]
         let resolved = validate(&base_only(VALID_BASE)).unwrap().base;
 
         assert!(resolved.layouts.is_empty());
+    }
+
+    /// Base config declaring two layouts, `writing` covering the whole work
+    /// area and `coding` splitting it in half, so a profile overriding one
+    /// of them is visibly distinguishable from a profile overriding both.
+    const BASE_WITH_TWO_LAYOUTS: &str = r#"
+version = 1
+
+[layouts.writing]
+cells = [{ x = 0.0, y = 0.0, width = 1.0, height = 1.0 }]
+
+[layouts.coding]
+cells = [
+  { x = 0.0, y = 0.0, width = 0.5, height = 1.0 },
+  { x = 0.5, y = 0.0, width = 0.5, height = 1.0 },
+]
+"#;
+
+    fn with_profile(base: &str, contents: &str) -> CandidateConfig {
+        CandidateConfig {
+            base: base.to_owned(),
+            profiles: vec![CandidateProfile {
+                file_name: "desk.toml".to_owned(),
+                contents: contents.to_owned(),
+            }],
+        }
+    }
+
+    /// The one profile `validate` resolved for `candidate`.
+    fn only_profile(candidate: &CandidateConfig) -> ResolvedConfig {
+        let mut set = validate(candidate).expect("candidate should validate");
+        assert_eq!(
+            set.profiles.len(),
+            1,
+            "fixture declares exactly one profile"
+        );
+        set.profiles.remove(0).config
+    }
+
+    #[test]
+    fn a_profile_layout_override_replaces_only_the_layout_it_names() {
+        let resolved = only_profile(&with_profile(
+            BASE_WITH_TWO_LAYOUTS,
+            "fingerprint = \"DESK\"\n\
+             [layouts.writing]\n\
+             cells = [{ x = 0.25, y = 0.0, width = 0.5, height = 1.0 }]\n",
+        ));
+
+        let writing = resolved.layouts.get("writing").expect("still declared");
+        assert_eq!(writing.cells.len(), 1);
+        assert_eq!(writing.cells[0].x, 0.25, "the profile's cells win");
+        assert_eq!(
+            resolved.layouts.get("coding"),
+            validate(&base_only(BASE_WITH_TWO_LAYOUTS))
+                .unwrap()
+                .base
+                .layouts
+                .get("coding"),
+            "a layout the profile does not mention falls through unchanged"
+        );
+    }
+
+    #[test]
+    fn a_profile_can_add_a_layout_base_config_does_not_have() {
+        let resolved = only_profile(&with_profile(
+            BASE_WITH_TWO_LAYOUTS,
+            "fingerprint = \"DESK\"\n\
+             [layouts.docked]\n\
+             cells = [{ x = 0.0, y = 0.0, width = 0.34, height = 1.0 }]\n",
+        ));
+
+        assert!(resolved.layouts.contains_key("docked"));
+        assert!(
+            resolved.layouts.contains_key("writing") && resolved.layouts.contains_key("coding"),
+            "adding a layout does not replace the base set, got {:?}",
+            resolved.layouts.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_topology_matching_no_profile_resolves_to_the_base_layouts() {
+        let candidate = with_profile(
+            BASE_WITH_TWO_LAYOUTS,
+            "fingerprint = \"DESK\"\n\
+             [layouts.docked]\n\
+             cells = [{ x = 0.0, y = 0.0, width = 1.0, height = 1.0 }]\n",
+        );
+
+        // `validate` resolves base on its own as well as each profile, and
+        // base is what the engine selects when no fingerprint matches.
+        let base = validate(&candidate).unwrap().base;
+
+        assert_eq!(
+            base.layouts.keys().collect::<Vec<_>>(),
+            vec!["coding", "writing"],
+            "the base resolution must not see the profile's addition"
+        );
+    }
+
+    #[test]
+    fn a_profile_declaring_no_layouts_inherits_the_whole_base_set() {
+        let resolved = only_profile(&with_profile(
+            BASE_WITH_TWO_LAYOUTS,
+            "fingerprint = \"DESK\"\n[gaps]\nouter = 12\n",
+        ));
+
+        assert_eq!(
+            resolved.layouts.keys().collect::<Vec<_>>(),
+            vec!["coding", "writing"]
+        );
+    }
+
+    #[test]
+    fn a_profiles_own_layout_rules_are_checked_against_the_profile_file() {
+        let errors = validate(&with_profile(
+            BASE_WITH_TWO_LAYOUTS,
+            "fingerprint = \"DESK\"\n[layouts.docked]\ncells = []\n",
+        ))
+        .unwrap_err();
+
+        assert!(
+            errors.contains(&ValidationError::EmptyLayout {
+                file: "desk.toml".to_owned(),
+                layout: "docked".to_owned(),
+            }),
+            "the profile's own file must be named, got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn a_profile_layout_differing_only_by_case_from_a_base_layout_is_rejected() {
+        let errors = validate(&with_profile(
+            BASE_WITH_TWO_LAYOUTS,
+            "fingerprint = \"DESK\"\n\
+             [layouts.Writing]\n\
+             cells = [{ x = 0.0, y = 0.0, width = 1.0, height = 1.0 }]\n",
+        ))
+        .unwrap_err();
+
+        assert!(
+            errors.contains(&ValidationError::DuplicateLayoutName {
+                file: "desk.toml".to_owned(),
+                first: "writing".to_owned(),
+                second: "Writing".to_owned(),
+            }),
+            "got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn a_profile_can_bind_a_layout_only_it_declares() {
+        let resolved = only_profile(&with_profile(
+            BASE_WITH_TWO_LAYOUTS,
+            "fingerprint = \"DESK\"\n\
+             [hotkeys.apply-layout]\n\
+             docked = \"ctrl+alt+1\"\n\
+             [layouts.docked]\n\
+             cells = [{ x = 0.0, y = 0.0, width = 1.0, height = 1.0 }]\n",
+        ));
+
+        assert_eq!(
+            resolved.hotkeys.get(&Command::ApplyLayout {
+                name: "docked".to_owned()
+            }),
+            Some(&combo("ctrl+alt+1")),
+            "the referential check runs against the merged layout set"
+        );
+    }
+
+    #[test]
+    fn a_profile_layouts_table_survives_a_round_trip_through_toml() {
+        let profile: ProfileConfig = toml::from_str(
+            "fingerprint = \"DESK\"\n\
+             [layouts.docked]\n\
+             cells = [{ x = 0.0, y = 0.0, width = 0.5, height = 1.0 }]\n",
+        )
+        .expect("a profile layouts table parses");
+
+        let rendered = toml::to_string_pretty(&profile).unwrap();
+        let reparsed: ProfileConfig = toml::from_str(&rendered).unwrap();
+
+        assert_eq!(reparsed, profile);
+    }
+
+    #[test]
+    fn a_profile_with_no_layouts_grows_no_empty_layouts_table() {
+        let profile: ProfileConfig = toml::from_str("fingerprint = \"DESK\"\n").unwrap();
+
+        let rendered = toml::to_string_pretty(&profile).unwrap();
+
+        assert!(
+            !rendered.contains("[layouts]"),
+            "rewriting a layout-free profile must not add a header, got:\n{rendered}"
+        );
     }
 }

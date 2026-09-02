@@ -166,6 +166,7 @@ pub fn save_profile_settings(
         behavior: Default::default(),
         automatic_tiling: None,
         focus_border: FocusBorderOverride::default(),
+        layouts: Default::default(),
     });
     profile.automatic_tiling = Some(AutomaticTilingSection {
         enabled: update.automatic_tiling_enabled,
