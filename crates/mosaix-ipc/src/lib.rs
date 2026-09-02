@@ -9,7 +9,10 @@ pub mod protocol;
 
 #[cfg(windows)]
 pub use client::{send_request, IpcConnection, IpcError};
-pub use handler::{handle_request, HotkeyBindingSnapshot, StateSnapshot};
+pub use handler::{
+    handle_request, ConfigError, ConfigStore, HotkeyBindingSnapshot, StateSnapshot,
+    UnavailableConfigStore,
+};
 #[cfg(windows)]
 pub use pipe::{pipe_name, IpcServer, PIPE_NAME_PREFIX};
 pub use protocol::*;

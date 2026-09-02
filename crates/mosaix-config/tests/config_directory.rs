@@ -14,9 +14,11 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use mosaix_config::{
-    ensure_default_config, fallback_config, load, save_profile_settings, watch, Command,
-    ConfigEvent, FocusBorderOverride, GapsOverride, KeyCombo, ProfileSettingsUpdate, RgbaColor,
+    edit_layouts, ensure_default_config, fallback_config, load, save_profile_settings, watch,
+    Command, ConfigEvent, ConfigIoError, FocusBorderOverride, GapsOverride, KeyCombo, LayoutEdit,
+    LayoutEditError, ProfileSettingsUpdate, RgbaColor,
 };
+use mosaix_domain::NormalizedRect;
 
 /// A fresh, empty directory under the system temp dir, unique to this test
 /// process and call site.
@@ -116,6 +118,340 @@ fn saving_tiling_settings_keeps_a_profiles_hand_written_layouts() {
         Some(1),
         "the profile's layouts must survive a settings write, got {:?}",
         profile.layouts.keys().collect::<Vec<_>>()
+    );
+
+    cleanup(&dir);
+}
+
+/// A one-cell layout covering the left `width` of a work area, the
+/// smallest thing an edit can carry.
+fn cells(width: f64) -> Vec<NormalizedRect> {
+    vec![NormalizedRect {
+        x: 0.0,
+        y: 0.0,
+        width,
+        height: 1.0,
+    }]
+}
+
+const DESK: &str = "DISPLAY-A@0,0 1920x1080 scale=1";
+
+/// A config directory with a `DESK`-matched profile that declares
+/// `docked`, alongside base config's `writing`.
+fn dir_with_layered_layouts(label: &str) -> PathBuf {
+    let dir = temp_dir(label);
+    ensure_default_config(&dir).unwrap();
+    edit_layouts(
+        &dir,
+        DESK,
+        LayoutEdit::Save {
+            name: "writing".to_owned(),
+            cells: cells(1.0),
+        },
+    )
+    .unwrap();
+    fs::write(
+        dir.join("profiles").join("desk.toml"),
+        format!(
+            "fingerprint = \"{DESK}\"\n\
+             [layouts.docked]\n\
+             cells = [{{ x = 0.0, y = 0.0, width = 0.5, height = 1.0 }}]\n"
+        ),
+    )
+    .unwrap();
+    dir
+}
+
+#[test]
+fn a_new_layout_is_written_to_base_config_and_is_immediately_resolvable() {
+    let dir = temp_dir("layout-save");
+    ensure_default_config(&dir).unwrap();
+
+    let write = edit_layouts(
+        &dir,
+        DESK,
+        LayoutEdit::Save {
+            name: "writing".to_owned(),
+            cells: cells(0.6),
+        },
+    )
+    .expect("saving a new layout should succeed");
+
+    assert_eq!(
+        write.file, "config.toml",
+        "a layout no layer declares yet belongs to base config, so it is available at every desk"
+    );
+    assert_eq!(
+        write.config.base.layouts["writing"].cells[0].width, 0.6,
+        "the write returns the config as it now stands, so the agent need not wait for the reload"
+    );
+    // And it is on disk, not just in the returned value.
+    let reloaded = load(&dir).unwrap().unwrap();
+    assert_eq!(reloaded.base.layouts["writing"].cells, cells(0.6));
+
+    cleanup(&dir);
+}
+
+#[test]
+fn saving_over_a_layout_the_matched_profile_declares_writes_the_profile() {
+    let dir = dir_with_layered_layouts("layout-save-profile");
+
+    let write = edit_layouts(
+        &dir,
+        DESK,
+        LayoutEdit::Save {
+            name: "docked".to_owned(),
+            cells: cells(0.75),
+        },
+    )
+    .expect("rewriting a profile-supplied layout should succeed");
+
+    assert_eq!(
+        write.file, "desk.toml",
+        "the write lands in the layer that supplies the value (ADR 0022)"
+    );
+    let reloaded = load(&dir).unwrap().unwrap();
+    assert_eq!(
+        reloaded.profiles[0].config.layouts["docked"].cells,
+        cells(0.75)
+    );
+    assert!(
+        !reloaded.base.layouts.contains_key("docked"),
+        "base config must not grow a copy of a profile's layout"
+    );
+
+    cleanup(&dir);
+}
+
+#[test]
+fn a_layout_can_be_renamed_duplicated_and_deleted() {
+    let dir = temp_dir("layout-manage");
+    ensure_default_config(&dir).unwrap();
+    edit_layouts(
+        &dir,
+        DESK,
+        LayoutEdit::Save {
+            name: "draft".to_owned(),
+            cells: cells(0.4),
+        },
+    )
+    .unwrap();
+
+    edit_layouts(
+        &dir,
+        DESK,
+        LayoutEdit::Rename {
+            from: "draft".to_owned(),
+            to: "writing".to_owned(),
+        },
+    )
+    .expect("rename");
+    let renamed = load(&dir).unwrap().unwrap().base.layouts;
+    assert!(!renamed.contains_key("draft"), "the old name is gone");
+    assert_eq!(
+        renamed["writing"].cells,
+        cells(0.4),
+        "the cells travel with it"
+    );
+
+    edit_layouts(
+        &dir,
+        DESK,
+        LayoutEdit::Duplicate {
+            from: "writing".to_owned(),
+            to: "writing wide".to_owned(),
+        },
+    )
+    .expect("duplicate");
+    let duplicated = load(&dir).unwrap().unwrap().base.layouts;
+    assert_eq!(duplicated["writing wide"].cells, cells(0.4));
+    assert!(duplicated.contains_key("writing"), "the original stays");
+
+    edit_layouts(
+        &dir,
+        DESK,
+        LayoutEdit::Delete {
+            name: "writing".to_owned(),
+        },
+    )
+    .expect("delete");
+    let remaining = load(&dir).unwrap().unwrap().base.layouts;
+    assert_eq!(remaining.keys().collect::<Vec<_>>(), vec!["writing wide"]);
+
+    cleanup(&dir);
+}
+
+#[test]
+fn a_duplicate_name_is_refused_before_anything_is_written() {
+    let dir = temp_dir("layout-name-taken");
+    ensure_default_config(&dir).unwrap();
+    edit_layouts(
+        &dir,
+        DESK,
+        LayoutEdit::Save {
+            name: "writing".to_owned(),
+            cells: cells(0.6),
+        },
+    )
+    .unwrap();
+
+    // Differing only by case, which whole-directory validation would
+    // reject -- so the refusal has to come first, not after the write.
+    let error = edit_layouts(
+        &dir,
+        DESK,
+        LayoutEdit::Duplicate {
+            from: "writing".to_owned(),
+            to: "Writing".to_owned(),
+        },
+    )
+    .unwrap_err();
+
+    assert!(
+        matches!(
+            error,
+            ConfigIoError::LayoutEdit(LayoutEditError::NameTaken { ref name }) if name == "Writing"
+        ),
+        "got {error:?}"
+    );
+    assert_eq!(
+        load(&dir).unwrap().unwrap().base.layouts["writing"].cells,
+        cells(0.6),
+        "nothing was written"
+    );
+
+    cleanup(&dir);
+}
+
+#[test]
+fn an_empty_layout_name_is_refused() {
+    let dir = temp_dir("layout-empty-name");
+    ensure_default_config(&dir).unwrap();
+
+    let error = edit_layouts(
+        &dir,
+        DESK,
+        LayoutEdit::Save {
+            name: "   ".to_owned(),
+            cells: cells(1.0),
+        },
+    )
+    .unwrap_err();
+
+    assert!(
+        matches!(error, ConfigIoError::LayoutEdit(LayoutEditError::EmptyName)),
+        "got {error:?}"
+    );
+
+    cleanup(&dir);
+}
+
+#[test]
+fn editing_a_layout_that_does_not_exist_is_refused_naming_it() {
+    let dir = temp_dir("layout-unknown");
+    ensure_default_config(&dir).unwrap();
+
+    let error = edit_layouts(
+        &dir,
+        DESK,
+        LayoutEdit::Delete {
+            name: "writing".to_owned(),
+        },
+    )
+    .unwrap_err();
+
+    assert!(error.to_string().contains("writing"), "got {error}");
+
+    cleanup(&dir);
+}
+
+#[test]
+fn a_layout_both_layers_declare_cannot_be_deleted_without_saying_which() {
+    // Deleting the profile's copy would make base config's reappear, and
+    // deleting base config's would change nothing visible. Neither is what
+    // a user pressing Delete means, so the edit says so.
+    let dir = dir_with_layered_layouts("layout-both-layers");
+    fs::write(
+        dir.join("profiles").join("desk.toml"),
+        format!(
+            "fingerprint = \"{DESK}\"\n\
+             [layouts.writing]\n\
+             cells = [{{ x = 0.0, y = 0.0, width = 0.5, height = 1.0 }}]\n"
+        ),
+    )
+    .unwrap();
+
+    let error = edit_layouts(
+        &dir,
+        DESK,
+        LayoutEdit::Delete {
+            name: "writing".to_owned(),
+        },
+    )
+    .unwrap_err();
+
+    let message = error.to_string();
+    assert!(message.contains("config.toml"), "{message}");
+    assert!(message.contains("desk.toml"), "{message}");
+
+    cleanup(&dir);
+}
+
+#[test]
+fn an_edit_that_would_invalidate_the_directory_persists_nothing() {
+    let dir = temp_dir("layout-invalid-edit");
+    ensure_default_config(&dir).unwrap();
+
+    let error = edit_layouts(
+        &dir,
+        DESK,
+        LayoutEdit::Save {
+            name: "writing".to_owned(),
+            // Runs off the right of the work area.
+            cells: vec![NormalizedRect {
+                x: 0.6,
+                y: 0.0,
+                width: 0.9,
+                height: 1.0,
+            }],
+        },
+    )
+    .unwrap_err();
+
+    assert!(
+        matches!(error, ConfigIoError::Validation(_)),
+        "a candidate whole-directory validation rejects is a validation failure, got {error:?}"
+    );
+    assert!(
+        load(&dir).unwrap().unwrap().base.layouts.is_empty(),
+        "the rejected layout must not be on disk"
+    );
+
+    cleanup(&dir);
+}
+
+#[test]
+fn a_layout_edit_leaves_hand_written_hotkeys_intact() {
+    // Base config is rewritten whole to add one layout, so everything the
+    // user put in it has to survive the round trip.
+    let dir = temp_dir("layout-keeps-hotkeys");
+    ensure_default_config(&dir).unwrap();
+
+    edit_layouts(
+        &dir,
+        DESK,
+        LayoutEdit::Save {
+            name: "writing".to_owned(),
+            cells: cells(1.0),
+        },
+    )
+    .unwrap();
+
+    let reloaded = load(&dir).unwrap().unwrap();
+    assert_eq!(
+        reloaded.base.hotkeys.get(&Command::SnapLeft),
+        Some(&KeyCombo::parse("ctrl+alt+left").unwrap()),
+        "the generated default bindings must still be there"
     );
 
     cleanup(&dir);

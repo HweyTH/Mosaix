@@ -1,5 +1,6 @@
 mod agent;
 mod commands;
+mod displays;
 mod editor;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -11,6 +12,11 @@ pub fn run() {
             commands::preview_layout,
             commands::save_and_apply_layout,
             commands::load_hotkey_bindings,
+            commands::load_saved_layouts,
+            commands::save_layout,
+            commands::rename_layout,
+            commands::duplicate_layout,
+            commands::delete_layout,
             commands::set_appearance,
             commands::load_automatic_tiling_settings,
             commands::save_automatic_tiling_settings,

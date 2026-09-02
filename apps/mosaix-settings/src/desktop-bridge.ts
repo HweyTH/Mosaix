@@ -7,6 +7,8 @@ import type {
   EditorSnapshot,
   HotkeyList,
   LayoutDraft,
+  LayoutWriteReceipt,
+  SavedLayout,
 } from "./layout-editor";
 
 export type InvokeCommand = (
@@ -25,6 +27,21 @@ function fromNormalizedDraft(draft: LayoutDraft): LayoutDraft {
       y: zone.y * 100,
       width: zone.width * 100,
       height: zone.height * 100,
+    })),
+  };
+}
+
+/// A saved layout's cells arrive normalized, like an editor snapshot's --
+/// the canvas works in percentages, so both cross the bridge the same way.
+function fromNormalizedLayout(layout: SavedLayout): SavedLayout {
+  return {
+    ...layout,
+    cells: layout.cells.map((cell) => ({
+      ...cell,
+      x: cell.x * 100,
+      y: cell.y * 100,
+      width: cell.width * 100,
+      height: cell.height * 100,
     })),
   };
 }
@@ -52,6 +69,18 @@ export function createTauriDesktopBridge(
     },
     loadHotkeyBindings: () =>
       invokeCommand("load_hotkey_bindings") as Promise<HotkeyList>,
+    loadSavedLayouts: async () => {
+      const layouts = await invokeCommand("load_saved_layouts") as SavedLayout[];
+      return layouts.map(fromNormalizedLayout);
+    },
+    saveLayout: (draft: LayoutDraft) =>
+      invokeCommand("save_layout", { draft: toNormalizedDraft(draft) }) as Promise<LayoutWriteReceipt>,
+    renameLayout: (from: string, to: string) =>
+      invokeCommand("rename_layout", { from, to }) as Promise<LayoutWriteReceipt>,
+    duplicateLayout: (from: string, to: string) =>
+      invokeCommand("duplicate_layout", { from, to }) as Promise<LayoutWriteReceipt>,
+    deleteLayout: (name: string) =>
+      invokeCommand("delete_layout", { name }) as Promise<LayoutWriteReceipt>,
     previewLayout: (draft: LayoutDraft) =>
       invokeCommand("preview_layout", { draft: toNormalizedDraft(draft) }) as Promise<CommandReceipt>,
     saveAndApplyLayout: (draft: LayoutDraft) =>

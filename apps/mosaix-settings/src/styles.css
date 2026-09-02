@@ -116,7 +116,18 @@ button { color: inherit; }
 .panel { flex: none; padding: 16px; border: 1px solid var(--line); border-radius: 14px; background: var(--panel); box-shadow: 0 25px 70px rgb(0 0 0 / 25%); backdrop-filter: blur(20px); }
 .tiling-settings p, .hotkey-list p { margin: 0 0 12px; color: var(--muted); font-size: 9px; line-height: 1.4; }
 .hotkey-list p:last-child { margin-bottom: 0; }
-.binding-list { display: flex; flex-direction: column; gap: 7px; margin: 0; padding: 0; list-style: none; }
+.binding-list, .library-list { display: flex; flex-direction: column; gap: 7px; margin: 0; padding: 0; list-style: none; }
+.library-item { display: grid; grid-template-columns: 1fr auto; gap: 3px 8px; padding: 8px 9px; border-left: 2px solid transparent; border-radius: 7px; background: color-mix(in srgb, var(--ink), transparent 95%); }
+.library-item.active { border-left-color: var(--accent); background: color-mix(in srgb, var(--accent), transparent 88%); }
+.library-item .layout-open { padding: 0; border: 0; color: var(--ink); background: none; font-size: 10px; font-weight: 650; text-align: left; cursor: pointer; }
+.library-detail { grid-column: 1; color: var(--muted-2); font: 8px ui-monospace, monospace; }
+.layout-actions { grid-row: 1 / 3; grid-column: 2; display: flex; align-items: center; gap: 4px; }
+.layout-actions button { width: 22px; height: 22px; border: 1px solid var(--line); border-radius: 6px; color: var(--muted); background: none; font-size: 10px; cursor: pointer; }
+.layout-actions button:hover { color: var(--ink); border-color: var(--zone-line); }
+.library-actions { display: flex; gap: 6px; margin-bottom: 12px; }
+.library-actions .primary-button, .library-actions .soft-button { flex: 1; padding: 0 8px; }
+.library-actions button[disabled] { opacity: .45; cursor: default; }
+.display-meta select { border: 0; color: inherit; background: none; font: inherit; cursor: pointer; }
 .binding { display: grid; grid-template-columns: 1fr auto; gap: 3px 8px; padding: 8px 9px; border-left: 2px solid transparent; border-radius: 7px; background: color-mix(in srgb, var(--ink), transparent 95%); }
 .binding-command { font-size: 10px; font-weight: 650; }
 .binding kbd { grid-row: 1; justify-self: end; padding: 2px 6px; border: 1px solid var(--line); border-radius: 5px; font: 8px/1.4 ui-monospace, monospace; }

@@ -16,14 +16,30 @@ export interface LayoutDraft {
   zones: ZoneDraft[];
 }
 
+export interface DisplaySummary {
+  name: string;
+  resolution: string;
+  scalePercent: number;
+  /// The work area's pixel dimensions. The canvas is drawn at these
+  /// proportions, so a preview shows the shape the layout will really take.
+  workAreaWidth: number;
+  workAreaHeight: number;
+}
+
 export interface EditorSnapshot {
   appearance: Appearance;
-  display: {
-    name: string;
-    resolution: string;
-    scalePercent: number;
-  };
+  /// Every display a layout can be previewed against, primary first.
+  displays: DisplaySummary[];
   draft: LayoutDraft;
+}
+
+export interface SavedLayout {
+  name: string;
+  cells: ZoneDraft[];
+}
+
+export interface LayoutWriteReceipt {
+  file: string;
 }
 
 export interface CommandReceipt {
@@ -61,6 +77,11 @@ export interface HotkeyList {
 export interface DesktopBridge {
   loadEditorSnapshot(): Promise<EditorSnapshot>;
   loadHotkeyBindings(): Promise<HotkeyList>;
+  loadSavedLayouts(): Promise<SavedLayout[]>;
+  saveLayout(draft: LayoutDraft): Promise<LayoutWriteReceipt>;
+  renameLayout(from: string, to: string): Promise<LayoutWriteReceipt>;
+  duplicateLayout(from: string, to: string): Promise<LayoutWriteReceipt>;
+  deleteLayout(name: string): Promise<LayoutWriteReceipt>;
   previewLayout(draft: LayoutDraft): Promise<CommandReceipt>;
   saveAndApplyLayout(draft: LayoutDraft): Promise<CommandReceipt>;
   setAppearance(appearance: Appearance): Promise<void>;
@@ -82,26 +103,26 @@ export function bindingLabel(command: string): string {
   return rest.length > 0 ? `${title} · ${rest.join(".")}` : title;
 }
 
-export interface HotkeyWatchHandlers {
-  onChange: (list: HotkeyList) => void;
+export interface WatchHandlers<T> {
+  onChange: (value: T) => void;
   onError: (error: unknown) => void;
 }
 
-/// Re-reads the binding list every `intervalMs`, reporting only when the
-/// answer has actually changed. Returns a function that stops it.
+/// Calls `read` every `intervalMs`, reporting only when the answer has
+/// actually changed. Returns a function that stops it.
 ///
 /// Polling rather than a push from the agent: the IPC protocol answers
 /// requests and never initiates, so a settings window that wants to notice
-/// a docking event has to ask. A topology change swaps the matched profile,
-/// and with it both the combinations on screen and the files behind them.
+/// a change made elsewhere -- docking a laptop, hand-editing a config file
+/// -- has to ask.
 ///
-/// Reporting only changes is what keeps this from re-rendering the list
-/// every tick -- and it applies to failures too, so an agent that is not
-/// running is reported once rather than twice a second.
-export function watchHotkeyBindings(
-  bridge: Pick<DesktopBridge, "loadHotkeyBindings">,
-  handlers: HotkeyWatchHandlers,
-  intervalMs = 2000,
+/// Reporting only changes is what keeps this from re-rendering every tick,
+/// and it applies to failures too, so an agent that is not running is
+/// reported once rather than twice a second.
+export function watchChanges<T>(
+  read: () => Promise<T>,
+  handlers: WatchHandlers<T>,
+  intervalMs: number,
 ): () => void {
   let reported: string | undefined;
   const report = (key: string, emit: () => void): void => {
@@ -111,8 +132,8 @@ export function watchHotkeyBindings(
   };
   const poll = async (): Promise<void> => {
     try {
-      const list = await bridge.loadHotkeyBindings();
-      report(`ok:${JSON.stringify(list)}`, () => handlers.onChange(list));
+      const value = await read();
+      report(`ok:${JSON.stringify(value)}`, () => handlers.onChange(value));
     } catch (error: unknown) {
       report(`error:${String(error)}`, () => handlers.onError(error));
     }
@@ -120,6 +141,27 @@ export function watchHotkeyBindings(
   const timer = setInterval(() => void poll(), intervalMs);
   void poll();
   return () => clearInterval(timer);
+}
+
+/// Watches the hotkey bindings. A topology change swaps the matched
+/// profile, and with it both the combinations on screen and the files
+/// behind them.
+export function watchHotkeyBindings(
+  bridge: Pick<DesktopBridge, "loadHotkeyBindings">,
+  handlers: WatchHandlers<HotkeyList>,
+  intervalMs = 2000,
+): () => void {
+  return watchChanges(() => bridge.loadHotkeyBindings(), handlers, intervalMs);
+}
+
+/// Watches the saved-layout set, so a layout added by hand in a
+/// configuration file appears without reopening the window.
+export function watchSavedLayouts(
+  bridge: Pick<DesktopBridge, "loadSavedLayouts">,
+  handlers: WatchHandlers<SavedLayout[]>,
+  intervalMs = 2000,
+): () => void {
+  return watchChanges(() => bridge.loadSavedLayouts(), handlers, intervalMs);
 }
 
 function escapeHtml(value: string): string {
@@ -143,6 +185,29 @@ function renderZones(snapshot: EditorSnapshot, selectedZoneId: number): string {
         </button>`,
     )
     .join("");
+}
+
+function renderLayouts(
+  layouts: SavedLayout[] | undefined,
+  selected: string | undefined,
+  error: string | undefined,
+): string {
+  if (error !== undefined) return `<p data-layout-error>${escapeHtml(error)}</p>`;
+  if (layouts === undefined) return `<p>Reading saved layouts…</p>`;
+  if (layouts.length === 0) return `<p>No saved layouts yet.</p>`;
+  return `<ul class="library-list">${layouts
+    .map(
+      (layout) => `
+        <li class="library-item${layout.name === selected ? " active" : ""}" data-layout="${escapeHtml(layout.name)}">
+          <button class="layout-open" data-open-layout="${escapeHtml(layout.name)}">${escapeHtml(layout.name)}</button>
+          <small class="library-detail">${layout.cells.length} zone${layout.cells.length === 1 ? "" : "s"}</small>
+          <span class="layout-actions">
+            <button data-duplicate-layout="${escapeHtml(layout.name)}" title="Duplicate">⧉</button>
+            <button data-delete-layout="${escapeHtml(layout.name)}" title="Delete">⌫</button>
+          </span>
+        </li>`,
+    )
+    .join("")}</ul>`;
 }
 
 function renderBindings(hotkeys: HotkeyList | undefined, hotkeyError: string | undefined): string {
@@ -171,6 +236,10 @@ export async function mountLayoutEditor(root: HTMLElement, bridge: DesktopBridge
   let tilingSettings = initialTilingSettings;
   let hotkeys: HotkeyList | undefined;
   let hotkeyError: string | undefined;
+  let layouts: SavedLayout[] | undefined;
+  let layoutError: string | undefined;
+  let selectedLayout: string | undefined;
+  let selectedDisplayIndex = 0;
   let selectedZoneId = snapshot.draft.zones[0]?.id ?? 0;
   let commandStatus = "Ready";
   const history: LayoutDraft[] = [];
@@ -183,6 +252,9 @@ export async function mountLayoutEditor(root: HTMLElement, bridge: DesktopBridge
 
   const render = (): void => {
     const selectedZone = snapshot.draft.zones.find((zone) => zone.id === selectedZoneId);
+    // Never undefined: the session always offers at least a nominal
+    // display, so the canvas has proportions to draw at.
+    const display = snapshot.displays[selectedDisplayIndex] ?? snapshot.displays[0]!;
     document.body.className = snapshot.appearance === "dark" ? "night-tide" : "warm-paper";
     root.innerHTML = `
       <main class="spatial-editor">
@@ -202,9 +274,17 @@ export async function mountLayoutEditor(root: HTMLElement, bridge: DesktopBridge
           <button class="icon-button" data-add-zone aria-label="Add zone">＋</button>
         </aside>
         <section class="world" aria-label="Layout canvas">
-          <div class="display-meta"><span><i></i>PRIMARY DISPLAY</span><span>${escapeHtml(snapshot.display.resolution)} · ${snapshot.display.scalePercent}%</span></div>
-          <div class="monitor-shell">
-            <div class="work-area">${renderZones(snapshot, selectedZoneId)}<span class="work-label">WORK AREA · ${escapeHtml(snapshot.display.resolution)}</span></div>
+          <div class="display-meta">
+            <span><i></i><select data-display>${snapshot.displays
+              .map(
+                (display, index) =>
+                  `<option value="${index}"${index === selectedDisplayIndex ? " selected" : ""}>${escapeHtml(display.name)}</option>`,
+              )
+              .join("")}</select></span>
+            <span>${escapeHtml(display.resolution)} · ${display.scalePercent}%</span>
+          </div>
+          <div class="monitor-shell" data-monitor style="aspect-ratio:${display.workAreaWidth} / ${display.workAreaHeight}">
+            <div class="work-area">${renderZones(snapshot, selectedZoneId)}<span class="work-label">WORK AREA · ${escapeHtml(display.resolution)}</span></div>
           </div>
           <div class="monitor-foot"><span></span><i></i><span></span></div>
         </section>
@@ -220,6 +300,15 @@ export async function mountLayoutEditor(root: HTMLElement, bridge: DesktopBridge
           <label class="field"><span>RGBA color</span><input data-border-color value="${escapeHtml(tilingSettings.focusBorderColor)}" pattern="#[0-9A-Fa-f]{8}" /></label>
           <label class="field"><span>Thickness</span><input data-border-thickness type="number" min="1" max="16" value="${tilingSettings.focusBorderThickness}" /></label>
           <button class="primary-button" data-save-tiling>Save tiling settings</button>
+        </aside>
+        <aside class="panel layout-library" aria-label="Saved layouts">
+          <div class="panel-title">SAVED LAYOUTS</div>
+          <label class="field"><span>Name</span><input data-layout-name value="${escapeHtml(snapshot.draft.name)}" /></label>
+          <div class="library-actions">
+            <button class="primary-button" data-save-layout>Save layout</button>
+            <button class="soft-button" data-rename-layout ${selectedLayout === undefined ? "disabled" : ""}>Rename</button>
+          </div>
+          ${renderLayouts(layouts, selectedLayout, layoutError)}
         </aside>
         <aside class="panel hotkey-list" aria-label="Hotkey bindings">
           <div class="panel-title">HOTKEYS</div>
@@ -249,6 +338,97 @@ export async function mountLayoutEditor(root: HTMLElement, bridge: DesktopBridge
         <div class="command-status" role="status">${commandStatus}</div>
       </main>`;
 
+    root.querySelector<HTMLSelectElement>("[data-display]")?.addEventListener("change", (event) => {
+      selectedDisplayIndex = Number((event.currentTarget as HTMLSelectElement).value);
+      render();
+    });
+    root.querySelector<HTMLInputElement>("[data-layout-name]")?.addEventListener("change", (event) => {
+      snapshot.draft.name = (event.currentTarget as HTMLInputElement).value;
+    });
+    /// Runs one configuration write and reports what the agent said. The
+    /// saved-layout list is re-read afterwards so the panel reflects the
+    /// write the agent actually made, rather than the one asked for.
+    const write = (
+      pending: string,
+      done: (receipt: LayoutWriteReceipt) => string,
+      request: () => Promise<LayoutWriteReceipt>,
+    ): void => {
+      commandStatus = pending;
+      render();
+      void request()
+        .then(async (receipt) => {
+          commandStatus = done(receipt);
+          layouts = await bridge.loadSavedLayouts();
+          layoutError = undefined;
+          render();
+        })
+        .catch((error: unknown) => {
+          commandStatus = `${pending.replace("…", "")} failed · ${String(error)}`;
+          render();
+        });
+    };
+    root.querySelector<HTMLElement>("[data-save-layout]")?.addEventListener("click", () => {
+      const draft = structuredClone(snapshot.draft);
+      write(
+        "Saving layout…",
+        (receipt) => `Saved to ${receipt.file}`,
+        () => bridge.saveLayout(draft).then((receipt) => {
+          selectedLayout = draft.name;
+          return receipt;
+        }),
+      );
+    });
+    root.querySelector<HTMLElement>("[data-rename-layout]")?.addEventListener("click", () => {
+      const from = selectedLayout;
+      const to = snapshot.draft.name;
+      if (from === undefined) return;
+      write(
+        "Renaming layout…",
+        (receipt) => `Renamed in ${receipt.file}`,
+        () => bridge.renameLayout(from, to).then((receipt) => {
+          selectedLayout = to;
+          return receipt;
+        }),
+      );
+    });
+    root.querySelectorAll<HTMLElement>("[data-duplicate-layout]").forEach((button) => {
+      button.addEventListener("click", () => {
+        const from = button.dataset.duplicateLayout!;
+        write(
+          "Duplicating layout…",
+          (receipt) => `Duplicated in ${receipt.file}`,
+          () => bridge.duplicateLayout(from, `${from} copy`),
+        );
+      });
+    });
+    root.querySelectorAll<HTMLElement>("[data-delete-layout]").forEach((button) => {
+      button.addEventListener("click", () => {
+        const name = button.dataset.deleteLayout!;
+        write(
+          "Deleting layout…",
+          (receipt) => `Deleted from ${receipt.file}`,
+          () => bridge.deleteLayout(name).then((receipt) => {
+            if (selectedLayout === name) selectedLayout = undefined;
+            return receipt;
+          }),
+        );
+      });
+    });
+    root.querySelectorAll<HTMLElement>("[data-open-layout]").forEach((button) => {
+      button.addEventListener("click", () => {
+        const name = button.dataset.openLayout!;
+        const layout = layouts?.find((candidate) => candidate.name === name);
+        if (layout === undefined) return;
+        // Opening a saved layout replaces the draft deliberately -- it is
+        // the one action that is meant to discard what is on the canvas.
+        rememberDraft();
+        selectedLayout = name;
+        snapshot.draft = { ...snapshot.draft, name, zones: structuredClone(layout.cells) };
+        selectedZoneId = snapshot.draft.zones[0]?.id ?? 0;
+        commandStatus = `Editing ${name}`;
+        render();
+      });
+    });
     root.querySelectorAll<HTMLElement>("[data-zone]").forEach((zone) => {
       zone.addEventListener("click", () => {
         selectedZoneId = Number(zone.dataset.zone);
@@ -396,6 +576,21 @@ export async function mountLayoutEditor(root: HTMLElement, bridge: DesktopBridge
 
   render();
 
+  // The saved-layout list is re-read on the same cadence as the bindings,
+  // so a layout added by hand in the file shows up here. Only the *list*
+  // is replaced: the draft on the canvas is the user's in-progress work,
+  // and the echo of the editor's own write must not discard it.
+  watchSavedLayouts(bridge, {
+    onChange: (list) => {
+      layouts = list;
+      layoutError = undefined;
+      render();
+    },
+    onError: (error) => {
+      layoutError = `Could not read saved layouts · ${String(error)}`;
+      render();
+    },
+  });
   watchHotkeyBindings(bridge, {
     onChange: (list) => {
       hotkeys = list;

@@ -111,7 +111,7 @@ A persistent, click-through outline around the focused managed window, including
 _Avoid_: Snap preview overlay, focus animation, window decoration
 
 **Saved layout**:
-A named set of zone rectangles for one display that a user can apply on demand, stored in configuration and overridable per display topology like any other config field (ADR 0004). It records *shape only*: applying it fills its cells with whichever managed windows exist, in visual window order, and never identifies a particular window (ADR 0018). Restoring a layout to specific windows by identity is deferred (issue #28).
+A named set of zone rectangles for one display that a user can apply on demand, stored in configuration and overridable per display topology like any other config field (ADR 0004). Written either by hand or from the settings application, which asks the agent to perform the write rather than editing a file itself (ADR 0022). It records *shape only*: applying it fills its cells with whichever managed windows exist, in visual window order, and never identifies a particular window (ADR 0018). Restoring a layout to specific windows by identity is deferred (issue #28).
 _Avoid_: Arrangement, scene, saved workspace. ARCHITECTURE.md uses "arrangement" in two senses -- "saved arrangements" (section 1) for this concept, and "the requested arrangement" (section 9.3) for a planner's current output -- so prefer "saved layout" for the stored artifact and leave "arrangement" to the planner sense.
 
 **Hotkey capture**:

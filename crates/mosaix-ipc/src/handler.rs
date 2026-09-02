@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use mosaix_config::{Command, ConfigLayer, ResolvedConfig, SavedLayout};
+use mosaix_config::{Command, ConfigLayer, LayoutEdit, LayoutWrite, ResolvedConfig, SavedLayout};
 use mosaix_engine::{
     EligibilityReason, EngineState, Event, EventSender, StateReader, ZoneSnapDirection,
 };
@@ -207,10 +207,52 @@ impl From<EngineState> for StateSnapshot {
     }
 }
 
+/// The agent's configuration directory, as the request handler needs it.
+///
+/// A trait rather than a path, so what the handler does with a layout edit
+/// -- which errors it reports, what it answers with, and that it makes the
+/// change live rather than waiting out the reload debounce -- is testable
+/// without a directory on disk. The agent's implementation is the real
+/// `mosaix_config::edit_layouts`.
+pub trait ConfigStore: Send + Sync {
+    /// Applies `edit` against the topology `fingerprint` is for, returning
+    /// the file it landed in and the configuration as it now stands, or a
+    /// reason the caller can act on.
+    fn edit_layouts(&self, fingerprint: &str, edit: LayoutEdit)
+        -> Result<LayoutWrite, ConfigError>;
+}
+
+/// A configuration change that could not be made, in words meant for the
+/// person who asked for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigError(pub String);
+
+/// A store for an agent with nowhere to write: the configuration directory
+/// could not be located at startup.
+///
+/// Refusing every edit with that reason is the honest answer. Reporting
+/// success for a write that went nowhere is the failure this whole path
+/// exists to avoid.
+#[derive(Debug, Clone)]
+pub struct UnavailableConfigStore {
+    pub reason: String,
+}
+
+impl ConfigStore for UnavailableConfigStore {
+    fn edit_layouts(
+        &self,
+        _fingerprint: &str,
+        _edit: LayoutEdit,
+    ) -> Result<LayoutWrite, ConfigError> {
+        Err(ConfigError(self.reason.clone()))
+    }
+}
+
 pub fn handle_request(
     request: &IpcRequest,
     events: &EventSender,
     state_reader: &StateReader,
+    config: &dyn ConfigStore,
 ) -> IpcResponse {
     match request {
         IpcRequest::Ping => IpcResponse::Ok { data: None },
@@ -345,6 +387,68 @@ pub fn handle_request(
                 },
             }
         }
+        IpcRequest::SaveLayout { name, cells } => edit_layouts(
+            events,
+            state_reader,
+            config,
+            LayoutEdit::Save {
+                name: name.clone(),
+                cells: cells.clone(),
+            },
+        ),
+        IpcRequest::RenameLayout { from, to } => edit_layouts(
+            events,
+            state_reader,
+            config,
+            LayoutEdit::Rename {
+                from: from.clone(),
+                to: to.clone(),
+            },
+        ),
+        IpcRequest::DuplicateLayout { from, to } => edit_layouts(
+            events,
+            state_reader,
+            config,
+            LayoutEdit::Duplicate {
+                from: from.clone(),
+                to: to.clone(),
+            },
+        ),
+        IpcRequest::DeleteLayout { name } => edit_layouts(
+            events,
+            state_reader,
+            config,
+            LayoutEdit::Delete { name: name.clone() },
+        ),
+    }
+}
+
+/// Performs one saved-layout edit and makes the result live.
+///
+/// The write is validated and persisted by `config`; delivering the
+/// resulting configuration straight into the reducer is what makes a layout
+/// applicable the moment the save is confirmed, rather than after the
+/// reload debounce (ADR 0008). The watcher's echo arrives shortly after
+/// carrying the identical set, and the reducer already discards a config
+/// change that changes nothing.
+fn edit_layouts(
+    events: &EventSender,
+    state_reader: &StateReader,
+    config: &dyn ConfigStore,
+    edit: LayoutEdit,
+) -> IpcResponse {
+    let fingerprint = mosaix_domain::topology_fingerprint(&state_reader.snapshot().displays);
+    match config.edit_layouts(&fingerprint, edit) {
+        Ok(write) => match send_event(events, Event::ConfigChanged(Box::new(write.config))) {
+            // The file is what the caller cannot work out for itself: with
+            // a profile matched, the layer that received the write and the
+            // one the user was looking at are different objects (ADR 0022).
+            IpcResponse::Ok { .. } => IpcResponse::Ok {
+                data: Some(serde_json::json!({ "file": write.file })),
+            },
+            other => other,
+        },
+        Err(ConfigError(reason)) => IpcResponse::Error { message: reason },
     }
 }
 
@@ -535,6 +639,230 @@ mod tests {
         );
     }
 
+    /// A configuration directory that records what it was asked to do and
+    /// answers however the test scripted.
+    #[derive(Debug, Default)]
+    struct RecordingStore {
+        edits: std::sync::Mutex<Vec<(String, LayoutEdit)>>,
+        answer: Option<Result<LayoutWrite, ConfigError>>,
+    }
+
+    impl RecordingStore {
+        fn answering(answer: Result<LayoutWrite, ConfigError>) -> Self {
+            Self {
+                edits: std::sync::Mutex::default(),
+                answer: Some(answer),
+            }
+        }
+
+        fn wrote(file: &str, layouts: &[(&str, f64)]) -> Self {
+            let mut base = ResolvedConfig::default();
+            for (name, width) in layouts {
+                base.layouts.insert(
+                    (*name).to_owned(),
+                    SavedLayout {
+                        cells: vec![mosaix_domain::NormalizedRect {
+                            x: 0.0,
+                            y: 0.0,
+                            width: *width,
+                            height: 1.0,
+                        }],
+                    },
+                );
+            }
+            Self::answering(Ok(LayoutWrite {
+                file: file.to_owned(),
+                config: mosaix_config::ResolvedConfigSet {
+                    base,
+                    profiles: Vec::new(),
+                },
+            }))
+        }
+    }
+
+    impl ConfigStore for RecordingStore {
+        fn edit_layouts(
+            &self,
+            fingerprint: &str,
+            edit: LayoutEdit,
+        ) -> Result<LayoutWrite, ConfigError> {
+            self.edits
+                .lock()
+                .unwrap()
+                .push((fingerprint.to_owned(), edit));
+            self.answer
+                .clone()
+                .expect("the test scripted no answer for this edit")
+        }
+    }
+
+    fn one_cell() -> Vec<mosaix_domain::NormalizedRect> {
+        vec![mosaix_domain::NormalizedRect {
+            x: 0.0,
+            y: 0.0,
+            width: 0.5,
+            height: 1.0,
+        }]
+    }
+
+    #[test]
+    fn saving_a_layout_answers_with_the_file_the_write_landed_in() {
+        let engine = mosaix_engine::spawn_engine(Vec::new(), Default::default());
+        let store = RecordingStore::wrote("desk.toml", &[("writing", 0.5)]);
+
+        let response = handle_request(
+            &IpcRequest::SaveLayout {
+                name: "writing".to_owned(),
+                cells: one_cell(),
+            },
+            &engine.events(),
+            &engine.state_reader(),
+            &store,
+        );
+
+        match response {
+            IpcResponse::Ok { data } => assert_eq!(data.unwrap()["file"], "desk.toml"),
+            other => panic!("expected a confirmed save, got {other:?}"),
+        }
+        assert_eq!(
+            store.edits.lock().unwrap()[0].1,
+            LayoutEdit::Save {
+                name: "writing".to_owned(),
+                cells: one_cell(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_saved_layout_is_applicable_without_waiting_for_the_reload() {
+        // The write is on disk either way; what this asserts is that the
+        // agent does not make the user wait out the debounce before the
+        // layout can be applied.
+        let engine = mosaix_engine::spawn_engine(Vec::new(), Default::default());
+
+        handle_request(
+            &IpcRequest::SaveLayout {
+                name: "writing".to_owned(),
+                cells: one_cell(),
+            },
+            &engine.events(),
+            &engine.state_reader(),
+            &RecordingStore::wrote("config.toml", &[("writing", 0.5)]),
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline
+            && !engine
+                .state_reader()
+                .snapshot()
+                .resolved_config
+                .layouts
+                .contains_key("writing")
+        {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+
+        assert!(
+            engine
+                .state_reader()
+                .snapshot()
+                .resolved_config
+                .layouts
+                .contains_key("writing"),
+            "the saved layout should be in effect as soon as the save is confirmed"
+        );
+    }
+
+    #[test]
+    fn a_refused_layout_edit_is_reported_with_the_reason() {
+        let engine = mosaix_engine::spawn_engine(Vec::new(), Default::default());
+        let store = RecordingStore::answering(Err(ConfigError(
+            "a saved layout named \"writing\" already exists".to_owned(),
+        )));
+
+        let response = handle_request(
+            &IpcRequest::DuplicateLayout {
+                from: "draft".to_owned(),
+                to: "writing".to_owned(),
+            },
+            &engine.events(),
+            &engine.state_reader(),
+            &store,
+        );
+
+        assert_eq!(
+            response,
+            IpcResponse::Error {
+                message: "a saved layout named \"writing\" already exists".to_owned(),
+            },
+            "the caller needs the reason, not a generic failure"
+        );
+    }
+
+    #[test]
+    fn every_layout_edit_reaches_the_store_as_itself() {
+        let engine = mosaix_engine::spawn_engine(Vec::new(), Default::default());
+        for (request, expected) in [
+            (
+                IpcRequest::RenameLayout {
+                    from: "draft".to_owned(),
+                    to: "writing".to_owned(),
+                },
+                LayoutEdit::Rename {
+                    from: "draft".to_owned(),
+                    to: "writing".to_owned(),
+                },
+            ),
+            (
+                IpcRequest::DuplicateLayout {
+                    from: "writing".to_owned(),
+                    to: "writing wide".to_owned(),
+                },
+                LayoutEdit::Duplicate {
+                    from: "writing".to_owned(),
+                    to: "writing wide".to_owned(),
+                },
+            ),
+            (
+                IpcRequest::DeleteLayout {
+                    name: "writing".to_owned(),
+                },
+                LayoutEdit::Delete {
+                    name: "writing".to_owned(),
+                },
+            ),
+        ] {
+            let store = RecordingStore::wrote("config.toml", &[]);
+
+            handle_request(&request, &engine.events(), &engine.state_reader(), &store);
+
+            assert_eq!(store.edits.lock().unwrap()[0].1, expected);
+        }
+    }
+
+    #[test]
+    fn an_agent_with_no_configuration_directory_refuses_rather_than_claiming_a_save() {
+        let engine = mosaix_engine::spawn_engine(Vec::new(), Default::default());
+
+        let response = handle_request(
+            &IpcRequest::DeleteLayout {
+                name: "writing".to_owned(),
+            },
+            &engine.events(),
+            &engine.state_reader(),
+            &UnavailableConfigStore {
+                reason: "no configuration directory".to_owned(),
+            },
+        );
+
+        assert_eq!(
+            response,
+            IpcResponse::Error {
+                message: "no configuration directory".to_owned(),
+            }
+        );
+    }
+
     /// An ordinary tileable window on display 1, the shape every layout
     /// test's inventory is built from.
     fn managed_window(id: isize, bounds: Rect) -> Window {
@@ -629,6 +957,7 @@ mod tests {
             },
             &engine.events(),
             &engine.state_reader(),
+            &RecordingStore::default(),
         );
 
         assert_eq!(
@@ -683,6 +1012,7 @@ mod tests {
             },
             &engine.events(),
             &engine.state_reader(),
+            &RecordingStore::default(),
         );
 
         let IpcResponse::Ok { data: Some(data) } = response else {
@@ -702,6 +1032,7 @@ mod tests {
             },
             &engine.events(),
             &engine.state_reader(),
+            &RecordingStore::default(),
         );
 
         let IpcResponse::Error { message } = response else {
@@ -732,6 +1063,7 @@ mod tests {
             },
             &engine.events(),
             &engine.state_reader(),
+            &RecordingStore::default(),
         );
 
         let IpcResponse::Error { message } = response else {

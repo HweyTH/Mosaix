@@ -1,10 +1,14 @@
+use mosaix_domain::NormalizedRect;
 use serde::{Deserialize, Serialize};
 
-/// The wire contract this build speaks. Bumped to 2 when [`IpcRequest`]
-/// gained its first data-carrying variant ([`IpcRequest::ApplyLayout`]):
-/// an older agent has no tag for it, so the version is what makes the
-/// mismatch reportable instead of surfacing as a deserialization failure.
-pub const PROTOCOL_VERSION: u32 = 2;
+/// The wire contract this build speaks.
+///
+/// Bumped to 2 when [`IpcRequest`] gained its first data-carrying variant
+/// ([`IpcRequest::ApplyLayout`]), and to 3 for the saved-layout editing
+/// requests. An older agent has no tag for a request this build added, so
+/// the version is what makes the mismatch reportable instead of surfacing
+/// as a deserialization failure.
+pub const PROTOCOL_VERSION: u32 = 3;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct IpcEnvelope {
@@ -47,6 +51,28 @@ pub enum IpcRequest {
     /// display (ADR 0020). The first request carrying a payload, hence
     /// [`PROTOCOL_VERSION`] 2.
     ApplyLayout {
+        name: String,
+    },
+    /// Create the saved layout `name`, or replace the cells of the one
+    /// that already exists.
+    ///
+    /// This and the three below are how the settings application changes
+    /// configuration: it asks, the agent writes (ADR 0022). Each lands in
+    /// the layer that supplies the layout being edited, and each is
+    /// answered with the file it went to.
+    SaveLayout {
+        name: String,
+        cells: Vec<NormalizedRect>,
+    },
+    RenameLayout {
+        from: String,
+        to: String,
+    },
+    DuplicateLayout {
+        from: String,
+        to: String,
+    },
+    DeleteLayout {
         name: String,
     },
 }
@@ -186,6 +212,26 @@ mod tests {
             IpcRequest::SwapDown,
             IpcRequest::GetPauseState,
             IpcRequest::ApplyLayout {
+                name: "writing".to_owned(),
+            },
+            IpcRequest::SaveLayout {
+                name: "writing".to_owned(),
+                cells: vec![NormalizedRect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 0.5,
+                    height: 1.0,
+                }],
+            },
+            IpcRequest::RenameLayout {
+                from: "writing".to_owned(),
+                to: "drafting".to_owned(),
+            },
+            IpcRequest::DuplicateLayout {
+                from: "writing".to_owned(),
+                to: "writing wide".to_owned(),
+            },
+            IpcRequest::DeleteLayout {
                 name: "writing".to_owned(),
             },
         ];

@@ -16,10 +16,12 @@ use std::time::Duration;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use thiserror::Error;
 
+use mosaix_domain::NormalizedRect;
+
 use crate::defaults::default_config_content;
 use crate::schema::{
-    AutomaticTilingSection, FocusBorderOverride, GapsOverride, ProfileConfig, ResolvedConfigSet,
-    BASE_CONFIG_FILE_NAME as BASE_FILE_NAME,
+    AutomaticTilingSection, BaseConfig, FocusBorderOverride, GapsOverride, ProfileConfig,
+    ResolvedConfigSet, SavedLayout, BASE_CONFIG_FILE_NAME as BASE_FILE_NAME,
 };
 use crate::validate::{validate, CandidateConfig, CandidateProfile, ValidationError};
 
@@ -50,6 +52,77 @@ pub enum ConfigIoError {
 
     #[error("updated config directory failed validation: {0}")]
     Validation(String),
+
+    #[error(transparent)]
+    LayoutEdit(#[from] LayoutEditError),
+}
+
+/// Why a saved-layout edit was never attempted.
+///
+/// Distinct from [`ConfigIoError::Validation`], which is whole-directory
+/// validation's verdict on the candidate an edit produced (ADR 0007).
+/// These are refusals reached before any file is written, so the caller
+/// can tell "your configuration would be invalid" from "that is not a
+/// change I can make".
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum LayoutEditError {
+    #[error("there is no saved layout named {name:?}")]
+    UnknownLayout { name: String },
+
+    #[error("a saved layout named {name:?} already exists")]
+    NameTaken { name: String },
+
+    #[error("a saved layout's name may not be empty or whitespace-only")]
+    EmptyName,
+
+    #[error(
+        "saved layout {name:?} is declared in both {base_file} and {profile_file}; \
+         edit those files directly to say which one you mean"
+    )]
+    DeclaredInBothLayers {
+        name: String,
+        base_file: String,
+        profile_file: String,
+    },
+}
+
+/// One change to the saved-layout set, performed by the agent on the
+/// user's behalf. The settings application never writes a configuration
+/// file itself (ADR 0022).
+#[derive(Debug, Clone, PartialEq)]
+pub enum LayoutEdit {
+    /// Create `name`, or replace the cells of the one that exists.
+    Save {
+        name: String,
+        cells: Vec<NormalizedRect>,
+    },
+    Rename {
+        from: String,
+        to: String,
+    },
+    /// Copy `from`'s cells to the new layout `to`.
+    Duplicate {
+        from: String,
+        to: String,
+    },
+    Delete {
+        name: String,
+    },
+}
+
+/// What a layout edit did: which file received it, and the whole config
+/// directory as it now stands.
+///
+/// The resolved set travels back so the agent can make the change live
+/// immediately rather than waiting out the reload debounce (ADR 0008) --
+/// a user who saves a layout and presses its hotkey should not have to
+/// pause first. The echo that arrives through the watcher a moment later
+/// is then identical, and the reducer already discards a config change
+/// that changes nothing.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LayoutWrite {
+    pub file: String,
+    pub config: ResolvedConfigSet,
 }
 
 #[derive(Debug, Clone)]
@@ -189,15 +262,7 @@ pub fn save_profile_settings(
             contents: contents.clone(),
         });
     }
-    let resolved = validate(&candidate).map_err(|errors| {
-        ConfigIoError::Validation(
-            errors
-                .into_iter()
-                .map(|error| error.to_string())
-                .collect::<Vec<_>>()
-                .join("; "),
-        )
-    })?;
+    let resolved = validate(&candidate).map_err(validation_message)?;
 
     let destination = dir.join(PROFILES_DIR_NAME).join(&file_name);
     let temp = dir
@@ -206,6 +271,246 @@ pub fn save_profile_settings(
     fs::write(&temp, contents).map_err(|error| io_error(&temp, error))?;
     replace_file(&temp, &destination).map_err(|error| io_error(&destination, error))?;
     Ok(resolved)
+}
+
+/// A candidate's base config and its `fingerprint`-matched profile (if
+/// any), each paired with the file it was read from -- the two layers a
+/// saved-layout edit can land in (ADR 0022).
+struct LayoutLayers {
+    base: BaseConfig,
+    profile: Option<(String, ProfileConfig)>,
+}
+
+impl LayoutLayers {
+    /// Whether the profile supplies `name`, `None` if no layer declares
+    /// it.
+    ///
+    /// A name both layers declare has no single answer, and guessing would
+    /// make a delete look like it failed when base config's copy
+    /// reappeared -- so it is reported rather than resolved.
+    fn supplier(&self, name: &str) -> Result<Option<bool>, LayoutEditError> {
+        let in_base = self.base.layouts.contains_key(name);
+        let profile = self
+            .profile
+            .as_ref()
+            .filter(|(_, profile)| profile.layouts.contains_key(name));
+        match (in_base, profile) {
+            (true, Some((file, _))) => Err(LayoutEditError::DeclaredInBothLayers {
+                name: name.to_owned(),
+                base_file: BASE_FILE_NAME.to_owned(),
+                profile_file: file.clone(),
+            }),
+            (_, Some(_)) => Ok(Some(true)),
+            (true, None) => Ok(Some(false)),
+            (false, None) => Ok(None),
+        }
+    }
+
+    /// Every layout name either layer declares.
+    fn names(&self) -> impl Iterator<Item = &String> {
+        self.base.layouts.keys().chain(
+            self.profile
+                .iter()
+                .flat_map(|(_, profile)| profile.layouts.keys()),
+        )
+    }
+
+    fn cells(&self, name: &str, from_profile: bool) -> Vec<NormalizedRect> {
+        let layouts = if from_profile {
+            self.profile
+                .as_ref()
+                .map(|(_, profile)| &profile.layouts)
+                .expect("a profile-supplied layout implies a matched profile")
+        } else {
+            &self.base.layouts
+        };
+        layouts
+            .get(name)
+            .map(|layout| layout.cells.clone())
+            .unwrap_or_default()
+    }
+}
+
+fn parse_layers(
+    candidate: &CandidateConfig,
+    fingerprint: &str,
+) -> Result<LayoutLayers, ConfigIoError> {
+    let base: BaseConfig = toml::from_str(&candidate.base)
+        .map_err(|error| ConfigIoError::Validation(format!("{BASE_FILE_NAME}: {error}")))?;
+    let mut profile = None;
+    for candidate_profile in &candidate.profiles {
+        let parsed: ProfileConfig =
+            toml::from_str(&candidate_profile.contents).map_err(|error| {
+                ConfigIoError::Validation(format!("{}: {error}", candidate_profile.file_name))
+            })?;
+        if parsed.fingerprint == fingerprint {
+            profile = Some((candidate_profile.file_name.clone(), parsed));
+            break;
+        }
+    }
+    Ok(LayoutLayers { base, profile })
+}
+
+/// Rejects `name` as a layout that does not exist yet: empty, or
+/// colliding with one that does.
+///
+/// The collision check ignores case, because whole-directory validation
+/// rejects two layouts whose names differ only by case. Catching it here
+/// tells the user before the write rather than through a rejected
+/// candidate afterwards.
+fn check_new_name(layers: &LayoutLayers, name: &str) -> Result<(), LayoutEditError> {
+    if name.trim().is_empty() {
+        return Err(LayoutEditError::EmptyName);
+    }
+    if layers
+        .names()
+        .any(|existing| existing.to_lowercase() == name.to_lowercase())
+    {
+        return Err(LayoutEditError::NameTaken {
+            name: name.to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Which layer an edit writes, the layout it takes out of that layer, and
+/// the one it leaves there. A rename is a removal and an addition in one
+/// file, which is why this is not two separate decisions.
+type EditPlan = (bool, Option<String>, Option<(String, Vec<NormalizedRect>)>);
+
+fn plan_edit(layers: &LayoutLayers, edit: &LayoutEdit) -> Result<EditPlan, LayoutEditError> {
+    let unknown = |name: &String| LayoutEditError::UnknownLayout { name: name.clone() };
+    match edit {
+        LayoutEdit::Save { name, cells } => {
+            let supplier = layers.supplier(name)?;
+            if supplier.is_none() {
+                check_new_name(layers, name)?;
+            }
+            // A layout that exists is rewritten where it lives; a new one
+            // goes to base config, so it is available at every desk.
+            Ok((
+                supplier.unwrap_or(false),
+                None,
+                Some((name.clone(), cells.clone())),
+            ))
+        }
+        LayoutEdit::Rename { from, to } => {
+            let from_profile = layers.supplier(from)?.ok_or_else(|| unknown(from))?;
+            // Renaming `writing` to `Writing` is a change of case, not a
+            // collision with itself: the old name leaves in the same write.
+            if !from.eq_ignore_ascii_case(to) {
+                check_new_name(layers, to)?;
+            } else if to.trim().is_empty() {
+                return Err(LayoutEditError::EmptyName);
+            }
+            let cells = layers.cells(from, from_profile);
+            Ok((from_profile, Some(from.clone()), Some((to.clone(), cells))))
+        }
+        LayoutEdit::Duplicate { from, to } => {
+            let from_profile = layers.supplier(from)?.ok_or_else(|| unknown(from))?;
+            check_new_name(layers, to)?;
+            // The copy lands beside its original, so a variant of a
+            // desk-specific layout stays desk-specific.
+            let cells = layers.cells(from, from_profile);
+            Ok((from_profile, None, Some((to.clone(), cells))))
+        }
+        LayoutEdit::Delete { name } => {
+            let from_profile = layers.supplier(name)?.ok_or_else(|| unknown(name))?;
+            Ok((from_profile, Some(name.clone()), None))
+        }
+    }
+}
+
+/// Applies `edit` to the configuration directory `dir`, writing the layer
+/// that currently supplies the layout being edited: the profile matching
+/// `fingerprint` if it declares that layout, otherwise base config
+/// (ADR 0022). A layout being created belongs to neither layer yet, so it
+/// goes to base config.
+///
+/// The whole directory is validated as one candidate before anything is
+/// written (ADR 0007), so an edit that would leave an invalid
+/// configuration is refused and nothing is persisted. The write itself is
+/// a temp file and an atomic replace, matching [`save_profile_settings`].
+pub fn edit_layouts(
+    dir: &Path,
+    fingerprint: &str,
+    edit: LayoutEdit,
+) -> Result<LayoutWrite, ConfigIoError> {
+    ensure_default_config(dir)?;
+    let mut candidate = read_candidate(dir)?;
+    let layers = parse_layers(&candidate, fingerprint)?;
+    let (into_profile, removed, added) = plan_edit(&layers, &edit)?;
+
+    let (file_name, contents) = if into_profile {
+        let (file_name, mut profile) = layers
+            .profile
+            .clone()
+            .expect("a profile-supplied layout implies a matched profile");
+        edit_layout_table(&mut profile.layouts, &removed, &added);
+        (file_name, to_toml(&profile)?)
+    } else {
+        let mut base = layers.base.clone();
+        edit_layout_table(&mut base.layouts, &removed, &added);
+        (BASE_FILE_NAME.to_owned(), to_toml(&base)?)
+    };
+
+    if into_profile {
+        candidate
+            .profiles
+            .iter_mut()
+            .find(|profile| profile.file_name == file_name)
+            .expect("the matched profile was read from this candidate")
+            .contents = contents.clone();
+    } else {
+        candidate.base = contents.clone();
+    }
+    let config = validate(&candidate).map_err(validation_message)?;
+
+    let destination = if into_profile {
+        dir.join(PROFILES_DIR_NAME).join(&file_name)
+    } else {
+        dir.join(&file_name)
+    };
+    let temp = destination.with_file_name(format!(".{file_name}.mosaix-tmp"));
+    fs::write(&temp, contents).map_err(|error| io_error(&temp, error))?;
+    replace_file(&temp, &destination).map_err(|error| io_error(&destination, error))?;
+
+    Ok(LayoutWrite {
+        file: file_name,
+        config,
+    })
+}
+
+fn edit_layout_table(
+    layouts: &mut std::collections::BTreeMap<String, SavedLayout>,
+    removed: &Option<String>,
+    added: &Option<(String, Vec<NormalizedRect>)>,
+) {
+    if let Some(name) = removed {
+        layouts.remove(name);
+    }
+    if let Some((name, cells)) = added {
+        layouts.insert(
+            name.clone(),
+            SavedLayout {
+                cells: cells.clone(),
+            },
+        );
+    }
+}
+
+fn to_toml<T: serde::Serialize>(value: &T) -> Result<String, ConfigIoError> {
+    toml::to_string_pretty(value).map_err(|error| ConfigIoError::Validation(error.to_string()))
+}
+
+fn validation_message(errors: Vec<ValidationError>) -> ConfigIoError {
+    ConfigIoError::Validation(
+        errors
+            .into_iter()
+            .map(|error| error.to_string())
+            .collect::<Vec<_>>()
+            .join("; "),
+    )
 }
 
 /// Ensures `dir` (and its `profiles/` subdirectory) exist and that

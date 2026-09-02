@@ -7,6 +7,7 @@
 //! connection's lifetime, so the agent recovers when the application dies
 //! and the operating system closes the pipe handle (ADR 0021).
 
+use mosaix_config::LayoutEdit;
 use mosaix_ipc::StateSnapshot;
 
 /// Why an agent request did not succeed. The three cases are kept apart
@@ -37,6 +38,14 @@ pub trait AgentTransport: Send + std::fmt::Debug {
     /// those belong to. The agent is the authority for all three -- the
     /// settings application reads no configuration file of its own.
     fn state(&mut self) -> Result<StateSnapshot, AgentError>;
+
+    /// Asks the agent to change the saved-layout set, returning the
+    /// configuration file the write landed in.
+    ///
+    /// The agent performs every configuration write (ADR 0022), so this
+    /// is the only way the settings application changes a layout, and a
+    /// change it cannot confirm is an error rather than a claim.
+    fn edit_layouts(&mut self, edit: LayoutEdit) -> Result<String, AgentError>;
 }
 
 /// The transport this build talks to a real agent through.
@@ -66,10 +75,15 @@ impl AgentTransport for UnsupportedPlatform {
     fn state(&mut self) -> Result<StateSnapshot, AgentError> {
         Err(AgentError::Unavailable)
     }
+
+    fn edit_layouts(&mut self, _edit: LayoutEdit) -> Result<String, AgentError> {
+        Err(AgentError::Unavailable)
+    }
 }
 
 #[cfg(windows)]
 mod windows_transport {
+    use mosaix_config::LayoutEdit;
     use mosaix_ipc::{IpcConnection, IpcError, IpcRequest, IpcResponse, StateSnapshot};
 
     use super::{AgentError, AgentTransport};
@@ -144,6 +158,21 @@ mod windows_transport {
                 name: name.to_owned(),
             })
             .map(|_| ())
+        }
+
+        fn edit_layouts(&mut self, edit: LayoutEdit) -> Result<String, AgentError> {
+            let data = self.confirmed(match edit {
+                LayoutEdit::Save { name, cells } => IpcRequest::SaveLayout { name, cells },
+                LayoutEdit::Rename { from, to } => IpcRequest::RenameLayout { from, to },
+                LayoutEdit::Duplicate { from, to } => IpcRequest::DuplicateLayout { from, to },
+                LayoutEdit::Delete { name } => IpcRequest::DeleteLayout { name },
+            })?;
+            Ok(data
+                .as_ref()
+                .and_then(|data| data.get("file"))
+                .and_then(|file| file.as_str())
+                .unwrap_or("your configuration")
+                .to_owned())
         }
 
         fn state(&mut self) -> Result<StateSnapshot, AgentError> {

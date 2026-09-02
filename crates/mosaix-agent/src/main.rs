@@ -251,7 +251,23 @@ fn main() {
         }
     }
 
-    let ipc_server = match mosaix_ipc::IpcServer::start(engine.events(), engine.state_reader()) {
+    // Configuration writes requested over IPC go through the same
+    // directory the watcher is reading. An agent that never found a
+    // directory refuses them with that reason rather than reporting a
+    // save it did not make.
+    let config_store: std::sync::Arc<dyn mosaix_ipc::ConfigStore> = match &watchable_config_dir {
+        Some(dir) => std::sync::Arc::new(DirectoryConfigStore { dir: dir.clone() }),
+        None => std::sync::Arc::new(mosaix_ipc::UnavailableConfigStore {
+            reason: "Mosaix could not open its configuration directory, so it cannot save changes"
+                .to_owned(),
+        }),
+    };
+
+    let ipc_server = match mosaix_ipc::IpcServer::start(
+        engine.events(),
+        engine.state_reader(),
+        config_store,
+    ) {
         Ok(server) => Some(server),
         Err(err) => {
             tracing::error!(%err, "failed to start IPC server; the mosaix CLI will be unavailable");
@@ -975,4 +991,26 @@ fn main() {
 fn main() {
     eprintln!("mosaix-agent currently only supports Windows (no macOS platform adapter yet).");
     std::process::exit(1);
+}
+
+/// The agent's configuration directory, as the IPC handler sees it.
+///
+/// The whole implementation is `mosaix_config::edit_layouts`; what this
+/// adds is the directory the agent resolved at startup and the translation
+/// of a config error into the sentence the person who asked for the change
+/// reads.
+#[derive(Debug)]
+struct DirectoryConfigStore {
+    dir: std::path::PathBuf,
+}
+
+impl mosaix_ipc::ConfigStore for DirectoryConfigStore {
+    fn edit_layouts(
+        &self,
+        fingerprint: &str,
+        edit: mosaix_config::LayoutEdit,
+    ) -> Result<mosaix_config::LayoutWrite, mosaix_ipc::ConfigError> {
+        mosaix_config::edit_layouts(&self.dir, fingerprint, edit)
+            .map_err(|error| mosaix_ipc::ConfigError(error.to_string()))
+    }
 }

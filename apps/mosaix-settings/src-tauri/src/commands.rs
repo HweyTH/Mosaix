@@ -4,6 +4,7 @@ use tauri::State;
 
 use crate::editor::{
     Appearance, CommandReceipt, EditorSession, EditorSnapshot, HotkeyList, LayoutDraft,
+    LayoutWriteReceipt, SavedLayoutView,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -152,6 +153,57 @@ pub fn save_and_apply_layout(
 pub fn load_hotkey_bindings(state: State<'_, EditorState>) -> Result<HotkeyList, String> {
     let mut session = state.0.lock().map_err(|_| "editor state is unavailable")?;
     session.hotkeys().map_err(|error| error.to_string())
+}
+
+/// The saved layouts the agent currently offers.
+#[tauri::command]
+pub fn load_saved_layouts(state: State<'_, EditorState>) -> Result<Vec<SavedLayoutView>, String> {
+    let mut session = state.0.lock().map_err(|_| "editor state is unavailable")?;
+    session.layouts().map_err(|error| error.to_string())
+}
+
+/// Persists the drawn layout under the name it carries. The agent does
+/// the writing; this reports only what it confirmed (ADR 0022).
+#[tauri::command]
+pub fn save_layout(
+    draft: LayoutDraft,
+    state: State<'_, EditorState>,
+) -> Result<LayoutWriteReceipt, String> {
+    let mut session = state.0.lock().map_err(|_| "editor state is unavailable")?;
+    session.save(draft).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub fn rename_layout(
+    from: String,
+    to: String,
+    state: State<'_, EditorState>,
+) -> Result<LayoutWriteReceipt, String> {
+    let mut session = state.0.lock().map_err(|_| "editor state is unavailable")?;
+    session
+        .rename(&from, &to)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub fn duplicate_layout(
+    from: String,
+    to: String,
+    state: State<'_, EditorState>,
+) -> Result<LayoutWriteReceipt, String> {
+    let mut session = state.0.lock().map_err(|_| "editor state is unavailable")?;
+    session
+        .duplicate(&from, &to)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub fn delete_layout(
+    name: String,
+    state: State<'_, EditorState>,
+) -> Result<LayoutWriteReceipt, String> {
+    let mut session = state.0.lock().map_err(|_| "editor state is unavailable")?;
+    session.delete(&name).map_err(|error| error.to_string())
 }
 
 #[tauri::command]

@@ -30,7 +30,7 @@ use windows::Win32::System::Pipes::{
 };
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
-use crate::handler::handle_request;
+use crate::handler::{handle_request, ConfigStore};
 use crate::protocol::{decode_request, wrap_response, IpcResponse};
 
 pub const PIPE_NAME_PREFIX: &str = r"\\.\pipe\mosaix-";
@@ -59,12 +59,18 @@ pub struct IpcServer {
 }
 
 impl IpcServer {
-    pub fn start(events: EventSender, state_reader: StateReader) -> std::io::Result<Self> {
+    /// `config` is what a request that changes configuration is performed
+    /// through: shared across client threads, so it is behind an `Arc`.
+    pub fn start(
+        events: EventSender,
+        state_reader: StateReader,
+        config: Arc<dyn ConfigStore>,
+    ) -> std::io::Result<Self> {
         let stop_flag = Arc::new(AtomicBool::new(false));
         let thread_flag = Arc::clone(&stop_flag);
         let join_handle = thread::Builder::new()
             .name("mosaix-ipc".to_owned())
-            .spawn(move || server_loop(events, state_reader, thread_flag))?;
+            .spawn(move || server_loop(events, state_reader, config, thread_flag))?;
         Ok(Self {
             stop_flag,
             join_handle: Some(join_handle),
@@ -98,7 +104,12 @@ impl IpcServer {
     }
 }
 
-fn server_loop(events: EventSender, state_reader: StateReader, stop_flag: Arc<AtomicBool>) {
+fn server_loop(
+    events: EventSender,
+    state_reader: StateReader,
+    config: Arc<dyn ConfigStore>,
+    stop_flag: Arc<AtomicBool>,
+) {
     let name = wide(&pipe_name());
     while !stop_flag.load(Ordering::SeqCst) {
         let security = match PipeSecurity::for_current_user() {
@@ -150,6 +161,7 @@ fn server_loop(events: EventSender, state_reader: StateReader, stop_flag: Arc<At
         // to keep an instance available for the next connection.
         let events = events.clone();
         let state_reader = state_reader.clone();
+        let config = Arc::clone(&config);
         let client = ClientPipe(pipe);
         if let Err(error) = thread::Builder::new()
             .name("mosaix-ipc-client".to_owned())
@@ -159,7 +171,7 @@ fn server_loop(events: EventSender, state_reader: StateReader, stop_flag: Arc<At
                 // Reading the field directly would capture the bare
                 // `HANDLE` instead, which isn't.
                 let pipe = client.into_handle();
-                handle_client(pipe, &events, &state_reader);
+                handle_client(pipe, &events, &state_reader, config.as_ref());
                 unsafe {
                     let _ = DisconnectNamedPipe(pipe);
                     let _ = CloseHandle(pipe);
@@ -189,7 +201,12 @@ impl ClientPipe {
 
 unsafe impl Send for ClientPipe {}
 
-fn handle_client(pipe: HANDLE, events: &EventSender, state_reader: &StateReader) {
+fn handle_client(
+    pipe: HANDLE,
+    events: &EventSender,
+    state_reader: &StateReader,
+    config: &dyn ConfigStore,
+) {
     let file = unsafe { File::from_raw_handle(pipe.0 as RawHandle) };
     let mut reader = BufReader::new(file);
     let mut recent_requests: VecDeque<Instant> = VecDeque::new();
@@ -223,7 +240,7 @@ fn handle_client(pipe: HANDLE, events: &EventSender, state_reader: &StateReader)
             break;
         }
         let response = match decode_request(&bytes) {
-            Ok(request) => handle_request(&request, events, state_reader),
+            Ok(request) => handle_request(&request, events, state_reader, config),
             Err(response) => response,
         };
         if !write_response(&mut reader, response) {

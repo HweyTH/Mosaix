@@ -7,15 +7,27 @@ import {
   type DesktopBridge,
   type EditorSnapshot,
   type HotkeyList,
+  type SavedLayout,
 } from "./layout-editor";
 
 const snapshot: EditorSnapshot = {
   appearance: "light",
-  display: {
-    name: "Studio Display",
-    resolution: "2560 × 1440",
-    scalePercent: 100,
-  },
+  displays: [
+    {
+      name: "Primary display",
+      resolution: "2560 × 1400",
+      scalePercent: 100,
+      workAreaWidth: 2560,
+      workAreaHeight: 1400,
+    },
+    {
+      name: "Display 2",
+      resolution: "1920 × 1040",
+      scalePercent: 125,
+      workAreaWidth: 1920,
+      workAreaHeight: 1040,
+    },
+  ],
   draft: {
     name: "Developer Focus",
     gap: 12,
@@ -59,10 +71,25 @@ const hotkeys: HotkeyList = {
   ],
 };
 
+const savedLayouts: SavedLayout[] = [
+  {
+    name: "writing",
+    cells: [
+      { id: 1, name: "Zone 1", x: 0, y: 0, width: 60, height: 100 },
+      { id: 2, name: "Zone 2", x: 60, y: 0, width: 40, height: 100 },
+    ],
+  },
+];
+
 function bridge(): DesktopBridge {
   return {
     loadEditorSnapshot: vi.fn().mockResolvedValue(structuredClone(snapshot)),
     loadHotkeyBindings: vi.fn().mockResolvedValue(structuredClone(hotkeys)),
+    loadSavedLayouts: vi.fn().mockResolvedValue(structuredClone(savedLayouts)),
+    saveLayout: vi.fn().mockResolvedValue({ file: "config.toml" }),
+    renameLayout: vi.fn().mockResolvedValue({ file: "config.toml" }),
+    duplicateLayout: vi.fn().mockResolvedValue({ file: "config.toml" }),
+    deleteLayout: vi.fn().mockResolvedValue({ file: "desk.toml" }),
     previewLayout: vi.fn().mockResolvedValue({ revision: 1, status: "previewing" }),
     saveAndApplyLayout: vi.fn().mockResolvedValue({ revision: 2, status: "applied" }),
     setAppearance: vi.fn().mockResolvedValue(undefined),
@@ -253,6 +280,152 @@ describe("layout editor", () => {
     expect(root.querySelector("[data-hotkey-error]")?.textContent).toContain(
       "the Mosaix agent is not running",
     );
+  });
+});
+
+describe("saved layouts", () => {
+  it("saves the drawn layout under the name in the panel and reports the file", async () => {
+    const root = document.createElement("div");
+    document.body.append(root);
+    const desktop = bridge();
+    desktop.saveLayout = vi.fn().mockResolvedValue({ file: "desk.toml" });
+    await mountLayoutEditor(root, desktop);
+
+    const name = root.querySelector<HTMLInputElement>("[data-layout-name]")!;
+    name.value = "Writing";
+    name.dispatchEvent(new Event("change", { bubbles: true }));
+    root.querySelector<HTMLElement>("[data-save-layout]")!.click();
+    await vi.waitFor(() =>
+      expect(root.querySelector(".command-status")?.textContent).toContain("desk.toml"),
+    );
+
+    expect(desktop.saveLayout).toHaveBeenCalledWith(
+      expect.objectContaining({ name: "Writing", zones: expect.any(Array) }),
+    );
+  });
+
+  it("reports a rejected save as a failure carrying the agent's reason", async () => {
+    const root = document.createElement("div");
+    document.body.append(root);
+    const desktop = bridge();
+    desktop.saveLayout = vi
+      .fn()
+      .mockRejectedValue(new Error("config.toml: saved layout \"writing\" declares no cells"));
+    await mountLayoutEditor(root, desktop);
+
+    root.querySelector<HTMLElement>("[data-save-layout]")!.click();
+    await vi.waitFor(() =>
+      expect(root.querySelector(".command-status")?.textContent).toContain("failed"),
+    );
+
+    expect(root.querySelector(".command-status")?.textContent).toContain("declares no cells");
+  });
+
+  it("lists saved layouts and duplicates or deletes the one asked for", async () => {
+    const root = document.createElement("div");
+    document.body.append(root);
+    const desktop = bridge();
+    await mountLayoutEditor(root, desktop);
+    await vi.waitFor(() => expect(root.querySelector(".library-item")).not.toBeNull());
+
+    expect(root.querySelector(".library-item")?.textContent).toContain("writing");
+    expect(root.querySelector(".library-item")?.textContent).toContain("2 zones");
+
+    root.querySelector<HTMLElement>("[data-duplicate-layout]")!.click();
+    await vi.waitFor(() => expect(desktop.duplicateLayout).toHaveBeenCalled());
+    expect(desktop.duplicateLayout).toHaveBeenCalledWith("writing", "writing copy");
+
+    root.querySelector<HTMLElement>("[data-delete-layout]")!.click();
+    await vi.waitFor(() => expect(desktop.deleteLayout).toHaveBeenCalledWith("writing"));
+  });
+
+  it("renames the layout it is editing to the name in the panel", async () => {
+    const root = document.createElement("div");
+    document.body.append(root);
+    const desktop = bridge();
+    await mountLayoutEditor(root, desktop);
+    await vi.waitFor(() => expect(root.querySelector("[data-open-layout]")).not.toBeNull());
+
+    root.querySelector<HTMLElement>("[data-open-layout]")!.click();
+    const name = root.querySelector<HTMLInputElement>("[data-layout-name]")!;
+    name.value = "drafting";
+    name.dispatchEvent(new Event("change", { bubbles: true }));
+    root.querySelector<HTMLElement>("[data-rename-layout]")!.click();
+
+    await vi.waitFor(() =>
+      expect(desktop.renameLayout).toHaveBeenCalledWith("writing", "drafting"),
+    );
+  });
+
+  it("opening a saved layout loads its cells onto the canvas", async () => {
+    const root = document.createElement("div");
+    document.body.append(root);
+    await mountLayoutEditor(root, bridge());
+    await vi.waitFor(() => expect(root.querySelector("[data-open-layout]")).not.toBeNull());
+
+    root.querySelector<HTMLElement>("[data-open-layout]")!.click();
+
+    expect(root.querySelectorAll(".zone")).toHaveLength(2);
+    expect(root.querySelector<HTMLInputElement>("[data-layout-name]")!.value).toBe("writing");
+  });
+
+  it("does not discard in-progress edits when the write echoes back", async () => {
+    // The editor's own save returns through the same list re-read that a
+    // hand edit does. That echo has to leave the canvas alone.
+    const root = document.createElement("div");
+    document.body.append(root);
+    const desktop = bridge();
+    await mountLayoutEditor(root, desktop);
+    await vi.waitFor(() => expect(root.querySelector(".library-item")).not.toBeNull());
+
+    const zoneName = root.querySelector<HTMLInputElement>("[data-zone-name]")!;
+    zoneName.value = "Editor";
+    zoneName.dispatchEvent(new Event("change", { bubbles: true }));
+    root.querySelector<HTMLElement>("[data-save-layout]")!.click();
+    await vi.waitFor(() =>
+      expect(root.querySelector(".command-status")?.textContent).toContain("Saved to"),
+    );
+
+    expect(root.querySelector<HTMLInputElement>("[data-zone-name]")!.value).toBe("Editor");
+    expect(root.querySelectorAll(".zone")).toHaveLength(3);
+  });
+
+  it("shows a layout added by hand in the configuration file", async () => {
+    vi.useFakeTimers();
+    const root = document.createElement("div");
+    document.body.append(root);
+    const desktop = bridge();
+    desktop.loadSavedLayouts = vi
+      .fn()
+      .mockResolvedValueOnce(structuredClone(savedLayouts))
+      .mockResolvedValue([
+        ...structuredClone(savedLayouts),
+        { name: "hand written", cells: [{ id: 1, name: "Zone 1", x: 0, y: 0, width: 100, height: 100 }] },
+      ]);
+    await mountLayoutEditor(root, desktop);
+
+    await vi.advanceTimersByTimeAsync(2500);
+    vi.useRealTimers();
+
+    expect(root.textContent).toContain("hand written");
+  });
+});
+
+describe("display selection", () => {
+  it("draws the canvas at the selected display's work-area proportions", async () => {
+    const root = document.createElement("div");
+    document.body.append(root);
+    await mountLayoutEditor(root, bridge());
+
+    const monitor = () => root.querySelector<HTMLElement>("[data-monitor]")!;
+    expect(monitor().style.aspectRatio.replace(/\s/g, "")).toBe("2560/1400");
+
+    const picker = root.querySelector<HTMLSelectElement>("[data-display]")!;
+    picker.value = "1";
+    picker.dispatchEvent(new Event("change", { bubbles: true }));
+
+    expect(monitor().style.aspectRatio.replace(/\s/g, "")).toBe("1920/1040");
+    expect(root.querySelector(".work-label")?.textContent).toContain("1920 × 1040");
   });
 });
 

@@ -2,6 +2,9 @@ use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 
+use mosaix_config::LayoutEdit;
+use mosaix_domain::NormalizedRect;
+
 use crate::agent::{self, AgentError, AgentTransport};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -37,13 +40,53 @@ pub struct DisplaySummary {
     pub name: String,
     pub resolution: String,
     pub scale_percent: u16,
+    /// The work area's own pixel dimensions, so a preview is drawn at the
+    /// proportions the layout will actually take. A layout's cells are
+    /// fractions of this rectangle (ADR 0018).
+    pub work_area_width: i32,
+    pub work_area_height: i32,
+}
+
+/// The display the editor draws against when no adapter could name a real
+/// one -- off Windows, or when enumeration failed.
+///
+/// Nominal on purpose: it is better to draw a canvas and say the display
+/// is unknown than to render nothing.
+pub fn nominal_display() -> DisplaySummary {
+    DisplaySummary {
+        name: "No display detected".to_owned(),
+        resolution: "1920 × 1080".to_owned(),
+        scale_percent: 100,
+        work_area_width: 1920,
+        work_area_height: 1080,
+    }
+}
+
+/// One saved layout as the interface lists it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SavedLayoutView {
+    pub name: String,
+    pub cells: Vec<ZoneDraft>,
+}
+
+/// What a confirmed configuration write did.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LayoutWriteReceipt {
+    /// The configuration file the agent wrote. Worth reporting because
+    /// with a profile matched it is not necessarily the file the user
+    /// would have guessed (ADR 0022).
+    pub file: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EditorSnapshot {
     pub appearance: Appearance,
-    pub display: DisplaySummary,
+    /// Every display the layout can be previewed against, primary first.
+    /// Never empty: a nominal display stands in when none was found.
+    pub displays: Vec<DisplaySummary>,
     pub draft: LayoutDraft,
 }
 
@@ -117,6 +160,7 @@ pub enum EditorCommandError {
         detail: String,
     },
     EmptyLayout,
+    EmptyLayoutName,
     DuplicateZoneId {
         zone_id: u32,
     },
@@ -146,6 +190,9 @@ impl std::fmt::Display for EditorCommandError {
                 write!(formatter, "could not reach the Mosaix agent: {detail}")
             }
             Self::EmptyLayout => formatter.write_str("a layout must contain at least one zone"),
+            Self::EmptyLayoutName => {
+                formatter.write_str("a layout needs a name before it can be saved")
+            }
             Self::DuplicateZoneId { zone_id } => {
                 write!(formatter, "zone {zone_id} appears more than once")
             }
@@ -175,7 +222,7 @@ pub struct EditorSession {
 
 impl Default for EditorSession {
     fn default() -> Self {
-        Self::with_agent(agent::connect())
+        Self::with_agent(agent::connect(), crate::displays::enumerate())
     }
 }
 
@@ -183,15 +230,15 @@ impl EditorSession {
     /// A session talking to `agent`. The connection is opened by the
     /// caller and held here, so the agent sees one connection per settings
     /// window rather than one per request (ADR 0021).
-    pub fn with_agent(agent: Box<dyn AgentTransport>) -> Self {
+    pub fn with_agent(agent: Box<dyn AgentTransport>, displays: Vec<DisplaySummary>) -> Self {
         Self {
             agent,
             snapshot: EditorSnapshot {
                 appearance: Appearance::Dark,
-                display: DisplaySummary {
-                    name: "Studio Display".to_owned(),
-                    resolution: "2560 × 1440".to_owned(),
-                    scale_percent: 100,
+                displays: if displays.is_empty() {
+                    vec![nominal_display()]
+                } else {
+                    displays
                 },
                 draft: LayoutDraft {
                     name: "Developer Focus".to_owned(),
@@ -244,24 +291,25 @@ impl EditorSession {
         })
     }
 
-    /// Asks the agent to apply the saved layout `draft` names, and reports
-    /// success only if the agent confirms it. The editor performs no
-    /// placement and writes no configuration file of its own -- the agent
-    /// is the authority for both.
+    /// Saves the drawn layout and then applies it, reporting success only
+    /// if the agent confirms both. The editor performs no placement and
+    /// writes no configuration file of its own -- the agent is the
+    /// authority for both.
     ///
-    /// Only the *name* crosses the transport today, so this applies
-    /// whichever saved layout configuration holds under that name, not the
-    /// cells currently drawn on screen. Persisting a drawn layout back to
-    /// configuration -- which is what makes the two the same thing -- is
-    /// issue #37. The draft is still validated first, so an unusable
-    /// drawing is refused here rather than saved by a later ticket's code
-    /// path.
+    /// The save comes first because only the *name* crosses the transport
+    /// on an apply: applying without saving would lay out whichever cells
+    /// configuration already held under that name, which is not what a
+    /// user looking at their own drawing means by "apply". A save the
+    /// agent refuses stops here, so nothing is applied and nothing claims
+    /// to have been.
     pub fn apply(&mut self, draft: LayoutDraft) -> Result<CommandReceipt, EditorCommandError> {
-        validate_draft(&draft)?;
+        let name = draft.name.clone();
+        self.save(draft)?;
         self.agent
-            .apply_saved_layout(&draft.name)
+            .apply_saved_layout(&name)
             .map_err(EditorCommandError::from)?;
-        self.revision += 1;
+        // The save already advanced the revision. One click on Save &
+        // apply is one change, however many requests it takes.
         Ok(CommandReceipt {
             revision: self.revision,
             status: CommandStatus::Applied,
@@ -292,9 +340,113 @@ impl EditorSession {
         })
     }
 
+    /// The saved layouts the agent currently has, by name.
+    pub fn layouts(&mut self) -> Result<Vec<SavedLayoutView>, EditorCommandError> {
+        let state = self.agent.state().map_err(EditorCommandError::from)?;
+        Ok(state
+            .saved_layouts
+            .into_iter()
+            .map(|(name, layout)| SavedLayoutView {
+                name,
+                cells: layout
+                    .cells
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, cell)| ZoneDraft {
+                        id: index as u32 + 1,
+                        name: format!("Zone {}", index + 1),
+                        x: cell.x,
+                        y: cell.y,
+                        width: cell.width,
+                        height: cell.height,
+                    })
+                    .collect(),
+            })
+            .collect())
+    }
+
+    /// Saves `draft` as the saved layout it names, and reports the file
+    /// the agent wrote.
+    ///
+    /// The drawing is checked here so an unusable one is refused before
+    /// the agent is asked; the name is checked for the two problems that
+    /// have nothing to do with the rest of the configuration, so the
+    /// common mistakes are reported before the write rather than as a
+    /// rejected candidate afterwards. Everything else -- a name already
+    /// taken, a layout declared in two layers -- is the agent's to
+    /// answer, because only the agent can see the whole directory.
+    pub fn save(&mut self, draft: LayoutDraft) -> Result<LayoutWriteReceipt, EditorCommandError> {
+        validate_draft(&draft)?;
+        check_name(&draft.name)?;
+        self.edit(LayoutEdit::Save {
+            name: draft.name.clone(),
+            cells: draft
+                .zones
+                .iter()
+                .map(|zone| NormalizedRect {
+                    x: zone.x,
+                    y: zone.y,
+                    width: zone.width,
+                    height: zone.height,
+                })
+                .collect(),
+        })
+    }
+
+    pub fn rename(
+        &mut self,
+        from: &str,
+        to: &str,
+    ) -> Result<LayoutWriteReceipt, EditorCommandError> {
+        check_name(to)?;
+        self.edit(LayoutEdit::Rename {
+            from: from.to_owned(),
+            to: to.to_owned(),
+        })
+    }
+
+    pub fn duplicate(
+        &mut self,
+        from: &str,
+        to: &str,
+    ) -> Result<LayoutWriteReceipt, EditorCommandError> {
+        check_name(to)?;
+        self.edit(LayoutEdit::Duplicate {
+            from: from.to_owned(),
+            to: to.to_owned(),
+        })
+    }
+
+    pub fn delete(&mut self, name: &str) -> Result<LayoutWriteReceipt, EditorCommandError> {
+        self.edit(LayoutEdit::Delete {
+            name: name.to_owned(),
+        })
+    }
+
+    fn edit(&mut self, edit: LayoutEdit) -> Result<LayoutWriteReceipt, EditorCommandError> {
+        let file = self
+            .agent
+            .edit_layouts(edit)
+            .map_err(EditorCommandError::from)?;
+        self.revision += 1;
+        Ok(LayoutWriteReceipt { file })
+    }
+
     pub fn set_appearance(&mut self, appearance: Appearance) {
         self.snapshot.appearance = appearance;
     }
+}
+
+/// Rejects a layout name that is empty or whitespace-only.
+///
+/// The one name rule the settings application can check on its own:
+/// whether a name is *taken* depends on the whole configuration
+/// directory, which only the agent has.
+fn check_name(name: &str) -> Result<(), EditorCommandError> {
+    if name.trim().is_empty() {
+        return Err(EditorCommandError::EmptyLayoutName);
+    }
+    Ok(())
 }
 
 impl From<AgentError> for EditorCommandError {
@@ -362,36 +514,43 @@ mod tests {
     /// An agent that answers with whatever the test scripted. The session
     /// owns its transport, so what the agent was asked is recorded through
     /// a handle the test keeps rather than read back off the fake.
-    #[derive(Debug)]
+    #[derive(Debug, Default)]
     struct FakeAgent {
         outcome: Option<Result<(), AgentError>>,
         applied: Arc<Mutex<Vec<String>>>,
         state: Option<Result<StateSnapshot, AgentError>>,
+        edits: Arc<Mutex<Vec<LayoutEdit>>>,
+        edit_outcome: Option<Result<String, AgentError>>,
     }
 
     impl FakeAgent {
+        /// A fake that confirms saves and answers an apply with `outcome`
+        /// -- the shape every apply test wants, since an apply now saves
+        /// first.
         fn answering(outcome: Result<(), AgentError>) -> Self {
             Self {
                 outcome: Some(outcome),
-                applied: Arc::default(),
-                state: None,
+                edit_outcome: Some(Ok("config.toml".to_owned())),
+                ..Self::default()
             }
         }
 
         /// A fake with no scripted answer: reaching it is a test failure.
         fn never_asked() -> Self {
-            Self {
-                outcome: None,
-                applied: Arc::default(),
-                state: None,
-            }
+            Self::default()
         }
 
         fn reporting(state: Result<StateSnapshot, AgentError>) -> Self {
             Self {
-                outcome: None,
-                applied: Arc::default(),
                 state: Some(state),
+                ..Self::default()
+            }
+        }
+
+        fn writing(outcome: Result<String, AgentError>) -> Self {
+            Self {
+                edit_outcome: Some(outcome),
+                ..Self::default()
             }
         }
     }
@@ -408,6 +567,13 @@ mod tests {
             self.state
                 .clone()
                 .expect("the test scripted no state for this request")
+        }
+
+        fn edit_layouts(&mut self, edit: LayoutEdit) -> Result<String, AgentError> {
+            self.edits.lock().unwrap().push(edit);
+            self.edit_outcome
+                .clone()
+                .expect("the test scripted no answer for this edit")
         }
     }
 
@@ -439,14 +605,13 @@ mod tests {
 
     #[test]
     fn the_hotkey_list_carries_each_bindings_supplying_file() {
-        let mut session =
-            EditorSession::with_agent(Box::new(FakeAgent::reporting(Ok(state_reporting(
-                "MON-A@0,0 1920x1080 scale=1",
-                vec![
-                    binding("snap-left", "ctrl+alt+left", "base", "config.toml"),
-                    binding("snap-right", "ctrl+shift+right", "profile", "desk.toml"),
-                ],
-            )))));
+        let mut session = session(FakeAgent::reporting(Ok(state_reporting(
+            "MON-A@0,0 1920x1080 scale=1",
+            vec![
+                binding("snap-left", "ctrl+alt+left", "base", "config.toml"),
+                binding("snap-right", "ctrl+shift+right", "profile", "desk.toml"),
+            ],
+        ))));
 
         let list = session.hotkeys().expect("the agent answered");
 
@@ -461,11 +626,173 @@ mod tests {
     }
 
     #[test]
+    fn saving_a_drawn_layout_sends_its_cells_and_reports_the_file_written() {
+        let agent = FakeAgent::writing(Ok("desk.toml".to_owned()));
+        let edits = Arc::clone(&agent.edits);
+        let mut session = session(agent);
+        let mut draft = session.load().draft;
+        draft.name = "Writing".to_owned();
+
+        let receipt = session.save(draft).expect("a confirmed save");
+
+        assert_eq!(
+            receipt.file, "desk.toml",
+            "the destination is worth reporting: with a profile matched it is not the obvious file"
+        );
+        let sent = edits.lock().unwrap().clone();
+        match &sent[0] {
+            LayoutEdit::Save { name, cells } => {
+                assert_eq!(name, "Writing");
+                assert_eq!(cells.len(), 3, "the drawn cells, not just the name");
+                assert_eq!(cells[0].width, 0.62);
+            }
+            other => panic!("expected a save, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_save_the_agent_rejected_is_a_failure_carrying_its_reason() {
+        let mut session = session(FakeAgent::writing(Err(AgentError::Rejected {
+            reason:
+                "config.toml: saved layout \"writing\" cell 0 falls outside a display work area"
+                    .to_owned(),
+        })));
+        let draft = session.load().draft;
+
+        let error = session.save(draft).unwrap_err();
+
+        assert!(
+            error.to_string().contains("falls outside"),
+            "the agent's own reason is the only thing the user can act on, got {error}"
+        );
+    }
+
+    #[test]
+    fn a_layout_with_no_name_is_refused_before_the_agent_is_asked() {
+        // The fake has no scripted answer, so reaching it would panic.
+        let mut session = session(FakeAgent::never_asked());
+        let mut draft = session.load().draft;
+        draft.name = "   ".to_owned();
+
+        assert_eq!(
+            session.save(draft),
+            Err(EditorCommandError::EmptyLayoutName)
+        );
+    }
+
+    #[test]
+    fn renaming_duplicating_and_deleting_each_reach_the_agent_as_themselves() {
+        for (act, expected) in [
+            (
+                Box::new(|session: &mut EditorSession| session.rename("draft", "writing"))
+                    as Box<dyn Fn(&mut EditorSession) -> _>,
+                LayoutEdit::Rename {
+                    from: "draft".to_owned(),
+                    to: "writing".to_owned(),
+                },
+            ),
+            (
+                Box::new(|session: &mut EditorSession| {
+                    session.duplicate("writing", "writing wide")
+                }),
+                LayoutEdit::Duplicate {
+                    from: "writing".to_owned(),
+                    to: "writing wide".to_owned(),
+                },
+            ),
+            (
+                Box::new(|session: &mut EditorSession| session.delete("writing")),
+                LayoutEdit::Delete {
+                    name: "writing".to_owned(),
+                },
+            ),
+        ] {
+            let agent = FakeAgent::writing(Ok("config.toml".to_owned()));
+            let edits = Arc::clone(&agent.edits);
+            let mut session = session(agent);
+
+            act(&mut session).expect("a confirmed edit");
+
+            assert_eq!(edits.lock().unwrap()[0], expected);
+        }
+    }
+
+    #[test]
+    fn renaming_to_an_empty_name_is_refused_before_the_agent_is_asked() {
+        let mut session = session(FakeAgent::never_asked());
+
+        assert_eq!(
+            session.rename("writing", "  "),
+            Err(EditorCommandError::EmptyLayoutName)
+        );
+    }
+
+    #[test]
+    fn the_saved_layout_list_comes_from_the_agent_with_its_cells() {
+        let mut state = state_reporting("MON-A", Vec::new());
+        state.saved_layouts.insert(
+            "writing".to_owned(),
+            mosaix_config::SavedLayout {
+                cells: vec![
+                    mosaix_domain::NormalizedRect {
+                        x: 0.0,
+                        y: 0.0,
+                        width: 0.6,
+                        height: 1.0,
+                    },
+                    mosaix_domain::NormalizedRect {
+                        x: 0.6,
+                        y: 0.0,
+                        width: 0.4,
+                        height: 1.0,
+                    },
+                ],
+            },
+        );
+        let mut session = session(FakeAgent::reporting(Ok(state)));
+
+        let layouts = session.layouts().expect("the agent answered");
+
+        assert_eq!(layouts.len(), 1);
+        assert_eq!(layouts[0].name, "writing");
+        assert_eq!(layouts[0].cells.len(), 2);
+        assert_eq!(layouts[0].cells[1].x, 0.6);
+        assert_eq!(
+            layouts[0].cells[0].id, 1,
+            "cells get ids so the editor can select one after loading it"
+        );
+    }
+
+    #[test]
+    fn the_editor_offers_the_real_displays_a_layout_can_be_previewed_against() {
+        let session = session(FakeAgent::never_asked());
+
+        let displays = session.load().displays;
+
+        assert_eq!(displays[0].name, "Primary display");
+        assert_eq!(
+            (displays[0].work_area_width, displays[0].work_area_height),
+            (2560, 1400),
+            "a preview drawn at the wrong proportions shows the wrong shape"
+        );
+        assert_eq!(displays[1].work_area_width, 1920);
+    }
+
+    #[test]
+    fn an_editor_with_no_displays_found_still_has_one_to_draw_against() {
+        let session = EditorSession::with_agent(Box::new(FakeAgent::never_asked()), Vec::new());
+
+        let displays = session.load().displays;
+
+        assert_eq!(displays.len(), 1);
+        assert_eq!(displays[0].name, "No display detected");
+    }
+
+    #[test]
     fn the_hotkey_list_reports_an_absent_agent_rather_than_an_empty_list() {
         // An empty list and "no agent to ask" look identical on screen
         // unless the second one is an error.
-        let mut session =
-            EditorSession::with_agent(Box::new(FakeAgent::reporting(Err(AgentError::Unavailable))));
+        let mut session = session(FakeAgent::reporting(Err(AgentError::Unavailable)));
 
         assert_eq!(
             session.hotkeys().unwrap_err(),
@@ -475,9 +802,9 @@ mod tests {
 
     #[test]
     fn the_hotkey_list_keeps_a_version_mismatch_distinct_from_a_rejection() {
-        let mut session = EditorSession::with_agent(Box::new(FakeAgent::reporting(Err(
-            AgentError::VersionMismatch { server_version: 1 },
-        ))));
+        let mut session = session(FakeAgent::reporting(Err(AgentError::VersionMismatch {
+            server_version: 1,
+        })));
 
         assert_eq!(
             session.hotkeys().unwrap_err(),
@@ -485,15 +812,40 @@ mod tests {
         );
     }
 
+    /// Two displays of different shapes, so a test can tell which one a
+    /// preview was drawn against.
+    fn test_displays() -> Vec<DisplaySummary> {
+        vec![
+            DisplaySummary {
+                name: "Primary display".to_owned(),
+                resolution: "2560 × 1400".to_owned(),
+                scale_percent: 100,
+                work_area_width: 2560,
+                work_area_height: 1400,
+            },
+            DisplaySummary {
+                name: "Display 2".to_owned(),
+                resolution: "1920 × 1040".to_owned(),
+                scale_percent: 125,
+                work_area_width: 1920,
+                work_area_height: 1040,
+            },
+        ]
+    }
+
+    fn session(agent: FakeAgent) -> EditorSession {
+        EditorSession::with_agent(Box::new(agent), test_displays())
+    }
+
     fn session_with(outcome: Result<(), AgentError>) -> EditorSession {
-        EditorSession::with_agent(Box::new(FakeAgent::answering(outcome)))
+        session(FakeAgent::answering(outcome))
     }
 
     #[test]
     fn editor_session_previews_locally_without_involving_the_agent() {
         // The fake has no scripted answer, so a preview that reached the
         // agent would panic rather than pass.
-        let mut session = EditorSession::with_agent(Box::new(FakeAgent::never_asked()));
+        let mut session = session(FakeAgent::never_asked());
         let mut draft = session.load().draft;
         draft.gap = 20;
 
@@ -519,7 +871,7 @@ mod tests {
     fn an_apply_asks_the_agent_for_the_drafts_own_layout_name() {
         let agent = FakeAgent::answering(Ok(()));
         let applied = Arc::clone(&agent.applied);
-        let mut session = EditorSession::with_agent(Box::new(agent));
+        let mut session = session(agent);
         let mut draft = session.load().draft;
         draft.name = "Writing".to_owned();
 
@@ -580,9 +932,54 @@ mod tests {
     }
 
     #[test]
+    fn an_apply_saves_the_drawing_before_applying_it() {
+        // Applying sends only a name, so a draft that was never saved
+        // would lay out whatever configuration already held under it.
+        let agent = FakeAgent::answering(Ok(()));
+        let edits = Arc::clone(&agent.edits);
+        let applied = Arc::clone(&agent.applied);
+        let mut session = session(agent);
+        let mut draft = session.load().draft;
+        draft.name = "Writing".to_owned();
+
+        session.apply(draft).expect("a confirmed save and apply");
+
+        assert!(
+            matches!(&edits.lock().unwrap()[0], LayoutEdit::Save { name, .. } if name == "Writing"),
+            "the drawn cells must be persisted first"
+        );
+        assert_eq!(*applied.lock().unwrap(), vec!["Writing".to_owned()]);
+    }
+
+    #[test]
+    fn an_apply_whose_save_was_refused_never_reaches_the_apply() {
+        let agent = FakeAgent {
+            edit_outcome: Some(Err(AgentError::Rejected {
+                reason: "config.toml: saved layout \"writing\" declares no cells".to_owned(),
+            })),
+            // No scripted apply answer: reaching it would panic.
+            ..FakeAgent::default()
+        };
+        let applied = Arc::clone(&agent.applied);
+        let mut session = session(agent);
+        let draft = session.load().draft;
+
+        let error = session.apply(draft).unwrap_err();
+
+        assert!(
+            error.to_string().contains("declares no cells"),
+            "got {error}"
+        );
+        assert!(
+            applied.lock().unwrap().is_empty(),
+            "nothing should be applied after a refused save"
+        );
+    }
+
+    #[test]
     fn an_invalid_draft_is_rejected_before_the_agent_is_asked() {
         // The fake has no scripted answer, so reaching it would panic.
-        let mut session = EditorSession::with_agent(Box::new(FakeAgent::never_asked()));
+        let mut session = session(FakeAgent::never_asked());
         let mut draft = session.load().draft;
         draft.zones.clear();
 
