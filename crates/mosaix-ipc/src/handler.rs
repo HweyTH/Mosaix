@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use mosaix_config::SavedLayout;
+use mosaix_config::{Command, ConfigLayer, ResolvedConfig, SavedLayout};
 use mosaix_engine::{
     EligibilityReason, EngineState, Event, EventSender, StateReader, ZoneSnapDirection,
 };
@@ -36,6 +36,81 @@ pub struct StateSnapshot {
     /// (CONTEXT.md "Saved layout"). Shape only -- a layout never names a
     /// window, so there is nothing here to sanitize (ADR 0018).
     pub saved_layouts: BTreeMap<String, SavedLayout>,
+    /// Every hotkey binding in effect for the current topology, each
+    /// naming the configuration file that supplies it. This is what lets
+    /// the settings application list bindings without reading a TOML file,
+    /// and what makes the write destination visible before a save
+    /// (ADR 0022).
+    pub hotkeys: Vec<HotkeyBindingSnapshot>,
+}
+
+/// One resolved hotkey binding, flattened for a client that has no
+/// `mosaix-config` types to deserialize into.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct HotkeyBindingSnapshot {
+    /// The command's TOML path -- `snap-left`, or `apply-layout.writing`
+    /// for a layout binding. The same spelling a validation error uses, so
+    /// what the interface shows and what an error names are one string.
+    pub command: String,
+    /// The saved layout a parameterized binding applies, `None` for the
+    /// unit verbs. Broken out so a client can label the binding without
+    /// re-parsing `command`.
+    pub layout: Option<String>,
+    /// The combination, in the spelling config files use
+    /// (`ctrl+alt+left`).
+    pub combo: String,
+    /// Which layer supplies this binding: `base` or `profile`.
+    pub source: String,
+    /// The file that supplies it, and so the file a GUI edit of it would
+    /// be written to (ADR 0022).
+    pub file: String,
+}
+
+fn layer_name(layer: ConfigLayer) -> &'static str {
+    match layer {
+        ConfigLayer::Base => "base",
+        ConfigLayer::Profile => "profile",
+    }
+}
+
+/// Every binding in `config`, paired with where it came from.
+///
+/// A binding with no recorded source is reported as base-supplied rather
+/// than skipped: `merge` records one for every binding it resolves, so the
+/// only way to reach this is a `ResolvedConfig` built by hand, and hiding
+/// a real binding from the list would be worse than naming the wrong file
+/// for it.
+fn binding_snapshots(config: &ResolvedConfig) -> Vec<HotkeyBindingSnapshot> {
+    config
+        .hotkeys
+        .iter()
+        .map(|(command, combo)| {
+            let layer = config
+                .binding_sources
+                .get(command)
+                .copied()
+                .unwrap_or(ConfigLayer::Base);
+            HotkeyBindingSnapshot {
+                command: command.to_string(),
+                layout: match command {
+                    Command::ApplyLayout { name } => Some(name.clone()),
+                    _ => None,
+                },
+                combo: combo.to_string(),
+                source: layer_name(layer).to_owned(),
+                file: match layer {
+                    ConfigLayer::Base => mosaix_config::BASE_CONFIG_FILE_NAME.to_owned(),
+                    // A profile-supplied binding always comes from a
+                    // resolved config `validate` produced, which is where
+                    // the filename is attached.
+                    ConfigLayer::Profile => config
+                        .profile_file
+                        .clone()
+                        .unwrap_or_else(|| "the matched profile".to_owned()),
+                },
+            }
+        })
+        .collect()
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -112,6 +187,7 @@ impl From<EngineState> for StateSnapshot {
             .collect();
         managed_windows.sort_by_key(|window| window.window_id);
         let saved_layouts = state.resolved_config.layouts.clone();
+        let hotkeys = binding_snapshots(&state.resolved_config);
         Self {
             revision: state.revision,
             display_count: state.displays.len(),
@@ -126,6 +202,7 @@ impl From<EngineState> for StateSnapshot {
             degraded_windows,
             managed_windows,
             saved_layouts,
+            hotkeys,
         }
     }
 }
@@ -370,6 +447,92 @@ mod tests {
         let json = serde_json::to_value(StateSnapshot::from(state)).unwrap();
 
         assert_eq!(json["saved_layouts"]["writing"]["cells"][0]["width"], 0.6);
+    }
+
+    /// A resolved config binding `snap-left` from base config and
+    /// `snap-right` from the profile `desk.toml`, which is the split every
+    /// provenance assertion needs.
+    fn config_with_mixed_provenance() -> ResolvedConfig {
+        let mut config = ResolvedConfig {
+            profile_file: Some("desk.toml".to_owned()),
+            ..ResolvedConfig::default()
+        };
+        for (command, combo, layer) in [
+            (Command::SnapLeft, "ctrl+alt+left", ConfigLayer::Base),
+            (Command::SnapRight, "ctrl+shift+right", ConfigLayer::Profile),
+        ] {
+            config.hotkeys.insert(
+                command.clone(),
+                mosaix_config::KeyCombo::parse(combo).unwrap(),
+            );
+            config.binding_sources.insert(command, layer);
+        }
+        config
+    }
+
+    #[test]
+    fn state_snapshot_names_the_file_supplying_each_binding() {
+        let mut state = EngineState::default();
+        state.resolved_config = config_with_mixed_provenance();
+
+        let json = serde_json::to_value(StateSnapshot::from(state)).unwrap();
+
+        let bindings = json["hotkeys"].as_array().unwrap();
+        let left = bindings
+            .iter()
+            .find(|binding| binding["command"] == "snap-left")
+            .unwrap();
+        assert_eq!(left["combo"], "ctrl+alt+left");
+        assert_eq!(left["source"], "base");
+        assert_eq!(left["file"], "config.toml");
+
+        let right = bindings
+            .iter()
+            .find(|binding| binding["command"] == "snap-right")
+            .unwrap();
+        assert_eq!(right["source"], "profile");
+        assert_eq!(
+            right["file"], "desk.toml",
+            "an overridden binding must name the profile that would receive a write"
+        );
+    }
+
+    #[test]
+    fn state_snapshot_lists_a_layout_binding_with_the_layout_it_applies() {
+        let mut state = EngineState::default();
+        let command = Command::ApplyLayout {
+            name: "writing".to_owned(),
+        };
+        state.resolved_config.hotkeys.insert(
+            command.clone(),
+            mosaix_config::KeyCombo::parse("ctrl+alt+1").unwrap(),
+        );
+        state
+            .resolved_config
+            .binding_sources
+            .insert(command, ConfigLayer::Base);
+
+        let json = serde_json::to_value(StateSnapshot::from(state)).unwrap();
+
+        assert_eq!(json["hotkeys"][0]["command"], "apply-layout.writing");
+        assert_eq!(
+            json["hotkeys"][0]["layout"], "writing",
+            "a client labels a layout binding without re-parsing the command path"
+        );
+    }
+
+    #[test]
+    fn state_snapshot_lists_every_resolved_binding() {
+        let mut state = EngineState::default();
+        state.resolved_config = mosaix_config::fallback_config();
+
+        let snapshot = StateSnapshot::from(state.clone());
+
+        assert_eq!(
+            snapshot.hotkeys.len(),
+            state.resolved_config.hotkeys.len(),
+            "the list is what a user reads instead of the TOML file, so it cannot be partial"
+        );
     }
 
     /// An ordinary tileable window on display 1, the shape every layout

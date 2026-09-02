@@ -10,8 +10,8 @@ use thiserror::Error;
 use std::collections::BTreeMap;
 
 use crate::schema::{
-    BaseConfig, Command, KeyCombo, ProfileConfig, ResolvedConfig, ResolvedConfigSet,
-    ResolvedProfile, SavedLayout, CURRENT_VERSION,
+    BaseConfig, Command, ConfigLayer, KeyCombo, ProfileConfig, ResolvedConfig, ResolvedConfigSet,
+    ResolvedProfile, SavedLayout, BASE_CONFIG_FILE_NAME, CURRENT_VERSION,
 };
 
 /// One profile candidate: its filename (for error messages -- profiles are
@@ -230,10 +230,16 @@ pub fn merge(base: &BaseConfig, profile: Option<&ProfileConfig>) -> ResolvedConf
     let mut automatic_tiling_enabled = false;
     let mut focus_border = base.focus_border;
     let mut layouts = base.layouts.clone();
+    let mut binding_sources: BTreeMap<Command, ConfigLayer> = base
+        .hotkeys
+        .keys()
+        .map(|command| (command.clone(), ConfigLayer::Base))
+        .collect();
 
     if let Some(profile) = profile {
         for (command, combo) in &profile.hotkeys {
             hotkeys.insert(command.clone(), combo.clone());
+            binding_sources.insert(command.clone(), ConfigLayer::Profile);
         }
         if let Some(outer) = profile.gaps.outer {
             gaps.outer = outer;
@@ -262,22 +268,26 @@ pub fn merge(base: &BaseConfig, profile: Option<&ProfileConfig>) -> ResolvedConf
 
     ResolvedConfig {
         hotkeys,
+        binding_sources,
         gaps,
         behavior,
         automatic_tiling_enabled,
         focus_border,
         layouts,
+        // Attached by `validate`, which is the only place a profile's
+        // filename is known.
+        profile_file: None,
     }
 }
 
 fn parse_base(contents: &str) -> Result<BaseConfig, ValidationError> {
     let base: BaseConfig = toml::from_str(contents).map_err(|err| ValidationError::Parse {
-        file: "config.toml".to_string(),
+        file: BASE_CONFIG_FILE_NAME.to_string(),
         message: err.to_string(),
     })?;
     if base.version != CURRENT_VERSION {
         return Err(ValidationError::UnsupportedVersion {
-            file: "config.toml".to_string(),
+            file: BASE_CONFIG_FILE_NAME.to_string(),
             found: base.version,
             expected: CURRENT_VERSION,
         });
@@ -378,23 +388,27 @@ pub fn validate(candidate: &CandidateConfig) -> Result<ResolvedConfigSet, Vec<Va
         return Err(errors);
     };
 
-    errors.extend(layout_errors("config.toml", &base.layouts));
+    errors.extend(layout_errors(BASE_CONFIG_FILE_NAME, &base.layouts));
 
     let base_resolved = merge(&base, None);
     if !(1..=16).contains(&base_resolved.focus_border.thickness) {
         errors.push(ValidationError::InvalidFocusBorderThickness {
-            file: "config.toml".to_owned(),
+            file: BASE_CONFIG_FILE_NAME.to_owned(),
             found: base_resolved.focus_border.thickness,
         });
     }
-    if let Some(err) = duplicate_binding("config.toml", &base_resolved) {
+    if let Some(err) = duplicate_binding(BASE_CONFIG_FILE_NAME, &base_resolved) {
         errors.push(err);
     }
-    errors.extend(unknown_layout_bindings("config.toml", &base_resolved));
+    errors.extend(unknown_layout_bindings(
+        BASE_CONFIG_FILE_NAME,
+        &base_resolved,
+    ));
 
     let mut resolved_profiles = Vec::new();
     for (file_name, profile) in &profiles {
-        let resolved = merge(&base, Some(profile));
+        let mut resolved = merge(&base, Some(profile));
+        resolved.profile_file = Some((*file_name).to_owned());
         if !(1..=16).contains(&resolved.focus_border.thickness) {
             errors.push(ValidationError::InvalidFocusBorderThickness {
                 file: (*file_name).to_owned(),
@@ -679,11 +693,17 @@ snap-right = "ctrl+alt+left"
             resolved,
             ResolvedConfig {
                 hotkeys: base.hotkeys.clone(),
+                binding_sources: base
+                    .hotkeys
+                    .keys()
+                    .map(|command| (command.clone(), ConfigLayer::Base))
+                    .collect(),
                 gaps: base.gaps,
                 behavior: base.behavior.clone(),
                 automatic_tiling_enabled: false,
                 focus_border: base.focus_border,
                 layouts: base.layouts.clone(),
+                profile_file: None,
             }
         );
     }
@@ -1371,6 +1391,96 @@ cells = [
         let reparsed: ProfileConfig = toml::from_str(&rendered).unwrap();
 
         assert_eq!(reparsed, profile);
+    }
+
+    /// Base config binding two commands, so a profile overriding one of
+    /// them leaves the other visibly base-supplied.
+    const BASE_WITH_TWO_BINDINGS: &str = r#"
+version = 1
+
+[hotkeys]
+snap-left = "ctrl+alt+left"
+snap-right = "ctrl+alt+right"
+"#;
+
+    #[test]
+    fn a_binding_no_profile_touches_is_recorded_as_base_supplied() {
+        let resolved = validate(&base_only(BASE_WITH_TWO_BINDINGS)).unwrap().base;
+
+        assert_eq!(
+            resolved.binding_sources.get(&Command::SnapLeft),
+            Some(&ConfigLayer::Base)
+        );
+        assert_eq!(
+            resolved.profile_file, None,
+            "base config alone supplies it, so there is no profile file to name"
+        );
+    }
+
+    #[test]
+    fn a_binding_the_matched_profile_overrides_is_recorded_as_profile_supplied() {
+        let resolved = only_profile(&with_profile(
+            BASE_WITH_TWO_BINDINGS,
+            "fingerprint = \"DESK\"\n[hotkeys]\nsnap-left = \"ctrl+shift+left\"\n",
+        ));
+
+        assert_eq!(
+            resolved.binding_sources.get(&Command::SnapLeft),
+            Some(&ConfigLayer::Profile),
+            "the profile supplies the value on screen, so it receives the write"
+        );
+        assert_eq!(
+            resolved.binding_sources.get(&Command::SnapRight),
+            Some(&ConfigLayer::Base),
+            "a binding the profile does not mention still comes from base config"
+        );
+        assert_eq!(
+            resolved.profile_file,
+            Some("desk.toml".to_owned()),
+            "the file a profile-supplied write would land in has to be nameable"
+        );
+    }
+
+    #[test]
+    fn a_binding_only_the_profile_declares_is_recorded_as_profile_supplied() {
+        let resolved = only_profile(&with_profile(
+            BASE_WITH_TWO_BINDINGS,
+            "fingerprint = \"DESK\"\n[hotkeys]\ntoggle-pause = \"ctrl+alt+p\"\n",
+        ));
+
+        assert_eq!(
+            resolved.binding_sources.get(&Command::TogglePause),
+            Some(&ConfigLayer::Profile)
+        );
+    }
+
+    #[test]
+    fn a_layout_binding_carries_provenance_like_any_other() {
+        let resolved = only_profile(&with_profile(
+            BASE_WITH_TWO_LAYOUTS,
+            "fingerprint = \"DESK\"\n[hotkeys.apply-layout]\nwriting = \"ctrl+alt+1\"\n",
+        ));
+
+        assert_eq!(
+            resolved.binding_sources.get(&Command::ApplyLayout {
+                name: "writing".to_owned()
+            }),
+            Some(&ConfigLayer::Profile)
+        );
+    }
+
+    #[test]
+    fn every_resolved_binding_has_a_source_and_no_source_lacks_a_binding() {
+        let resolved = only_profile(&with_profile(
+            BASE_WITH_TWO_BINDINGS,
+            "fingerprint = \"DESK\"\n[hotkeys]\nsnap-left = \"ctrl+shift+left\"\ntoggle-pause = \"ctrl+alt+p\"\n",
+        ));
+
+        assert_eq!(
+            resolved.hotkeys.keys().collect::<Vec<_>>(),
+            resolved.binding_sources.keys().collect::<Vec<_>>(),
+            "the parallel field must stay keyed identically to the map it describes"
+        );
     }
 
     #[test]

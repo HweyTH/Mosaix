@@ -2,7 +2,9 @@ use std::sync::Mutex;
 
 use tauri::State;
 
-use crate::editor::{Appearance, CommandReceipt, EditorSession, EditorSnapshot, LayoutDraft};
+use crate::editor::{
+    Appearance, CommandReceipt, EditorSession, EditorSnapshot, HotkeyList, LayoutDraft,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -142,6 +144,14 @@ pub fn save_and_apply_layout(
 ) -> Result<CommandReceipt, String> {
     let mut session = state.0.lock().map_err(|_| "editor state is unavailable")?;
     session.apply(draft).map_err(|error| error.to_string())
+}
+
+/// Every hotkey binding in effect, for the read-only list in the
+/// interface. Read from the agent, not from disk.
+#[tauri::command]
+pub fn load_hotkey_bindings(state: State<'_, EditorState>) -> Result<HotkeyList, String> {
+    let mut session = state.0.lock().map_err(|_| "editor state is unavailable")?;
+    session.hotkeys().map_err(|error| error.to_string())
 }
 
 #[tauri::command]

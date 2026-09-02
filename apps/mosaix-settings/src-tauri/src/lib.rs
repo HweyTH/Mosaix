@@ -10,6 +10,7 @@ pub fn run() {
             commands::load_editor_snapshot,
             commands::preview_layout,
             commands::save_and_apply_layout,
+            commands::load_hotkey_bindings,
             commands::set_appearance,
             commands::load_automatic_tiling_settings,
             commands::save_automatic_tiling_settings,

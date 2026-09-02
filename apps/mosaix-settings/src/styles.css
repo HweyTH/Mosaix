@@ -112,8 +112,17 @@ button { color: inherit; }
 .zone.active .resize-handle { opacity: 1; }
 
 .properties { position: absolute; z-index: 6; right: 26px; top: 50%; width: 214px; padding: 16px; transform: translateY(-50%); border: 1px solid var(--line); border-radius: 14px; background: var(--panel); box-shadow: 0 25px 70px rgb(0 0 0 / 25%); backdrop-filter: blur(20px); }
-.tiling-settings { position: absolute; z-index: 6; left: 78px; top: 88px; width: 225px; padding: 16px; border: 1px solid var(--line); border-radius: 14px; background: var(--panel); box-shadow: 0 25px 70px rgb(0 0 0 / 25%); backdrop-filter: blur(20px); }
-.tiling-settings p { margin: 0 0 12px; color: var(--muted); font-size: 9px; line-height: 1.4; }
+.left-rail { position: absolute; z-index: 6; left: 78px; top: 88px; bottom: 96px; width: 225px; display: flex; flex-direction: column; gap: 12px; overflow-y: auto; scrollbar-width: thin; }
+.panel { flex: none; padding: 16px; border: 1px solid var(--line); border-radius: 14px; background: var(--panel); box-shadow: 0 25px 70px rgb(0 0 0 / 25%); backdrop-filter: blur(20px); }
+.tiling-settings p, .hotkey-list p { margin: 0 0 12px; color: var(--muted); font-size: 9px; line-height: 1.4; }
+.hotkey-list p:last-child { margin-bottom: 0; }
+.binding-list { display: flex; flex-direction: column; gap: 7px; margin: 0; padding: 0; list-style: none; }
+.binding { display: grid; grid-template-columns: 1fr auto; gap: 3px 8px; padding: 8px 9px; border-left: 2px solid transparent; border-radius: 7px; background: color-mix(in srgb, var(--ink), transparent 95%); }
+.binding-command { font-size: 10px; font-weight: 650; }
+.binding kbd { grid-row: 1; justify-self: end; padding: 2px 6px; border: 1px solid var(--line); border-radius: 5px; font: 8px/1.4 ui-monospace, monospace; }
+.binding-file { grid-column: 1 / -1; color: var(--muted-2); font: 8px ui-monospace, monospace; overflow-wrap: anywhere; }
+.binding[data-source="profile"] { border-left-color: var(--accent); }
+.binding[data-source="profile"] .binding-file { color: var(--accent); }
 .tiling-settings code { display: block; max-height: 34px; overflow: auto; color: var(--ink); font-size: 8px; overflow-wrap: anywhere; }
 .tiling-settings .primary-button { width: 100%; margin-top: 10px; }
 .panel-title { margin-bottom: 17px; font-size: 10px; font-weight: 800; letter-spacing: .05em; }

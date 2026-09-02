@@ -273,7 +273,7 @@ fn main() {
                 for event in config_events {
                     if let mosaix_config::ConfigEvent::Changed(set) = event {
                         if events
-                            .send(mosaix_engine::Event::ConfigChanged(set))
+                            .send(mosaix_engine::Event::ConfigChanged(Box::new(set)))
                             .is_err()
                         {
                             tracing::warn!("reducer stopped; config forwarder exiting");

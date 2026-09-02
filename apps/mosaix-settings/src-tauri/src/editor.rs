@@ -47,6 +47,39 @@ pub struct EditorSnapshot {
     pub draft: LayoutDraft,
 }
 
+/// One hotkey binding as the interface shows it: what it does, what
+/// presses it, and which configuration file supplies it.
+///
+/// Read-only here. Editing arrives with the capture dialog (issue #40),
+/// which is what turns `file` from information into the destination of a
+/// write (ADR 0022).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HotkeyBindingView {
+    /// The command's TOML path: `snap-left`, or `apply-layout.writing`.
+    pub command: String,
+    /// The saved layout a parameterized binding applies.
+    pub layout: Option<String>,
+    pub combo: String,
+    /// `base` or `profile`.
+    pub source: String,
+    /// The configuration file currently supplying this binding.
+    pub file: String,
+}
+
+/// Every binding in effect, plus the topology they are in effect for.
+///
+/// The fingerprint travels with the list because a topology change can
+/// swap the matched profile and so change both the combinations and the
+/// files behind them. A caller re-reading the list uses it to tell "the
+/// same answer again" from "a different desk".
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HotkeyList {
+    pub topology_fingerprint: String,
+    pub bindings: Vec<HotkeyBindingView>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CommandStatus {
@@ -235,6 +268,30 @@ impl EditorSession {
         })
     }
 
+    /// Every hotkey binding the agent currently has in effect, each
+    /// naming the file that supplies it.
+    ///
+    /// Read through the agent rather than off disk: the agent is the
+    /// authority for resolved configuration, and reading the files here
+    /// would show what is written rather than what is running.
+    pub fn hotkeys(&mut self) -> Result<HotkeyList, EditorCommandError> {
+        let state = self.agent.state().map_err(EditorCommandError::from)?;
+        Ok(HotkeyList {
+            topology_fingerprint: state.topology_fingerprint,
+            bindings: state
+                .hotkeys
+                .into_iter()
+                .map(|binding| HotkeyBindingView {
+                    command: binding.command,
+                    layout: binding.layout,
+                    combo: binding.combo,
+                    source: binding.source,
+                    file: binding.file,
+                })
+                .collect(),
+        })
+    }
+
     pub fn set_appearance(&mut self, appearance: Appearance) {
         self.snapshot.appearance = appearance;
     }
@@ -300,6 +357,8 @@ mod tests {
 
     use std::sync::{Arc, Mutex};
 
+    use mosaix_ipc::StateSnapshot;
+
     /// An agent that answers with whatever the test scripted. The session
     /// owns its transport, so what the agent was asked is recorded through
     /// a handle the test keeps rather than read back off the fake.
@@ -307,6 +366,7 @@ mod tests {
     struct FakeAgent {
         outcome: Option<Result<(), AgentError>>,
         applied: Arc<Mutex<Vec<String>>>,
+        state: Option<Result<StateSnapshot, AgentError>>,
     }
 
     impl FakeAgent {
@@ -314,6 +374,7 @@ mod tests {
             Self {
                 outcome: Some(outcome),
                 applied: Arc::default(),
+                state: None,
             }
         }
 
@@ -322,6 +383,15 @@ mod tests {
             Self {
                 outcome: None,
                 applied: Arc::default(),
+                state: None,
+            }
+        }
+
+        fn reporting(state: Result<StateSnapshot, AgentError>) -> Self {
+            Self {
+                outcome: None,
+                applied: Arc::default(),
+                state: Some(state),
             }
         }
     }
@@ -333,6 +403,86 @@ mod tests {
                 .clone()
                 .expect("the test scripted no answer for this request")
         }
+
+        fn state(&mut self) -> Result<StateSnapshot, AgentError> {
+            self.state
+                .clone()
+                .expect("the test scripted no state for this request")
+        }
+    }
+
+    /// A state snapshot carrying `bindings` and nothing else of interest.
+    fn state_reporting(
+        fingerprint: &str,
+        bindings: Vec<mosaix_ipc::HotkeyBindingSnapshot>,
+    ) -> StateSnapshot {
+        let mut snapshot = StateSnapshot::from(mosaix_engine::EngineState::default());
+        snapshot.topology_fingerprint = fingerprint.to_owned();
+        snapshot.hotkeys = bindings;
+        snapshot
+    }
+
+    fn binding(
+        command: &str,
+        combo: &str,
+        source: &str,
+        file: &str,
+    ) -> mosaix_ipc::HotkeyBindingSnapshot {
+        mosaix_ipc::HotkeyBindingSnapshot {
+            command: command.to_owned(),
+            layout: None,
+            combo: combo.to_owned(),
+            source: source.to_owned(),
+            file: file.to_owned(),
+        }
+    }
+
+    #[test]
+    fn the_hotkey_list_carries_each_bindings_supplying_file() {
+        let mut session =
+            EditorSession::with_agent(Box::new(FakeAgent::reporting(Ok(state_reporting(
+                "MON-A@0,0 1920x1080 scale=1",
+                vec![
+                    binding("snap-left", "ctrl+alt+left", "base", "config.toml"),
+                    binding("snap-right", "ctrl+shift+right", "profile", "desk.toml"),
+                ],
+            )))));
+
+        let list = session.hotkeys().expect("the agent answered");
+
+        assert_eq!(list.topology_fingerprint, "MON-A@0,0 1920x1080 scale=1");
+        assert_eq!(list.bindings[0].file, "config.toml");
+        assert_eq!(list.bindings[0].source, "base");
+        assert_eq!(
+            list.bindings[1].file, "desk.toml",
+            "a profile-supplied binding names the profile, which is where an edit would land"
+        );
+        assert_eq!(list.bindings[1].source, "profile");
+    }
+
+    #[test]
+    fn the_hotkey_list_reports_an_absent_agent_rather_than_an_empty_list() {
+        // An empty list and "no agent to ask" look identical on screen
+        // unless the second one is an error.
+        let mut session =
+            EditorSession::with_agent(Box::new(FakeAgent::reporting(Err(AgentError::Unavailable))));
+
+        assert_eq!(
+            session.hotkeys().unwrap_err(),
+            EditorCommandError::AgentUnavailable
+        );
+    }
+
+    #[test]
+    fn the_hotkey_list_keeps_a_version_mismatch_distinct_from_a_rejection() {
+        let mut session = EditorSession::with_agent(Box::new(FakeAgent::reporting(Err(
+            AgentError::VersionMismatch { server_version: 1 },
+        ))));
+
+        assert_eq!(
+            session.hotkeys().unwrap_err(),
+            EditorCommandError::AgentVersionMismatch { server_version: 1 }
+        );
     }
 
     fn session_with(outcome: Result<(), AgentError>) -> EditorSession {

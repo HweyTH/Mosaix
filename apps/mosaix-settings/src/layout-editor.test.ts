@@ -1,9 +1,12 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
+  bindingLabel,
   mountLayoutEditor,
+  watchHotkeyBindings,
   type DesktopBridge,
   type EditorSnapshot,
+  type HotkeyList,
 } from "./layout-editor";
 
 const snapshot: EditorSnapshot = {
@@ -36,9 +39,30 @@ const tilingSettings = {
   focusBorderThickness: 2,
 };
 
+const hotkeys: HotkeyList = {
+  topologyFingerprint: "DISPLAY-A@0,0 2560x1440 scale=1",
+  bindings: [
+    {
+      command: "snap-left",
+      layout: null,
+      combo: "ctrl+alt+left",
+      source: "base",
+      file: "config.toml",
+    },
+    {
+      command: "apply-layout.writing",
+      layout: "writing",
+      combo: "ctrl+alt+1",
+      source: "profile",
+      file: "desk.toml",
+    },
+  ],
+};
+
 function bridge(): DesktopBridge {
   return {
     loadEditorSnapshot: vi.fn().mockResolvedValue(structuredClone(snapshot)),
+    loadHotkeyBindings: vi.fn().mockResolvedValue(structuredClone(hotkeys)),
     previewLayout: vi.fn().mockResolvedValue({ revision: 1, status: "previewing" }),
     saveAndApplyLayout: vi.fn().mockResolvedValue({ revision: 2, status: "applied" }),
     setAppearance: vi.fn().mockResolvedValue(undefined),
@@ -191,5 +215,123 @@ describe("layout editor", () => {
     expect(root.querySelector<HTMLInputElement>("[data-allow-overlap]")!.checked).toBe(false);
     root.querySelector<HTMLElement>("[data-command='undo']")!.click();
     expect(root.querySelector<HTMLInputElement>("[data-allow-overlap]")!.checked).toBe(true);
+  });
+
+  it("lists every binding with the configuration file that supplies it", async () => {
+    const root = document.createElement("div");
+    document.body.append(root);
+
+    await mountLayoutEditor(root, bridge());
+    await vi.waitFor(() => expect(root.querySelector(".binding")).not.toBeNull());
+
+    const rows = root.querySelectorAll<HTMLElement>(".binding");
+    expect(rows).toHaveLength(2);
+    expect(rows[0]!.textContent).toContain("Snap left");
+    expect(rows[0]!.textContent).toContain("ctrl+alt+left");
+    expect(rows[0]!.textContent).toContain("config.toml");
+    expect(rows[0]!.dataset.source).toBe("base");
+
+    // The layout binding is in the same list, not a separate one.
+    expect(rows[1]!.textContent).toContain("Apply layout · writing");
+    expect(rows[1]!.textContent).toContain("desk.toml");
+    expect(rows[1]!.dataset.source).toBe("profile");
+  });
+
+  it("tells the user when the bindings could not be read at all", async () => {
+    const root = document.createElement("div");
+    document.body.append(root);
+    const desktop = bridge();
+    desktop.loadHotkeyBindings = vi
+      .fn()
+      .mockRejectedValue(new Error("the Mosaix agent is not running"));
+
+    await mountLayoutEditor(root, desktop);
+    await vi.waitFor(() =>
+      expect(root.querySelector("[data-hotkey-error]")).not.toBeNull(),
+    );
+
+    expect(root.querySelector("[data-hotkey-error]")?.textContent).toContain(
+      "the Mosaix agent is not running",
+    );
+  });
+});
+
+describe("binding labels", () => {
+  it("reads a label off the command's own TOML path", () => {
+    expect(bindingLabel("snap-left")).toBe("Snap left");
+    expect(bindingLabel("toggle-automatic-tiling")).toBe("Toggle automatic tiling");
+    expect(bindingLabel("apply-layout.writing")).toBe("Apply layout · writing");
+    expect(bindingLabel("apply-layout.deep.work")).toBe("Apply layout · deep.work");
+  });
+});
+
+describe("hotkey binding watch", () => {
+  it("reports a new matched profile's bindings when the topology changes", async () => {
+    vi.useFakeTimers();
+    const docked: HotkeyList = {
+      topologyFingerprint: "DISPLAY-A|DISPLAY-B",
+      bindings: [
+        {
+          command: "snap-left",
+          layout: null,
+          combo: "ctrl+shift+left",
+          source: "profile",
+          file: "desk.toml",
+        },
+      ],
+    };
+    const loadHotkeyBindings = vi
+      .fn()
+      .mockResolvedValueOnce(structuredClone(hotkeys))
+      .mockResolvedValueOnce(structuredClone(hotkeys))
+      .mockResolvedValue(structuredClone(docked));
+    const onChange = vi.fn();
+    const stop = watchHotkeyBindings({ loadHotkeyBindings }, { onChange, onError: vi.fn() }, 1000);
+
+    await vi.advanceTimersByTimeAsync(2500);
+    stop();
+    vi.useRealTimers();
+
+    // Three reads, two distinct answers: the unchanged second read is not
+    // re-reported, and the docked one is.
+    expect(loadHotkeyBindings).toHaveBeenCalledTimes(3);
+    expect(onChange).toHaveBeenCalledTimes(2);
+    expect(onChange.mock.calls[1]![0]).toEqual(docked);
+  });
+
+  it("reports a read failure once rather than on every tick", async () => {
+    vi.useFakeTimers();
+    const loadHotkeyBindings = vi.fn().mockRejectedValue(new Error("agent is not running"));
+    const onError = vi.fn();
+    const stop = watchHotkeyBindings(
+      { loadHotkeyBindings },
+      { onChange: vi.fn(), onError },
+      1000,
+    );
+
+    await vi.advanceTimersByTimeAsync(3500);
+    stop();
+    vi.useRealTimers();
+
+    expect(loadHotkeyBindings.mock.calls.length).toBeGreaterThan(1);
+    expect(onError).toHaveBeenCalledTimes(1);
+  });
+
+  it("stops reading once its stop function is called", async () => {
+    vi.useFakeTimers();
+    const loadHotkeyBindings = vi.fn().mockResolvedValue(structuredClone(hotkeys));
+    const stop = watchHotkeyBindings(
+      { loadHotkeyBindings },
+      { onChange: vi.fn(), onError: vi.fn() },
+      1000,
+    );
+
+    await vi.advanceTimersByTimeAsync(1500);
+    const readsBeforeStop = loadHotkeyBindings.mock.calls.length;
+    stop();
+    await vi.advanceTimersByTimeAsync(5000);
+    vi.useRealTimers();
+
+    expect(loadHotkeyBindings.mock.calls.length).toBe(readsBeforeStop);
   });
 });

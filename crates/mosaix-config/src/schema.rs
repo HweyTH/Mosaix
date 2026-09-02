@@ -13,6 +13,11 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use mosaix_domain::{Gaps, NormalizedRect};
 
+/// The base config file's name, and the name validation errors and
+/// provenance use to refer to it. Base config is one fixed file, unlike a
+/// profile, whose filename is whatever the user called it (ADR 0004).
+pub const BASE_CONFIG_FILE_NAME: &str = "config.toml";
+
 /// The `version` value this build of `mosaix-config` understands. Any other
 /// value (including a missing field, which fails to parse rather than
 /// defaulting) is a validation error -- no lenient guessing (ADR 0007).
@@ -526,6 +531,29 @@ pub struct ProfileConfig {
     pub layouts: BTreeMap<String, SavedLayout>,
 }
 
+/// Which configuration layer a resolved value came from.
+///
+/// A merge result reads the same whichever file supplied it, so this is
+/// the only record of where a value originated -- and the settings
+/// application needs it, because a binding edited there is written to the
+/// layer that currently supplies it (ADR 0022). Whenever a profile is
+/// matched, the value on screen and the file that would receive a write
+/// are different objects, and the user has to be told which.
+///
+/// Carries no filename: profiles are matched by fingerprint, never by
+/// filename (ADR 0004), so the file is a fact `validate` knows and `merge`
+/// does not. It is recorded once per resolved config, in
+/// [`ResolvedConfig::profile_file`], rather than repeated per binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ConfigLayer {
+    /// `config.toml`.
+    Base,
+    /// The matched topology profile, named by
+    /// [`ResolvedConfig::profile_file`].
+    Profile,
+}
+
 /// The merged result of base config plus (optionally) one profile
 /// (CONTEXT.md "Resolved config") -- the actual settings in effect for one
 /// topology. What [`crate::merge`] produces and what
@@ -539,11 +567,25 @@ pub struct ProfileConfig {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ResolvedConfig {
     pub hotkeys: BTreeMap<Command, KeyCombo>,
+    /// Which layer supplied each binding in `hotkeys`, keyed identically.
+    ///
+    /// A parallel field rather than a change to `hotkeys`' value type
+    /// deliberately: the bindings map has consumers in `mosaix-agent` and
+    /// this crate's own diff that care only about what is bound to what,
+    /// and pairing every value with its origin would fan a UI concern out
+    /// into all of them for nothing.
+    pub binding_sources: BTreeMap<Command, ConfigLayer>,
     pub gaps: Gaps,
     pub behavior: BehaviorSection,
     pub automatic_tiling_enabled: bool,
     pub focus_border: FocusBorderSection,
     pub layouts: BTreeMap<String, SavedLayout>,
+    /// The profile file this config was merged from, or `None` when base
+    /// config alone supplies it. Set by [`crate::validate`], which is
+    /// where a filename is known; [`crate::merge`] leaves it `None`
+    /// because a profile is matched by fingerprint and does not carry the
+    /// name of the file it was read from (ADR 0004).
+    pub profile_file: Option<String>,
 }
 
 /// One profile's resolved settings, paired with the `fingerprint` it's

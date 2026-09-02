@@ -31,8 +31,8 @@ pub use io::{
     ConfigWatcher, ProfileSettingsUpdate, DEBOUNCE_WINDOW,
 };
 pub use schema::{
-    AutomaticTilingSection, BaseConfig, BehaviorSection, Command, FocusBorderOverride,
+    AutomaticTilingSection, BaseConfig, BehaviorSection, Command, ConfigLayer, FocusBorderOverride,
     FocusBorderSection, GapsOverride, KeyCombo, ProfileConfig, ResolvedConfig, ResolvedConfigSet,
-    ResolvedProfile, RgbaColor, SavedLayout, CURRENT_VERSION,
+    ResolvedProfile, RgbaColor, SavedLayout, BASE_CONFIG_FILE_NAME, CURRENT_VERSION,
 };
 pub use validate::{merge, validate, CandidateConfig, CandidateProfile, ValidationError};

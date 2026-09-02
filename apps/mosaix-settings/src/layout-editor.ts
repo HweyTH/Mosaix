@@ -42,13 +42,84 @@ export interface AutomaticTilingSettings {
   focusBorderThickness: number;
 }
 
+/// One hotkey binding as the interface shows it. `file` is the
+/// configuration file that currently supplies it, and so the file an edit
+/// of it would be written to (ADR 0022).
+export interface HotkeyBinding {
+  command: string;
+  layout: string | null;
+  combo: string;
+  source: "base" | "profile";
+  file: string;
+}
+
+export interface HotkeyList {
+  topologyFingerprint: string;
+  bindings: HotkeyBinding[];
+}
+
 export interface DesktopBridge {
   loadEditorSnapshot(): Promise<EditorSnapshot>;
+  loadHotkeyBindings(): Promise<HotkeyList>;
   previewLayout(draft: LayoutDraft): Promise<CommandReceipt>;
   saveAndApplyLayout(draft: LayoutDraft): Promise<CommandReceipt>;
   setAppearance(appearance: Appearance): Promise<void>;
   loadAutomaticTilingSettings(): Promise<AutomaticTilingSettings>;
   saveAutomaticTilingSettings(settings: AutomaticTilingSettings): Promise<AutomaticTilingSettings>;
+}
+
+/// The label for a command's TOML path: `snap-left` becomes "Snap left",
+/// and `apply-layout.writing` becomes "Apply layout · writing".
+///
+/// Reads the path rather than carrying a table of pretty names, so a verb
+/// added to the schema shows up here without a second edit -- at the cost
+/// of a label that is only as good as the verb's spelling, which is the
+/// right trade for a list a user scans rather than reads.
+export function bindingLabel(command: string): string {
+  const [verb, ...rest] = command.split(".");
+  const words = (verb ?? "").split("-").join(" ");
+  const title = words.charAt(0).toUpperCase() + words.slice(1);
+  return rest.length > 0 ? `${title} · ${rest.join(".")}` : title;
+}
+
+export interface HotkeyWatchHandlers {
+  onChange: (list: HotkeyList) => void;
+  onError: (error: unknown) => void;
+}
+
+/// Re-reads the binding list every `intervalMs`, reporting only when the
+/// answer has actually changed. Returns a function that stops it.
+///
+/// Polling rather than a push from the agent: the IPC protocol answers
+/// requests and never initiates, so a settings window that wants to notice
+/// a docking event has to ask. A topology change swaps the matched profile,
+/// and with it both the combinations on screen and the files behind them.
+///
+/// Reporting only changes is what keeps this from re-rendering the list
+/// every tick -- and it applies to failures too, so an agent that is not
+/// running is reported once rather than twice a second.
+export function watchHotkeyBindings(
+  bridge: Pick<DesktopBridge, "loadHotkeyBindings">,
+  handlers: HotkeyWatchHandlers,
+  intervalMs = 2000,
+): () => void {
+  let reported: string | undefined;
+  const report = (key: string, emit: () => void): void => {
+    if (key === reported) return;
+    reported = key;
+    emit();
+  };
+  const poll = async (): Promise<void> => {
+    try {
+      const list = await bridge.loadHotkeyBindings();
+      report(`ok:${JSON.stringify(list)}`, () => handlers.onChange(list));
+    } catch (error: unknown) {
+      report(`error:${String(error)}`, () => handlers.onError(error));
+    }
+  };
+  const timer = setInterval(() => void poll(), intervalMs);
+  void poll();
+  return () => clearInterval(timer);
 }
 
 function escapeHtml(value: string): string {
@@ -74,12 +145,32 @@ function renderZones(snapshot: EditorSnapshot, selectedZoneId: number): string {
     .join("");
 }
 
+function renderBindings(hotkeys: HotkeyList | undefined, hotkeyError: string | undefined): string {
+  if (hotkeyError !== undefined) {
+    return `<p data-hotkey-error>${escapeHtml(hotkeyError)}</p>`;
+  }
+  if (hotkeys === undefined) return `<p>Reading bindings…</p>`;
+  if (hotkeys.bindings.length === 0) return `<p>No hotkeys are bound.</p>`;
+  return `<ul class="binding-list">${hotkeys.bindings
+    .map(
+      (binding) => `
+        <li class="binding" data-binding="${escapeHtml(binding.command)}" data-source="${escapeHtml(binding.source)}">
+          <span class="binding-command">${escapeHtml(bindingLabel(binding.command))}</span>
+          <kbd>${escapeHtml(binding.combo)}</kbd>
+          <small class="binding-file">${binding.source === "profile" ? "profile · " : ""}${escapeHtml(binding.file)}</small>
+        </li>`,
+    )
+    .join("")}</ul>`;
+}
+
 export async function mountLayoutEditor(root: HTMLElement, bridge: DesktopBridge): Promise<void> {
   const [snapshot, initialTilingSettings] = await Promise.all([
     bridge.loadEditorSnapshot(),
     bridge.loadAutomaticTilingSettings(),
   ]);
   let tilingSettings = initialTilingSettings;
+  let hotkeys: HotkeyList | undefined;
+  let hotkeyError: string | undefined;
   let selectedZoneId = snapshot.draft.zones[0]?.id ?? 0;
   let commandStatus = "Ready";
   const history: LayoutDraft[] = [];
@@ -117,7 +208,8 @@ export async function mountLayoutEditor(root: HTMLElement, bridge: DesktopBridge
           </div>
           <div class="monitor-foot"><span></span><i></i><span></span></div>
         </section>
-        <aside class="tiling-settings" aria-label="Automatic tiling settings">
+        <div class="left-rail">
+        <aside class="panel tiling-settings" aria-label="Automatic tiling settings">
           <div class="panel-title">AUTOMATIC TILING</div>
           <p><small>Current topology</small><br><code data-topology-fingerprint>${escapeHtml(tilingSettings.topologyFingerprint)}</code></p>
           <p data-profile-status>${tilingSettings.matchedProfile ? "Matched topology profile" : "No profile yet — saving creates one"}</p>
@@ -129,6 +221,11 @@ export async function mountLayoutEditor(root: HTMLElement, bridge: DesktopBridge
           <label class="field"><span>Thickness</span><input data-border-thickness type="number" min="1" max="16" value="${tilingSettings.focusBorderThickness}" /></label>
           <button class="primary-button" data-save-tiling>Save tiling settings</button>
         </aside>
+        <aside class="panel hotkey-list" aria-label="Hotkey bindings">
+          <div class="panel-title">HOTKEYS</div>
+          ${renderBindings(hotkeys, hotkeyError)}
+        </aside>
+        </div>
         ${selectedZone ? `
           <aside class="properties" aria-label="Zone properties">
             <div class="panel-title">ZONE ${String(selectedZone.id).padStart(2, "0")}</div>
@@ -298,4 +395,16 @@ export async function mountLayoutEditor(root: HTMLElement, bridge: DesktopBridge
   };
 
   render();
+
+  watchHotkeyBindings(bridge, {
+    onChange: (list) => {
+      hotkeys = list;
+      hotkeyError = undefined;
+      render();
+    },
+    onError: (error) => {
+      hotkeyError = `Could not read hotkeys · ${String(error)}`;
+      render();
+    },
+  });
 }

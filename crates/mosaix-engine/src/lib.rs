@@ -398,7 +398,12 @@ pub enum Event {
     /// 0007). The active profile is re-selected against [`EngineState`]'s
     /// current topology exactly the way [`Event::DisplayTopologyChanged`]
     /// re-selects it against the current config set (ADR 0004).
-    ConfigChanged(ResolvedConfigSet),
+    ///
+    /// Boxed because it dwarfs every other variant: a resolved config
+    /// carries three maps plus its provenance, and `Event` is moved
+    /// through the queue on every window message. One heap allocation per
+    /// config reload is cheaper than paying that width on every event.
+    ConfigChanged(Box<ResolvedConfigSet>),
 
     /// Pause all window management. Placement-related events become no-ops
     /// until [`Event::ResumeRequested`] fires. Idempotent — pausing when
@@ -966,7 +971,7 @@ fn apply(state: &mut EngineState, event: Event) {
         }
 
         Event::ConfigChanged(config_set) => {
-            if config_set == state.config_set {
+            if *config_set == state.config_set {
                 tracing::debug!("config event was not a real change; ignoring");
                 return;
             }
@@ -977,7 +982,7 @@ fn apply(state: &mut EngineState, event: Event) {
             }
             state.automatic_tiling_active =
                 state.resolved_config.automatic_tiling_enabled && !state.automatic_tiling_suspended;
-            state.config_set = config_set;
+            state.config_set = *config_set;
             reconcile_balanced_grids(state);
             state.revision += 1;
         }
@@ -2847,7 +2852,9 @@ mod tests {
         );
         apply(
             &mut state,
-            Event::ConfigChanged(config_set_with_gaps(mosaix_domain::Gaps::new(10, 4))),
+            Event::ConfigChanged(Box::new(config_set_with_gaps(mosaix_domain::Gaps::new(
+                10, 4,
+            )))),
         );
         apply(
             &mut state,
@@ -2882,7 +2889,9 @@ mod tests {
         );
         apply(
             &mut state,
-            Event::ConfigChanged(config_set_with_gaps(mosaix_domain::Gaps::new(10, 4))),
+            Event::ConfigChanged(Box::new(config_set_with_gaps(mosaix_domain::Gaps::new(
+                10, 4,
+            )))),
         );
         apply(
             &mut state,
@@ -2923,7 +2932,9 @@ mod tests {
         );
         apply(
             &mut state,
-            Event::ConfigChanged(config_set_with_gaps(mosaix_domain::Gaps::new(10, 4))),
+            Event::ConfigChanged(Box::new(config_set_with_gaps(mosaix_domain::Gaps::new(
+                10, 4,
+            )))),
         );
         apply(
             &mut state,
@@ -2948,7 +2959,9 @@ mod tests {
         // delivers new gap values with no restart.
         apply(
             &mut state,
-            Event::ConfigChanged(config_set_with_gaps(mosaix_domain::Gaps::new(20, 8))),
+            Event::ConfigChanged(Box::new(config_set_with_gaps(mosaix_domain::Gaps::new(
+                20, 8,
+            )))),
         );
         apply(
             &mut state,
@@ -3356,10 +3369,7 @@ mod tests {
         ResolvedConfig {
             hotkeys,
             gaps: mosaix_domain::Gaps::default(),
-            behavior: mosaix_config::BehaviorSection::default(),
-            automatic_tiling_enabled: false,
-            focus_border: mosaix_config::FocusBorderSection::default(),
-            layouts: std::collections::BTreeMap::new(),
+            ..ResolvedConfig::default()
         }
     }
 
@@ -3373,12 +3383,8 @@ mod tests {
     fn config_set_with_gaps(gaps: mosaix_domain::Gaps) -> ResolvedConfigSet {
         ResolvedConfigSet {
             base: ResolvedConfig {
-                hotkeys: std::collections::BTreeMap::new(),
                 gaps,
-                behavior: mosaix_config::BehaviorSection::default(),
-                automatic_tiling_enabled: false,
-                focus_border: mosaix_config::FocusBorderSection::default(),
-                layouts: std::collections::BTreeMap::new(),
+                ..ResolvedConfig::default()
             },
             profiles: Vec::new(),
         }
@@ -3574,7 +3580,10 @@ mod tests {
         assert_eq!(state.resolved_config, ResolvedConfig::default());
 
         let new_config_set = config_set_with_left_binding("ctrl+alt+left");
-        apply(&mut state, Event::ConfigChanged(new_config_set.clone()));
+        apply(
+            &mut state,
+            Event::ConfigChanged(Box::new(new_config_set.clone())),
+        );
 
         assert_eq!(state.resolved_config, new_config_set.base);
         assert_eq!(state.config_set, new_config_set);
@@ -3585,10 +3594,13 @@ mod tests {
     fn apply_config_changed_ignores_an_identical_resolved_config() {
         let mut state = EngineState::default();
         let config_set = config_set_with_left_binding("ctrl+alt+left");
-        apply(&mut state, Event::ConfigChanged(config_set.clone()));
+        apply(
+            &mut state,
+            Event::ConfigChanged(Box::new(config_set.clone())),
+        );
         let revision_after_first = state.revision;
 
-        apply(&mut state, Event::ConfigChanged(config_set));
+        apply(&mut state, Event::ConfigChanged(Box::new(config_set)));
 
         assert_eq!(
             state.revision, revision_after_first,
@@ -3601,12 +3613,15 @@ mod tests {
         let mut state = EngineState::default();
         apply(
             &mut state,
-            Event::ConfigChanged(config_set_with_left_binding("ctrl+alt+left")),
+            Event::ConfigChanged(Box::new(config_set_with_left_binding("ctrl+alt+left"))),
         );
         let revision_after_first = state.revision;
 
         let second_config_set = config_set_with_left_binding("ctrl+shift+left");
-        apply(&mut state, Event::ConfigChanged(second_config_set.clone()));
+        apply(
+            &mut state,
+            Event::ConfigChanged(Box::new(second_config_set.clone())),
+        );
 
         assert_eq!(state.resolved_config, second_config_set.base);
         assert_eq!(state.revision, revision_after_first + 1);
@@ -3624,7 +3639,7 @@ mod tests {
             base: ResolvedConfig::default(),
             profiles: vec![profile.clone()],
         };
-        apply(&mut state, Event::ConfigChanged(config_set));
+        apply(&mut state, Event::ConfigChanged(Box::new(config_set)));
         assert_eq!(
             state.resolved_config,
             ResolvedConfig::default(),
@@ -3674,7 +3689,7 @@ mod tests {
                 },
             }],
         };
-        apply(&mut state, Event::ConfigChanged(config_set));
+        apply(&mut state, Event::ConfigChanged(Box::new(config_set)));
         apply(&mut state, Event::DisplayTopologyChanged(laptop));
 
         assert_eq!(
@@ -3704,7 +3719,7 @@ mod tests {
             base: base.clone(),
             profiles: vec![profile],
         };
-        apply(&mut state, Event::ConfigChanged(config_set));
+        apply(&mut state, Event::ConfigChanged(Box::new(config_set)));
 
         apply(
             &mut state,
@@ -3734,7 +3749,7 @@ mod tests {
             base: ResolvedConfig::default(),
             profiles: vec![profile_a.clone(), profile_b.clone()],
         };
-        apply(&mut state, Event::ConfigChanged(config_set));
+        apply(&mut state, Event::ConfigChanged(Box::new(config_set)));
 
         apply(
             &mut state,
@@ -4068,7 +4083,7 @@ mod tests {
             base: ResolvedConfig::default(),
             profiles: vec![],
         };
-        apply(&mut state, Event::ConfigChanged(config_set));
+        apply(&mut state, Event::ConfigChanged(Box::new(config_set)));
         assert!(state.paused);
     }
 

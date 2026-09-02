@@ -35,7 +35,8 @@ A session-only override that stops grid reflows for the current display topology
 _Avoid_: Pause (which stops all placement commands), disabling the profile
 
 **Resolved config**:
-The merged result of base config plus whichever profile (if any) matches the current topology -- the actual set of hotkeys/gaps/behavior-flags in effect at a given moment. What `Event::ConfigChanged` (ADR 0005) carries into `EngineState`.
+The merged result of base config plus whichever profile (if any) matches the current topology -- the actual set of hotkeys/gaps/behavior-flags in effect at a given moment. What `Event::ConfigChanged` (ADR 0005) carries into `EngineState`. It also carries *provenance*: which layer supplied each hotkey binding, and the profile file it came from, so a GUI edit can be written to the layer that supplies the value it shows (ADR 0022).
+_Avoid_: Effective config, active config (either is fine in prose, but the type is `ResolvedConfig` and the glossary term is "resolved config").
 
 **Gap** (outer / inner):
 Configurable inset applied to a computed zone `Rect` after `mosaix-layout`'s zone functions produce it (ADR 0006). *Outer gap* insets edges that touch the display's work-area boundary; *inner gap* insets edges that would border a neighboring zone, even under manual-snap-only Phase 1 where no second window is actually being placed. Applied by `apply_gaps`, kept separate from the pure zone-fraction functions (`snap_to_half` etc.), which stay gap-unaware.

@@ -19,6 +19,7 @@ use thiserror::Error;
 use crate::defaults::default_config_content;
 use crate::schema::{
     AutomaticTilingSection, FocusBorderOverride, GapsOverride, ProfileConfig, ResolvedConfigSet,
+    BASE_CONFIG_FILE_NAME as BASE_FILE_NAME,
 };
 use crate::validate::{validate, CandidateConfig, CandidateProfile, ValidationError};
 
@@ -28,7 +29,6 @@ use crate::validate::{validate, CandidateConfig, CandidateProfile, ValidationErr
 /// file would notice.
 pub const DEBOUNCE_WINDOW: Duration = Duration::from_millis(300);
 
-const BASE_FILE_NAME: &str = "config.toml";
 const PROFILES_DIR_NAME: &str = "profiles";
 
 /// Everything that can go wrong reading, creating, or watching a config

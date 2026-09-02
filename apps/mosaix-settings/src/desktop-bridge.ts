@@ -5,6 +5,7 @@ import type {
   CommandReceipt,
   DesktopBridge,
   EditorSnapshot,
+  HotkeyList,
   LayoutDraft,
 } from "./layout-editor";
 
@@ -49,6 +50,8 @@ export function createTauriDesktopBridge(
       const snapshot = await invokeCommand("load_editor_snapshot") as EditorSnapshot;
       return { ...snapshot, draft: fromNormalizedDraft(snapshot.draft) };
     },
+    loadHotkeyBindings: () =>
+      invokeCommand("load_hotkey_bindings") as Promise<HotkeyList>,
     previewLayout: (draft: LayoutDraft) =>
       invokeCommand("preview_layout", { draft: toNormalizedDraft(draft) }) as Promise<CommandReceipt>,
     saveAndApplyLayout: (draft: LayoutDraft) =>

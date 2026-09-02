@@ -7,6 +7,8 @@
 //! connection's lifetime, so the agent recovers when the application dies
 //! and the operating system closes the pipe handle (ADR 0021).
 
+use mosaix_ipc::StateSnapshot;
+
 /// Why an agent request did not succeed. The three cases are kept apart
 /// deliberately: a user running an old agent needs to be told to update,
 /// not left reading a rejection reason that will never make sense.
@@ -29,6 +31,12 @@ pub trait AgentTransport: Send + std::fmt::Debug {
     /// Asks the agent to apply the saved layout called `name`. Returns
     /// `Ok` only when the agent confirms it did so.
     fn apply_saved_layout(&mut self, name: &str) -> Result<(), AgentError>;
+
+    /// Reads the agent's current state: the resolved hotkey bindings with
+    /// their provenance, the saved layouts on offer, and the topology
+    /// those belong to. The agent is the authority for all three -- the
+    /// settings application reads no configuration file of its own.
+    fn state(&mut self) -> Result<StateSnapshot, AgentError>;
 }
 
 /// The transport this build talks to a real agent through.
@@ -54,11 +62,15 @@ impl AgentTransport for UnsupportedPlatform {
     fn apply_saved_layout(&mut self, _name: &str) -> Result<(), AgentError> {
         Err(AgentError::Unavailable)
     }
+
+    fn state(&mut self) -> Result<StateSnapshot, AgentError> {
+        Err(AgentError::Unavailable)
+    }
 }
 
 #[cfg(windows)]
 mod windows_transport {
-    use mosaix_ipc::{IpcConnection, IpcError, IpcRequest, IpcResponse};
+    use mosaix_ipc::{IpcConnection, IpcError, IpcRequest, IpcResponse, StateSnapshot};
 
     use super::{AgentError, AgentTransport};
 
@@ -91,6 +103,22 @@ mod windows_transport {
             }
         }
 
+        /// Sends `request` and returns the data the agent answered with,
+        /// only when the agent confirmed the request. A refusal, a version
+        /// mismatch, and a broken connection stay three distinct errors.
+        fn confirmed(
+            &mut self,
+            request: IpcRequest,
+        ) -> Result<Option<serde_json::Value>, AgentError> {
+            match self.send(request)? {
+                IpcResponse::Ok { data } => Ok(data),
+                IpcResponse::Error { message } => Err(AgentError::Rejected { reason: message }),
+                IpcResponse::VersionMismatch { server_version } => {
+                    Err(AgentError::VersionMismatch { server_version })
+                }
+            }
+        }
+
         fn send(&mut self, request: IpcRequest) -> Result<IpcResponse, AgentError> {
             if self.connection.is_none() {
                 self.connection = Some(IpcConnection::connect().map_err(from_ipc_error)?);
@@ -112,15 +140,23 @@ mod windows_transport {
 
     impl AgentTransport for HeldConnection {
         fn apply_saved_layout(&mut self, name: &str) -> Result<(), AgentError> {
-            match self.send(IpcRequest::ApplyLayout {
+            self.confirmed(IpcRequest::ApplyLayout {
                 name: name.to_owned(),
-            })? {
-                IpcResponse::Ok { .. } => Ok(()),
-                IpcResponse::Error { message } => Err(AgentError::Rejected { reason: message }),
-                IpcResponse::VersionMismatch { server_version } => {
-                    Err(AgentError::VersionMismatch { server_version })
+            })
+            .map(|_| ())
+        }
+
+        fn state(&mut self) -> Result<StateSnapshot, AgentError> {
+            let data = self.confirmed(IpcRequest::GetState)?;
+            serde_json::from_value(data.unwrap_or(serde_json::Value::Null)).map_err(|error| {
+                // The agent answered, but not with the shape this build
+                // expects. That is a transport-level disagreement, not a
+                // refusal, and a version mismatch would already have been
+                // reported as one.
+                AgentError::Transport {
+                    detail: format!("could not read the agent's state: {error}"),
                 }
-            }
+            })
         }
     }
 
