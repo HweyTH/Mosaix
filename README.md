@@ -27,13 +27,18 @@ A cross-platform window tiling application for Windows 11 and macOS.
 - **Tray and CLI control** -- pause/resume, open config folder, and quit from the
   tray; the `mosaix` CLI drives every command over versioned named-pipe IPC,
   including `mosaix state --json`.
+- **Saved layouts** -- named sets of normalized cells declared under
+  `[layouts]`, applied to the focused window's display with
+  `mosaix layout apply <name>` or a hotkey bound under
+  `[hotkeys.apply-layout]`. Gaps apply as they do to the grid; surplus cells
+  are left empty and surplus windows are reported rather than dropped.
 - **Visual layout editor** -- a Tauri 2 settings app for drafting and previewing
-  zone layouts.
+  zone layouts, and for asking the agent to apply one.
 - **Failure containment** -- placement rejection detection with a per-window
   circuit breaker, elevated-window skipping, and degraded-tiling diagnostics.
 
-Not yet built: the macOS adapter, saved arrangements and workspaces, and
-applying layout-editor changes to the running agent.
+Not yet built: the macOS adapter, workspaces, hotkey editing in the settings
+app, and saving a drafted layout back to configuration.
 
 ## Installation
 

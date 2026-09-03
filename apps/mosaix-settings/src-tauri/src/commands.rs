@@ -2,7 +2,10 @@ use std::sync::Mutex;
 
 use tauri::State;
 
-use crate::editor::{Appearance, CommandReceipt, EditorSession, EditorSnapshot, LayoutDraft};
+use crate::editor::{
+    Appearance, BindingWriteReceipt, CommandReceipt, EditorSession, EditorSnapshot, HotkeyList,
+    HotkeyProbeResult, LayoutDraft, LayoutWriteReceipt, SavedLayoutList,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -142,6 +145,137 @@ pub fn save_and_apply_layout(
 ) -> Result<CommandReceipt, String> {
     let mut session = state.0.lock().map_err(|_| "editor state is unavailable")?;
     session.apply(draft).map_err(|error| error.to_string())
+}
+
+/// Every hotkey binding in effect, for the read-only list in the
+/// interface. Read from the agent, not from disk.
+#[tauri::command]
+pub fn load_hotkey_bindings(state: State<'_, EditorState>) -> Result<HotkeyList, String> {
+    let mut session = state.0.lock().map_err(|_| "editor state is unavailable")?;
+    session.hotkeys().map_err(|error| error.to_string())
+}
+
+/// The saved layouts the agent currently offers, each naming the file
+/// that supplies it.
+#[tauri::command]
+pub fn load_saved_layouts(state: State<'_, EditorState>) -> Result<SavedLayoutList, String> {
+    let mut session = state.0.lock().map_err(|_| "editor state is unavailable")?;
+    session.layouts().map_err(|error| error.to_string())
+}
+
+/// Persists the drawn layout under the name it carries. The agent does
+/// the writing; this reports only what it confirmed (ADR 0022).
+///
+/// `to_base` is the interface's redirect control: it sends the write to
+/// base config rather than to the layer that supplies the layout.
+#[tauri::command]
+pub fn save_layout(
+    draft: LayoutDraft,
+    to_base: bool,
+    state: State<'_, EditorState>,
+) -> Result<LayoutWriteReceipt, String> {
+    let mut session = state.0.lock().map_err(|_| "editor state is unavailable")?;
+    session
+        .save(draft, to_base)
+        .map_err(|error| error.to_string())
+}
+
+/// Renames a saved layout, in whichever file declares it.
+#[tauri::command]
+pub fn rename_layout(
+    from: String,
+    to: String,
+    state: State<'_, EditorState>,
+) -> Result<LayoutWriteReceipt, String> {
+    let mut session = state.0.lock().map_err(|_| "editor state is unavailable")?;
+    session
+        .rename(&from, &to)
+        .map_err(|error| error.to_string())
+}
+
+/// Copies a saved layout's cells to a new name, beside the original.
+#[tauri::command]
+pub fn duplicate_layout(
+    from: String,
+    to: String,
+    state: State<'_, EditorState>,
+) -> Result<LayoutWriteReceipt, String> {
+    let mut session = state.0.lock().map_err(|_| "editor state is unavailable")?;
+    session
+        .duplicate(&from, &to)
+        .map_err(|error| error.to_string())
+}
+
+/// Removes a saved layout from the file that declares it.
+#[tauri::command]
+pub fn delete_layout(
+    name: String,
+    state: State<'_, EditorState>,
+) -> Result<LayoutWriteReceipt, String> {
+    let mut session = state.0.lock().map_err(|_| "editor state is unavailable")?;
+    session.delete(&name).map_err(|error| error.to_string())
+}
+
+/// Asks the agent whether a captured combination can be bound, before
+/// the user commits to it.
+#[tauri::command]
+pub fn probe_hotkey(
+    combo: String,
+    for_command: String,
+    state: State<'_, EditorState>,
+) -> Result<HotkeyProbeResult, String> {
+    let mut session = state.0.lock().map_err(|_| "editor state is unavailable")?;
+    session
+        .probe_hotkey(&combo, &for_command)
+        .map_err(|error| error.to_string())
+}
+
+/// Binds a command to a combination. The agent does the writing; this
+/// reports only what it confirmed (ADR 0022).
+#[tauri::command]
+pub fn set_binding(
+    command: String,
+    combo: String,
+    to_base: bool,
+    state: State<'_, EditorState>,
+) -> Result<BindingWriteReceipt, String> {
+    let mut session = state.0.lock().map_err(|_| "editor state is unavailable")?;
+    session
+        .set_binding(&command, &combo, to_base)
+        .map_err(|error| error.to_string())
+}
+
+/// Steps a binding back toward its default.
+#[tauri::command]
+pub fn reset_binding(
+    command: String,
+    state: State<'_, EditorState>,
+) -> Result<BindingWriteReceipt, String> {
+    let mut session = state.0.lock().map_err(|_| "editor state is unavailable")?;
+    session
+        .reset_binding(&command)
+        .map_err(|error| error.to_string())
+}
+
+/// Opens hotkey capture: the agent unregisters every binding until the
+/// editor closes it, or until this application's connection ends -- so a
+/// crash brings the hotkeys back without an agent restart (ADR 0021).
+#[tauri::command]
+pub fn start_hotkey_capture(state: State<'_, EditorState>) -> Result<(), String> {
+    let mut session = state.0.lock().map_err(|_| "editor state is unavailable")?;
+    session
+        .start_hotkey_capture()
+        .map_err(|error| error.to_string())
+}
+
+/// Closes hotkey capture, so the agent registers the bindings again and
+/// reports which of them came back.
+#[tauri::command]
+pub fn end_hotkey_capture(state: State<'_, EditorState>) -> Result<(), String> {
+    let mut session = state.0.lock().map_err(|_| "editor state is unavailable")?;
+    session
+        .end_hotkey_capture()
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]

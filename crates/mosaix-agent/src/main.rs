@@ -25,10 +25,15 @@ mod overlay;
 /// Starts `RegisterHotKey` registration for `bindings` and a forwarder
 /// thread translating each firing into `Event::ZoneSnapRequested`,
 /// mirroring the shape of every other OS-event forwarder in this file.
-/// Per-binding registration failures are logged and otherwise ignored (ADR
-/// 0002's partial-success posture, preserved through every re-registration,
-/// not just the first); only a failure to start the registration thread
-/// itself is reported to the caller.
+/// Registration stays partial-success (ADR 0002), preserved through every
+/// re-registration and not just the first; only a failure to start the
+/// registration thread itself is reported to the caller.
+///
+/// Which bindings the platform refused travels back into engine state as
+/// [`mosaix_engine::Event::HotkeyRegistrationReported`], so a combination
+/// another application took while hotkey capture held registration
+/// suspended is named to the user rather than left as a shortcut that
+/// silently stopped working (ADR 0021).
 ///
 /// When `overlay_tx` is present, each successful enqueue also signals the
 /// snap-preview controller (Feature 34) with the pre-send revision so it
@@ -36,6 +41,7 @@ mod overlay;
 #[cfg(windows)]
 fn start_hotkeys_and_forward(
     bindings: Vec<mosaix_platform_windows::HotkeyBinding>,
+    mut registry: hotkeys::HotkeyRegistry,
     events: mosaix_engine::EventSender,
     state_reader: mosaix_engine::StateReader,
     overlay_tx: Option<std::sync::mpsc::Sender<overlay::OverlayRequest>>,
@@ -44,103 +50,46 @@ fn start_hotkeys_and_forward(
     std::thread::JoinHandle<()>,
 )> {
     let (registrations, hotkey_events) = mosaix_platform_windows::start_hotkeys(bindings)?;
+    let mut unregistered = Vec::new();
     for result in &registrations.results {
         if let Err(err) = &result.outcome {
-            let command = hotkeys::command_for_hotkey_id(result.id);
+            // A binding the OS refused holds no registry entry, so its id
+            // resolves to nothing rather than to a command that never
+            // actually got a hotkey.
+            let command = registry.forget(result.id);
             tracing::error!(
                 hotkey_id = result.id,
                 ?command,
                 %err,
                 "failed to register hotkey; that binding will not work, the rest still will"
             );
+            unregistered.extend(command);
         }
     }
+    // Sent on every pass, including the one that reports nothing: an
+    // empty report is what clears a previous pass's failures once the
+    // combination comes back.
+    let _ = events.send(mosaix_engine::Event::HotkeyRegistrationReported { unregistered });
     let forwarder = std::thread::spawn(move || {
         for fired in hotkey_events {
-            let Some(command) = hotkeys::command_for_hotkey_id(fired.id) else {
+            let Some(command) = registry.command_for(fired.id) else {
                 tracing::warn!(
                     hotkey_id = fired.id,
                     "hotkey fired for an unknown id; ignoring"
                 );
                 continue;
             };
-            let pre_revision = state_reader.snapshot().revision;
-            let event = match command {
-                mosaix_config::Command::Rearrange => mosaix_engine::Event::RearrangeRequested,
-                mosaix_config::Command::ToggleAutomaticTiling => {
-                    mosaix_engine::Event::ToggleAutomaticTilingRequested
-                }
-                mosaix_config::Command::ToggleFloating => {
-                    mosaix_engine::Event::ToggleFloatingRequested
-                }
-                mosaix_config::Command::FocusLeft => {
-                    mosaix_engine::Event::DirectionalFocusRequested {
-                        direction: mosaix_engine::CardinalDirection::Left,
-                    }
-                }
-                mosaix_config::Command::FocusRight => {
-                    mosaix_engine::Event::DirectionalFocusRequested {
-                        direction: mosaix_engine::CardinalDirection::Right,
-                    }
-                }
-                mosaix_config::Command::FocusUp => {
-                    mosaix_engine::Event::DirectionalFocusRequested {
-                        direction: mosaix_engine::CardinalDirection::Up,
-                    }
-                }
-                mosaix_config::Command::FocusDown => {
-                    mosaix_engine::Event::DirectionalFocusRequested {
-                        direction: mosaix_engine::CardinalDirection::Down,
-                    }
-                }
-                mosaix_config::Command::SwapLeft => {
-                    mosaix_engine::Event::DirectionalSwapRequested {
-                        direction: mosaix_engine::CardinalDirection::Left,
-                    }
-                }
-                mosaix_config::Command::SwapRight => {
-                    mosaix_engine::Event::DirectionalSwapRequested {
-                        direction: mosaix_engine::CardinalDirection::Right,
-                    }
-                }
-                mosaix_config::Command::SwapUp => mosaix_engine::Event::DirectionalSwapRequested {
-                    direction: mosaix_engine::CardinalDirection::Up,
-                },
-                mosaix_config::Command::SwapDown => {
-                    mosaix_engine::Event::DirectionalSwapRequested {
-                        direction: mosaix_engine::CardinalDirection::Down,
-                    }
-                }
-                mosaix_config::Command::TogglePause => {
-                    if state_reader.snapshot().paused {
-                        mosaix_engine::Event::ResumeRequested
-                    } else {
-                        mosaix_engine::Event::PauseRequested
-                    }
-                }
-                command => mosaix_engine::Event::ZoneSnapRequested {
-                    direction: hotkeys::direction_for_command(command),
-                },
-            };
+            // One snapshot for both reads, so the revision the overlay
+            // flashes from and the pause state `toggle-pause` inverts
+            // describe the same instant.
+            let snapshot = state_reader.snapshot();
+            let pre_revision = snapshot.revision;
+            let event = hotkeys::event_for_command(&command, snapshot.paused);
             if events.send(event).is_err() {
                 tracing::warn!("reducer stopped; hotkey forwarder exiting");
                 break;
             }
-            if !matches!(
-                command,
-                mosaix_config::Command::Rearrange
-                    | mosaix_config::Command::ToggleAutomaticTiling
-                    | mosaix_config::Command::ToggleFloating
-                    | mosaix_config::Command::FocusLeft
-                    | mosaix_config::Command::FocusRight
-                    | mosaix_config::Command::FocusUp
-                    | mosaix_config::Command::FocusDown
-                    | mosaix_config::Command::SwapLeft
-                    | mosaix_config::Command::SwapRight
-                    | mosaix_config::Command::SwapUp
-                    | mosaix_config::Command::SwapDown
-                    | mosaix_config::Command::TogglePause
-            ) {
+            if hotkeys::is_zone_snap(&command) {
                 if let Some(tx) = &overlay_tx {
                     let _ = tx.send(overlay::OverlayRequest::FlashAfterSnap {
                         revision: pre_revision,
@@ -313,7 +262,24 @@ fn main() {
         }
     }
 
-    let ipc_server = match mosaix_ipc::IpcServer::start(engine.events(), engine.state_reader()) {
+    // Configuration writes requested over IPC go through the same
+    // directory the watcher is reading. An agent that never found a
+    // directory refuses them with that reason rather than reporting a
+    // save it did not make.
+    let config_store: std::sync::Arc<dyn mosaix_ipc::ConfigStore> = match &watchable_config_dir {
+        Some(dir) => std::sync::Arc::new(DirectoryConfigStore { dir: dir.clone() }),
+        None => std::sync::Arc::new(mosaix_ipc::UnavailableConfigStore {
+            reason: "Mosaix could not open its configuration directory, so it cannot save changes"
+                .to_owned(),
+        }),
+    };
+
+    let ipc_server = match mosaix_ipc::IpcServer::start(
+        engine.events(),
+        engine.state_reader(),
+        config_store,
+        std::sync::Arc::new(PlatformHotkeyProbe),
+    ) {
         Ok(server) => Some(server),
         Err(err) => {
             tracing::error!(%err, "failed to start IPC server; the mosaix CLI will be unavailable");
@@ -335,7 +301,7 @@ fn main() {
                 for event in config_events {
                     if let mosaix_config::ConfigEvent::Changed(set) = event {
                         if events
-                            .send(mosaix_engine::Event::ConfigChanged(set))
+                            .send(mosaix_engine::Event::ConfigChanged(Box::new(set)))
                             .is_err()
                         {
                             tracing::warn!("reducer stopped; config forwarder exiting");
@@ -668,8 +634,11 @@ fn main() {
     // agent's lifetime.
     let last_registered_hotkeys =
         hotkeys::runtime_hotkeys(&engine.state_reader().snapshot().resolved_config);
+    let (initial_bindings, initial_registry) =
+        hotkeys::bindings_from_resolved(&last_registered_hotkeys);
     let initial_hotkey_registration = match start_hotkeys_and_forward(
-        hotkeys::bindings_from_resolved(&last_registered_hotkeys),
+        initial_bindings,
+        initial_registry,
         engine.events(),
         engine.state_reader(),
         overlay_tx.clone(),
@@ -689,6 +658,13 @@ fn main() {
     // (ADR 0005). A hot-edited `config.toml` (ticket 03) and a
     // topology-triggered profile switch (ticket 04) both flow through the
     // same `EngineState::resolved_config`, so this one poller covers both.
+    //
+    // It is also the one place that reads
+    // `EngineState::hotkey_capture_suspended`: while the settings
+    // application's hotkey editor is open, this registers nothing, so a
+    // combination the user is about to press reaches the editor instead
+    // of firing a command. Keeping that here rather than in a new engine
+    // effect is what keeps hotkey ownership in one place (ADR 0021).
     const HOTKEY_REBIND_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
     let (hotkey_rebind_stop_tx, hotkey_rebind_stop_rx) = std::sync::mpsc::channel::<()>();
     let hotkey_rebind_forwarder = {
@@ -698,36 +674,59 @@ fn main() {
         std::thread::spawn(move || {
             let mut previous_hotkeys = last_registered_hotkeys;
             let mut current_registration = initial_hotkey_registration;
+            // What the current registration was made under, so lifting or
+            // entering suspension is itself a reason to act -- the
+            // bindings need not have changed for the answer to.
+            let mut previously_suspended = false;
             loop {
                 match hotkey_rebind_stop_rx.recv_timeout(HOTKEY_REBIND_POLL_INTERVAL) {
                     Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                 }
 
-                let current_hotkeys =
-                    hotkeys::runtime_hotkeys(&state_reader.snapshot().resolved_config);
-                if mosaix_config::diff_bindings(&previous_hotkeys, &current_hotkeys).is_empty() {
+                // One snapshot for both reads, so a capture that starts
+                // between them cannot leave this pass registering
+                // bindings the editor is about to need.
+                let state = state_reader.snapshot();
+                let suspended = state.hotkey_capture_suspended;
+                let current_hotkeys = hotkeys::runtime_hotkeys(&state.resolved_config);
+                let bindings_changed =
+                    !mosaix_config::diff_bindings(&previous_hotkeys, &current_hotkeys).is_empty();
+                if !bindings_changed && suspended == previously_suspended {
                     continue;
                 }
-                tracing::info!("resolved hotkey bindings changed; re-registering hotkeys");
 
                 if let Some((registrations, forwarder)) = current_registration.take() {
                     registrations.stop();
                     let _ = forwarder.join();
                 }
-                current_registration = match start_hotkeys_and_forward(
-                    hotkeys::bindings_from_resolved(&current_hotkeys),
-                    events.clone(),
-                    state_reader.clone(),
-                    overlay_tx.clone(),
-                ) {
-                    Ok(pair) => Some(pair),
-                    Err(err) => {
-                        tracing::error!(%err, "failed to re-register hotkeys after a binding change; hotkeys are unregistered until the next change");
-                        None
+                current_registration = if suspended {
+                    // A config reload arriving mid-capture updates what
+                    // will be registered when the editor closes, and
+                    // registers nothing now.
+                    tracing::info!("hotkey capture is active; leaving every binding unregistered");
+                    None
+                } else {
+                    tracing::info!("registering hotkeys for the current resolved bindings");
+                    // A fresh registry every time: an id the previous
+                    // registration owned cannot survive into this one.
+                    let (bindings, registry) = hotkeys::bindings_from_resolved(&current_hotkeys);
+                    match start_hotkeys_and_forward(
+                        bindings,
+                        registry,
+                        events.clone(),
+                        state_reader.clone(),
+                        overlay_tx.clone(),
+                    ) {
+                        Ok(pair) => Some(pair),
+                        Err(err) => {
+                            tracing::error!(%err, "failed to re-register hotkeys after a binding change; hotkeys are unregistered until the next change");
+                            None
+                        }
                     }
                 };
                 previous_hotkeys = current_hotkeys;
+                previously_suspended = suspended;
             }
 
             if let Some((registrations, forwarder)) = current_registration {
@@ -1030,4 +1029,62 @@ fn main() {
 fn main() {
     eprintln!("mosaix-agent currently only supports Windows (no macOS platform adapter yet).");
     std::process::exit(1);
+}
+
+/// The agent's configuration directory, as the IPC handler sees it.
+///
+/// The whole implementation is `mosaix_config`'s two edit functions; what
+/// this adds is the directory the agent resolved at startup and the
+/// translation of a config error into the sentence the person who asked
+/// for the change reads.
+#[derive(Debug)]
+struct DirectoryConfigStore {
+    dir: std::path::PathBuf,
+}
+
+impl mosaix_ipc::ConfigStore for DirectoryConfigStore {
+    fn edit_layouts(
+        &self,
+        fingerprint: &str,
+        edit: mosaix_config::LayoutEdit,
+    ) -> Result<mosaix_config::LayoutWrite, mosaix_ipc::ConfigError> {
+        mosaix_config::edit_layouts(&self.dir, fingerprint, edit)
+            .map_err(|error| mosaix_ipc::ConfigError(error.to_string()))
+    }
+
+    fn edit_bindings(
+        &self,
+        fingerprint: &str,
+        edit: mosaix_config::BindingEdit,
+    ) -> Result<mosaix_config::BindingWrite, mosaix_ipc::ConfigError> {
+        mosaix_config::edit_bindings(&self.dir, fingerprint, edit)
+            .map_err(|error| mosaix_ipc::ConfigError(error.to_string()))
+    }
+}
+
+/// The real `RegisterHotKey` probe, behind the handler's platform-neutral
+/// trait.
+///
+/// Translating a `KeyCombo` into modifier flags and a virtual-key code is
+/// the same translation registration already goes through, so a
+/// combination that probes as available is one that can actually be
+/// registered -- and a key name with no virtual-key code behind it is
+/// reported as unsupported rather than as taken.
+#[derive(Debug)]
+struct PlatformHotkeyProbe;
+
+impl mosaix_ipc::HotkeyProbe for PlatformHotkeyProbe {
+    fn probe(&self, combo: &mosaix_config::KeyCombo) -> mosaix_ipc::ProbeOutcome {
+        let Some((modifiers, vk)) = hotkeys::binding_parts(combo) else {
+            return mosaix_ipc::ProbeOutcome::Unsupported {
+                reason: format!("Mosaix has no key named {:?}", combo.key),
+            };
+        };
+        match mosaix_platform_windows::probe_hotkey(modifiers, vk) {
+            mosaix_platform_windows::HotkeyAvailability::Available => {
+                mosaix_ipc::ProbeOutcome::Available
+            }
+            mosaix_platform_windows::HotkeyAvailability::Taken => mosaix_ipc::ProbeOutcome::Taken,
+        }
+    }
 }

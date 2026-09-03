@@ -23,7 +23,7 @@ _Avoid_: Transaction (alone, without "placement" -- too generic)
 The settings in `config.toml` -- hotkeys, gaps, behavior flags -- that apply whenever the current display topology matches no saved profile. Not itself called a "profile"; profiles are overlays *on top of* base config, not siblings of it.
 
 **Profile**:
-A named file under `profiles/` (e.g. `profiles/office.toml`) that overrides some or all of base config's fields for one specific display topology. Matched by comparing its stored `fingerprint` field against the current `topology_fingerprint()` output -- never by filename, since a real fingerprint contains characters (`|`, spaces) that aren't valid in a Windows filename (ADR 0004). A profile is a sparse overlay: any field it doesn't mention falls through to base config (field-level merge, ADR 0004), and it can override anything base config has, including hotkey bindings.
+A named file under `profiles/` (e.g. `profiles/office.toml`) that overrides some or all of base config's fields for one specific display topology. Matched by comparing its stored `fingerprint` field against the current `topology_fingerprint()` output -- never by filename, since a real fingerprint contains characters (`|`, spaces) that aren't valid in a Windows filename (ADR 0004). A profile is a sparse overlay: any field it doesn't mention falls through to base config (field-level merge, ADR 0004), and it can override anything base config has, including hotkey bindings and saved layouts. Its `layouts` table is keyed by name, so a profile replaces the layouts it names and inherits the rest.
 _Avoid_: Layout (alone -- this repo also has zone layouts and, eventually, workspace layouts; say "layout profile" or "profile" with the monitor-topology sense established in context)
 
 **Tiling-enabled profile**:
@@ -35,7 +35,8 @@ A session-only override that stops grid reflows for the current display topology
 _Avoid_: Pause (which stops all placement commands), disabling the profile
 
 **Resolved config**:
-The merged result of base config plus whichever profile (if any) matches the current topology -- the actual set of hotkeys/gaps/behavior-flags in effect at a given moment. What `Event::ConfigChanged` (ADR 0005) carries into `EngineState`.
+The merged result of base config plus whichever profile (if any) matches the current topology -- the actual set of hotkeys/gaps/behavior-flags in effect at a given moment. What `Event::ConfigChanged` (ADR 0005) carries into `EngineState`. It also carries *provenance*: which layer supplied each hotkey binding, and the profile file it came from, so a GUI edit can be written to the layer that supplies the value it shows (ADR 0022).
+_Avoid_: Effective config, active config (either is fine in prose, but the type is `ResolvedConfig` and the glossary term is "resolved config").
 
 **Gap** (outer / inner):
 Configurable inset applied to a computed zone `Rect` after `mosaix-layout`'s zone functions produce it (ADR 0006). *Outer gap* insets edges that touch the display's work-area boundary; *inner gap* insets edges that would border a neighboring zone, even under manual-snap-only Phase 1 where no second window is actually being placed. Applied by `apply_gaps`, kept separate from the pure zone-fraction functions (`snap_to_half` etc.), which stay gap-unaware.
@@ -108,3 +109,11 @@ _Avoid_: Preview (alone), ghost window, highlight
 **Focus border**:
 A persistent, click-through outline around the focused managed window, including tiled and floating windows, shown only while automatic tiling is active. Its only first-release customization is enabled state, color, and thickness; it is hidden in manual, suspended, and paused states. Also hidden whenever there is nothing to outline: a focused window that is minimized, hidden, or cloaked, and one currently in an interactive placement session, whose position is not yet settled. A maximized or full-screen window keeps its border. Follows where the window actually is rather than where Mosaix last placed it (ADR 0017), and is drawn by its own overlay, distinct from the snap preview.
 _Avoid_: Snap preview overlay, focus animation, window decoration
+
+**Saved layout**:
+A named set of zone rectangles for one display that a user can apply on demand, stored in configuration and overridable per display topology like any other config field (ADR 0004). Written either by hand or from the settings application, which asks the agent to perform the write rather than editing a file itself (ADR 0022). It records *shape only*: applying it fills its cells with whichever managed windows exist, in visual window order, and never identifies a particular window (ADR 0018). Restoring a layout to specific windows by identity is deferred (issue #28).
+_Avoid_: Arrangement, scene, saved workspace. ARCHITECTURE.md uses "arrangement" in two senses -- "saved arrangements" (section 1) for this concept, and "the requested arrangement" (section 9.3) for a planner's current output -- so prefer "saved layout" for the stored artifact and leave "arrangement" to the planner sense.
+
+**Hotkey capture**:
+Reading a key combination by having the user press it in the settings hotkey editor, rather than typing it as text. Because `RegisterHotKey` is OS-arbitrated and gives Mosaix no way to swallow a keystroke (ADR 0002), capture requires the agent to unregister every binding for as long as the editor window is open, bounded by the editor's IPC connection so a crash re-registers (ADR 0021). The capture buffer itself is armed only while a single capture dialog is frontmost.
+_Avoid_: Capture (alone). "Capture" also names the deferred idea of recording the current on-screen arrangement as a saved layout (issue #28); say "hotkey capture" for this one and "capture-from-current" for that one.

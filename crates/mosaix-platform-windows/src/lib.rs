@@ -45,7 +45,8 @@ pub use events::{start_event_hooks, EventHooks, RawEvent, WindowHandle};
 pub use focus_border::{start_focus_border, FocusBorder, FocusBorderStyle};
 #[cfg(windows)]
 pub use hotkeys::{
-    start_hotkeys, HotkeyBinding, HotkeyFired, HotkeyRegistrationResult, HotkeyRegistrations,
+    probe_hotkey, start_hotkeys, HotkeyAvailability, HotkeyBinding, HotkeyFired,
+    HotkeyRegistrationResult, HotkeyRegistrations,
 };
 #[cfg(windows)]
 pub use overlay::{start_preview_overlay, PreviewOverlay};
