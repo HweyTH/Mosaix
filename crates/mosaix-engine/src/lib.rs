@@ -195,6 +195,18 @@ pub struct EngineState {
     /// Ordered effects emitted by committed placement transitions. Consumers
     /// retain a cursor; the log is part of the published deterministic state.
     pub effects: Vec<EngineEffect>,
+    /// The saved layout most recently applied to each display, by name.
+    ///
+    /// Published state rather than an internal note: machine-readable
+    /// state carries the saved layouts and which one was last applied per
+    /// display, so tooling built on top can tell what a display is
+    /// currently arranged as.
+    ///
+    /// Recorded only for an application that actually placed something --
+    /// a rejected apply changes nothing, and claiming otherwise would
+    /// make this the one part of published state that lies. Entries for a
+    /// display that leaves the topology are dropped with it.
+    pub last_applied_layouts: HashMap<DisplayId, String>,
     /// Whether the settings application's hotkey editor is open and every
     /// binding must therefore stay unregistered (ADR 0021).
     ///
@@ -766,6 +778,12 @@ fn apply(state: &mut EngineState, event: Event) {
             state.deferred_reflow_displays.clear();
             migrate_orphaned_windows(state, &displays);
             state.displays = displays;
+            // A display that is gone has no arrangement to report. Keeping
+            // its entry would leave published state naming a layout as
+            // current for a screen nobody can see.
+            state
+                .last_applied_layouts
+                .retain(|display_id, _| state.displays.iter().any(|d| d.id == *display_id));
             if topology_identity_changed {
                 state.resolved_config = select_resolved_config(&state.config_set, &state.displays);
                 state.automatic_tiling_suspended = false;
@@ -1376,6 +1394,11 @@ fn apply(state: &mut EngineState, event: Event) {
                         if place_window(state, window_id, plan.display_id, bounds, None) {
                             placed.push(window_id);
                         }
+                    }
+                    if !placed.is_empty() {
+                        state
+                            .last_applied_layouts
+                            .insert(plan.display_id, name.clone());
                     }
                     // Applying a layout is an explicit placement, so it
                     // session-floats what it placed exactly as a zone snap
@@ -2068,6 +2091,7 @@ pub fn spawn_engine_with_capacity(
         interactive_placement: None,
         deferred_reflow_displays: HashSet::new(),
         effects: Vec::new(),
+        last_applied_layouts: HashMap::new(),
         hotkey_capture_suspended: false,
         unregistered_bindings: Vec::new(),
     };
@@ -5831,5 +5855,78 @@ mod tests {
         );
 
         assert_eq!(state.revision, revision);
+    }
+
+    #[test]
+    fn applying_a_layout_records_it_as_that_displays_current_arrangement() {
+        let mut state = state_with_saved_layout("half", &[(0.0, 0.0, 0.5, 1.0)]);
+        apply(
+            &mut state,
+            Event::WindowsObserved {
+                windows: vec![window_at(1, 1, Rect::new(0, 0, 400, 300))],
+            },
+        );
+        state.focused_window = Some(WindowId(1));
+
+        apply(
+            &mut state,
+            Event::SavedLayoutApplyRequested {
+                name: "half".to_owned(),
+            },
+        );
+
+        assert_eq!(
+            state.last_applied_layouts.get(&DisplayId(1)),
+            Some(&"half".to_owned()),
+            "machine-readable state has to say what a display is currently arranged as"
+        );
+    }
+
+    #[test]
+    fn a_rejected_layout_apply_records_nothing() {
+        let mut state = state_with_saved_layout("half", &[(0.0, 0.0, 0.5, 1.0)]);
+        // Nothing focused, so the apply is rejected with a reason and
+        // changes nothing (ADR 0020).
+
+        apply(
+            &mut state,
+            Event::SavedLayoutApplyRequested {
+                name: "half".to_owned(),
+            },
+        );
+
+        assert!(
+            state.last_applied_layouts.is_empty(),
+            "an apply that placed nothing must not claim a display is arranged as it"
+        );
+    }
+
+    #[test]
+    fn a_display_that_leaves_the_topology_takes_its_recorded_layout_with_it() {
+        let mut state = state_with_saved_layout("half", &[(0.0, 0.0, 0.5, 1.0)]);
+        apply(
+            &mut state,
+            Event::WindowsObserved {
+                windows: vec![window_at(1, 1, Rect::new(0, 0, 400, 300))],
+            },
+        );
+        state.focused_window = Some(WindowId(1));
+        apply(
+            &mut state,
+            Event::SavedLayoutApplyRequested {
+                name: "half".to_owned(),
+            },
+        );
+        assert!(!state.last_applied_layouts.is_empty());
+
+        apply(
+            &mut state,
+            Event::DisplayTopologyChanged(vec![display(2, "MON-B", 1920)]),
+        );
+
+        assert!(
+            state.last_applied_layouts.is_empty(),
+            "a display nobody can see has no current arrangement to report"
+        );
     }
 }

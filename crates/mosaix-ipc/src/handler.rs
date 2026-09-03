@@ -39,6 +39,14 @@ pub struct StateSnapshot {
     /// (CONTEXT.md "Saved layout"). Shape only -- a layout never names a
     /// window, so there is nothing here to sanitize (ADR 0018).
     pub saved_layouts: BTreeMap<String, SavedLayout>,
+    /// The saved layout most recently applied to each display, keyed by
+    /// display id.
+    ///
+    /// Alongside `saved_layouts`, this is what lets tooling built on top
+    /// of Mosaix tell what a display is currently arranged as, not just
+    /// what it could be arranged as. A display absent from this map has
+    /// had no saved layout applied since the agent started.
+    pub last_applied_layouts: BTreeMap<isize, String>,
     /// Which layer supplies each entry of `saved_layouts`, keyed
     /// identically. This is what lets the settings application show a
     /// layout write's destination *before* the save rather than only in
@@ -89,10 +97,16 @@ pub struct HotkeyBindingSnapshot {
     /// re-parsing `command`.
     pub layout: Option<String>,
     /// The combination, in the spelling config files use
-    /// (`ctrl+alt+left`).
-    pub combo: String,
-    /// Which layer supplies this binding: `base`, `profile`, or
-    /// `unknown` for a resolved config that recorded no source.
+    /// (`ctrl+alt+left`), or `None` for a command nothing is bound to.
+    ///
+    /// The list covers every command Mosaix has rather than only the
+    /// bound ones, so a command can be *given* a combination in the
+    /// interface and not only rebound -- and so a binding reset out of
+    /// existence leaves a row to bind again rather than vanishing.
+    pub combo: Option<String>,
+    /// Which layer supplies this binding: `base`, `profile`, `unbound`
+    /// for a command nothing binds, or `unknown` for a resolved config
+    /// that recorded no source.
     pub source: String,
     /// The file that supplies it, and so the file a GUI edit of it would
     /// be written to (ADR 0022).
@@ -141,21 +155,54 @@ fn supplying_file(layer: Option<ConfigLayer>, profile_file: &Option<String>) -> 
     }
 }
 
+/// Every command the interface can bind, in a stable order: the unit
+/// verbs as they are declared, then one entry per saved layout.
+///
+/// Every command, not every *binding*, because a command nothing binds is
+/// exactly the one a user most wants to reach -- a saved layout that is
+/// not yet one keystroke away, or a binding they just reset out of
+/// existence.
+fn bindable_commands(config: &ResolvedConfig) -> Vec<Command> {
+    let mut commands: Vec<Command> = Command::unit_verbs()
+        .into_iter()
+        .chain(config.layouts.keys().map(|name| Command::ApplyLayout {
+            name: name.clone(),
+        }))
+        .collect();
+    // Whatever is actually bound is listed too, even a layout binding
+    // whose layout is not declared -- which validation rejects, so it
+    // should never arrive, and dropping it silently is exactly how a
+    // binding the user can see in their file would go missing here.
+    for command in config.hotkeys.keys() {
+        if !commands.contains(command) {
+            commands.push(command.clone());
+        }
+    }
+    commands
+}
+
 fn binding_snapshots(config: &ResolvedConfig) -> Vec<HotkeyBindingSnapshot> {
-    config
-        .hotkeys
-        .iter()
-        .map(|(command, combo)| {
-            let layer = config.binding_sources.get(command).copied();
+    bindable_commands(config)
+        .into_iter()
+        .map(|command| {
+            let combo = config.hotkeys.get(&command);
+            // A command nothing binds has no supplying layer, and so no
+            // file to name: a write would create it, and where it would
+            // be created is the caller's rule to apply, not a fact about
+            // the configuration as it stands.
+            let layer = combo.and(config.binding_sources.get(&command).copied());
             HotkeyBindingSnapshot {
-                command: command.to_string(),
-                layout: match command {
+                layout: match &command {
                     Command::ApplyLayout { name } => Some(name.clone()),
                     _ => None,
                 },
-                combo: combo.to_string(),
-                source: layer_name(layer),
-                file: supplying_file(layer, &config.profile_file),
+                combo: combo.map(|combo| combo.to_string()),
+                source: match combo {
+                    Some(_) => layer_name(layer),
+                    None => "unbound".to_owned(),
+                },
+                file: combo.and_then(|_| supplying_file(layer, &config.profile_file)),
+                command: command.to_string(),
             }
         })
         .collect()
@@ -258,6 +305,11 @@ impl From<EngineState> for StateSnapshot {
             })
             .collect();
         managed_windows.sort_by_key(|window| window.window_id);
+        let last_applied_layouts = state
+            .last_applied_layouts
+            .iter()
+            .map(|(display_id, name)| (display_id.0, name.clone()))
+            .collect();
         let saved_layouts = state.resolved_config.layouts.clone();
         let layout_sources = layout_source_snapshots(&state.resolved_config);
         let hotkeys = binding_snapshots(&state.resolved_config);
@@ -280,6 +332,7 @@ impl From<EngineState> for StateSnapshot {
             degraded_windows,
             managed_windows,
             saved_layouts,
+            last_applied_layouts,
             layout_sources,
             hotkeys,
             hotkey_capture_suspended: state.hotkey_capture_suspended,
@@ -967,11 +1020,17 @@ mod tests {
 
         let json = serde_json::to_value(StateSnapshot::from(state)).unwrap();
 
-        assert_eq!(json["hotkeys"][0]["command"], "apply-layout.writing");
+        let layout_binding = json["hotkeys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|binding| binding["command"] == "apply-layout.writing")
+            .expect("a bound layout command is listed");
         assert_eq!(
-            json["hotkeys"][0]["layout"], "writing",
+            layout_binding["layout"], "writing",
             "a client labels a layout binding without re-parsing the command path"
         );
+        assert_eq!(layout_binding["combo"], "ctrl+alt+1");
     }
 
     #[test]
@@ -981,10 +1040,50 @@ mod tests {
 
         let snapshot = StateSnapshot::from(state.clone());
 
+        for command in state.resolved_config.hotkeys.keys() {
+            assert!(
+                snapshot
+                    .hotkeys
+                    .iter()
+                    .any(|binding| binding.command == command.to_string()),
+                "the list is what a user reads instead of the TOML file, so it cannot be \
+                 partial; {command} is missing"
+            );
+        }
+    }
+
+    #[test]
+    fn state_snapshot_lists_a_command_nothing_binds_so_it_can_be_given_a_combination() {
+        let mut state = EngineState::default();
+        state.resolved_config.layouts.insert(
+            "writing".to_owned(),
+            SavedLayout { cells: Vec::new() },
+        );
+
+        let json = serde_json::to_value(StateSnapshot::from(state)).unwrap();
+
+        let unbound = json["hotkeys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|binding| binding["command"] == "apply-layout.writing")
+            .expect("a saved layout is bindable whether or not it is bound");
+        assert!(unbound["combo"].is_null());
+        assert_eq!(unbound["source"], "unbound");
+        assert!(
+            unbound["file"].is_null(),
+            "nothing supplies it yet, so there is no file to name"
+        );
+    }
+
+    #[test]
+    fn every_unit_verb_is_listed_even_with_nothing_bound_at_all() {
+        let json = serde_json::to_value(StateSnapshot::from(EngineState::default())).unwrap();
+
         assert_eq!(
-            snapshot.hotkeys.len(),
-            state.resolved_config.hotkeys.len(),
-            "the list is what a user reads instead of the TOML file, so it cannot be partial"
+            json["hotkeys"].as_array().unwrap().len(),
+            Command::unit_verbs().len(),
+            "a command reset out of existence has to leave a row to bind again"
         );
     }
 
@@ -1929,5 +2028,17 @@ mod tests {
             ),
             other => panic!("expected a refusal, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn the_state_snapshot_says_what_each_display_is_currently_arranged_as() {
+        let mut state = EngineState::default();
+        state
+            .last_applied_layouts
+            .insert(DisplayId(3), "writing".to_owned());
+
+        let json = serde_json::to_value(StateSnapshot::from(state)).unwrap();
+
+        assert_eq!(json["last_applied_layouts"]["3"], "writing");
     }
 }

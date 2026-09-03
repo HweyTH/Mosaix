@@ -1001,3 +1001,60 @@ describe("capture suspension lifetime", () => {
     expect(desktop.endHotkeyCapture).toHaveBeenCalledTimes(1);
   });
 });
+
+describe("unbound commands", () => {
+  const withUnbound: HotkeyList = {
+    ...structuredClone(hotkeys),
+    bindings: [
+      ...structuredClone(hotkeys).bindings,
+      {
+        command: "apply-layout.reading",
+        layout: "reading",
+        combo: null,
+        source: "unbound",
+        file: null,
+      },
+    ],
+  };
+
+  async function mounted(): Promise<{ root: HTMLElement; desktop: DesktopBridge; stop: () => void }> {
+    const desktop = bridge();
+    desktop.loadHotkeyBindings = vi.fn().mockResolvedValue(structuredClone(withUnbound));
+    const root = document.createElement("div");
+    document.body.append(root);
+    const stop = await mountLayoutEditor(root, desktop);
+    await vi.waitFor(() =>
+      expect(root.querySelector('[data-binding="apply-layout.reading"]')).not.toBeNull(),
+    );
+    return { root, desktop, stop };
+  }
+
+  it("lists a saved layout nothing is bound to, so it can be given a combination", async () => {
+    const { root, stop } = await mounted();
+
+    const row = root.querySelector('[data-binding="apply-layout.reading"]')!;
+    expect(row.querySelector("kbd")?.textContent).toBe("not bound");
+    expect(
+      row.querySelector<HTMLButtonElement>("[data-reset-binding]")!.disabled,
+      "there is nothing to reset a binding to when nothing binds it",
+    ).toBe(true);
+    stop();
+  });
+
+  it("binds an unbound command through the same capture dialog", async () => {
+    const { root, desktop, stop } = await mounted();
+
+    root.querySelector<HTMLElement>('[data-rebind="apply-layout.reading"]')!.click();
+    expect(root.querySelector("[data-binding-destination]")?.textContent).toContain(
+      "config.toml",
+    );
+    window.dispatchEvent(
+      new KeyboardEvent("keydown", { code: "Digit2", ctrlKey: true, altKey: true }),
+    );
+    root.querySelector<HTMLElement>("[data-capture-save]")!.click();
+
+    await vi.waitFor(() => expect(desktop.setBinding).toHaveBeenCalled());
+    expect(desktop.setBinding).toHaveBeenCalledWith("apply-layout.reading", "ctrl+alt+2", false);
+    stop();
+  });
+});

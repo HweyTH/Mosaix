@@ -92,16 +92,21 @@ export interface AutomaticTilingSettings {
 }
 
 /**
- * One hotkey binding as the interface shows it. `file` is the
+ * One bindable command as the interface shows it. `file` is the
  * configuration file that currently supplies it, and so the file an edit
  * of it would be written to (ADR 0022).
+ *
+ * Every command appears, bound or not: a saved layout that is not yet a
+ * keystroke away is exactly the one a user wants to reach, and a binding
+ * reset out of existence has to leave a row to bind again.
  */
 export interface HotkeyBinding {
   command: string;
   layout: string | null;
-  combo: string;
-  source: "base" | "profile" | "unknown";
-  /** Absent when the agent could not name the file supplying this binding. */
+  /** `null` for a command nothing is bound to. */
+  combo: string | null;
+  source: "base" | "profile" | "unbound" | "unknown";
+  /** Absent when nothing supplies this binding, or the agent could not name it. */
   file: string | null;
 }
 
@@ -404,17 +409,17 @@ function renderBindings(hotkeys: HotkeyList | undefined, hotkeyError: string | u
   }
   if (hotkeys === undefined) return `<p>Reading bindings…</p>`;
   const notices = renderRegistrationNotices(hotkeys);
-  if (hotkeys.bindings.length === 0) return `${notices}<p>No hotkeys are bound.</p>`;
+  if (hotkeys.bindings.length === 0) return `${notices}<p>No commands to bind.</p>`;
   return `${notices}<ul class="binding-list">${hotkeys.bindings
     .map(
       (binding) => `
         <li class="binding" data-binding="${escapeHtml(binding.command)}" data-source="${escapeHtml(binding.source)}">
           <span class="binding-command">${escapeHtml(bindingLabel(binding.command))}</span>
-          <kbd>${escapeHtml(binding.combo)}</kbd>
-          <small class="binding-file">${binding.source === "profile" ? "profile · " : ""}${escapeHtml(binding.file ?? "source unknown")}</small>
+          <kbd>${binding.combo === null ? "not bound" : escapeHtml(binding.combo)}</kbd>
+          <small class="binding-file">${binding.source === "profile" ? "profile · " : ""}${escapeHtml(binding.file ?? (binding.combo === null ? "nothing supplies it yet" : "source unknown"))}</small>
           <span class="binding-actions">
-            <button data-rebind="${escapeHtml(binding.command)}" title="Rebind">⌨</button>
-            <button data-reset-binding="${escapeHtml(binding.command)}" title="Reset to default">↺</button>
+            <button data-rebind="${escapeHtml(binding.command)}" title="${binding.combo === null ? "Bind" : "Rebind"}">⌨</button>
+            <button data-reset-binding="${escapeHtml(binding.command)}" title="Reset to default" ${binding.combo === null ? "disabled" : ""}>↺</button>
           </span>
         </li>`,
     )

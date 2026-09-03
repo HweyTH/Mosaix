@@ -115,12 +115,12 @@ pub struct EditorSnapshot {
     pub draft: LayoutDraft,
 }
 
-/// One hotkey binding as the interface shows it: what it does, what
-/// presses it, and which configuration file supplies it.
+/// One bindable command as the interface shows it: what it does, what
+/// presses it if anything does, and which configuration file supplies it.
 ///
-/// Read-only here. Editing arrives with the capture dialog (issue #40),
-/// which is what turns `file` from information into the destination of a
-/// write (ADR 0022).
+/// Every command appears, bound or not, so one that nothing binds -- a
+/// saved layout that is not yet a keystroke away, or a binding just reset
+/// out of existence -- can still be given a combination.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HotkeyBindingView {
@@ -128,8 +128,9 @@ pub struct HotkeyBindingView {
     pub command: String,
     /// The saved layout a parameterized binding applies.
     pub layout: Option<String>,
-    pub combo: String,
-    /// `base`, `profile`, or `unknown`.
+    /// The combination, or `None` for a command nothing is bound to.
+    pub combo: Option<String>,
+    /// `base`, `profile`, `unbound`, or `unknown`.
     pub source: String,
     /// The configuration file currently supplying this binding, absent
     /// when the agent could not name it.
@@ -853,7 +854,7 @@ mod tests {
         mosaix_ipc::HotkeyBindingSnapshot {
             command: command.to_owned(),
             layout: None,
-            combo: combo.to_owned(),
+            combo: Some(combo.to_owned()),
             source: source.to_owned(),
             file: Some(file.to_owned()),
         }
