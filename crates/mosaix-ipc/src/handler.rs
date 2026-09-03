@@ -42,6 +42,19 @@ pub struct StateSnapshot {
     /// and what makes the write destination visible before a save
     /// (ADR 0022).
     pub hotkeys: Vec<HotkeyBindingSnapshot>,
+    /// Whether a hotkey editor currently holds registration suspended
+    /// (ADR 0021). The editor states this rather than leaving the user to
+    /// infer it from shortcuts that have stopped working.
+    pub hotkey_capture_suspended: bool,
+    /// The commands whose bindings the last registration pass could not
+    /// register, in the same TOML-path spelling
+    /// [`HotkeyBindingSnapshot::command`] uses.
+    ///
+    /// Normally empty. A combination another application took while
+    /// capture held registration suspended appears here when the editor
+    /// closes, which is how the user finds out a shortcut is dead rather
+    /// than by pressing it.
+    pub unregistered_bindings: Vec<String>,
 }
 
 /// One resolved hotkey binding, flattened for a client that has no
@@ -190,6 +203,11 @@ impl From<EngineState> for StateSnapshot {
         managed_windows.sort_by_key(|window| window.window_id);
         let saved_layouts = state.resolved_config.layouts.clone();
         let hotkeys = binding_snapshots(&state.resolved_config);
+        let unregistered_bindings = state
+            .unregistered_bindings
+            .iter()
+            .map(|command| command.to_string())
+            .collect();
         Self {
             revision: state.revision,
             display_count: state.displays.len(),
@@ -205,6 +223,8 @@ impl From<EngineState> for StateSnapshot {
             managed_windows,
             saved_layouts,
             hotkeys,
+            hotkey_capture_suspended: state.hotkey_capture_suspended,
+            unregistered_bindings,
         }
     }
 }
@@ -422,6 +442,8 @@ pub fn handle_request(
             config,
             LayoutEdit::Delete { name: name.clone() },
         ),
+        IpcRequest::StartHotkeyCapture => send_event(events, Event::HotkeyCaptureStarted),
+        IpcRequest::EndHotkeyCapture => send_event(events, Event::HotkeyCaptureEnded),
     }
 }
 
@@ -451,6 +473,46 @@ fn edit_layouts(
             other => other,
         },
         Err(ConfigError(reason)) => IpcResponse::Error { message: reason },
+    }
+}
+
+/// One connection's hold on hotkey-capture suspension.
+///
+/// Suspension is bounded by the connection that asked for it, not by a
+/// message (ADR 0021), and the transport owns that lifetime -- so the
+/// bookkeeping lives here, next to the request mapping, where it can be
+/// tested without a pipe: what a connection asked for, and what its
+/// ending therefore owes the engine.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct CaptureHold {
+    held: bool,
+}
+
+impl CaptureHold {
+    /// Records what `request` did, given the `response` it produced.
+    ///
+    /// Only a request the agent accepted counts. A capture-start the
+    /// engine never received suspended nothing, so its connection owes no
+    /// capture-end when it ends.
+    pub fn observe(&mut self, request: &IpcRequest, response: &IpcResponse) {
+        if !matches!(response, IpcResponse::Ok { .. }) {
+            return;
+        }
+        match request {
+            IpcRequest::StartHotkeyCapture => self.held = true,
+            IpcRequest::EndHotkeyCapture => self.held = false,
+            _ => {}
+        }
+    }
+
+    /// The event this connection's ending owes the engine, if any.
+    ///
+    /// `Some` exactly when the connection still holds suspension -- the
+    /// case a crash or a kill produces, where the editor never sent
+    /// capture-end and the closed pipe handle is the only signal that it
+    /// is gone.
+    pub fn release(&mut self) -> Option<Event> {
+        std::mem::take(&mut self.held).then_some(Event::HotkeyCaptureEnded)
     }
 }
 
@@ -1075,5 +1137,85 @@ mod tests {
             message.contains("focused"),
             "the rejection must say what was missing, got {message:?}"
         );
+    }
+
+    #[test]
+    fn the_capture_pair_suspends_and_restores_registration_through_the_reducer() {
+        let engine = mosaix_engine::spawn_engine(Vec::new(), Default::default());
+        let store = UnavailableConfigStore {
+            reason: "no configuration directory".to_owned(),
+        };
+
+        handle_request(
+            &IpcRequest::StartHotkeyCapture,
+            &engine.events(),
+            &engine.state_reader(),
+            &store,
+        );
+        wait_for_revision(&engine, 1);
+        assert!(engine.state_reader().snapshot().hotkey_capture_suspended);
+
+        handle_request(
+            &IpcRequest::EndHotkeyCapture,
+            &engine.events(),
+            &engine.state_reader(),
+            &store,
+        );
+        wait_for_revision(&engine, 2);
+        assert!(!engine.state_reader().snapshot().hotkey_capture_suspended);
+    }
+
+    #[test]
+    fn a_connection_that_started_capture_owes_a_capture_end_when_it_ends() {
+        let mut hold = CaptureHold::default();
+
+        hold.observe(&IpcRequest::StartHotkeyCapture, &IpcResponse::Ok { data: None });
+
+        assert!(matches!(hold.release(), Some(Event::HotkeyCaptureEnded)));
+    }
+
+    #[test]
+    fn a_connection_that_ended_capture_cleanly_owes_nothing() {
+        let mut hold = CaptureHold::default();
+        hold.observe(&IpcRequest::StartHotkeyCapture, &IpcResponse::Ok { data: None });
+
+        hold.observe(&IpcRequest::EndHotkeyCapture, &IpcResponse::Ok { data: None });
+
+        assert!(hold.release().is_none());
+    }
+
+    #[test]
+    fn a_capture_start_the_agent_refused_leaves_nothing_to_release() {
+        let mut hold = CaptureHold::default();
+
+        hold.observe(
+            &IpcRequest::StartHotkeyCapture,
+            &IpcResponse::Error {
+                message: "Engine stopped".to_owned(),
+            },
+        );
+
+        assert!(hold.release().is_none());
+    }
+
+    #[test]
+    fn releasing_twice_reports_the_debt_once() {
+        let mut hold = CaptureHold::default();
+        hold.observe(&IpcRequest::StartHotkeyCapture, &IpcResponse::Ok { data: None });
+
+        assert!(matches!(hold.release(), Some(Event::HotkeyCaptureEnded)));
+        assert!(hold.release().is_none());
+    }
+
+    #[test]
+    fn the_state_snapshot_names_the_bindings_that_did_not_come_back() {
+        let mut state = EngineState::default();
+        state.hotkey_capture_suspended = true;
+        state.unregistered_bindings = vec![mosaix_config::Command::SnapLeft];
+
+        let json = serde_json::to_value(StateSnapshot::from(state)).unwrap();
+
+        assert_eq!(json["hotkey_capture_suspended"], true);
+        assert_eq!(json["unregistered_bindings"][0], "snap-left");
     }
 }

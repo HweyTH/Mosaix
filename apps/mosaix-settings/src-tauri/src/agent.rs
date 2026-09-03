@@ -46,6 +46,20 @@ pub trait AgentTransport: Send + std::fmt::Debug {
     /// is the only way the settings application changes a layout, and a
     /// change it cannot confirm is an error rather than a claim.
     fn edit_layouts(&mut self, edit: LayoutEdit) -> Result<String, AgentError>;
+
+    /// Asks the agent to unregister every hotkey, so a combination the
+    /// user presses next reaches the editor instead of firing a command
+    /// (ADR 0021).
+    ///
+    /// Suspension lasts until [`AgentTransport::end_hotkey_capture`] or,
+    /// failing that, until this connection ends -- which is what brings
+    /// the hotkeys back when the settings application is killed rather
+    /// than closed.
+    fn start_hotkey_capture(&mut self) -> Result<(), AgentError>;
+
+    /// Asks the agent to register the hotkeys again. The editor closing
+    /// cleanly is the ordinary way suspension ends.
+    fn end_hotkey_capture(&mut self) -> Result<(), AgentError>;
 }
 
 /// The transport this build talks to a real agent through.
@@ -79,6 +93,14 @@ impl AgentTransport for UnsupportedPlatform {
     fn edit_layouts(&mut self, _edit: LayoutEdit) -> Result<String, AgentError> {
         Err(AgentError::Unavailable)
     }
+
+    fn start_hotkey_capture(&mut self) -> Result<(), AgentError> {
+        Err(AgentError::Unavailable)
+    }
+
+    fn end_hotkey_capture(&mut self) -> Result<(), AgentError> {
+        Err(AgentError::Unavailable)
+    }
 }
 
 #[cfg(windows)]
@@ -99,6 +121,14 @@ mod windows_transport {
     #[derive(Debug, Default)]
     pub struct HeldConnection {
         connection: Option<IpcConnection>,
+        /// Whether the editor believes hotkey capture is in effect.
+        ///
+        /// Suspension is bounded by the connection (ADR 0021), so a
+        /// connection that breaks and is replaced takes the agent's
+        /// suspension with it. Remembering the intent here is what lets
+        /// the replacement re-assert it, rather than leaving the editor
+        /// showing a capture dialog while every hotkey is live again.
+        capturing: bool,
     }
 
     impl HeldConnection {
@@ -109,6 +139,7 @@ mod windows_transport {
             match IpcConnection::connect() {
                 Ok(connection) => Self {
                     connection: Some(connection),
+                    capturing: false,
                 },
                 Err(error) => {
                     tracing::debug!(%error, "no Mosaix agent to connect to yet");
@@ -135,7 +166,14 @@ mod windows_transport {
 
         fn send(&mut self, request: IpcRequest) -> Result<IpcResponse, AgentError> {
             if self.connection.is_none() {
-                self.connection = Some(IpcConnection::connect().map_err(from_ipc_error)?);
+                let mut connection = IpcConnection::connect().map_err(from_ipc_error)?;
+                if self.capturing && request != IpcRequest::StartHotkeyCapture {
+                    // The agent released suspension when the previous
+                    // connection died. Re-asserting it before anything
+                    // else keeps the editor's claim true.
+                    let _ = connection.send(IpcRequest::StartHotkeyCapture);
+                }
+                self.connection = Some(connection);
             }
             let outcome = self
                 .connection
@@ -173,6 +211,20 @@ mod windows_transport {
                 .and_then(|file| file.as_str())
                 .unwrap_or("your configuration")
                 .to_owned())
+        }
+
+        fn start_hotkey_capture(&mut self) -> Result<(), AgentError> {
+            self.confirmed(IpcRequest::StartHotkeyCapture)?;
+            self.capturing = true;
+            Ok(())
+        }
+
+        fn end_hotkey_capture(&mut self) -> Result<(), AgentError> {
+            // Cleared first: whatever the agent answers, this editor is
+            // no longer capturing, and a reconnect must not revive a
+            // suspension the user has finished with.
+            self.capturing = false;
+            self.confirmed(IpcRequest::EndHotkeyCapture).map(|_| ())
         }
 
         fn state(&mut self) -> Result<StateSnapshot, AgentError> {

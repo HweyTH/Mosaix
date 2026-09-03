@@ -127,6 +127,15 @@ pub struct HotkeyBindingView {
 pub struct HotkeyList {
     pub topology_fingerprint: String,
     pub bindings: Vec<HotkeyBindingView>,
+    /// Whether the agent currently has every binding unregistered for a
+    /// hotkey editor. Shown rather than inferred: while it is true no
+    /// Mosaix hotkey works anywhere on the system, and a user who is not
+    /// told will read that as Mosaix having stopped working (ADR 0021).
+    pub capture_suspended: bool,
+    /// The commands whose bindings did not come back from the last
+    /// registration pass, named so a shortcut another application took
+    /// during capture is visible rather than merely dead.
+    pub unregistered_commands: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -332,6 +341,8 @@ impl EditorSession {
         let state = self.agent.state().map_err(EditorCommandError::from)?;
         Ok(HotkeyList {
             topology_fingerprint: state.topology_fingerprint,
+            capture_suspended: state.hotkey_capture_suspended,
+            unregistered_commands: state.unregistered_bindings,
             bindings: state
                 .hotkeys
                 .into_iter()
@@ -344,6 +355,26 @@ impl EditorSession {
                 })
                 .collect(),
         })
+    }
+
+    /// Opens hotkey capture: the agent unregisters every binding until
+    /// this session closes it, or until the connection ends (ADR 0021).
+    ///
+    /// Held for the editor's lifetime rather than for one dialog, so
+    /// alt-tabbing away does not churn `RegisterHotKey` and risk losing a
+    /// combination to another application on each cycle.
+    pub fn start_hotkey_capture(&mut self) -> Result<(), EditorCommandError> {
+        self.agent
+            .start_hotkey_capture()
+            .map_err(EditorCommandError::from)
+    }
+
+    /// Closes hotkey capture, so the agent registers the bindings again
+    /// and reports which of them came back.
+    pub fn end_hotkey_capture(&mut self) -> Result<(), EditorCommandError> {
+        self.agent
+            .end_hotkey_capture()
+            .map_err(EditorCommandError::from)
     }
 
     /// The saved layouts the agent currently has, by name.
@@ -533,6 +564,7 @@ mod tests {
         state: Option<Result<StateSnapshot, AgentError>>,
         edits: Arc<Mutex<Vec<LayoutEdit>>>,
         edit_outcome: Option<Result<String, AgentError>>,
+        capture: Arc<Mutex<Vec<bool>>>,
     }
 
     impl FakeAgent {
@@ -586,6 +618,16 @@ mod tests {
             self.edit_outcome
                 .clone()
                 .expect("the test scripted no answer for this edit")
+        }
+
+        fn start_hotkey_capture(&mut self) -> Result<(), AgentError> {
+            self.capture.lock().unwrap().push(true);
+            Ok(())
+        }
+
+        fn end_hotkey_capture(&mut self) -> Result<(), AgentError> {
+            self.capture.lock().unwrap().push(false);
+            Ok(())
         }
     }
 
@@ -1032,5 +1074,37 @@ mod tests {
                 second_zone_id: 4,
             })
         );
+    }
+
+    #[test]
+    fn opening_and_closing_the_editor_asks_the_agent_to_suspend_and_resume() {
+        let agent = FakeAgent::default();
+        let capture = Arc::clone(&agent.capture);
+        let mut session = session(agent);
+
+        session.start_hotkey_capture().expect("the agent answered");
+        session.end_hotkey_capture().expect("the agent answered");
+
+        assert_eq!(
+            *capture.lock().unwrap(),
+            vec![true, false],
+            "the editor asks for suspension when it opens and releases it when it closes"
+        );
+    }
+
+    #[test]
+    fn the_hotkey_list_states_that_capture_has_registration_suspended() {
+        let mut state = state_reporting("MON-A", vec![binding("snap-left", "ctrl+alt+left", "base", "config.toml")]);
+        state.hotkey_capture_suspended = true;
+        state.unregistered_bindings = vec!["snap-right".to_owned()];
+        let mut session = session(FakeAgent::reporting(Ok(state)));
+
+        let list = session.hotkeys().expect("the agent answered");
+
+        assert!(
+            list.capture_suspended,
+            "a user whose hotkeys have stopped working is told why rather than left to infer it"
+        );
+        assert_eq!(list.unregistered_commands, vec!["snap-right".to_owned()]);
     }
 }

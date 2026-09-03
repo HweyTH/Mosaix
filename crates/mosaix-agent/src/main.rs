@@ -25,10 +25,15 @@ mod overlay;
 /// Starts `RegisterHotKey` registration for `bindings` and a forwarder
 /// thread translating each firing into `Event::ZoneSnapRequested`,
 /// mirroring the shape of every other OS-event forwarder in this file.
-/// Per-binding registration failures are logged and otherwise ignored (ADR
-/// 0002's partial-success posture, preserved through every re-registration,
-/// not just the first); only a failure to start the registration thread
-/// itself is reported to the caller.
+/// Registration stays partial-success (ADR 0002), preserved through every
+/// re-registration and not just the first; only a failure to start the
+/// registration thread itself is reported to the caller.
+///
+/// Which bindings the platform refused travels back into engine state as
+/// [`mosaix_engine::Event::HotkeyRegistrationReported`], so a combination
+/// another application took while hotkey capture held registration
+/// suspended is named to the user rather than left as a shortcut that
+/// silently stopped working (ADR 0021).
 ///
 /// When `overlay_tx` is present, each successful enqueue also signals the
 /// snap-preview controller (Feature 34) with the pre-send revision so it
@@ -45,6 +50,7 @@ fn start_hotkeys_and_forward(
     std::thread::JoinHandle<()>,
 )> {
     let (registrations, hotkey_events) = mosaix_platform_windows::start_hotkeys(bindings)?;
+    let mut unregistered = Vec::new();
     for result in &registrations.results {
         if let Err(err) = &result.outcome {
             // A binding the OS refused holds no registry entry, so its id
@@ -57,8 +63,13 @@ fn start_hotkeys_and_forward(
                 %err,
                 "failed to register hotkey; that binding will not work, the rest still will"
             );
+            unregistered.extend(command);
         }
     }
+    // Sent on every pass, including the one that reports nothing: an
+    // empty report is what clears a previous pass's failures once the
+    // combination comes back.
+    let _ = events.send(mosaix_engine::Event::HotkeyRegistrationReported { unregistered });
     let forwarder = std::thread::spawn(move || {
         for fired in hotkey_events {
             let Some(command) = registry.command_for(fired.id) else {
@@ -646,6 +657,13 @@ fn main() {
     // (ADR 0005). A hot-edited `config.toml` (ticket 03) and a
     // topology-triggered profile switch (ticket 04) both flow through the
     // same `EngineState::resolved_config`, so this one poller covers both.
+    //
+    // It is also the one place that reads
+    // `EngineState::hotkey_capture_suspended`: while the settings
+    // application's hotkey editor is open, this registers nothing, so a
+    // combination the user is about to press reaches the editor instead
+    // of firing a command. Keeping that here rather than in a new engine
+    // effect is what keeps hotkey ownership in one place (ADR 0021).
     const HOTKEY_REBIND_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
     let (hotkey_rebind_stop_tx, hotkey_rebind_stop_rx) = std::sync::mpsc::channel::<()>();
     let hotkey_rebind_forwarder = {
@@ -655,40 +673,61 @@ fn main() {
         std::thread::spawn(move || {
             let mut previous_hotkeys = last_registered_hotkeys;
             let mut current_registration = initial_hotkey_registration;
+            // What the current registration was made under, so lifting or
+            // entering suspension is itself a reason to act -- the
+            // bindings need not have changed for the answer to.
+            let mut previously_suspended = false;
             loop {
                 match hotkey_rebind_stop_rx.recv_timeout(HOTKEY_REBIND_POLL_INTERVAL) {
                     Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                 }
 
-                let current_hotkeys =
-                    hotkeys::runtime_hotkeys(&state_reader.snapshot().resolved_config);
-                if mosaix_config::diff_bindings(&previous_hotkeys, &current_hotkeys).is_empty() {
+                // One snapshot for both reads, so a capture that starts
+                // between them cannot leave this pass registering
+                // bindings the editor is about to need.
+                let state = state_reader.snapshot();
+                let suspended = state.hotkey_capture_suspended;
+                let current_hotkeys = hotkeys::runtime_hotkeys(&state.resolved_config);
+                let bindings_changed =
+                    !mosaix_config::diff_bindings(&previous_hotkeys, &current_hotkeys).is_empty();
+                if !bindings_changed && suspended == previously_suspended {
                     continue;
                 }
-                tracing::info!("resolved hotkey bindings changed; re-registering hotkeys");
 
                 if let Some((registrations, forwarder)) = current_registration.take() {
                     registrations.stop();
                     let _ = forwarder.join();
                 }
-                // A fresh registry every time: an id the previous
-                // registration owned cannot survive into this one.
-                let (bindings, registry) = hotkeys::bindings_from_resolved(&current_hotkeys);
-                current_registration = match start_hotkeys_and_forward(
-                    bindings,
-                    registry,
-                    events.clone(),
-                    state_reader.clone(),
-                    overlay_tx.clone(),
-                ) {
-                    Ok(pair) => Some(pair),
-                    Err(err) => {
-                        tracing::error!(%err, "failed to re-register hotkeys after a binding change; hotkeys are unregistered until the next change");
-                        None
+                current_registration = if suspended {
+                    // A config reload arriving mid-capture updates what
+                    // will be registered when the editor closes, and
+                    // registers nothing now.
+                    tracing::info!(
+                        "hotkey capture is active; leaving every binding unregistered"
+                    );
+                    None
+                } else {
+                    tracing::info!("registering hotkeys for the current resolved bindings");
+                    // A fresh registry every time: an id the previous
+                    // registration owned cannot survive into this one.
+                    let (bindings, registry) = hotkeys::bindings_from_resolved(&current_hotkeys);
+                    match start_hotkeys_and_forward(
+                        bindings,
+                        registry,
+                        events.clone(),
+                        state_reader.clone(),
+                        overlay_tx.clone(),
+                    ) {
+                        Ok(pair) => Some(pair),
+                        Err(err) => {
+                            tracing::error!(%err, "failed to re-register hotkeys after a binding change; hotkeys are unregistered until the next change");
+                            None
+                        }
                     }
                 };
                 previous_hotkeys = current_hotkeys;
+                previously_suspended = suspended;
             }
 
             if let Some((registrations, forwarder)) = current_registration {

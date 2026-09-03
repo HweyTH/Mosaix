@@ -53,6 +53,8 @@ const tilingSettings = {
 
 const hotkeys: HotkeyList = {
   topologyFingerprint: "DISPLAY-A@0,0 2560x1440 scale=1",
+  captureSuspended: false,
+  unregisteredCommands: [],
   bindings: [
     {
       command: "snap-left",
@@ -85,6 +87,8 @@ function bridge(): DesktopBridge {
   return {
     loadEditorSnapshot: vi.fn().mockResolvedValue(structuredClone(snapshot)),
     loadHotkeyBindings: vi.fn().mockResolvedValue(structuredClone(hotkeys)),
+    startHotkeyCapture: vi.fn().mockResolvedValue(undefined),
+    endHotkeyCapture: vi.fn().mockResolvedValue(undefined),
     loadSavedLayouts: vi.fn().mockResolvedValue(structuredClone(savedLayouts)),
     saveLayout: vi.fn().mockResolvedValue({ file: "config.toml" }),
     renameLayout: vi.fn().mockResolvedValue({ file: "config.toml" }),
@@ -504,6 +508,8 @@ describe("hotkey binding watch", () => {
     vi.useFakeTimers();
     const docked: HotkeyList = {
       topologyFingerprint: "DISPLAY-A|DISPLAY-B",
+      captureSuspended: false,
+      unregisteredCommands: [],
       bindings: [
         {
           command: "snap-left",
@@ -567,5 +573,41 @@ describe("hotkey binding watch", () => {
     vi.useRealTimers();
 
     expect(loadHotkeyBindings.mock.calls.length).toBe(readsBeforeStop);
+  });
+});
+
+describe("hotkey registration notices", () => {
+  it("states that hotkeys are off while capture holds them, and names the ones that did not come back", async () => {
+    const desktop = bridge();
+    desktop.loadHotkeyBindings = vi.fn().mockResolvedValue({
+      ...structuredClone(hotkeys),
+      captureSuspended: true,
+      unregisteredCommands: ["snap-right"],
+    });
+    const root = document.createElement("div");
+
+    const stop = await mountLayoutEditor(root, desktop);
+    await vi.waitFor(() =>
+      expect(root.querySelector("[data-capture-suspended]")).not.toBeNull(),
+    );
+
+    expect(root.querySelector("[data-capture-suspended]")?.textContent).toContain(
+      "Hotkeys are off while the editor is open",
+    );
+    expect(root.querySelector("[data-unregistered-bindings]")?.textContent).toContain(
+      "Snap right",
+    );
+    stop();
+  });
+
+  it("shows no notice when every binding registered and nothing is suspended", async () => {
+    const root = document.createElement("div");
+
+    const stop = await mountLayoutEditor(root, bridge());
+    await vi.waitFor(() => expect(root.querySelector(".binding-list")).not.toBeNull());
+
+    expect(root.querySelector("[data-capture-suspended]")).toBeNull();
+    expect(root.querySelector("[data-unregistered-bindings]")).toBeNull();
+    stop();
   });
 });

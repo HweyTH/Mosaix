@@ -132,6 +132,9 @@ button { color: inherit; }
 .binding-command { font-size: 10px; font-weight: 650; }
 .binding kbd { grid-row: 1; justify-self: end; padding: 2px 6px; border: 1px solid var(--line); border-radius: 5px; font: 8px/1.4 ui-monospace, monospace; }
 .binding-file { grid-column: 1 / -1; color: var(--muted-2); font: 8px ui-monospace, monospace; overflow-wrap: anywhere; }
+.binding-notice { padding: 8px 9px; border-left: 2px solid var(--zone-line); border-radius: 7px; background: color-mix(in srgb, var(--zone-line), transparent 92%); }
+.binding-notice.warning { border-left-color: var(--accent); background: color-mix(in srgb, var(--accent), transparent 92%); }
+.hotkey-list .binding-notice { color: var(--ink); }
 .binding[data-source="profile"] { border-left-color: var(--accent); }
 .binding[data-source="profile"] .binding-file { color: var(--accent); }
 .tiling-settings code { display: block; max-height: 34px; overflow: auto; color: var(--ink); font-size: 8px; overflow-wrap: anywhere; }

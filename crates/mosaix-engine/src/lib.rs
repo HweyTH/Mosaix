@@ -40,7 +40,7 @@ use std::sync::mpsc::{sync_channel, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
-use mosaix_config::{ResolvedConfig, ResolvedConfigSet};
+use mosaix_config::{Command, ResolvedConfig, ResolvedConfigSet};
 use mosaix_domain::{
     topology_fingerprint, Display, DisplayId, Rect, Window, WindowId, WindowLifecycle,
 };
@@ -195,6 +195,23 @@ pub struct EngineState {
     /// Ordered effects emitted by committed placement transitions. Consumers
     /// retain a cursor; the log is part of the published deterministic state.
     pub effects: Vec<EngineEffect>,
+    /// Whether the settings application's hotkey editor is open and every
+    /// binding must therefore stay unregistered (ADR 0021).
+    ///
+    /// A flag rather than an effect. The agent's hotkey-rebind poller --
+    /// the same path a profile switch already re-registers through --
+    /// reads it and registers nothing while it is set, which keeps hotkey
+    /// ownership in one place and adds no new effect kind.
+    pub hotkey_capture_suspended: bool,
+    /// The bindings the most recent registration pass could not register,
+    /// in the spelling configuration files use.
+    ///
+    /// Re-registration after capture is partial-success, as registration
+    /// already is: a combination another application took while Mosaix was
+    /// suspended comes back failed. Recording which ones is what lets the
+    /// editor name them rather than leaving the user to discover a dead
+    /// shortcut (ADR 0021).
+    pub unregistered_bindings: Vec<Command>,
 }
 
 impl EngineState {
@@ -527,6 +544,33 @@ pub enum Event {
     /// back.
     SavedLayoutApplyRequested {
         name: String,
+    },
+
+    /// The settings application opened its hotkey editor, so every
+    /// binding must stay unregistered until it closes (ADR 0021).
+    ///
+    /// Sets [`EngineState::hotkey_capture_suspended`]. Idempotent: a
+    /// second editor window sets a flag that is already set, and the
+    /// connection that closes last clears it.
+    HotkeyCaptureStarted,
+
+    /// The hotkey editor is gone -- closed, crashed, or killed -- so
+    /// bindings can be registered again.
+    ///
+    /// Emitted by the agent when the settings application's connection
+    /// ends for any reason, because Windows closes the pipe handle even on
+    /// a hard kill. That is what bounds suspension by the connection
+    /// rather than by a message that can be lost (ADR 0021).
+    HotkeyCaptureEnded,
+
+    /// The outcome of a registration pass: the bindings the platform
+    /// refused, in the spelling configuration files use.
+    ///
+    /// Sent by the agent after each pass, so a binding that did not come
+    /// back from capture can be named to the user rather than discovered
+    /// as a dead shortcut (ADR 0021).
+    HotkeyRegistrationReported {
+        unregistered: Vec<Command>,
     },
 }
 
@@ -1353,6 +1397,43 @@ fn apply(state: &mut EngineState, event: Event) {
                 }
             }
         }
+
+        Event::HotkeyCaptureStarted => {
+            if state.hotkey_capture_suspended {
+                tracing::debug!("hotkey capture already suspended registration; ignoring");
+                return;
+            }
+            tracing::info!("hotkey editor opened; hotkey registration suspended");
+            state.hotkey_capture_suspended = true;
+            // Last capture's leftovers are not this one's news. The pass
+            // that follows the editor closing reports afresh.
+            state.unregistered_bindings.clear();
+            state.revision += 1;
+        }
+
+        Event::HotkeyCaptureEnded => {
+            if !state.hotkey_capture_suspended {
+                tracing::debug!("hotkey capture ended but registration was not suspended");
+                return;
+            }
+            tracing::info!("hotkey editor closed; hotkey registration resumed");
+            state.hotkey_capture_suspended = false;
+            state.revision += 1;
+        }
+
+        Event::HotkeyRegistrationReported { unregistered } => {
+            if state.unregistered_bindings == unregistered {
+                return;
+            }
+            if !unregistered.is_empty() {
+                tracing::warn!(
+                    count = unregistered.len(),
+                    "some hotkey bindings did not register; another application may own them"
+                );
+            }
+            state.unregistered_bindings = unregistered;
+            state.revision += 1;
+        }
     }
 }
 
@@ -1987,6 +2068,8 @@ pub fn spawn_engine_with_capacity(
         interactive_placement: None,
         deferred_reflow_displays: HashSet::new(),
         effects: Vec::new(),
+        hotkey_capture_suspended: false,
+        unregistered_bindings: Vec::new(),
     };
     let state = Arc::new(Mutex::new(initial_state.clone()));
 
@@ -5644,5 +5727,109 @@ mod tests {
                 display_id: DisplayId(1)
             })
         );
+    }
+
+    #[test]
+    fn hotkey_capture_start_suspends_registration_and_end_restores_it() {
+        let mut state = EngineState::default();
+
+        apply(&mut state, Event::HotkeyCaptureStarted);
+        assert!(state.hotkey_capture_suspended);
+        assert_eq!(state.revision, 1);
+
+        apply(&mut state, Event::HotkeyCaptureEnded);
+        assert!(!state.hotkey_capture_suspended);
+        assert_eq!(state.revision, 2);
+    }
+
+    #[test]
+    fn a_repeated_capture_start_changes_nothing() {
+        let mut state = EngineState::default();
+        apply(&mut state, Event::HotkeyCaptureStarted);
+
+        apply(&mut state, Event::HotkeyCaptureStarted);
+
+        assert!(state.hotkey_capture_suspended);
+        assert_eq!(state.revision, 1, "a second editor window is not a second suspension");
+    }
+
+    #[test]
+    fn capture_end_without_a_capture_changes_nothing() {
+        let mut state = EngineState::default();
+
+        apply(&mut state, Event::HotkeyCaptureEnded);
+
+        assert!(!state.hotkey_capture_suspended);
+        assert_eq!(state.revision, 0);
+    }
+
+    #[test]
+    fn a_config_reload_during_capture_leaves_registration_suspended() {
+        let mut state = EngineState::default();
+        apply(&mut state, Event::HotkeyCaptureStarted);
+
+        apply(
+            &mut state,
+            Event::ConfigChanged(Box::default()),
+        );
+
+        assert!(
+            state.hotkey_capture_suspended,
+            "a configuration change must not lift the editor's suspension"
+        );
+    }
+
+    #[test]
+    fn a_registration_pass_records_the_bindings_that_did_not_come_back() {
+        let mut state = EngineState::default();
+
+        apply(
+            &mut state,
+            Event::HotkeyRegistrationReported {
+                unregistered: vec![Command::SnapLeft],
+            },
+        );
+
+        assert_eq!(state.unregistered_bindings, vec![Command::SnapLeft]);
+        assert_eq!(state.revision, 1);
+    }
+
+    #[test]
+    fn opening_the_editor_clears_the_previous_passs_failures() {
+        let mut state = EngineState::default();
+        apply(
+            &mut state,
+            Event::HotkeyRegistrationReported {
+                unregistered: vec![Command::SnapLeft],
+            },
+        );
+
+        apply(&mut state, Event::HotkeyCaptureStarted);
+
+        assert!(
+            state.unregistered_bindings.is_empty(),
+            "last capture's failures are not this one's news"
+        );
+    }
+
+    #[test]
+    fn an_unchanged_registration_report_does_not_bump_the_revision() {
+        let mut state = EngineState::default();
+        apply(
+            &mut state,
+            Event::HotkeyRegistrationReported {
+                unregistered: vec![Command::SnapLeft],
+            },
+        );
+        let revision = state.revision;
+
+        apply(
+            &mut state,
+            Event::HotkeyRegistrationReported {
+                unregistered: vec![Command::SnapLeft],
+            },
+        );
+
+        assert_eq!(state.revision, revision);
     }
 }

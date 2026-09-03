@@ -209,6 +209,27 @@ pub fn delete_layout(
     session.delete(&name).map_err(|error| error.to_string())
 }
 
+/// Opens hotkey capture: the agent unregisters every binding until the
+/// editor closes it, or until this application's connection ends -- so a
+/// crash brings the hotkeys back without an agent restart (ADR 0021).
+#[tauri::command]
+pub fn start_hotkey_capture(state: State<'_, EditorState>) -> Result<(), String> {
+    let mut session = state.0.lock().map_err(|_| "editor state is unavailable")?;
+    session
+        .start_hotkey_capture()
+        .map_err(|error| error.to_string())
+}
+
+/// Closes hotkey capture, so the agent registers the bindings again and
+/// reports which of them came back.
+#[tauri::command]
+pub fn end_hotkey_capture(state: State<'_, EditorState>) -> Result<(), String> {
+    let mut session = state.0.lock().map_err(|_| "editor state is unavailable")?;
+    session
+        .end_hotkey_capture()
+        .map_err(|error| error.to_string())
+}
+
 #[tauri::command]
 pub fn set_appearance(appearance: Appearance, state: State<'_, EditorState>) -> Result<(), String> {
     let mut session = state.0.lock().map_err(|_| "editor state is unavailable")?;

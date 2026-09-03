@@ -79,11 +79,26 @@ export interface HotkeyBinding {
 export interface HotkeyList {
   topologyFingerprint: string;
   bindings: HotkeyBinding[];
+  /**
+   * Whether the agent currently has every binding unregistered for a
+   * hotkey editor. While it is true no Mosaix hotkey works anywhere on
+   * the system, so the interface says so rather than leaving the user to
+   * read it as Mosaix having stopped working (ADR 0021).
+   */
+  captureSuspended: boolean;
+  /**
+   * Commands whose bindings did not come back from the last registration
+   * pass -- a combination another application took while capture held
+   * registration suspended.
+   */
+  unregisteredCommands: string[];
 }
 
 export interface DesktopBridge {
   loadEditorSnapshot(): Promise<EditorSnapshot>;
   loadHotkeyBindings(): Promise<HotkeyList>;
+  startHotkeyCapture(): Promise<void>;
+  endHotkeyCapture(): Promise<void>;
   loadSavedLayouts(): Promise<SavedLayout[]>;
   saveLayout(draft: LayoutDraft): Promise<LayoutWriteReceipt>;
   renameLayout(from: string, to: string): Promise<LayoutWriteReceipt>;
@@ -233,13 +248,35 @@ function renderLayouts(
     .join("")}</ul>`;
 }
 
+/**
+ * What the user needs told about the state of registration, above the
+ * list itself: that hotkeys are off while the editor holds them, and
+ * which of them another application took while they were off (ADR 0021).
+ *
+ * Both are stated rather than left to be inferred from a shortcut that
+ * has stopped working.
+ */
+function renderRegistrationNotices(hotkeys: HotkeyList): string {
+  const suspended = hotkeys.captureSuspended
+    ? `<p class="binding-notice" data-capture-suspended>Hotkeys are off while the editor is open. They come back when you close it, even if this window crashes.</p>`
+    : "";
+  const missing =
+    hotkeys.unregisteredCommands.length > 0
+      ? `<p class="binding-notice warning" data-unregistered-bindings>Did not come back · ${hotkeys.unregisteredCommands
+          .map((command) => escapeHtml(bindingLabel(command)))
+          .join(", ")} · another application owns the combination</p>`
+      : "";
+  return `${suspended}${missing}`;
+}
+
 function renderBindings(hotkeys: HotkeyList | undefined, hotkeyError: string | undefined): string {
   if (hotkeyError !== undefined) {
     return `<p data-hotkey-error>${escapeHtml(hotkeyError)}</p>`;
   }
   if (hotkeys === undefined) return `<p>Reading bindings…</p>`;
-  if (hotkeys.bindings.length === 0) return `<p>No hotkeys are bound.</p>`;
-  return `<ul class="binding-list">${hotkeys.bindings
+  const notices = renderRegistrationNotices(hotkeys);
+  if (hotkeys.bindings.length === 0) return `${notices}<p>No hotkeys are bound.</p>`;
+  return `${notices}<ul class="binding-list">${hotkeys.bindings
     .map(
       (binding) => `
         <li class="binding" data-binding="${escapeHtml(binding.command)}" data-source="${escapeHtml(binding.source)}">

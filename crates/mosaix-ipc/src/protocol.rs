@@ -4,11 +4,11 @@ use serde::{Deserialize, Serialize};
 /// The wire contract this build speaks.
 ///
 /// Bumped to 2 when [`IpcRequest`] gained its first data-carrying variant
-/// ([`IpcRequest::ApplyLayout`]), and to 3 for the saved-layout editing
-/// requests. An older agent has no tag for a request this build added, so
-/// the version is what makes the mismatch reportable instead of surfacing
-/// as a deserialization failure.
-pub const PROTOCOL_VERSION: u32 = 3;
+/// ([`IpcRequest::ApplyLayout`]), to 3 for the saved-layout editing
+/// requests, and to 4 for the hotkey-capture pair. An older agent has no
+/// tag for a request this build added, so the version is what makes the
+/// mismatch reportable instead of surfacing as a deserialization failure.
+pub const PROTOCOL_VERSION: u32 = 4;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct IpcEnvelope {
@@ -75,6 +75,18 @@ pub enum IpcRequest {
     DeleteLayout {
         name: String,
     },
+    /// The hotkey editor is open on this connection: unregister every
+    /// binding until it closes (ADR 0021).
+    ///
+    /// Suspension is bounded by the connection that asked for it, not by
+    /// the matching request below. The agent emits capture-end when this
+    /// connection ends for any reason -- close, crash, or kill -- because
+    /// Windows closes the pipe handle either way, so there is no exit
+    /// message that can be lost.
+    StartHotkeyCapture,
+    /// The hotkey editor closed cleanly. Registration resumes, exactly as
+    /// it would have when this connection ended.
+    EndHotkeyCapture,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -234,6 +246,8 @@ mod tests {
             IpcRequest::DeleteLayout {
                 name: "writing".to_owned(),
             },
+            IpcRequest::StartHotkeyCapture,
+            IpcRequest::EndHotkeyCapture,
         ];
         for request in requests {
             let decoded: IpcEnvelope = serde_json::from_str(

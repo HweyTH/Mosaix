@@ -17,6 +17,8 @@ pub fn run() {
             commands::rename_layout,
             commands::duplicate_layout,
             commands::delete_layout,
+            commands::start_hotkey_capture,
+            commands::end_hotkey_capture,
             commands::set_appearance,
             commands::load_automatic_tiling_settings,
             commands::save_automatic_tiling_settings,

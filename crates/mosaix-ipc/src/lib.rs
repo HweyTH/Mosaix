@@ -10,7 +10,7 @@ pub mod protocol;
 #[cfg(windows)]
 pub use client::{send_request, IpcConnection, IpcError};
 pub use handler::{
-    handle_request, ConfigError, ConfigStore, HotkeyBindingSnapshot, StateSnapshot,
+    handle_request, CaptureHold, ConfigError, ConfigStore, HotkeyBindingSnapshot, StateSnapshot,
     UnavailableConfigStore,
 };
 #[cfg(windows)]

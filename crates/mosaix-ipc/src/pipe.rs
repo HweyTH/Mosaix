@@ -30,7 +30,7 @@ use windows::Win32::System::Pipes::{
 };
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
-use crate::handler::{handle_request, ConfigStore};
+use crate::handler::{handle_request, CaptureHold, ConfigStore};
 use crate::protocol::{decode_request, wrap_response, IpcResponse};
 
 pub const PIPE_NAME_PREFIX: &str = r"\\.\pipe\mosaix-";
@@ -210,6 +210,12 @@ fn handle_client(
     let file = unsafe { File::from_raw_handle(pipe.0 as RawHandle) };
     let mut reader = BufReader::new(file);
     let mut recent_requests: VecDeque<Instant> = VecDeque::new();
+    // What this connection owes the engine when it ends, however it ends.
+    // A settings application that is killed rather than closed never sends
+    // capture-end; the operating system closing this pipe handle is what
+    // breaks the read loop below, and releasing the hold there is what
+    // brings the hotkeys back without an agent restart (ADR 0021).
+    let mut capture = CaptureHold::default();
     loop {
         let mut bytes = Vec::with_capacity(1024);
         match reader
@@ -240,12 +246,20 @@ fn handle_client(
             break;
         }
         let response = match decode_request(&bytes) {
-            Ok(request) => handle_request(&request, events, state_reader, config),
+            Ok(request) => {
+                let response = handle_request(&request, events, state_reader, config);
+                capture.observe(&request, &response);
+                response
+            }
             Err(response) => response,
         };
         if !write_response(&mut reader, response) {
             break;
         }
+    }
+    if let Some(event) = capture.release() {
+        tracing::info!("settings connection ended while holding hotkey capture; re-registering");
+        let _ = events.send(event);
     }
     // The outer loop owns close/disconnect. Avoid File closing the handle
     // before that cleanup is performed.

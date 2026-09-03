@@ -71,6 +71,9 @@ export function createTauriDesktopBridge(
     },
     loadHotkeyBindings: () =>
       invokeCommand("load_hotkey_bindings") as Promise<HotkeyList>,
+    startHotkeyCapture: () =>
+      invokeCommand("start_hotkey_capture") as Promise<void>,
+    endHotkeyCapture: () => invokeCommand("end_hotkey_capture") as Promise<void>,
     loadSavedLayouts: async () => {
       const layouts = await invokeCommand("load_saved_layouts") as SavedLayout[];
       return layouts.map(fromNormalizedLayout);
