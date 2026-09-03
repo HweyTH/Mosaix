@@ -203,14 +203,17 @@ export function capturedCombo(session: CaptureSession): string | null {
 }
 
 /**
- * What the dialog shows while the user is still pressing, including the
- * incomplete states `capturedCombo` refuses to return.
+ * The one line the dialog shows: the combination, or why there is not one
+ * yet. Every incomplete state `capturedCombo` refuses to return has its
+ * own short answer here, so the dialog needs no second line of
+ * instructions above it.
  */
 export function capturedLabel(session: CaptureSession): string {
   const captured = session.captured;
-  if (captured === undefined) return "Press a combination…";
-  if (captured.key === null) return "Mosaix has no name for that key";
+  if (!session.armed) return "Click to listen";
+  if (captured === undefined) return "Press a combination";
+  if (captured.key === null) return "Unsupported key";
   const complete = capturedCombo(session);
-  if (complete === null) return "Add a modifier — Ctrl, Alt, Shift, or Win";
+  if (complete === null) return "Add a modifier";
   return complete;
 }

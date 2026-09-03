@@ -352,7 +352,7 @@ function renderLayouts(
       (layout) => `
         <li class="library-item${layout.name === selected ? " active" : ""}" data-layout="${escapeHtml(layout.name)}" data-source="${escapeHtml(layout.source)}">
           <button class="layout-open" data-open-layout="${escapeHtml(layout.name)}">${escapeHtml(layout.name)}</button>
-          <small class="library-detail">${layout.cells.length} zone${layout.cells.length === 1 ? "" : "s"} · ${layout.source === "profile" ? "profile · " : ""}${escapeHtml(layout.file ?? "source unknown")}</small>
+          <small class="library-detail">${layout.cells.length} zone${layout.cells.length === 1 ? "" : "s"} · ${escapeHtml(layout.file ?? "")}</small>
           <span class="layout-actions">
             <button data-duplicate-layout="${escapeHtml(layout.name)}" title="Duplicate">⧉</button>
             <button data-delete-layout="${escapeHtml(layout.name)}" title="Delete">⌫</button>
@@ -377,7 +377,7 @@ function renderSaveDestination(
   toBase: boolean,
 ): string {
   const redirect = destination.redirectable
-    ? `<label class="toggle-line redirect"><span>Save to base config instead<small>Moves it out of this desk's profile</small></span><input data-redirect-to-base type="checkbox" ${toBase ? "checked" : ""} /></label>`
+    ? `<label class="toggle-line redirect"><span>Save to base config</span><input data-redirect-to-base type="checkbox" ${toBase ? "checked" : ""} /></label>`
     : "";
   return `<p class="save-destination" data-save-destination>Saves to <code>${escapeHtml(destination.file)}</code></p>${redirect}`;
 }
@@ -392,13 +392,13 @@ function renderSaveDestination(
  */
 function renderRegistrationNotices(hotkeys: HotkeyList): string {
   const suspended = hotkeys.captureSuspended
-    ? `<p class="binding-notice" data-capture-suspended>Hotkeys are off while the editor is open. They come back when you close it, even if this window crashes.</p>`
+    ? `<p class="binding-notice" data-capture-suspended>Hotkeys are off while this window is open.</p>`
     : "";
   const missing =
     hotkeys.unregisteredCommands.length > 0
-      ? `<p class="binding-notice warning" data-unregistered-bindings>Did not come back · ${hotkeys.unregisteredCommands
+      ? `<p class="binding-notice warning" data-unregistered-bindings>Taken by another app · ${hotkeys.unregisteredCommands
           .map((command) => escapeHtml(bindingLabel(command)))
-          .join(", ")} · another application owns the combination</p>`
+          .join(", ")}</p>`
       : "";
   return `${suspended}${missing}`;
 }
@@ -416,7 +416,7 @@ function renderBindings(hotkeys: HotkeyList | undefined, hotkeyError: string | u
         <li class="binding" data-binding="${escapeHtml(binding.command)}" data-source="${escapeHtml(binding.source)}">
           <span class="binding-command">${escapeHtml(bindingLabel(binding.command))}</span>
           <kbd>${binding.combo === null ? "not bound" : escapeHtml(binding.combo)}</kbd>
-          <small class="binding-file">${binding.source === "profile" ? "profile · " : ""}${escapeHtml(binding.file ?? (binding.combo === null ? "nothing supplies it yet" : "source unknown"))}</small>
+          <small class="binding-file">${escapeHtml(binding.file ?? "")}</small>
           <span class="binding-actions">
             <button data-rebind="${escapeHtml(binding.command)}" title="${binding.combo === null ? "Bind" : "Rebind"}">⌨</button>
             <button data-reset-binding="${escapeHtml(binding.command)}" title="Reset to default" ${binding.combo === null ? "disabled" : ""}>↺</button>
@@ -456,11 +456,10 @@ function renderCaptureDialog(
     <div class="capture-backdrop" data-capture-dialog role="dialog" aria-modal="true" aria-label="Rebind ${escapeHtml(bindingLabel(capture.command))}">
       <div class="capture-dialog">
         <div class="panel-title">REBIND ${escapeHtml(bindingLabel(capture.command)).toUpperCase()}</div>
-        <p class="capture-hint">${capture.session.armed ? "Mosaix is listening. Press the combination you want." : "This window lost focus, so nothing is being captured. Click here and press again."}</p>
         <div class="capture-combo${combo === null ? " incomplete" : ""}" data-captured-combo>${escapeHtml(capturedLabel(capture.session))}</div>
         ${renderVerdict(capture.verdict)}
         <p class="save-destination" data-binding-destination>Saves to <code>${escapeHtml(destination.file)}</code></p>
-        ${destination.redirectable ? `<label class="toggle-line redirect"><span>Save to base config instead<small>Applies at every desk, not just this one</small></span><input data-binding-redirect type="checkbox" ${capture.toBase ? "checked" : ""} /></label>` : ""}
+        ${destination.redirectable ? `<label class="toggle-line redirect"><span>Save to base config</span><input data-binding-redirect type="checkbox" ${capture.toBase ? "checked" : ""} /></label>` : ""}
         <div class="library-actions">
           <button class="primary-button" data-capture-save ${savable ? "" : "disabled"}>Save binding</button>
           <button class="soft-button" data-capture-cancel>Cancel</button>
@@ -488,11 +487,11 @@ function renderVerdict(verdict: HotkeyProbeResult | undefined): string {
     case "available":
       return `${notice("ok", "Available")}${warning}`;
     case "mosaix_binding":
-      return `${notice("warning", `Already bound to ${escapeHtml(bindingLabel(verdict.command ?? ""))} · save anyway to take it over`)}${warning}`;
+      return `${notice("warning", `Bound to ${escapeHtml(bindingLabel(verdict.command ?? ""))}`)}${warning}`;
     case "system_or_other_application":
-      return `${notice("warning", "The system or another application owns this · save anyway if you know it is free")}${warning}`;
+      return `${notice("warning", "Taken by another app")}${warning}`;
     case "reserved":
-      return `${notice("blocked", "Windows handles this itself, so a binding to it would never fire")}${warning}`;
+      return `${notice("blocked", "Reserved by Windows")}${warning}`;
     case "unsupported":
       return `${notice("blocked", escapeHtml(verdict.reason ?? "Mosaix cannot express this combination"))}${warning}`;
   }
@@ -579,6 +578,10 @@ export async function mountLayoutEditor(
           <small data-product-subtitle>Layout Tab</small>
         </header>
         <div class="top-actions">
+          <nav class="appearance-toggle" aria-label="Appearance">
+            <button data-appearance="dark" aria-pressed="${snapshot.appearance === "dark"}" title="Dark">☾</button>
+            <button data-appearance="light" aria-pressed="${snapshot.appearance === "light"}" title="Light">☀</button>
+          </nav>
           <button class="soft-button" data-preview><i></i>Live preview</button>
           <button class="primary-button" data-save-apply>Save &amp; apply</button>
         </div>
@@ -645,10 +648,6 @@ export async function mountLayoutEditor(
         <nav class="command-dock" aria-label="Zone commands">
           <button data-command="undo" ${history.length === 0 ? "disabled" : ""}><kbd>⌘ Z</kbd> Undo</button><button data-command="split"><kbd>S</kbd> Split</button><button data-command="duplicate"><kbd>D</kbd> Duplicate</button><button data-command="delete"><kbd>⌫</kbd> Delete</button>
           <button class="new-zone" data-add-zone>＋ New zone</button>
-        </nav>
-        <nav class="appearance-toggle" aria-label="Appearance">
-          <button data-appearance="dark" aria-pressed="${snapshot.appearance === "dark"}"><i>☾</i><span>Dark<small>Night Tide</small></span></button>
-          <button data-appearance="light" aria-pressed="${snapshot.appearance === "light"}"><i>☀</i><span>Light<small>Warm Paper</small></span></button>
         </nav>
         <div class="command-status" role="status">${commandStatus}</div>
         ${renderCaptureDialog(capture, hotkeys)}

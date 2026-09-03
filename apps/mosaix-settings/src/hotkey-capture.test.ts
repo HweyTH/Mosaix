@@ -53,7 +53,7 @@ describe("capture buffer", () => {
     session = pressKey(session, press("ControlLeft", { ctrlKey: true }));
 
     expect(capturedCombo(session)).toBeNull();
-    expect(capturedLabel(session)).toContain("Press a combination");
+    expect(capturedLabel(session)).toBe("Press a combination");
   });
 
   it("refuses a bare key with no modifier, which would swallow it everywhere", () => {
@@ -62,7 +62,7 @@ describe("capture buffer", () => {
     session = pressKey(session, press("KeyJ"));
 
     expect(capturedCombo(session)).toBeNull();
-    expect(capturedLabel(session)).toContain("Add a modifier");
+    expect(capturedLabel(session)).toBe("Add a modifier");
   });
 
   it("says so when Mosaix has no name for the key pressed", () => {
@@ -71,7 +71,7 @@ describe("capture buffer", () => {
     session = pressKey(session, press("Pause", { ctrlKey: true }));
 
     expect(capturedCombo(session)).toBeNull();
-    expect(capturedLabel(session)).toContain("no name for that key");
+    expect(capturedLabel(session)).toBe("Unsupported key");
   });
 
   it("replaces the previous capture rather than accumulating", () => {

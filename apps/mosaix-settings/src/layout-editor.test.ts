@@ -626,7 +626,7 @@ describe("hotkey registration notices", () => {
     );
 
     expect(root.querySelector("[data-capture-suspended]")?.textContent).toContain(
-      "Hotkeys are off while the editor is open",
+      "Hotkeys are off",
     );
     expect(root.querySelector("[data-unregistered-bindings]")?.textContent).toContain(
       "Snap right",
@@ -877,8 +877,8 @@ describe("hotkey capture dialog", () => {
     window.dispatchEvent(new Event("blur"));
 
     expect(root.querySelector<HTMLButtonElement>("[data-capture-save]")!.disabled).toBe(true);
-    expect(root.querySelector("[data-capture-dialog]")?.textContent).toContain(
-      "lost focus",
+    expect(root.querySelector("[data-captured-combo]")?.textContent).toContain(
+      "Click to listen",
     );
     stop();
   });

@@ -404,7 +404,7 @@ fn is_reserved(combo: &KeyCombo) -> bool {
 /// is a worse answer than saying so (ADR 0021).
 fn advisory(combo: &KeyCombo) -> Option<String> {
     combo.key.eq_ignore_ascii_case("F12").then(|| {
-        "Windows reserves F12 for the debugger, so this binding may not fire".to_owned()
+        "F12 is reserved for the debugger".to_owned()
     })
 }
 
