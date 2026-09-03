@@ -432,15 +432,21 @@ impl EditorSession {
         })
     }
 
-    /// Asks the agent whether `combo` can be bound.
+    /// Asks the agent whether `combo` can be bound to `for_command`.
     ///
     /// Asked before the save, so a combination something else owns is
     /// reported while the user is still choosing rather than after they
-    /// have committed to it (ADR 0021).
-    pub fn probe_hotkey(&mut self, combo: &str) -> Result<HotkeyProbeResult, EditorCommandError> {
+    /// have committed to it (ADR 0021). The command travels with the
+    /// question so re-pressing a binding's own combination is not
+    /// reported as a conflict with itself.
+    pub fn probe_hotkey(
+        &mut self,
+        combo: &str,
+        for_command: &str,
+    ) -> Result<HotkeyProbeResult, EditorCommandError> {
         let answer = self
             .agent
-            .probe_hotkey(combo)
+            .probe_hotkey(combo, for_command)
             .map_err(EditorCommandError::from)?;
         serde_json::from_value(answer).map_err(|error| EditorCommandError::AgentTransportFailed {
             detail: format!("could not read the agent's verdict: {error}"),
@@ -460,10 +466,8 @@ impl EditorSession {
         to_base: bool,
     ) -> Result<BindingWriteReceipt, EditorCommandError> {
         let command = parse_command(command)?;
-        let combo =
-            KeyCombo::parse(combo).map_err(|reason| EditorCommandError::UnusableCombination {
-                reason,
-            })?;
+        let combo = KeyCombo::parse(combo)
+            .map_err(|reason| EditorCommandError::UnusableCombination { reason })?;
         self.edit_binding(BindingEdit::Set {
             command,
             combo,
@@ -780,7 +784,10 @@ mod tests {
         fn about_hotkeys(answer: serde_json::Value) -> Self {
             Self {
                 probe_answer: Some(answer),
-                binding_outcome: Some(Ok(("config.toml".to_owned(), Some("ctrl+alt+j".to_owned())))),
+                binding_outcome: Some(Ok((
+                    "config.toml".to_owned(),
+                    Some("ctrl+alt+j".to_owned()),
+                ))),
                 ..Self::default()
             }
         }
@@ -812,10 +819,12 @@ mod tests {
             Ok(())
         }
 
-        fn probe_hotkey(&mut self, _combo: &str) -> Result<serde_json::Value, AgentError> {
-            self.probe_answer
-                .clone()
-                .ok_or(AgentError::Unavailable)
+        fn probe_hotkey(
+            &mut self,
+            _combo: &str,
+            _for_command: &str,
+        ) -> Result<serde_json::Value, AgentError> {
+            self.probe_answer.clone().ok_or(AgentError::Unavailable)
         }
 
         fn edit_binding(
@@ -899,7 +908,11 @@ mod tests {
         );
         let sent = edits.lock().unwrap().clone();
         match &sent[0] {
-            LayoutEdit::Save { name, cells, to_base } => {
+            LayoutEdit::Save {
+                name,
+                cells,
+                to_base,
+            } => {
                 assert_eq!(name, "Writing");
                 assert!(!to_base, "an ordinary save goes where the layout lives");
                 assert_eq!(cells.len(), 3, "the drawn cells, not just the name");
@@ -1299,7 +1312,10 @@ mod tests {
 
     #[test]
     fn the_hotkey_list_states_that_capture_has_registration_suspended() {
-        let mut state = state_reporting("MON-A", vec![binding("snap-left", "ctrl+alt+left", "base", "config.toml")]);
+        let mut state = state_reporting(
+            "MON-A",
+            vec![binding("snap-left", "ctrl+alt+left", "base", "config.toml")],
+        );
         state.hotkey_capture_suspended = true;
         state.unregistered_bindings = vec!["snap-right".to_owned()];
         let mut session = session(FakeAgent::reporting(Ok(state)));
@@ -1393,7 +1409,8 @@ mod tests {
         match &sent[0] {
             LayoutEdit::Save { to_base, .. } => assert!(
                 to_base,
-                "the redirect the user set has to travel with the write, or the                  destination shown and the file written disagree"
+                "the redirect the user set has to travel with the write, or the destination \
+                 shown and the file written disagree"
             ),
             other => panic!("expected a save, got {other:?}"),
         }
@@ -1407,7 +1424,9 @@ mod tests {
             "warning": null,
         })));
 
-        let verdict = session.probe_hotkey("ctrl+alt+left").expect("the agent answered");
+        let verdict = session
+            .probe_hotkey("ctrl+alt+left", "snap-right")
+            .expect("the agent answered");
 
         assert_eq!(verdict.availability, "mosaix_binding");
         assert_eq!(
@@ -1424,7 +1443,9 @@ mod tests {
             "warning": "Windows reserves F12 for the debugger, so this binding may not fire",
         })));
 
-        let verdict = session.probe_hotkey("ctrl+alt+f12").expect("the agent answered");
+        let verdict = session
+            .probe_hotkey("ctrl+alt+f12", "snap-left")
+            .expect("the agent answered");
 
         assert_eq!(verdict.availability, "available");
         assert!(verdict.warning.is_some());
@@ -1474,7 +1495,9 @@ mod tests {
         let edits = Arc::clone(&agent.binding_edits);
         let mut session = session(agent);
 
-        session.reset_binding("focus-down").expect("a confirmed write");
+        session
+            .reset_binding("focus-down")
+            .expect("a confirmed write");
 
         assert_eq!(
             edits.lock().unwrap().clone(),
@@ -1489,7 +1512,9 @@ mod tests {
         // The fake has no scripted binding answer, so reaching it panics.
         let mut session = session(FakeAgent::never_asked());
 
-        let error = session.set_binding("focus-down", "ctrl++", false).unwrap_err();
+        let error = session
+            .set_binding("focus-down", "ctrl++", false)
+            .unwrap_err();
 
         assert!(matches!(
             error,
@@ -1513,7 +1538,10 @@ mod tests {
 
     #[test]
     fn the_hotkey_list_names_the_file_a_new_binding_would_be_created_in() {
-        let mut session = session(FakeAgent::reporting(Ok(state_reporting("MON-A", Vec::new()))));
+        let mut session = session(FakeAgent::reporting(Ok(state_reporting(
+            "MON-A",
+            Vec::new(),
+        ))));
 
         let list = session.hotkeys().expect("the agent answered");
 

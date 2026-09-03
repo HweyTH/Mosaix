@@ -7,11 +7,12 @@ use serde::{Deserialize, Serialize};
 /// ([`IpcRequest::ApplyLayout`]), to 3 for the saved-layout editing
 /// requests, to 4 for the hotkey-capture pair, to 5 when
 /// [`IpcRequest::SaveLayout`] gained its write-destination redirect, and
-/// to 6 for the binding-editing requests. An
+/// to 6 for the binding-editing requests, and to 7 when
+/// [`IpcRequest::ProbeHotkey`] gained the command it is probing for. An
 /// older agent has no tag for a request this build added -- and no field
 /// for one an existing request grew -- so the version is what makes the
 /// mismatch reportable instead of surfacing as a deserialization failure.
-pub const PROTOCOL_VERSION: u32 = 6;
+pub const PROTOCOL_VERSION: u32 = 7;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct IpcEnvelope {
@@ -104,6 +105,10 @@ pub enum IpcRequest {
     /// asking.
     ProbeHotkey {
         combo: String,
+        /// The command being rebound, so its own binding does not count
+        /// as a conflict with itself. `None` when the question is asked
+        /// about no command in particular.
+        for_command: Option<String>,
     },
     /// Bind `command` to `combo`.
     ///
@@ -286,6 +291,7 @@ mod tests {
             IpcRequest::EndHotkeyCapture,
             IpcRequest::ProbeHotkey {
                 combo: "ctrl+alt+left".to_owned(),
+                for_command: Some("snap-left".to_owned()),
             },
             IpcRequest::SetBinding {
                 command_path: "snap-left".to_owned(),

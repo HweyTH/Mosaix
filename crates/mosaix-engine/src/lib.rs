@@ -207,14 +207,22 @@ pub struct EngineState {
     /// make this the one part of published state that lies. Entries for a
     /// display that leaves the topology are dropped with it.
     pub last_applied_layouts: HashMap<DisplayId, String>,
-    /// Whether the settings application's hotkey editor is open and every
-    /// binding must therefore stay unregistered (ADR 0021).
+    /// Whether a hotkey editor is open and every binding must therefore
+    /// stay unregistered (ADR 0021).
     ///
     /// A flag rather than an effect. The agent's hotkey-rebind poller --
     /// the same path a profile switch already re-registers through --
     /// reads it and registers nothing while it is set, which keeps hotkey
     /// ownership in one place and adds no new effect kind.
     pub hotkey_capture_suspended: bool,
+    /// How many editors currently hold suspension.
+    ///
+    /// A count, not a bool, so two settings windows behave: the second to
+    /// open does not re-suspend something already suspended, and the
+    /// first to close does not lift a suspension the other still needs
+    /// while its capture dialog is armed. `hotkey_capture_suspended` is
+    /// this reaching zero or not, and stays the published fact.
+    capture_holds: usize,
     /// The bindings the most recent registration pass could not register,
     /// in the spelling configuration files use.
     ///
@@ -1422,21 +1430,35 @@ fn apply(state: &mut EngineState, event: Event) {
         }
 
         Event::HotkeyCaptureStarted => {
+            state.capture_holds += 1;
             if state.hotkey_capture_suspended {
-                tracing::debug!("hotkey capture already suspended registration; ignoring");
+                tracing::debug!(
+                    holds = state.capture_holds,
+                    "another editor already holds hotkey capture"
+                );
                 return;
             }
             tracing::info!("hotkey editor opened; hotkey registration suspended");
             state.hotkey_capture_suspended = true;
-            // Last capture's leftovers are not this one's news. The pass
-            // that follows the editor closing reports afresh.
-            state.unregistered_bindings.clear();
+            // What did not come back from the *last* capture is
+            // deliberately left standing. It is only known once
+            // registration resumes, by which time the editor that caused
+            // it has closed -- so the next editor to open is the only one
+            // that can tell the user (ADR 0021).
             state.revision += 1;
         }
 
         Event::HotkeyCaptureEnded => {
-            if !state.hotkey_capture_suspended {
-                tracing::debug!("hotkey capture ended but registration was not suspended");
+            if state.capture_holds == 0 {
+                tracing::debug!("hotkey capture ended but no editor held it");
+                return;
+            }
+            state.capture_holds -= 1;
+            if state.capture_holds > 0 {
+                tracing::debug!(
+                    holds = state.capture_holds,
+                    "an editor closed but another still holds hotkey capture"
+                );
                 return;
             }
             tracing::info!("hotkey editor closed; hotkey registration resumed");
@@ -2093,6 +2115,7 @@ pub fn spawn_engine_with_capacity(
         effects: Vec::new(),
         last_applied_layouts: HashMap::new(),
         hotkey_capture_suspended: false,
+        capture_holds: 0,
         unregistered_bindings: Vec::new(),
     };
     let state = Arc::new(Mutex::new(initial_state.clone()));
@@ -5767,14 +5790,49 @@ mod tests {
     }
 
     #[test]
-    fn a_repeated_capture_start_changes_nothing() {
+    fn a_second_editor_does_not_re_suspend_what_is_already_suspended() {
         let mut state = EngineState::default();
         apply(&mut state, Event::HotkeyCaptureStarted);
 
         apply(&mut state, Event::HotkeyCaptureStarted);
 
         assert!(state.hotkey_capture_suspended);
-        assert_eq!(state.revision, 1, "a second editor window is not a second suspension");
+        assert_eq!(
+            state.revision, 1,
+            "a second editor window is not a second suspension"
+        );
+    }
+
+    #[test]
+    fn suspension_lasts_until_the_editor_that_closes_last() {
+        let mut state = EngineState::default();
+        apply(&mut state, Event::HotkeyCaptureStarted);
+        apply(&mut state, Event::HotkeyCaptureStarted);
+
+        apply(&mut state, Event::HotkeyCaptureEnded);
+
+        assert!(
+            state.hotkey_capture_suspended,
+            "one editor closing must not re-register under another whose capture dialog is armed"
+        );
+
+        apply(&mut state, Event::HotkeyCaptureEnded);
+
+        assert!(!state.hotkey_capture_suspended);
+    }
+
+    #[test]
+    fn a_stray_capture_end_cannot_drive_the_hold_count_below_zero() {
+        let mut state = EngineState::default();
+        apply(&mut state, Event::HotkeyCaptureEnded);
+        apply(&mut state, Event::HotkeyCaptureStarted);
+
+        apply(&mut state, Event::HotkeyCaptureEnded);
+
+        assert!(
+            !state.hotkey_capture_suspended,
+            "the one editor that opened has closed, so nothing holds suspension"
+        );
     }
 
     #[test]
@@ -5792,10 +5850,7 @@ mod tests {
         let mut state = EngineState::default();
         apply(&mut state, Event::HotkeyCaptureStarted);
 
-        apply(
-            &mut state,
-            Event::ConfigChanged(Box::default()),
-        );
+        apply(&mut state, Event::ConfigChanged(Box::default()));
 
         assert!(
             state.hotkey_capture_suspended,
@@ -5819,7 +5874,7 @@ mod tests {
     }
 
     #[test]
-    fn opening_the_editor_clears_the_previous_passs_failures() {
+    fn opening_the_editor_keeps_the_previous_passs_failures_to_report() {
         let mut state = EngineState::default();
         apply(
             &mut state,
@@ -5830,9 +5885,12 @@ mod tests {
 
         apply(&mut state, Event::HotkeyCaptureStarted);
 
-        assert!(
-            state.unregistered_bindings.is_empty(),
-            "last capture's failures are not this one's news"
+        assert_eq!(
+            state.unregistered_bindings,
+            vec![Command::SnapLeft],
+            "a binding that did not come back is only known after the editor that \
+             caused it has closed, so the next editor to open is the only one that \
+             can tell the user"
         );
     }
 

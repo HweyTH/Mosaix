@@ -381,6 +381,27 @@ impl LayoutLayers {
         }
     }
 
+    /// Which layer supplies `command`'s binding, `None` if neither binds
+    /// it.
+    ///
+    /// Unlike a saved layout, a command both layers bind is the ordinary
+    /// case rather than an ambiguity: that is what a profile override
+    /// *is*, and the profile wins the merge, so it is also the layer that
+    /// supplies the value on screen.
+    fn binding_supplier(&self, command: &Command) -> Option<ConfigLayer> {
+        if self
+            .profile
+            .as_ref()
+            .is_some_and(|(_, profile)| profile.hotkeys.contains_key(command))
+        {
+            return Some(ConfigLayer::Profile);
+        }
+        self.base
+            .hotkeys
+            .contains_key(command)
+            .then_some(ConfigLayer::Base)
+    }
+
     /// Every layout name either layer declares.
     fn names(&self) -> impl Iterator<Item = &String> {
         self.base.layouts.keys().chain(
@@ -548,47 +569,6 @@ fn plan_edit(layers: &LayoutLayers, edit: &LayoutEdit) -> Result<EditPlan, Layou
     }
 }
 
-/// The two layers a binding edit can land in, paired with the file each
-/// was read from -- the same shape [`LayoutLayers`] has, for the same
-/// reason (ADR 0022).
-struct BindingLayers {
-    base: BaseConfig,
-    profile: Option<(String, ProfileConfig)>,
-}
-
-impl BindingLayers {
-    /// Which layer supplies `command`, `None` if neither binds it.
-    ///
-    /// Unlike a saved layout, a binding both layers declare is the
-    /// ordinary case rather than an ambiguity: that is what a profile
-    /// override *is*, and the profile wins the merge, so it is also the
-    /// layer that supplies the value on screen.
-    fn supplier(&self, command: &Command) -> Option<ConfigLayer> {
-        if self
-            .profile
-            .as_ref()
-            .is_some_and(|(_, profile)| profile.hotkeys.contains_key(command))
-        {
-            return Some(ConfigLayer::Profile);
-        }
-        self.base
-            .hotkeys
-            .contains_key(command)
-            .then_some(ConfigLayer::Base)
-    }
-}
-
-fn parse_binding_layers(
-    candidate: &CandidateConfig,
-    fingerprint: &str,
-) -> Result<BindingLayers, ConfigIoError> {
-    let layers = parse_layers(candidate, fingerprint)?;
-    Ok(BindingLayers {
-        base: layers.base,
-        profile: layers.profile,
-    })
-}
-
 /// Which file a binding edit writes, and what the binding says there
 /// afterwards.
 ///
@@ -603,7 +583,7 @@ struct BindingPlan {
 }
 
 fn plan_binding_edit(
-    layers: &BindingLayers,
+    layers: &LayoutLayers,
     edit: &BindingEdit,
 ) -> Result<BindingPlan, BindingEditError> {
     match edit {
@@ -612,7 +592,7 @@ fn plan_binding_edit(
             combo,
             to_base,
         } => {
-            let supplier = layers.supplier(command);
+            let supplier = layers.binding_supplier(command);
             // A redirect only has an override to drop when the profile is
             // what supplies the binding. Otherwise it asks for where the
             // write was already going.
@@ -630,12 +610,11 @@ fn plan_binding_edit(
             })
         }
         BindingEdit::Reset { command } => {
-            let supplier =
-                layers
-                    .supplier(command)
-                    .ok_or_else(|| BindingEditError::UnboundCommand {
-                        command: command.to_string(),
-                    })?;
+            let supplier = layers.binding_supplier(command).ok_or_else(|| {
+                BindingEditError::UnboundCommand {
+                    command: command.to_string(),
+                }
+            })?;
             // Resetting a profile override is one step back toward the
             // default: the override goes and base config's value shows
             // through, whatever that is.
@@ -673,8 +652,8 @@ pub fn edit_bindings(
     edit: BindingEdit,
 ) -> Result<BindingWrite, ConfigIoError> {
     ensure_default_config(dir)?;
-    let mut candidate = read_candidate(dir)?;
-    let layers = parse_binding_layers(&candidate, fingerprint)?;
+    let candidate = read_candidate(dir)?;
+    let layers = parse_layers(&candidate, fingerprint)?;
     let plan = plan_binding_edit(&layers, &edit)?;
     let command = match &edit {
         BindingEdit::Set { command, .. } | BindingEdit::Reset { command } => command.clone(),
@@ -707,38 +686,16 @@ pub fn edit_bindings(
         None
     };
 
-    if into_profile {
-        candidate
-            .profiles
-            .iter_mut()
-            .find(|profile| profile.file_name == file_name)
-            .expect("the matched profile was read from this candidate")
-            .contents = contents.clone();
-    } else {
-        candidate.base = contents.clone();
-    }
-    if let Some((profile_file, profile_contents)) = &vacated {
-        candidate
-            .profiles
-            .iter_mut()
-            .find(|profile| &profile.file_name == profile_file)
-            .expect("the matched profile was read from this candidate")
-            .contents = profile_contents.clone();
-    }
-    let config = validate(&candidate).map_err(validation_message)?;
-
-    let destination = if into_profile {
-        dir.join(PROFILES_DIR_NAME).join(&file_name)
-    } else {
-        dir.join(&file_name)
-    };
-    write_atomically(&destination, &contents)?;
-    if let Some((profile_file, profile_contents)) = &vacated {
-        write_atomically(
-            &dir.join(PROFILES_DIR_NAME).join(profile_file),
-            profile_contents,
-        )?;
-    }
+    let config = commit(
+        dir,
+        candidate,
+        &PendingWrite {
+            into_profile,
+            file_name: file_name.clone(),
+            contents,
+            vacated,
+        },
+    )?;
 
     // Read the answer off the resolved set rather than off the plan: what
     // the user now has is the merge result, which a dropped profile
@@ -773,6 +730,69 @@ fn apply_binding(
     }
 }
 
+/// One edit's effect on disk: the file that receives it, what that file
+/// now says, and -- for a redirect, which moves a value out of the
+/// profile it lived in -- the profile file it also rewrites.
+struct PendingWrite {
+    /// Whether `file_name` is a profile rather than base config, which is
+    /// the difference between the two directories they live in.
+    into_profile: bool,
+    file_name: String,
+    contents: String,
+    /// The profile file a redirect empties, and its new contents.
+    vacated: Option<(String, String)>,
+}
+
+/// Validates the whole directory with `pending` applied and, only if that
+/// holds, writes it.
+///
+/// Whole-directory validation runs before anything is written (ADR 0007),
+/// so an edit that would leave the configuration invalid is refused and
+/// nothing is persisted. The destination is written before the profile a
+/// redirect empties, so a failure between the two leaves the value
+/// declared twice -- recoverable by hand -- rather than nowhere.
+///
+/// Shared by both edit paths because a saved layout and a hotkey binding
+/// differ only in what they put in the file, never in how the file gets
+/// there.
+fn commit(
+    dir: &Path,
+    mut candidate: CandidateConfig,
+    pending: &PendingWrite,
+) -> Result<ResolvedConfigSet, ConfigIoError> {
+    let patch = |candidate: &mut CandidateConfig, file_name: &str, contents: &str| {
+        candidate
+            .profiles
+            .iter_mut()
+            .find(|profile| profile.file_name == file_name)
+            .expect("the matched profile was read from this candidate")
+            .contents = contents.to_owned();
+    };
+    if pending.into_profile {
+        patch(&mut candidate, &pending.file_name, &pending.contents);
+    } else {
+        candidate.base = pending.contents.clone();
+    }
+    if let Some((profile_file, profile_contents)) = &pending.vacated {
+        patch(&mut candidate, profile_file, profile_contents);
+    }
+    let config = validate(&candidate).map_err(validation_message)?;
+
+    let destination = if pending.into_profile {
+        dir.join(PROFILES_DIR_NAME).join(&pending.file_name)
+    } else {
+        dir.join(&pending.file_name)
+    };
+    write_atomically(&destination, &pending.contents)?;
+    if let Some((profile_file, profile_contents)) = &pending.vacated {
+        write_atomically(
+            &dir.join(PROFILES_DIR_NAME).join(profile_file),
+            profile_contents,
+        )?;
+    }
+    Ok(config)
+}
+
 /// Applies `edit` to the configuration directory `dir`, writing the layer
 /// that currently supplies the layout being edited: the profile matching
 /// `fingerprint` if it declares that layout, otherwise base config
@@ -789,7 +809,7 @@ pub fn edit_layouts(
     edit: LayoutEdit,
 ) -> Result<LayoutWrite, ConfigIoError> {
     ensure_default_config(dir)?;
-    let mut candidate = read_candidate(dir)?;
+    let candidate = read_candidate(dir)?;
     let layers = parse_layers(&candidate, fingerprint)?;
     let plan = plan_edit(&layers, &edit)?;
     let into_profile = plan.destination == ConfigLayer::Profile;
@@ -808,9 +828,7 @@ pub fn edit_layouts(
     };
 
     // The second half of a redirect: the profile gives the layout up so
-    // base config's copy is the one the merge resolves to. Written after
-    // base config below, so a failure between the two leaves the layout
-    // declared twice -- recoverable by hand -- rather than nowhere.
+    // base config's copy is the one the merge resolves to.
     let vacated = match &plan.vacated {
         Some(name) => {
             let (file_name, mut profile) = layers
@@ -823,41 +841,16 @@ pub fn edit_layouts(
         None => None,
     };
 
-    if into_profile {
-        candidate
-            .profiles
-            .iter_mut()
-            .find(|profile| profile.file_name == file_name)
-            .expect("the matched profile was read from this candidate")
-            .contents = contents.clone();
-    } else {
-        candidate.base = contents.clone();
-    }
-    if let Some((profile_file, profile_contents)) = &vacated {
-        candidate
-            .profiles
-            .iter_mut()
-            .find(|profile| &profile.file_name == profile_file)
-            .expect("the matched profile was read from this candidate")
-            .contents = profile_contents.clone();
-    }
-    // Both halves of a redirect are validated as one candidate, so a move
-    // that would leave the directory invalid is refused before either
-    // file is touched (ADR 0007).
-    let config = validate(&candidate).map_err(validation_message)?;
-
-    let destination = if into_profile {
-        dir.join(PROFILES_DIR_NAME).join(&file_name)
-    } else {
-        dir.join(&file_name)
-    };
-    write_atomically(&destination, &contents)?;
-    if let Some((profile_file, profile_contents)) = &vacated {
-        write_atomically(
-            &dir.join(PROFILES_DIR_NAME).join(profile_file),
-            profile_contents,
-        )?;
-    }
+    let config = commit(
+        dir,
+        candidate,
+        &PendingWrite {
+            into_profile,
+            file_name: file_name.clone(),
+            contents,
+            vacated,
+        },
+    )?;
 
     Ok(LayoutWrite {
         file: file_name,

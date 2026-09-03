@@ -77,8 +77,11 @@ export function createTauriDesktopBridge(
     startHotkeyCapture: () =>
       invokeCommand("start_hotkey_capture") as Promise<void>,
     endHotkeyCapture: () => invokeCommand("end_hotkey_capture") as Promise<void>,
-    probeHotkey: (combo: string) =>
-      invokeCommand("probe_hotkey", { combo }) as Promise<HotkeyProbeResult>,
+    probeHotkey: (combo: string, forCommand: string) =>
+      invokeCommand("probe_hotkey", {
+        combo,
+        forCommand,
+      }) as Promise<HotkeyProbeResult>,
     setBinding: (command: string, combo: string, toBase: boolean) =>
       invokeCommand("set_binding", { command, combo, toBase }) as Promise<BindingWriteReceipt>,
     resetBinding: (command: string) =>

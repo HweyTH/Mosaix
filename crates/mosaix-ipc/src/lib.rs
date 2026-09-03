@@ -11,7 +11,7 @@ pub mod protocol;
 pub use client::{send_request, IpcConnection, IpcError};
 pub use handler::{
     handle_request, CaptureHold, ConfigError, ConfigStore, HotkeyBindingSnapshot, HotkeyProbe,
-    LayoutSourceSnapshot, ProbeOutcome, StateSnapshot, UnavailableConfigStore,
+    HotkeyVerdict, LayoutSourceSnapshot, ProbeOutcome, StateSnapshot, UnavailableConfigStore,
     UnavailableHotkeyProbe,
 };
 #[cfg(windows)]

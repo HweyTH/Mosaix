@@ -67,7 +67,11 @@ pub trait AgentTransport: Send + std::fmt::Debug {
     /// attempt the registration, and only it knows Mosaix's own resolved
     /// bindings well enough to say a conflict is one the user can resolve
     /// themselves (ADR 0021).
-    fn probe_hotkey(&mut self, combo: &str) -> Result<serde_json::Value, AgentError>;
+    fn probe_hotkey(
+        &mut self,
+        combo: &str,
+        for_command: &str,
+    ) -> Result<serde_json::Value, AgentError>;
 
     /// Asks the agent to change a binding, returning the configuration
     /// file the write landed in and the combination now in effect.
@@ -114,7 +118,11 @@ impl AgentTransport for UnsupportedPlatform {
         Err(AgentError::Unavailable)
     }
 
-    fn probe_hotkey(&mut self, _combo: &str) -> Result<serde_json::Value, AgentError> {
+    fn probe_hotkey(
+        &mut self,
+        _combo: &str,
+        _for_command: &str,
+    ) -> Result<serde_json::Value, AgentError> {
         Err(AgentError::Unavailable)
     }
 
@@ -255,10 +263,15 @@ mod windows_transport {
             self.confirmed(IpcRequest::EndHotkeyCapture).map(|_| ())
         }
 
-        fn probe_hotkey(&mut self, combo: &str) -> Result<serde_json::Value, AgentError> {
+        fn probe_hotkey(
+            &mut self,
+            combo: &str,
+            for_command: &str,
+        ) -> Result<serde_json::Value, AgentError> {
             Ok(self
                 .confirmed(IpcRequest::ProbeHotkey {
                     combo: combo.to_owned(),
+                    for_command: Some(for_command.to_owned()),
                 })?
                 .unwrap_or(serde_json::Value::Null))
         }

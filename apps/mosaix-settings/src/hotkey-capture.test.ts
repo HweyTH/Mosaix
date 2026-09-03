@@ -5,6 +5,7 @@ import {
   capturedCombo,
   capturedLabel,
   focusCapture,
+  isBareKey,
   keyName,
   openCapture,
   pressKey,
@@ -56,13 +57,24 @@ describe("capture buffer", () => {
     expect(capturedLabel(session)).toBe("Press a combination");
   });
 
-  it("refuses a bare key with no modifier, which would swallow it everywhere", () => {
+  it("accepts a bare key, which RegisterHotKey takes, but flags it", () => {
     let session = openCapture(nothingHeld);
 
-    session = pressKey(session, press("KeyJ"));
+    session = pressKey(session, press("F13"));
 
-    expect(capturedCombo(session)).toBeNull();
-    expect(capturedLabel(session)).toBe("Add a modifier");
+    expect(capturedCombo(session)).toBe("f13");
+    expect(
+      isBareKey(session),
+      "a global binding on a bare key takes it from every other application",
+    ).toBe(true);
+  });
+
+  it("does not flag a combination that carries a modifier", () => {
+    let session = openCapture(nothingHeld);
+
+    session = pressKey(session, press("KeyJ", { ctrlKey: true }));
+
+    expect(isBareKey(session)).toBe(false);
   });
 
   it("says so when Mosaix has no name for the key pressed", () => {

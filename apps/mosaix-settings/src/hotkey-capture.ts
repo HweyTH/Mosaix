@@ -184,10 +184,11 @@ export function focusCapture(session: CaptureSession): CaptureSession {
  * The combination in the spelling configuration files use, or `null` when
  * the buffer does not hold a complete one.
  *
- * Incomplete means one of three things: nothing pressed yet, a physical
- * key Mosaix has no name for, or a key with no modifier at all -- which
- * would bind a bare letter globally and swallow it from every other
- * application.
+ * Incomplete means nothing pressed yet, or a physical key Mosaix has no
+ * name for. A modifier is *not* required: `RegisterHotKey` takes a bare
+ * key, and Mosaix's own tests bind one. Binding a bare letter is a
+ * decision worth warning about ([`isBareKey`]) and not one to refuse --
+ * the user is entitled to it on their own machine.
  */
 export function capturedCombo(session: CaptureSession): string | null {
   const captured = session.captured;
@@ -197,9 +198,21 @@ export function capturedCombo(session: CaptureSession): string | null {
   if (captured.alt) parts.push("alt");
   if (captured.shift) parts.push("shift");
   if (captured.win) parts.push("win");
-  if (parts.length === 0) return null;
   parts.push(captured.key.toLowerCase());
   return parts.join("+");
+}
+
+/**
+ * Whether the buffer holds a key with no modifier at all.
+ *
+ * Worth saying out loud: a global binding on a bare key takes that key
+ * from every other application, which is rarely what someone means and
+ * never obvious afterwards.
+ */
+export function isBareKey(session: CaptureSession): boolean {
+  const captured = session.captured;
+  if (captured === undefined || captured.key === null) return false;
+  return !captured.ctrl && !captured.alt && !captured.shift && !captured.win;
 }
 
 /**
@@ -213,7 +226,5 @@ export function capturedLabel(session: CaptureSession): string {
   if (!session.armed) return "Click to listen";
   if (captured === undefined) return "Press a combination";
   if (captured.key === null) return "Unsupported key";
-  const complete = capturedCombo(session);
-  if (complete === null) return "Add a modifier";
-  return complete;
+  return capturedCombo(session) ?? "Press a combination";
 }

@@ -704,9 +704,7 @@ fn main() {
                     // A config reload arriving mid-capture updates what
                     // will be registered when the editor closes, and
                     // registers nothing now.
-                    tracing::info!(
-                        "hotkey capture is active; leaving every binding unregistered"
-                    );
+                    tracing::info!("hotkey capture is active; leaving every binding unregistered");
                     None
                 } else {
                     tracing::info!("registering hotkeys for the current resolved bindings");

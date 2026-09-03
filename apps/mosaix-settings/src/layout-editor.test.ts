@@ -708,7 +708,7 @@ describe("layout write destination", () => {
       expect(root.querySelector('[data-open-layout="docked"]')).not.toBeNull(),
     );
     expect(
-      root.querySelector("[data-redirect-to-base]"),
+      root.querySelector("[data-layout-redirect]"),
       "the untouched draft is a new layout, which goes to base config anyway",
     ).toBeNull();
 
@@ -717,11 +717,11 @@ describe("layout write destination", () => {
     // refused by the clash guard before any of this matters.
     root.querySelector<HTMLElement>('[data-open-layout="docked"]')!.click();
 
-    expect(root.querySelector("[data-save-destination]")?.textContent).toContain("desk.toml");
-    const redirect = root.querySelector<HTMLInputElement>("[data-redirect-to-base]")!;
+    expect(root.querySelector("[data-layout-destination]")?.textContent).toContain("desk.toml");
+    const redirect = root.querySelector<HTMLInputElement>("[data-layout-redirect]")!;
     redirect.checked = true;
     redirect.dispatchEvent(new Event("change", { bubbles: true }));
-    expect(root.querySelector("[data-save-destination]")?.textContent).toContain("config.toml");
+    expect(root.querySelector("[data-layout-destination]")?.textContent).toContain("config.toml");
 
     root.querySelector<HTMLElement>("[data-save-layout]")!.click();
     await vi.waitFor(() => expect(desktop.saveLayout).toHaveBeenCalled());
@@ -799,9 +799,12 @@ describe("hotkey capture dialog", () => {
 
     expect(save().disabled).toBe(true);
 
-    // A bare key is not a combination worth binding globally.
-    pressCombination(root, "KeyJ");
+    // A key Mosaix has no name for stays incomplete.
+    pressCombination(root, "Pause", { ctrlKey: true });
     expect(save().disabled).toBe(true);
+    expect(root.querySelector("[data-captured-combo]")?.textContent).toContain(
+      "Unsupported key",
+    );
 
     pressCombination(root, "KeyJ", { ctrlKey: true, altKey: true });
     expect(save().disabled).toBe(false);
@@ -824,10 +827,15 @@ describe("hotkey capture dialog", () => {
     await vi.waitFor(() =>
       expect(root.querySelector("[data-capture-verdict]")).not.toBeNull(),
     );
-    expect(desktop.probeHotkey).toHaveBeenCalledWith("ctrl+alt+j");
+    expect(
+      desktop.probeHotkey,
+      "the command travels with the question so a binding cannot conflict with itself",
+    ).toHaveBeenCalledWith("ctrl+alt+j", "snap-left");
     expect(root.querySelector("[data-capture-verdict]")?.textContent).toContain("Focus down");
-    // Mosaix does not overrule the user about their own machine.
-    expect(root.querySelector<HTMLButtonElement>("[data-capture-save]")!.disabled).toBe(false);
+    // Blocked, because whole-directory validation rejects two commands on
+    // one combination -- so offering the save would offer a write that
+    // can only be refused.
+    expect(root.querySelector<HTMLButtonElement>("[data-capture-save]")!.disabled).toBe(true);
     stop();
   });
 
@@ -1055,6 +1063,66 @@ describe("unbound commands", () => {
 
     await vi.waitFor(() => expect(desktop.setBinding).toHaveBeenCalled());
     expect(desktop.setBinding).toHaveBeenCalledWith("apply-layout.reading", "ctrl+alt+2", false);
+    stop();
+  });
+});
+
+describe("capture verdicts that block or warn", () => {
+  async function verdict(availability: string, extra: Record<string, unknown> = {}) {
+    const desktop = bridge();
+    desktop.probeHotkey = vi.fn().mockResolvedValue({
+      availability,
+      command: null,
+      warning: null,
+      reason: null,
+      ...extra,
+    });
+    const root = document.createElement("div");
+    document.body.append(root);
+    const stop = await mountLayoutEditor(root, desktop);
+    await vi.waitFor(() => expect(root.querySelector('[data-rebind="snap-left"]')).not.toBeNull());
+    root.querySelector<HTMLElement>('[data-rebind="snap-left"]')!.click();
+    window.dispatchEvent(
+      new KeyboardEvent("keydown", { code: "KeyJ", ctrlKey: true, altKey: true }),
+    );
+    await vi.waitFor(() => expect(root.querySelector("[data-capture-verdict]")).not.toBeNull());
+    return { root, stop };
+  }
+
+  it("still lets a combination another application owns be saved deliberately", async () => {
+    const { root, stop } = await verdict("system_or_other_application");
+
+    expect(
+      root.querySelector<HTMLButtonElement>("[data-capture-save]")!.disabled,
+      "Mosaix cannot arbitrate another application's claim, so it does not overrule the user",
+    ).toBe(false);
+    stop();
+  });
+
+  it("blocks a key Mosaix cannot express", async () => {
+    const { root, stop } = await verdict("unsupported", {
+      reason: 'Mosaix has no key named "BREAK"',
+    });
+
+    expect(root.querySelector<HTMLButtonElement>("[data-capture-save]")!.disabled).toBe(true);
+    stop();
+  });
+
+  it("warns about a bare key without refusing it", async () => {
+    const desktop = bridge();
+    const root = document.createElement("div");
+    document.body.append(root);
+    const stop = await mountLayoutEditor(root, desktop);
+    await vi.waitFor(() => expect(root.querySelector('[data-rebind="snap-left"]')).not.toBeNull());
+    root.querySelector<HTMLElement>('[data-rebind="snap-left"]')!.click();
+
+    window.dispatchEvent(new KeyboardEvent("keydown", { code: "F13", bubbles: true }));
+
+    expect(root.querySelector("[data-bare-key]")?.textContent).toContain("every app");
+    expect(
+      root.querySelector<HTMLButtonElement>("[data-capture-save]")!.disabled,
+      "RegisterHotKey takes a bare key; the user is entitled to it on their own machine",
+    ).toBe(false);
     stop();
   });
 });

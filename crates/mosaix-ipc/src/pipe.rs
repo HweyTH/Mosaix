@@ -176,7 +176,13 @@ fn server_loop(
                 // Reading the field directly would capture the bare
                 // `HANDLE` instead, which isn't.
                 let pipe = client.into_handle();
-                handle_client(pipe, &events, &state_reader, config.as_ref(), hotkeys.as_ref());
+                handle_client(
+                    pipe,
+                    &events,
+                    &state_reader,
+                    config.as_ref(),
+                    hotkeys.as_ref(),
+                );
                 unsafe {
                     let _ = DisconnectNamedPipe(pipe);
                     let _ = CloseHandle(pipe);

@@ -3,6 +3,7 @@ import {
   capturedCombo,
   capturedLabel,
   focusCapture,
+  isBareKey,
   openCapture,
   pressKey,
   releaseKey,
@@ -159,7 +160,7 @@ export interface DesktopBridge {
   loadHotkeyBindings(): Promise<HotkeyList>;
   startHotkeyCapture(): Promise<void>;
   endHotkeyCapture(): Promise<void>;
-  probeHotkey(combo: string): Promise<HotkeyProbeResult>;
+  probeHotkey(combo: string, forCommand: string): Promise<HotkeyProbeResult>;
   setBinding(command: string, combo: string, toBase: boolean): Promise<BindingWriteReceipt>;
   resetBinding(command: string): Promise<BindingWriteReceipt>;
   loadSavedLayouts(): Promise<SavedLayoutList>;
@@ -258,6 +259,18 @@ export function watchSavedLayouts(
 }
 
 /**
+ * Where a configuration write would land, and whether the redirect
+ * control can change it.
+ *
+ * The same question for a saved layout and for a binding, so it has one
+ * answer shape and one rendering ([`renderWriteDestination`]).
+ */
+export interface WriteDestination {
+  file: string;
+  redirectable: boolean;
+}
+
+/**
  * The configuration file a rebind of `binding` would land in, and whether
  * the redirect control can change it.
  *
@@ -269,7 +282,7 @@ export function bindingDestination(
   binding: HotkeyBinding | undefined,
   list: HotkeyList | undefined,
   toBase: boolean,
-): { file: string; redirectable: boolean } {
+): WriteDestination {
   const baseFile = list?.baseFile ?? "your base configuration";
   if (binding === undefined || binding.source !== "profile") {
     return { file: binding?.file ?? baseFile, redirectable: false };
@@ -294,7 +307,7 @@ export function saveDestination(
   name: string,
   list: SavedLayoutList | undefined,
   toBase: boolean,
-): { file: string; redirectable: boolean } {
+): WriteDestination {
   const baseFile = list?.baseFile ?? "your base configuration";
   const existing = list?.layouts.find(
     (layout) => layout.name.trim().toLowerCase() === name.trim().toLowerCase(),
@@ -363,23 +376,28 @@ function renderLayouts(
 }
 
 /**
- * Where the next save will go, said before it happens rather than in the
+ * Where the next write will go, said before it happens rather than in the
  * receipt afterwards.
  *
- * Whenever a profile is matched, the layout on screen and the file that
+ * Whenever a profile is matched, the value on screen and the file that
  * would receive the write are different objects, so naming the
  * destination is load-bearing rather than decorative (ADR 0022) -- and
  * the redirect beside it is the only way to move a desk-specific layout
- * out of its profile without editing TOML.
+ * or binding out of its profile without editing TOML.
+ *
+ * `marker` is the data attribute a test reaches for, which is the only
+ * thing that differs between the layout panel's copy and the capture
+ * dialog's.
  */
-function renderSaveDestination(
-  destination: { file: string; redirectable: boolean },
+function renderWriteDestination(
+  destination: WriteDestination,
   toBase: boolean,
+  marker: string,
 ): string {
   const redirect = destination.redirectable
-    ? `<label class="toggle-line redirect"><span>Save to base config</span><input data-redirect-to-base type="checkbox" ${toBase ? "checked" : ""} /></label>`
+    ? `<label class="toggle-line redirect"><span>Save to base config</span><input data-${marker}-redirect type="checkbox" ${toBase ? "checked" : ""} /></label>`
     : "";
-  return `<p class="save-destination" data-save-destination>Saves to <code>${escapeHtml(destination.file)}</code></p>${redirect}`;
+  return `<p class="save-destination" data-${marker}-destination>Saves to <code>${escapeHtml(destination.file)}</code></p>${redirect}`;
 }
 
 /**
@@ -446,20 +464,35 @@ function renderCaptureDialog(
     (candidate) => candidate.command === capture.command,
   );
   const destination = bindingDestination(binding, hotkeys, capture.toBase);
-  // Blocked, not merely warned: the two combinations Windows handles
-  // itself are never registered hotkeys, so a binding to one would be
-  // accepted and then never fire (ADR 0021).
-  const blocked = capture.verdict?.availability === "reserved";
-  const unusable = capture.verdict?.availability === "unsupported";
-  const savable = combo !== null && !blocked && !unusable;
+  // Three verdicts are blocked rather than merely warned, and each for a
+  // reason the user cannot argue with:
+  //
+  // - `reserved` -- Windows handles the combination itself, so a binding
+  //   to it would be accepted and then never fire (ADR 0021).
+  // - `unsupported` -- Mosaix has no virtual-key code for the key.
+  // - `mosaix_binding` -- whole-directory validation rejects two commands
+  //   on one combination, so this write can only ever be refused. ADR
+  //   0021's "save a conflicting binding deliberately" is about a
+  //   combination *another application* owns, which Mosaix cannot
+  //   arbitrate; one Mosaix owns is the case the user can resolve
+  //   themselves, by freeing it first.
+  const blocked =
+    capture.verdict !== undefined &&
+    ["reserved", "unsupported", "mosaix_binding"].includes(
+      capture.verdict.availability,
+    );
+  const savable = combo !== null && !blocked;
   return `
     <div class="capture-backdrop" data-capture-dialog role="dialog" aria-modal="true" aria-label="Rebind ${escapeHtml(bindingLabel(capture.command))}">
       <div class="capture-dialog">
         <div class="panel-title">REBIND ${escapeHtml(bindingLabel(capture.command)).toUpperCase()}</div>
         <div class="capture-combo${combo === null ? " incomplete" : ""}" data-captured-combo>${escapeHtml(capturedLabel(capture.session))}</div>
-        ${renderVerdict(capture.verdict)}
-        <p class="save-destination" data-binding-destination>Saves to <code>${escapeHtml(destination.file)}</code></p>
-        ${destination.redirectable ? `<label class="toggle-line redirect"><span>Save to base config</span><input data-binding-redirect type="checkbox" ${capture.toBase ? "checked" : ""} /></label>` : ""}
+        ${renderVerdict(capture.verdict)}${
+          isBareKey(capture.session)
+            ? `<p class="capture-verdict warning" data-bare-key>No modifier · taken from every app</p>`
+            : ""
+        }
+        ${renderWriteDestination(destination, capture.toBase, "binding")}
         <div class="library-actions">
           <button class="primary-button" data-capture-save ${savable ? "" : "disabled"}>Save binding</button>
           <button class="soft-button" data-capture-cancel>Cancel</button>
@@ -487,7 +520,7 @@ function renderVerdict(verdict: HotkeyProbeResult | undefined): string {
     case "available":
       return `${notice("ok", "Available")}${warning}`;
     case "mosaix_binding":
-      return `${notice("warning", `Bound to ${escapeHtml(bindingLabel(verdict.command ?? ""))}`)}${warning}`;
+      return `${notice("blocked", `Bound to ${escapeHtml(bindingLabel(verdict.command ?? ""))} · free it first`)}${warning}`;
     case "system_or_other_application":
       return `${notice("warning", "Taken by another app")}${warning}`;
     case "reserved":
@@ -621,7 +654,7 @@ export async function mountLayoutEditor(
         <aside class="panel layout-library" aria-label="Saved layouts">
           <div class="panel-title">SAVED LAYOUTS</div>
           <label class="field"><span>Name</span><input data-layout-name value="${escapeHtml(snapshot.draft.name)}" /></label>
-          ${renderSaveDestination(destination, redirectToBase)}
+          ${renderWriteDestination(destination, redirectToBase, "layout")}
           <div class="library-actions">
             <button class="primary-button" data-save-layout>Save layout</button>
             <button class="soft-button" data-rename-layout ${selectedLayout === undefined ? "disabled" : ""}>Rename</button>
@@ -667,7 +700,7 @@ export async function mountLayoutEditor(
       // save would land, and saying so late is saying it too late.
       render();
     });
-    root.querySelector<HTMLInputElement>("[data-redirect-to-base]")?.addEventListener("change", (event) => {
+    root.querySelector<HTMLInputElement>("[data-layout-redirect]")?.addEventListener("change", (event) => {
       redirectToBase = (event.currentTarget as HTMLInputElement).checked;
       render();
     });
@@ -676,18 +709,23 @@ export async function mountLayoutEditor(
      * saved-layout list is re-read afterwards so the panel reflects the
      * write the agent actually made, rather than the one asked for.
      */
-    const write = (
+    /**
+     * Runs one configuration write and reports what the agent said, then
+     * re-reads through `refresh` so the panel reflects the write the
+     * agent actually made rather than the one asked for.
+     */
+    const request = <T,>(
       pending: string,
-      done: (receipt: LayoutWriteReceipt) => string,
-      request: () => Promise<LayoutWriteReceipt>,
+      call: () => Promise<T>,
+      done: (result: T) => string,
+      refresh: () => Promise<void>,
     ): void => {
       commandStatus = pending;
       render();
-      void request()
-        .then(async (receipt) => {
-          commandStatus = done(receipt);
-          layouts = await bridge.loadSavedLayouts();
-          layoutError = undefined;
+      void call()
+        .then(async (result) => {
+          commandStatus = done(result);
+          await refresh();
           render();
         })
         .catch((error: unknown) => {
@@ -695,6 +733,19 @@ export async function mountLayoutEditor(
           render();
         });
     };
+    const reloadLayouts = async (): Promise<void> => {
+      layouts = await bridge.loadSavedLayouts();
+      layoutError = undefined;
+    };
+    const reloadHotkeys = async (): Promise<void> => {
+      hotkeys = await bridge.loadHotkeyBindings();
+      hotkeyError = undefined;
+    };
+    const write = (
+      pending: string,
+      done: (receipt: LayoutWriteReceipt) => string,
+      call: () => Promise<LayoutWriteReceipt>,
+    ): void => request(pending, call, done, reloadLayouts);
     root.querySelector<HTMLElement>("[data-save-layout]")?.addEventListener("click", () => {
       const draft = structuredClone(snapshot.draft);
       // Saving replaces the cells of a layout that already carries this
@@ -937,23 +988,15 @@ export async function mountLayoutEditor(
     root.querySelectorAll<HTMLElement>("[data-reset-binding]").forEach((button) => {
       button.addEventListener("click", () => {
         const command = button.dataset.resetBinding!;
-        commandStatus = "Resetting binding…";
-        render();
-        void bridge
-          .resetBinding(command)
-          .then(async (receipt) => {
-            commandStatus =
-              receipt.combo === null
-                ? `${bindingLabel(command)} is now unbound · ${receipt.file}`
-                : `${bindingLabel(command)} reset to ${receipt.combo} · ${receipt.file}`;
-            hotkeys = await bridge.loadHotkeyBindings();
-            hotkeyError = undefined;
-            render();
-          })
-          .catch((error: unknown) => {
-            commandStatus = `Reset failed · ${String(error)}`;
-            render();
-          });
+        request(
+          "Resetting binding…",
+          () => bridge.resetBinding(command),
+          (receipt) =>
+            receipt.combo === null
+              ? `${bindingLabel(command)} is now unbound · ${receipt.file}`
+              : `${bindingLabel(command)} reset to ${receipt.combo} · ${receipt.file}`,
+          reloadHotkeys,
+        );
       });
     });
     root.querySelector<HTMLInputElement>("[data-binding-redirect]")?.addEventListener("change", (event) => {
@@ -973,21 +1016,14 @@ export async function mountLayoutEditor(
       if (combo === null) return;
       const command = capture.command;
       const toBase = capture.toBase;
-      commandStatus = "Saving binding…";
       capture = undefined;
-      render();
-      void bridge
-        .setBinding(command, combo, toBase)
-        .then(async (receipt) => {
-          commandStatus = `${bindingLabel(command)} bound to ${receipt.combo ?? combo} · ${receipt.file}`;
-          hotkeys = await bridge.loadHotkeyBindings();
-          hotkeyError = undefined;
-          render();
-        })
-        .catch((error: unknown) => {
-          commandStatus = `Rebind failed · ${String(error)}`;
-          render();
-        });
+      request(
+        "Saving binding…",
+        () => bridge.setBinding(command, combo, toBase),
+        (receipt) =>
+          `${bindingLabel(command)} bound to ${receipt.combo ?? combo} · ${receipt.file}`,
+        reloadHotkeys,
+      );
     });
 
     restoreFocus(focused);
@@ -1006,7 +1042,7 @@ export async function mountLayoutEditor(
     if (combo === null) return;
     const asked = capture.command;
     void bridge
-      .probeHotkey(combo)
+      .probeHotkey(combo, asked)
       .then((verdict) => {
         if (capture === undefined || capture.command !== asked) return;
         if (capturedCombo(capture.session) !== combo) return;

@@ -14,9 +14,10 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use mosaix_config::{
-    edit_bindings, edit_layouts, ensure_default_config, fallback_config, load, save_profile_settings, watch,
-    BindingEdit, Command, ConfigEvent, ConfigIoError, ConfigLayer, FocusBorderOverride,
-    GapsOverride, KeyCombo, LayoutEdit, LayoutEditError, ProfileSettingsUpdate, RgbaColor,
+    edit_bindings, edit_layouts, ensure_default_config, fallback_config, load,
+    save_profile_settings, watch, BindingEdit, Command, ConfigEvent, ConfigIoError, ConfigLayer,
+    FocusBorderOverride, GapsOverride, KeyCombo, LayoutEdit, LayoutEditError,
+    ProfileSettingsUpdate, RgbaColor,
 };
 use mosaix_domain::NormalizedRect;
 
@@ -254,7 +255,8 @@ fn redirecting_a_profile_supplied_layout_moves_it_into_base_config() {
     let profile_file = fs::read_to_string(dir.join("profiles").join("desk.toml")).unwrap();
     assert!(
         !profile_file.contains("docked"),
-        "the profile gives the layout up, or it would still win the merge          and the redirect would appear to succeed and change nothing: {profile_file}"
+        "the profile gives the layout up, or it would still win the merge and the \
+         redirect would appear to succeed and change nothing: {profile_file}"
     );
     assert_eq!(
         reloaded.profiles[0].config.layout_sources.get("docked"),
@@ -365,6 +367,8 @@ fn rebinding_a_base_supplied_command_writes_base_config() {
         reloaded.base.hotkeys[&Command::SnapRight],
         combo("ctrl+alt+pagedown")
     );
+
+    cleanup(&dir);
 }
 
 #[test]
@@ -396,6 +400,8 @@ fn rebinding_a_command_the_profile_overrides_writes_the_profile() {
         combo("ctrl+alt+left"),
         "base config keeps whatever it said; only the override moved"
     );
+
+    cleanup(&dir);
 }
 
 #[test]
@@ -433,6 +439,8 @@ fn redirecting_a_rebind_moves_it_out_of_the_profile() {
         Some(&ConfigLayer::Base),
         "provenance follows the move, so the destination shown next is the real one"
     );
+
+    cleanup(&dir);
 }
 
 #[test]
@@ -459,6 +467,8 @@ fn resetting_a_profile_override_falls_back_to_base_config() {
         !profile_file.contains("snap-left"),
         "the override is gone from the file: {profile_file}"
     );
+
+    cleanup(&dir);
 }
 
 #[test]
@@ -490,6 +500,8 @@ fn resetting_a_base_binding_restores_the_shipped_default() {
         Some(combo("ctrl+alt+left")),
         "a user undoing an experiment should not have to remember the default"
     );
+
+    cleanup(&dir);
 }
 
 #[test]
@@ -532,6 +544,8 @@ fn resetting_a_layout_binding_unbinds_it_because_it_has_no_default() {
     assert_eq!(write.combo, None);
     let reloaded = load(&dir).unwrap().unwrap();
     assert!(!reloaded.base.hotkeys.contains_key(&layout_binding));
+
+    cleanup(&dir);
 }
 
 #[test]
@@ -554,6 +568,8 @@ fn resetting_a_command_nothing_binds_is_refused_naming_it() {
         error.to_string().contains("apply-layout.writing"),
         "the refusal names what was asked for, got {error}"
     );
+
+    cleanup(&dir);
 }
 
 #[test]
@@ -581,6 +597,8 @@ fn a_rebind_onto_a_combination_another_binding_holds_persists_nothing() {
         combo("ctrl+alt+right"),
         "a refused candidate leaves the previous configuration untouched"
     );
+
+    cleanup(&dir);
 }
 
 #[test]
@@ -603,6 +621,8 @@ fn a_binding_edit_leaves_hand_written_layouts_intact() {
         reloaded.base.layouts.contains_key("writing"),
         "rewriting base config must preserve everything else it declares"
     );
+
+    cleanup(&dir);
 }
 
 #[test]

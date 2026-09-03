@@ -165,9 +165,12 @@ fn supplying_file(layer: Option<ConfigLayer>, profile_file: &Option<String>) -> 
 fn bindable_commands(config: &ResolvedConfig) -> Vec<Command> {
     let mut commands: Vec<Command> = Command::unit_verbs()
         .into_iter()
-        .chain(config.layouts.keys().map(|name| Command::ApplyLayout {
-            name: name.clone(),
-        }))
+        .chain(
+            config
+                .layouts
+                .keys()
+                .map(|name| Command::ApplyLayout { name: name.clone() }),
+        )
         .collect();
     // Whatever is actually bound is listed too, even a layout binding
     // whose layout is not declared -- which validation rejects, so it
@@ -181,6 +184,8 @@ fn bindable_commands(config: &ResolvedConfig) -> Vec<Command> {
     commands
 }
 
+/// Every command the interface can bind, paired with what presses it and
+/// where that came from -- the list a user reads instead of the TOML file.
 fn binding_snapshots(config: &ResolvedConfig) -> Vec<HotkeyBindingSnapshot> {
     bindable_commands(config)
         .into_iter()
@@ -403,63 +408,87 @@ fn is_reserved(combo: &KeyCombo) -> bool {
 /// absolute, and refusing a combination the user may well be able to use
 /// is a worse answer than saying so (ADR 0021).
 fn advisory(combo: &KeyCombo) -> Option<String> {
-    combo.key.eq_ignore_ascii_case("F12").then(|| {
-        "F12 is reserved for the debugger".to_owned()
-    })
+    combo
+        .key
+        .eq_ignore_ascii_case("F12")
+        .then(|| "F12 is reserved for the debugger".to_owned())
 }
 
-/// The Mosaix binding already using `combo`, if any.
+/// The Mosaix binding already using `combo`, other than `for_command`
+/// itself.
 ///
 /// Asked before the probe's answer is interpreted, because during hotkey
 /// capture the agent holds no registrations at all -- so a combination
 /// Mosaix itself owns probes as free, and only the resolved config knows
-/// otherwise.
-fn mosaix_owner(config: &ResolvedConfig, combo: &KeyCombo) -> Option<Command> {
+/// otherwise. `for_command` is excluded because re-pressing a binding's
+/// own combination is not a conflict with anything.
+fn mosaix_owner(
+    config: &ResolvedConfig,
+    combo: &KeyCombo,
+    for_command: Option<&Command>,
+) -> Option<Command> {
     config
         .hotkeys
         .iter()
-        .find(|(_, bound)| *bound == combo)
+        .find(|(command, bound)| *bound == combo && Some(*command) != for_command)
         .map(|(command, _)| command.clone())
 }
 
 /// The answer to "can I use this combination", as the interface reports
 /// it.
+///
+/// A typed answer rather than a hand-built object, so the field names the
+/// settings application deserializes are the ones this file declares.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct HotkeyVerdict {
+    /// `available`, `mosaix_binding`, `system_or_other_application`,
+    /// `reserved`, or `unsupported`.
+    pub availability: String,
+    /// The Mosaix binding already using it, for `mosaix_binding`.
+    pub command: Option<String>,
+    /// An advisory that does not block the binding, such as `F12`.
+    pub warning: Option<String>,
+    /// Why Mosaix cannot express the combination, for `unsupported`.
+    pub reason: Option<String>,
+}
+
+impl HotkeyVerdict {
+    fn new(availability: &str, warning: Option<String>) -> Self {
+        Self {
+            availability: availability.to_owned(),
+            command: None,
+            warning,
+            reason: None,
+        }
+    }
+}
+
 fn availability(
     config: &ResolvedConfig,
     probe: &dyn HotkeyProbe,
     combo: &KeyCombo,
-) -> serde_json::Value {
+    for_command: Option<&Command>,
+) -> HotkeyVerdict {
     let warning = advisory(combo);
     if is_reserved(combo) {
-        return serde_json::json!({
-            "availability": "reserved",
-            "warning": warning,
-        });
+        return HotkeyVerdict::new("reserved", warning);
     }
-    if let Some(command) = mosaix_owner(config, combo) {
-        return serde_json::json!({
-            "availability": "mosaix_binding",
-            "command": command.to_string(),
-            "warning": warning,
-        });
+    if let Some(command) = mosaix_owner(config, combo, for_command) {
+        return HotkeyVerdict {
+            command: Some(command.to_string()),
+            ..HotkeyVerdict::new("mosaix_binding", warning)
+        };
     }
     match probe.probe(combo) {
-        ProbeOutcome::Available => serde_json::json!({
-            "availability": "available",
-            "warning": warning,
-        }),
+        ProbeOutcome::Available => HotkeyVerdict::new("available", warning),
         // An unexplained refusal is attributed to the system (ADR 0021):
         // no Mosaix binding claimed it above, so whatever owns it is not
         // something the user can resolve inside Mosaix.
-        ProbeOutcome::Taken => serde_json::json!({
-            "availability": "system_or_other_application",
-            "warning": warning,
-        }),
-        ProbeOutcome::Unsupported { reason } => serde_json::json!({
-            "availability": "unsupported",
-            "reason": reason,
-            "warning": warning,
-        }),
+        ProbeOutcome::Taken => HotkeyVerdict::new("system_or_other_application", warning),
+        ProbeOutcome::Unsupported { reason } => HotkeyVerdict {
+            reason: Some(reason),
+            ..HotkeyVerdict::new("unsupported", warning)
+        },
     }
 }
 
@@ -703,16 +732,29 @@ pub fn handle_request(
         ),
         IpcRequest::StartHotkeyCapture => send_event(events, Event::HotkeyCaptureStarted),
         IpcRequest::EndHotkeyCapture => send_event(events, Event::HotkeyCaptureEnded),
-        IpcRequest::ProbeHotkey { combo } => match KeyCombo::parse(combo) {
-            Ok(combo) => IpcResponse::Ok {
-                data: Some(availability(
-                    &state_reader.snapshot().resolved_config,
-                    hotkeys,
-                    &combo,
-                )),
-            },
-            Err(reason) => IpcResponse::Error { message: reason },
-        },
+        IpcRequest::ProbeHotkey { combo, for_command } => {
+            let for_command = match for_command {
+                Some(path) => match Command::parse(path) {
+                    Some(command) => Some(command),
+                    None => return unknown_command(path),
+                },
+                None => None,
+            };
+            match KeyCombo::parse(combo) {
+                Ok(combo) => {
+                    let verdict = availability(
+                        &state_reader.snapshot().resolved_config,
+                        hotkeys,
+                        &combo,
+                        for_command.as_ref(),
+                    );
+                    IpcResponse::Ok {
+                        data: Some(serde_json::to_value(verdict).expect("a verdict serializes")),
+                    }
+                }
+                Err(reason) => IpcResponse::Error { message: reason },
+            }
+        }
         IpcRequest::SetBinding {
             command_path,
             combo,
@@ -1055,10 +1097,10 @@ mod tests {
     #[test]
     fn state_snapshot_lists_a_command_nothing_binds_so_it_can_be_given_a_combination() {
         let mut state = EngineState::default();
-        state.resolved_config.layouts.insert(
-            "writing".to_owned(),
-            SavedLayout { cells: Vec::new() },
-        );
+        state
+            .resolved_config
+            .layouts
+            .insert("writing".to_owned(), SavedLayout { cells: Vec::new() });
 
         let json = serde_json::to_value(StateSnapshot::from(state)).unwrap();
 
@@ -1335,13 +1377,13 @@ mod tests {
         ] {
             let store = RecordingStore::wrote("config.toml", &[]);
 
-        handle_request(
-            &request,
-            &engine.events(),
-            &engine.state_reader(),
-            &store,
-            &no_probe(),
-        );
+            handle_request(
+                &request,
+                &engine.events(),
+                &engine.state_reader(),
+                &store,
+                &no_probe(),
+            );
 
             assert_eq!(store.edits.lock().unwrap()[0].1, expected);
         }
@@ -1619,7 +1661,10 @@ mod tests {
     fn a_connection_that_started_capture_owes_a_capture_end_when_it_ends() {
         let mut hold = CaptureHold::default();
 
-        hold.observe(&IpcRequest::StartHotkeyCapture, &IpcResponse::Ok { data: None });
+        hold.observe(
+            &IpcRequest::StartHotkeyCapture,
+            &IpcResponse::Ok { data: None },
+        );
 
         assert!(matches!(hold.release(), Some(Event::HotkeyCaptureEnded)));
     }
@@ -1627,9 +1672,15 @@ mod tests {
     #[test]
     fn a_connection_that_ended_capture_cleanly_owes_nothing() {
         let mut hold = CaptureHold::default();
-        hold.observe(&IpcRequest::StartHotkeyCapture, &IpcResponse::Ok { data: None });
+        hold.observe(
+            &IpcRequest::StartHotkeyCapture,
+            &IpcResponse::Ok { data: None },
+        );
 
-        hold.observe(&IpcRequest::EndHotkeyCapture, &IpcResponse::Ok { data: None });
+        hold.observe(
+            &IpcRequest::EndHotkeyCapture,
+            &IpcResponse::Ok { data: None },
+        );
 
         assert!(hold.release().is_none());
     }
@@ -1651,7 +1702,10 @@ mod tests {
     #[test]
     fn releasing_twice_reports_the_debt_once() {
         let mut hold = CaptureHold::default();
-        hold.observe(&IpcRequest::StartHotkeyCapture, &IpcResponse::Ok { data: None });
+        hold.observe(
+            &IpcRequest::StartHotkeyCapture,
+            &IpcResponse::Ok { data: None },
+        );
 
         assert!(matches!(hold.release(), Some(Event::HotkeyCaptureEnded)));
         assert!(hold.release().is_none());
@@ -1772,6 +1826,7 @@ mod tests {
         let response = handle_request(
             &IpcRequest::ProbeHotkey {
                 combo: combo.to_owned(),
+                for_command: None,
             },
             &engine.events(),
             &engine.state_reader(),
@@ -1887,6 +1942,7 @@ mod tests {
         let response = handle_request(
             &IpcRequest::ProbeHotkey {
                 combo: "ctrl++".to_owned(),
+                for_command: None,
             },
             &engine.events(),
             &engine.state_reader(),
@@ -2040,5 +2096,62 @@ mod tests {
         let json = serde_json::to_value(StateSnapshot::from(state)).unwrap();
 
         assert_eq!(json["last_applied_layouts"]["3"], "writing");
+    }
+
+    #[test]
+    fn re_pressing_a_bindings_own_combination_is_not_a_conflict_with_itself() {
+        let engine = engine_bound(&[(Command::SnapLeft, "ctrl+alt+left")]);
+
+        let response = handle_request(
+            &IpcRequest::ProbeHotkey {
+                combo: "ctrl+alt+left".to_owned(),
+                for_command: Some("snap-left".to_owned()),
+            },
+            &engine.events(),
+            &engine.state_reader(),
+            &UnavailableConfigStore {
+                reason: "not asked".to_owned(),
+            },
+            &ScriptedProbe(ProbeOutcome::Available),
+        );
+
+        match response {
+            IpcResponse::Ok { data } => assert_eq!(
+                data.unwrap()["availability"],
+                "available",
+                "rebinding a command to what it is already bound to conflicts with nothing"
+            ),
+            other => panic!("expected a verdict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn another_commands_binding_is_still_a_conflict_when_probing_for_one() {
+        let engine = engine_bound(&[
+            (Command::SnapLeft, "ctrl+alt+left"),
+            (Command::SnapRight, "ctrl+alt+right"),
+        ]);
+
+        let response = handle_request(
+            &IpcRequest::ProbeHotkey {
+                combo: "ctrl+alt+left".to_owned(),
+                for_command: Some("snap-right".to_owned()),
+            },
+            &engine.events(),
+            &engine.state_reader(),
+            &UnavailableConfigStore {
+                reason: "not asked".to_owned(),
+            },
+            &ScriptedProbe(ProbeOutcome::Available),
+        );
+
+        match response {
+            IpcResponse::Ok { data } => {
+                let data = data.unwrap();
+                assert_eq!(data["availability"], "mosaix_binding");
+                assert_eq!(data["command"], "snap-left");
+            }
+            other => panic!("expected a verdict, got {other:?}"),
+        }
     }
 }

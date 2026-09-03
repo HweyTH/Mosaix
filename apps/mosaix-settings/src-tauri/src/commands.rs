@@ -221,11 +221,12 @@ pub fn delete_layout(
 #[tauri::command]
 pub fn probe_hotkey(
     combo: String,
+    for_command: String,
     state: State<'_, EditorState>,
 ) -> Result<HotkeyProbeResult, String> {
     let mut session = state.0.lock().map_err(|_| "editor state is unavailable")?;
     session
-        .probe_hotkey(&combo)
+        .probe_hotkey(&combo, &for_command)
         .map_err(|error| error.to_string())
 }
 
