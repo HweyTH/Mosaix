@@ -140,6 +140,24 @@ impl<'de> Deserialize<'de> for KeyCombo {
 #[serde(deny_unknown_fields)]
 pub struct BehaviorSection {}
 
+/// One normalized cell in a named saved layout.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LayoutCell {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+/// A reusable shape whose cells are filled in visual window order.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SavedLayout {
+    pub name: String,
+    pub cells: Vec<LayoutCell>,
+}
+
 /// Base config: `config.toml`'s full schema (CONTEXT.md "Base config").
 /// Applies whenever the current display topology matches no saved profile.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -152,6 +170,8 @@ pub struct BaseConfig {
     pub gaps: Gaps,
     #[serde(default)]
     pub behavior: BehaviorSection,
+    #[serde(default)]
+    pub layouts: Vec<SavedLayout>,
 }
 
 /// A sparse `outer`/`inner` override, letting a profile override just one
@@ -180,6 +200,8 @@ pub struct ProfileConfig {
     pub gaps: GapsOverride,
     #[serde(default)]
     pub behavior: BehaviorSection,
+    #[serde(default)]
+    pub layouts: Option<Vec<SavedLayout>>,
 }
 
 /// The merged result of base config plus (optionally) one profile
@@ -197,6 +219,7 @@ pub struct ResolvedConfig {
     pub hotkeys: BTreeMap<Command, KeyCombo>,
     pub gaps: Gaps,
     pub behavior: BehaviorSection,
+    pub layouts: Vec<SavedLayout>,
 }
 
 /// One profile's resolved settings, paired with the `fingerprint` it's

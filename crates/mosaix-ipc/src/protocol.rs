@@ -1,6 +1,19 @@
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct IpcLayoutCell {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct IpcSavedLayout {
+    pub name: String,
+    pub cells: Vec<IpcLayoutCell>,
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct IpcEnvelope {
@@ -30,6 +43,9 @@ pub enum IpcRequest {
     Resume,
     TogglePause,
     GetPauseState,
+    SaveLayout { layout: IpcSavedLayout },
+    ApplyLayoutByName { name: String },
+    ApplyLayoutDraft { cells: Vec<IpcLayoutCell> },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -68,7 +84,7 @@ mod tests {
 
     #[test]
     fn request_envelopes_round_trip_for_every_command() {
-        let requests = [
+        let requests = vec![
             IpcRequest::Ping,
             IpcRequest::GetState,
             IpcRequest::SnapLeft,
@@ -81,6 +97,28 @@ mod tests {
             IpcRequest::Resume,
             IpcRequest::TogglePause,
             IpcRequest::GetPauseState,
+            IpcRequest::SaveLayout {
+                layout: IpcSavedLayout {
+                    name: "Two columns".into(),
+                    cells: vec![IpcLayoutCell {
+                        x: 0.0,
+                        y: 0.0,
+                        width: 0.5,
+                        height: 1.0,
+                    }],
+                },
+            },
+            IpcRequest::ApplyLayoutByName {
+                name: "Two columns".into(),
+            },
+            IpcRequest::ApplyLayoutDraft {
+                cells: vec![IpcLayoutCell {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 1.0,
+                    height: 1.0,
+                }],
+            },
         ];
         for request in requests {
             let decoded: IpcEnvelope = serde_json::from_str(

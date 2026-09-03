@@ -17,7 +17,7 @@ use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use thiserror::Error;
 
 use crate::defaults::default_config_content;
-use crate::schema::ResolvedConfigSet;
+use crate::schema::{ResolvedConfigSet, SavedLayout};
 use crate::validate::{validate, CandidateConfig, CandidateProfile, ValidationError};
 
 /// Debounce window for coalescing raw filesystem events into one
@@ -114,6 +114,44 @@ pub fn ensure_default_config(dir: &Path) -> Result<(), ConfigIoError> {
 pub fn load(dir: &Path) -> Result<Result<ResolvedConfigSet, Vec<ValidationError>>, ConfigIoError> {
     let candidate = read_candidate(dir)?;
     Ok(validate(&candidate))
+}
+
+/// Replaces a base-config layout by name (case-insensitively), then atomically writes it.
+pub fn save_layout(dir: &Path, layout: SavedLayout) -> Result<(), ConfigIoError> {
+    let path = dir.join(BASE_FILE_NAME);
+    let mut candidate = read_candidate(dir)?;
+    let mut base: crate::schema::BaseConfig = toml::from_str(&candidate.base).map_err(|error| {
+        io_error(
+            &path,
+            std::io::Error::new(std::io::ErrorKind::InvalidData, error),
+        )
+    })?;
+    if let Some(existing) = base
+        .layouts
+        .iter_mut()
+        .find(|current| current.name.eq_ignore_ascii_case(&layout.name))
+    {
+        *existing = layout;
+    } else {
+        base.layouts.push(layout);
+    }
+    candidate.base = toml::to_string_pretty(&base).expect("config is serializable");
+    if let Err(errors) = validate(&candidate) {
+        return Err(io_error(
+            &path,
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                errors
+                    .into_iter()
+                    .map(|error| error.to_string())
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            ),
+        ));
+    }
+    let temp = path.with_extension("toml.tmp");
+    fs::write(&temp, candidate.base).map_err(|error| io_error(&temp, error))?;
+    fs::rename(&temp, &path).map_err(|error| io_error(&path, error))
 }
 
 /// One outcome of a debounced reload attempt from [`watch`].

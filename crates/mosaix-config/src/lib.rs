@@ -27,10 +27,11 @@ mod validate;
 pub use defaults::{default_base_config, default_config_content, fallback_config};
 pub use diff::diff_bindings;
 pub use io::{
-    ensure_default_config, load, watch, ConfigEvent, ConfigIoError, ConfigWatcher, DEBOUNCE_WINDOW,
+    ensure_default_config, load, save_layout, watch, ConfigEvent, ConfigIoError, ConfigWatcher,
+    DEBOUNCE_WINDOW,
 };
 pub use schema::{
-    BaseConfig, BehaviorSection, Command, GapsOverride, KeyCombo, ProfileConfig, ResolvedConfig,
-    ResolvedConfigSet, ResolvedProfile, CURRENT_VERSION,
+    BaseConfig, BehaviorSection, Command, GapsOverride, KeyCombo, LayoutCell, ProfileConfig,
+    ResolvedConfig, ResolvedConfigSet, ResolvedProfile, SavedLayout, CURRENT_VERSION,
 };
 pub use validate::{merge, validate, CandidateConfig, CandidateProfile, ValidationError};

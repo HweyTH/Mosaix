@@ -40,6 +40,7 @@ pub fn default_base_config() -> BaseConfig {
         hotkeys,
         gaps: Gaps::default(),
         behavior: BehaviorSection::default(),
+        layouts: Vec::new(),
     }
 }
 

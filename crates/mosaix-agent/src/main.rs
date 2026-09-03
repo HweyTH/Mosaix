@@ -185,8 +185,7 @@ fn main() {
             .iter()
             .filter_map(|window| {
                 let handle = mosaix_platform_windows::window_handle_from_id(window.id);
-                let (display_id, bounds) =
-                    mosaix_platform_windows::observed_window_state(handle)?;
+                let (display_id, bounds) = mosaix_platform_windows::observed_window_state(handle)?;
                 Some((window.id, display_id, bounds))
             })
             .collect();
@@ -205,12 +204,16 @@ fn main() {
         }
     }
 
-    let ipc_server = match mosaix_ipc::IpcServer::start(engine.events(), engine.state_reader()) {
-        Ok(server) => Some(server),
-        Err(err) => {
+    let ipc_server = match config_dir
+        .clone()
+        .map(|dir| mosaix_ipc::IpcServer::start(engine.events(), engine.state_reader(), dir))
+    {
+        Some(Ok(server)) => Some(server),
+        Some(Err(err)) => {
             tracing::error!(%err, "failed to start IPC server; the mosaix CLI will be unavailable");
             None
         }
+        None => None,
     };
 
     // Watches `config_dir` for hot-edits and forwards each successfully
@@ -324,24 +327,20 @@ fn main() {
     // Feature 34 — snap preview overlay. Started before the hotkey and
     // event-hook forwarders so both can feed it. Failure degrades to no
     // overlay rather than blocking the rest of the agent.
-    let (overlay_tx, overlay_controller) =
-        match mosaix_platform_windows::start_preview_overlay() {
-            Ok(preview) => {
-                let (tx, join_handle) = overlay::start_overlay_controller(
-                    engine.state_reader(),
-                    engine.events(),
-                    preview,
-                );
-                (Some(tx), Some(join_handle))
-            }
-            Err(err) => {
-                tracing::error!(
-                    %err,
-                    "failed to start snap preview overlay; drag/hotkey previews will be unavailable"
-                );
-                (None, None)
-            }
-        };
+    let (overlay_tx, overlay_controller) = match mosaix_platform_windows::start_preview_overlay() {
+        Ok(preview) => {
+            let (tx, join_handle) =
+                overlay::start_overlay_controller(engine.state_reader(), engine.events(), preview);
+            (Some(tx), Some(join_handle))
+        }
+        Err(err) => {
+            tracing::error!(
+                %err,
+                "failed to start snap preview overlay; drag/hotkey previews will be unavailable"
+            );
+            (None, None)
+        }
+    };
 
     let event_hooks_and_forwarder = match mosaix_platform_windows::start_event_hooks() {
         Ok((hooks, raw_events)) => {
@@ -552,9 +551,8 @@ fn main() {
                                 ?window_id,
                                 "window is elevated (Administrator); emitting PlacementRejected"
                             );
-                            let _ = rejection_events.send(
-                                mosaix_engine::Event::PlacementRejected { window_id },
-                            );
+                            let _ = rejection_events
+                                .send(mosaix_engine::Event::PlacementRejected { window_id });
                         }
                         continue;
                     }
@@ -585,9 +583,8 @@ fn main() {
                                 ?actual_bounds,
                                 "placement rejected: actual bounds differ from target"
                             );
-                            let _ = rejection_events.send(
-                                mosaix_engine::Event::PlacementRejected { window_id },
-                            );
+                            let _ = rejection_events
+                                .send(mosaix_engine::Event::PlacementRejected { window_id });
                         }
                     }
                 }
@@ -619,8 +616,7 @@ fn main() {
             // from main so console quit unblocks without hanging.
             let (tray_stop_tx, tray_stop_rx) = std::sync::mpsc::channel::<()>();
             let forwarder = std::thread::spawn(move || {
-                const TRAY_STATUS_POLL: std::time::Duration =
-                    std::time::Duration::from_millis(250);
+                const TRAY_STATUS_POLL: std::time::Duration = std::time::Duration::from_millis(250);
                 let mut last_paused = state_reader.snapshot().paused;
                 tray.set_paused(last_paused);
                 loop {
@@ -645,9 +641,8 @@ fn main() {
                         Ok(mosaix_platform_windows::TrayEvent::OpenConfig) => {
                             match &config_dir_for_tray {
                                 Some(dir) => {
-                                    if let Err(err) = std::process::Command::new("explorer")
-                                        .arg(dir)
-                                        .spawn()
+                                    if let Err(err) =
+                                        std::process::Command::new("explorer").arg(dir).spawn()
                                     {
                                         tracing::error!(
                                             %err,

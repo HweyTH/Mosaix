@@ -3,6 +3,7 @@
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::windows::io::{FromRawHandle, IntoRawHandle, RawHandle};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -49,12 +50,16 @@ pub struct IpcServer {
 }
 
 impl IpcServer {
-    pub fn start(events: EventSender, state_reader: StateReader) -> std::io::Result<Self> {
+    pub fn start(
+        events: EventSender,
+        state_reader: StateReader,
+        config_dir: PathBuf,
+    ) -> std::io::Result<Self> {
         let stop_flag = Arc::new(AtomicBool::new(false));
         let thread_flag = Arc::clone(&stop_flag);
         let join_handle = thread::Builder::new()
             .name("mosaix-ipc".to_owned())
-            .spawn(move || server_loop(events, state_reader, thread_flag))?;
+            .spawn(move || server_loop(events, state_reader, config_dir, thread_flag))?;
         Ok(Self {
             stop_flag,
             join_handle: Some(join_handle),
@@ -88,7 +93,12 @@ impl IpcServer {
     }
 }
 
-fn server_loop(events: EventSender, state_reader: StateReader, stop_flag: Arc<AtomicBool>) {
+fn server_loop(
+    events: EventSender,
+    state_reader: StateReader,
+    config_dir: PathBuf,
+    stop_flag: Arc<AtomicBool>,
+) {
     let name = wide(&pipe_name());
     while !stop_flag.load(Ordering::SeqCst) {
         let security = match PipeSecurity::for_current_user() {
@@ -125,7 +135,7 @@ fn server_loop(events: EventSender, state_reader: StateReader, stop_flag: Arc<At
             break;
         }
         if connected {
-            handle_client(pipe, &events, &state_reader);
+            handle_client(pipe, &events, &state_reader, &config_dir);
         }
         unsafe {
             let _ = DisconnectNamedPipe(pipe);
@@ -134,7 +144,12 @@ fn server_loop(events: EventSender, state_reader: StateReader, stop_flag: Arc<At
     }
 }
 
-fn handle_client(pipe: HANDLE, events: &EventSender, state_reader: &StateReader) {
+fn handle_client(
+    pipe: HANDLE,
+    events: &EventSender,
+    state_reader: &StateReader,
+    config_dir: &std::path::Path,
+) {
     let file = unsafe { File::from_raw_handle(pipe.0 as RawHandle) };
     let mut reader = BufReader::new(file);
     let mut request_count = 0;
@@ -175,7 +190,7 @@ fn handle_client(pipe: HANDLE, events: &EventSender, state_reader: &StateReader)
             Ok(IpcEnvelope {
                 payload: IpcPayload::Request(request),
                 ..
-            }) => handle_request(&request, events, state_reader),
+            }) => handle_request(&request, events, state_reader, config_dir),
             Ok(_) => IpcResponse::Error {
                 message: "expected an IPC request".to_owned(),
             },

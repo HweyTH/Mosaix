@@ -23,6 +23,21 @@
 
 use mosaix_domain::{allocate_edges, Gaps, NormalizedRect, Rect};
 
+/// Scales normalized saved-layout cells into pixel rectangles in `work_area`.
+pub fn resolve_layout_cells(work_area: Rect, cells: &[(f64, f64, f64, f64)]) -> Vec<Rect> {
+    cells
+        .iter()
+        .map(|&(x, y, width, height)| {
+            Rect::new(
+                work_area.x + (x * f64::from(work_area.width)).round() as i32,
+                work_area.y + (y * f64::from(work_area.height)).round() as i32,
+                (width * f64::from(work_area.width)).round() as i32,
+                (height * f64::from(work_area.height)).round() as i32,
+            )
+        })
+        .collect()
+}
+
 /// A named half-zone a window can be snapped to (architecture doc section
 /// 8.1, "Snap to named zone"; section 20, "Focused-window halves").
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -85,11 +100,7 @@ pub fn half_zone_at_edge(
     edge_threshold: i32,
 ) -> Option<HalfZone> {
     let (x, y) = point;
-    if x < work_area.x
-        || y < work_area.y
-        || x >= work_area.right()
-        || y >= work_area.bottom()
-    {
+    if x < work_area.x || y < work_area.y || x >= work_area.right() || y >= work_area.bottom() {
         return None;
     }
 
@@ -235,14 +246,28 @@ impl CycleStep {
 /// [`CycleStep::TwoThirds`] (CONTEXT.md "Zone cycle"). Delegates to
 /// [`snap_to_half`]/[`snap_to_third`], so it inherits their container-offset
 /// handling and gapless thirds.
-pub fn resolve_zone_cycle(container: Rect, direction: HorizontalDirection, step: CycleStep) -> Rect {
+pub fn resolve_zone_cycle(
+    container: Rect,
+    direction: HorizontalDirection,
+    step: CycleStep,
+) -> Rect {
     match (direction, step) {
         (HorizontalDirection::Left, CycleStep::Half) => snap_to_half(container, HalfZone::LeftHalf),
-        (HorizontalDirection::Right, CycleStep::Half) => snap_to_half(container, HalfZone::RightHalf),
-        (HorizontalDirection::Left, CycleStep::Third) => snap_to_third(container, ThirdZone::LeftThird),
-        (HorizontalDirection::Right, CycleStep::Third) => snap_to_third(container, ThirdZone::RightThird),
-        (HorizontalDirection::Left, CycleStep::TwoThirds) => snap_to_third(container, ThirdZone::LeftTwoThirds),
-        (HorizontalDirection::Right, CycleStep::TwoThirds) => snap_to_third(container, ThirdZone::RightTwoThirds),
+        (HorizontalDirection::Right, CycleStep::Half) => {
+            snap_to_half(container, HalfZone::RightHalf)
+        }
+        (HorizontalDirection::Left, CycleStep::Third) => {
+            snap_to_third(container, ThirdZone::LeftThird)
+        }
+        (HorizontalDirection::Right, CycleStep::Third) => {
+            snap_to_third(container, ThirdZone::RightThird)
+        }
+        (HorizontalDirection::Left, CycleStep::TwoThirds) => {
+            snap_to_third(container, ThirdZone::LeftTwoThirds)
+        }
+        (HorizontalDirection::Right, CycleStep::TwoThirds) => {
+            snap_to_third(container, ThirdZone::RightTwoThirds)
+        }
     }
 }
 
@@ -323,6 +348,17 @@ mod tests {
     use super::*;
 
     const WORK_AREA: Rect = Rect::new(0, 0, 1920, 1080);
+
+    #[test]
+    fn resolve_layout_cells_scales_normalized_cells_to_the_work_area() {
+        assert_eq!(
+            resolve_layout_cells(
+                Rect::new(-100, 20, 1000, 500),
+                &[(0.0, 0.0, 0.6, 1.0), (0.6, 0.0, 0.4, 1.0)]
+            ),
+            vec![Rect::new(-100, 20, 600, 500), Rect::new(500, 20, 400, 500)]
+        );
+    }
 
     #[test]
     fn left_half_takes_the_left_half_of_the_container() {
@@ -760,12 +796,16 @@ mod tests {
     }
 
     #[test]
-    fn resolve_zone_cycle_left_and_right_steps_are_gapless_and_cover_the_container_on_a_non_multiple_of_three_width() {
+    fn resolve_zone_cycle_left_and_right_steps_are_gapless_and_cover_the_container_on_a_non_multiple_of_three_width(
+    ) {
         let container = Rect::new(0, 0, 100, 50);
         let left_third = resolve_zone_cycle(container, HorizontalDirection::Left, CycleStep::Third);
-        let left_two_thirds = resolve_zone_cycle(container, HorizontalDirection::Left, CycleStep::TwoThirds);
-        let right_third = resolve_zone_cycle(container, HorizontalDirection::Right, CycleStep::Third);
-        let right_two_thirds = resolve_zone_cycle(container, HorizontalDirection::Right, CycleStep::TwoThirds);
+        let left_two_thirds =
+            resolve_zone_cycle(container, HorizontalDirection::Left, CycleStep::TwoThirds);
+        let right_third =
+            resolve_zone_cycle(container, HorizontalDirection::Right, CycleStep::Third);
+        let right_two_thirds =
+            resolve_zone_cycle(container, HorizontalDirection::Right, CycleStep::TwoThirds);
 
         assert_eq!(left_third.x, container.x);
         assert_eq!(left_two_thirds.x, container.x);
@@ -855,15 +895,9 @@ mod tests {
     #[test]
     fn apply_gaps_with_zero_outer_and_inner_gaps_is_a_no_op() {
         let raw_zone = snap_to_half(WORK_AREA, HalfZone::LeftHalf);
-        assert_eq!(
-            apply_gaps(raw_zone, WORK_AREA, Gaps::new(0, 0)),
-            raw_zone
-        );
+        assert_eq!(apply_gaps(raw_zone, WORK_AREA, Gaps::new(0, 0)), raw_zone);
 
         let maximized = maximize_to_work_area(WORK_AREA);
-        assert_eq!(
-            apply_gaps(maximized, WORK_AREA, Gaps::new(0, 0)),
-            maximized
-        );
+        assert_eq!(apply_gaps(maximized, WORK_AREA, Gaps::new(0, 0)), maximized);
     }
 }

@@ -1,5 +1,6 @@
 use mosaix_engine::{EngineState, Event, EventSender, StateReader, ZoneSnapDirection};
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 
 use crate::protocol::{IpcRequest, IpcResponse};
 
@@ -34,6 +35,7 @@ pub fn handle_request(
     request: &IpcRequest,
     events: &EventSender,
     state_reader: &StateReader,
+    config_dir: &Path,
 ) -> IpcResponse {
     match request {
         IpcRequest::Ping => IpcResponse::Ok { data: None },
@@ -85,6 +87,70 @@ pub fn handle_request(
             let value = serde_json::json!({ "paused": state.paused });
             IpcResponse::Ok { data: Some(value) }
         }
+        IpcRequest::ApplyLayoutByName { name } => {
+            if !can_apply(state_reader) {
+                return unavailable_apply_response();
+            }
+            send_event(events, Event::LayoutApplyRequested { name: name.clone() })
+        }
+        IpcRequest::ApplyLayoutDraft { cells } => {
+            if !can_apply(state_reader) {
+                return unavailable_apply_response();
+            }
+            send_event(
+                events,
+                Event::LayoutApplyDraftRequested {
+                    cells: cells
+                        .iter()
+                        .map(|cell| (cell.x, cell.y, cell.width, cell.height))
+                        .collect(),
+                },
+            )
+        }
+        IpcRequest::SaveLayout { layout } => match mosaix_config::save_layout(
+            config_dir,
+            mosaix_config::SavedLayout {
+                name: layout.name.clone(),
+                cells: layout
+                    .cells
+                    .iter()
+                    .map(|cell| mosaix_config::LayoutCell {
+                        x: cell.x,
+                        y: cell.y,
+                        width: cell.width,
+                        height: cell.height,
+                    })
+                    .collect(),
+            },
+        ) {
+            Ok(()) if can_apply(state_reader) => send_event(
+                events,
+                Event::LayoutApplyDraftRequested {
+                    cells: layout
+                        .cells
+                        .iter()
+                        .map(|cell| (cell.x, cell.y, cell.width, cell.height))
+                        .collect(),
+                },
+            ),
+            Ok(()) => unavailable_apply_response(),
+            Err(error) => IpcResponse::Error {
+                message: error.to_string(),
+            },
+        },
+    }
+}
+
+fn can_apply(state_reader: &StateReader) -> bool {
+    let state = state_reader.snapshot();
+    !state.paused
+        && state
+            .focused_window
+            .is_some_and(|window| state.windows.contains_key(&window))
+}
+fn unavailable_apply_response() -> IpcResponse {
+    IpcResponse::Error {
+        message: "no focused managed window is available to apply this layout".into(),
     }
 }
 

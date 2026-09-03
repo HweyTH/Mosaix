@@ -49,6 +49,7 @@ pub struct EditorSnapshot {
 #[serde(rename_all = "lowercase")]
 pub enum CommandStatus {
     Previewing,
+    Applied,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -61,6 +62,12 @@ pub struct CommandReceipt {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EditorCommandError {
     AgentUnavailable,
+    AgentRejected {
+        reason: String,
+    },
+    AgentVersionMismatch {
+        server_version: u32,
+    },
     EmptyLayout,
     DuplicateZoneId {
         zone_id: u32,
@@ -77,8 +84,15 @@ pub enum EditorCommandError {
 impl std::fmt::Display for EditorCommandError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::AgentUnavailable => formatter.write_str(
-                "the Mosaix agent IPC transport is not available yet; the draft was not saved or applied",
+            Self::AgentUnavailable => {
+                formatter.write_str("the Mosaix agent is unavailable; the draft was not applied")
+            }
+            Self::AgentRejected { reason } => {
+                write!(formatter, "the Mosaix agent rejected the layout: {reason}")
+            }
+            Self::AgentVersionMismatch { server_version } => write!(
+                formatter,
+                "the Mosaix agent uses incompatible protocol version {server_version}"
             ),
             Self::EmptyLayout => formatter.write_str("a layout must contain at least one zone"),
             Self::DuplicateZoneId { zone_id } => {
@@ -171,11 +185,63 @@ impl EditorSession {
 
     pub fn apply(&mut self, draft: LayoutDraft) -> Result<CommandReceipt, EditorCommandError> {
         validate_draft(&draft)?;
-        Err(EditorCommandError::AgentUnavailable)
+        let response = mosaix_ipc::send_request(mosaix_ipc::IpcRequest::SaveLayout {
+            layout: ipc_layout(&draft),
+        })
+        .map_err(|_| EditorCommandError::AgentUnavailable)?;
+        self.finish_apply(draft, response)
+    }
+
+    pub fn apply_only(&mut self, draft: LayoutDraft) -> Result<CommandReceipt, EditorCommandError> {
+        validate_draft(&draft)?;
+        let response = mosaix_ipc::send_request(mosaix_ipc::IpcRequest::ApplyLayoutDraft {
+            cells: ipc_layout(&draft).cells,
+        })
+        .map_err(|_| EditorCommandError::AgentUnavailable)?;
+        self.finish_apply(draft, response)
+    }
+
+    fn finish_apply(
+        &mut self,
+        draft: LayoutDraft,
+        response: mosaix_ipc::IpcResponse,
+    ) -> Result<CommandReceipt, EditorCommandError> {
+        match response {
+            mosaix_ipc::IpcResponse::Ok { .. } => {
+                self.revision += 1;
+                self.snapshot.draft = draft;
+                Ok(CommandReceipt {
+                    revision: self.revision,
+                    status: CommandStatus::Applied,
+                })
+            }
+            mosaix_ipc::IpcResponse::Error { message } => {
+                Err(EditorCommandError::AgentRejected { reason: message })
+            }
+            mosaix_ipc::IpcResponse::VersionMismatch { server_version } => {
+                Err(EditorCommandError::AgentVersionMismatch { server_version })
+            }
+        }
     }
 
     pub fn set_appearance(&mut self, appearance: Appearance) {
         self.snapshot.appearance = appearance;
+    }
+}
+
+fn ipc_layout(draft: &LayoutDraft) -> mosaix_ipc::IpcSavedLayout {
+    mosaix_ipc::IpcSavedLayout {
+        name: draft.name.clone(),
+        cells: draft
+            .zones
+            .iter()
+            .map(|zone| mosaix_ipc::IpcLayoutCell {
+                x: zone.x,
+                y: zone.y,
+                width: zone.width,
+                height: zone.height,
+            })
+            .collect(),
     }
 }
 
@@ -189,7 +255,11 @@ fn validate_draft(draft: &LayoutDraft) -> Result<(), EditorCommandError> {
         if !ids.insert(zone.id) {
             return Err(EditorCommandError::DuplicateZoneId { zone_id: zone.id });
         }
-        if zone.x < 0.0
+        if !zone.x.is_finite()
+            || !zone.y.is_finite()
+            || !zone.width.is_finite()
+            || !zone.height.is_finite()
+            || zone.x < 0.0
             || zone.y < 0.0
             || zone.width <= 0.0
             || zone.height <= 0.0

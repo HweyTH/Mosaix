@@ -9,6 +9,7 @@ pub fn run() {
             commands::load_editor_snapshot,
             commands::preview_layout,
             commands::save_and_apply_layout,
+            commands::apply_layout,
             commands::set_appearance,
         ])
         .run(tauri::generate_context!())

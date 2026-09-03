@@ -43,8 +43,8 @@ use std::thread::{self, JoinHandle};
 use mosaix_config::{ResolvedConfig, ResolvedConfigSet};
 use mosaix_domain::{topology_fingerprint, Display, DisplayId, Rect, WindowId};
 use mosaix_layout::{
-    apply_gaps, cycle_display, resolve_zone_cycle, snap_to_half, throw_preserving_ratio, CycleStep,
-    DisplayDirection, HalfZone, HorizontalDirection,
+    apply_gaps, cycle_display, resolve_layout_cells, resolve_zone_cycle, snap_to_half,
+    throw_preserving_ratio, CycleStep, DisplayDirection, HalfZone, HorizontalDirection,
 };
 
 /// Default bound on the event queue before a sender blocks. Chosen
@@ -162,8 +162,6 @@ impl WindowPlacement {
     }
 }
 
-
-
 /// The direction a zone-snap hotkey requests (CONTEXT.md "Zone"). Only
 /// [`ZoneSnapDirection::Left`]/[`ZoneSnapDirection::Right`] participate in
 /// zone cycling -- `ZoneSnapDirection::horizontal` is how
@@ -217,7 +215,9 @@ pub enum Event {
     /// section 20, "restore"). A no-op if the window isn't tracked, or has
     /// no remembered prior placement (e.g. it was only ever placed once,
     /// or was already restored).
-    WindowRestoreRequested { window_id: WindowId },
+    WindowRestoreRequested {
+        window_id: WindowId,
+    },
 
     /// Move a window to the adjacent display in `direction`, preserving
     /// its position/size as a fraction of the display's work area
@@ -259,7 +259,15 @@ pub enum Event {
     /// resolves to half with no cycle-step bookkeeping. Either way, the
     /// resolved bounds are placed through the same `place_window` path as
     /// any other placement, so the result remains restorable.
-    ZoneSnapRequested { direction: ZoneSnapDirection },
+    ZoneSnapRequested {
+        direction: ZoneSnapDirection,
+    },
+    LayoutApplyRequested {
+        name: String,
+    },
+    LayoutApplyDraftRequested {
+        cells: Vec<(f64, f64, f64, f64)>,
+    },
 
     /// The OS reported `window_id`'s current display and bounds, following
     /// its own location-changed notification -- which fires for both
@@ -340,7 +348,9 @@ pub enum Event {
     /// that window are suppressed and a warning is logged.  The count is
     /// reset to zero by any explicit [`Event::ZoneSnapRequested`] so the
     /// user always has an escape hatch.
-    PlacementRejected { window_id: WindowId },
+    PlacementRejected {
+        window_id: WindowId,
+    },
 }
 
 /// Applies one event to `state`. Must never panic -- a single bad event
@@ -531,6 +541,27 @@ fn apply(state: &mut EngineState, event: Event) {
             }
         }
 
+        Event::LayoutApplyRequested { name } => {
+            let Some(layout) = state
+                .resolved_config
+                .layouts
+                .iter()
+                .find(|layout| layout.name.eq_ignore_ascii_case(&name))
+            else {
+                return;
+            };
+            apply_layout_cells(
+                state,
+                layout
+                    .cells
+                    .iter()
+                    .map(|cell| (cell.x, cell.y, cell.width, cell.height))
+                    .collect(),
+            );
+        }
+
+        Event::LayoutApplyDraftRequested { cells } => apply_layout_cells(state, cells),
+
         Event::WindowBoundsObserved {
             window_id,
             display_id,
@@ -606,7 +637,10 @@ fn apply(state: &mut EngineState, event: Event) {
                 });
             }
             if registered > 0 {
-                tracing::info!(registered, "startup reconciliation registered existing windows");
+                tracing::info!(
+                    registered,
+                    "startup reconciliation registered existing windows"
+                );
                 state.revision += 1;
             } else {
                 tracing::debug!("startup reconciliation: no new windows to register");
@@ -626,8 +660,7 @@ fn apply(state: &mut EngineState, event: Event) {
             if topology_fingerprint(&displays) != topology_fingerprint(&state.displays) {
                 migrate_orphaned_windows(state, &displays);
                 state.displays = displays;
-                state.resolved_config =
-                    select_resolved_config(&state.config_set, &state.displays);
+                state.resolved_config = select_resolved_config(&state.config_set, &state.displays);
             }
             // Step 2: bulk-register any newly observed windows.
             let mut registered = 0usize;
@@ -643,10 +676,7 @@ fn apply(state: &mut EngineState, event: Event) {
                     }
                 });
             }
-            tracing::info!(
-                registered,
-                "wake reconciliation complete"
-            );
+            tracing::info!(registered, "wake reconciliation complete");
             state.revision += 1;
         }
 
@@ -791,6 +821,39 @@ fn place_window(
     true
 }
 
+fn apply_layout_cells(state: &mut EngineState, cells: Vec<(f64, f64, f64, f64)>) {
+    if state.paused {
+        return;
+    }
+    let Some(focused) = state.focused_window else {
+        return;
+    };
+    let Some(display_id) = state
+        .windows
+        .get(&focused)
+        .map(|placement| placement.display_id)
+    else {
+        return;
+    };
+    let Some(work_area) = work_area_of(&state.displays, display_id) else {
+        return;
+    };
+    let mut windows: Vec<(WindowId, Rect)> = state
+        .windows
+        .iter()
+        .filter(|(_, placement)| placement.display_id == display_id && !placement.circuit_open())
+        .map(|(id, placement)| (*id, placement.bounds))
+        .collect();
+    windows.sort_by_key(|(id, bounds)| (bounds.y, bounds.x, id.0));
+    for ((window_id, _), raw) in windows
+        .into_iter()
+        .zip(resolve_layout_cells(work_area, &cells))
+    {
+        let bounds = apply_gaps(raw, work_area, state.resolved_config.gaps);
+        place_window(state, window_id, display_id, bounds, None);
+    }
+}
+
 /// Migrate windows whose current `display_id` is absent from `new_displays`
 /// to the nearest surviving display, preserving their normalized position
 /// via [`throw_preserving_ratio`].  Called *before* `state.displays` is
@@ -802,7 +865,9 @@ fn migrate_orphaned_windows(state: &mut EngineState, new_displays: &[Display]) {
     if new_displays.is_empty() {
         // No surviving displays -- nothing sensible to migrate to.  Leave
         // windows untouched; they'll be reconciled when a display comes back.
-        tracing::warn!("all displays disappeared; deferring window migration until a display returns");
+        tracing::warn!(
+            "all displays disappeared; deferring window migration until a display returns"
+        );
         return;
     }
 
@@ -832,8 +897,7 @@ fn migrate_orphaned_windows(state: &mut EngineState, new_displays: &[Display]) {
         }
 
         // Find the old display's geometry.
-        let Some(old_display) = state.displays.iter().find(|d| d.id == placement.display_id)
-        else {
+        let Some(old_display) = state.displays.iter().find(|d| d.id == placement.display_id) else {
             continue;
         };
 
@@ -2321,6 +2385,7 @@ mod tests {
             hotkeys,
             gaps: mosaix_domain::Gaps::default(),
             behavior: mosaix_config::BehaviorSection::default(),
+            layouts: Vec::new(),
         }
     }
 
@@ -2337,6 +2402,7 @@ mod tests {
                 hotkeys: std::collections::BTreeMap::new(),
                 gaps,
                 behavior: mosaix_config::BehaviorSection::default(),
+                layouts: Vec::new(),
             },
             profiles: Vec::new(),
         }
@@ -2802,11 +2868,11 @@ mod tests {
     #[test]
     fn startup_reconciliation_with_empty_list_is_a_noop() {
         let mut state = EngineState::default();
-        apply(
-            &mut state,
-            Event::StartupReconciliation { windows: vec![] },
+        apply(&mut state, Event::StartupReconciliation { windows: vec![] });
+        assert_eq!(
+            state.revision, 0,
+            "empty reconciliation must not bump the revision"
         );
-        assert_eq!(state.revision, 0, "empty reconciliation must not bump the revision");
         assert!(state.windows.is_empty());
     }
 
@@ -2870,10 +2936,7 @@ mod tests {
         // Topology fingerprints differ when the display list changes, so even an
         // empty list is processed (the fingerprint of [] != fingerprint of [MON-A]).
         // But migration must gracefully handle the empty-display case.
-        apply(
-            &mut state,
-            Event::DisplayTopologyChanged(vec![]),
-        );
+        apply(&mut state, Event::DisplayTopologyChanged(vec![]));
 
         assert_eq!(
             state.windows.get(&WindowId(1)).unwrap().bounds,
@@ -2912,7 +2975,11 @@ mod tests {
             },
         );
 
-        assert_eq!(state.displays.len(), 2, "topology must include the new display");
+        assert_eq!(
+            state.displays.len(),
+            2,
+            "topology must include the new display"
+        );
         assert!(
             state.windows.contains_key(&WindowId(99)),
             "new window observed after wake must be registered"
@@ -2941,13 +3008,20 @@ mod tests {
                 bounds: Rect::new(0, 0, 960, 1080),
             },
         );
-        apply(&mut state, Event::PlacementRejected { window_id: WindowId(1) });
-        apply(&mut state, Event::PlacementRejected { window_id: WindowId(1) });
-
-        assert_eq!(
-            state.windows.get(&WindowId(1)).unwrap().rejection_count,
-            2
+        apply(
+            &mut state,
+            Event::PlacementRejected {
+                window_id: WindowId(1),
+            },
         );
+        apply(
+            &mut state,
+            Event::PlacementRejected {
+                window_id: WindowId(1),
+            },
+        );
+
+        assert_eq!(state.windows.get(&WindowId(1)).unwrap().rejection_count, 2);
         // Not yet at threshold; circuit must still be closed.
         assert!(
             !state.windows.get(&WindowId(1)).unwrap().circuit_open(),
@@ -2972,7 +3046,12 @@ mod tests {
         );
         // Drive to threshold.
         for _ in 0..CIRCUIT_BREAKER_THRESHOLD {
-            apply(&mut state, Event::PlacementRejected { window_id: WindowId(1) });
+            apply(
+                &mut state,
+                Event::PlacementRejected {
+                    window_id: WindowId(1),
+                },
+            );
         }
 
         assert!(
@@ -3026,7 +3105,12 @@ mod tests {
         );
         // Open the circuit.
         for _ in 0..CIRCUIT_BREAKER_THRESHOLD {
-            apply(&mut state, Event::PlacementRejected { window_id: WindowId(1) });
+            apply(
+                &mut state,
+                Event::PlacementRejected {
+                    window_id: WindowId(1),
+                },
+            );
         }
         assert!(state.windows.get(&WindowId(1)).unwrap().circuit_open());
 
@@ -3076,8 +3160,18 @@ mod tests {
 
         // Open circuit on window 1 and 3, but not 2.
         for _ in 0..CIRCUIT_BREAKER_THRESHOLD {
-            apply(&mut state, Event::PlacementRejected { window_id: WindowId(1) });
-            apply(&mut state, Event::PlacementRejected { window_id: WindowId(3) });
+            apply(
+                &mut state,
+                Event::PlacementRejected {
+                    window_id: WindowId(1),
+                },
+            );
+            apply(
+                &mut state,
+                Event::PlacementRejected {
+                    window_id: WindowId(3),
+                },
+            );
         }
 
         assert_eq!(

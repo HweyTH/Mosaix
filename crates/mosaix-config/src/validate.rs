@@ -9,7 +9,7 @@ use thiserror::Error;
 
 use crate::schema::{
     BaseConfig, Command, KeyCombo, ProfileConfig, ResolvedConfig, ResolvedConfigSet,
-    ResolvedProfile, CURRENT_VERSION,
+    ResolvedProfile, SavedLayout, CURRENT_VERSION,
 };
 
 /// One profile candidate: its filename (for error messages -- profiles are
@@ -64,6 +64,14 @@ pub enum ValidationError {
         first_file: String,
         second_file: String,
     },
+    #[error("{file}: invalid layout {name:?}: {message}")]
+    InvalidLayout {
+        file: String,
+        name: String,
+        message: String,
+    },
+    #[error("{file}: duplicate layout name {name:?}")]
+    DuplicateLayoutName { file: String, name: String },
 }
 
 /// Field-level merges `profile` (if any) over `base`: any field the profile
@@ -74,6 +82,7 @@ pub fn merge(base: &BaseConfig, profile: Option<&ProfileConfig>) -> ResolvedConf
     let mut hotkeys = base.hotkeys.clone();
     let mut gaps = base.gaps;
     let behavior = base.behavior.clone();
+    let mut layouts = base.layouts.clone();
 
     if let Some(profile) = profile {
         for (command, combo) in &profile.hotkeys {
@@ -85,13 +94,74 @@ pub fn merge(base: &BaseConfig, profile: Option<&ProfileConfig>) -> ResolvedConf
         if let Some(inner) = profile.gaps.inner {
             gaps.inner = inner;
         }
+        if let Some(overrides) = &profile.layouts {
+            layouts = overrides.clone();
+        }
     }
 
     ResolvedConfig {
         hotkeys,
         gaps,
         behavior,
+        layouts,
     }
+}
+
+fn layout_error(file: &str, layout: &SavedLayout) -> Option<ValidationError> {
+    if layout.name.trim().is_empty() {
+        return Some(ValidationError::InvalidLayout {
+            file: file.into(),
+            name: layout.name.clone(),
+            message: "name must not be blank".into(),
+        });
+    }
+    if layout.cells.is_empty() {
+        return Some(ValidationError::InvalidLayout {
+            file: file.into(),
+            name: layout.name.clone(),
+            message: "must contain at least one cell".into(),
+        });
+    }
+    for cell in &layout.cells {
+        if !cell.x.is_finite()
+            || !cell.y.is_finite()
+            || !cell.width.is_finite()
+            || !cell.height.is_finite()
+            || cell.x < 0.0
+            || cell.y < 0.0
+            || cell.width <= 0.0
+            || cell.height <= 0.0
+            || cell.x + cell.width > 1.0
+            || cell.y + cell.height > 1.0
+        {
+            return Some(ValidationError::InvalidLayout {
+                file: file.into(),
+                name: layout.name.clone(),
+                message: "cell is outside normalized bounds".into(),
+            });
+        }
+    }
+    None
+}
+
+fn validate_layouts(file: &str, resolved: &ResolvedConfig) -> Option<ValidationError> {
+    for layout in &resolved.layouts {
+        if let Some(error) = layout_error(file, layout) {
+            return Some(error);
+        }
+    }
+    for (index, layout) in resolved.layouts.iter().enumerate() {
+        if resolved.layouts[..index]
+            .iter()
+            .any(|other| other.name.eq_ignore_ascii_case(&layout.name))
+        {
+            return Some(ValidationError::DuplicateLayoutName {
+                file: file.into(),
+                name: layout.name.clone(),
+            });
+        }
+    }
+    None
 }
 
 fn parse_base(contents: &str) -> Result<BaseConfig, ValidationError> {
@@ -181,11 +251,16 @@ pub fn validate(candidate: &CandidateConfig) -> Result<ResolvedConfigSet, Vec<Va
     if let Some(err) = duplicate_binding("config.toml", &base_resolved) {
         errors.push(err);
     }
+    if let Some(err) = validate_layouts("config.toml", &base_resolved) {
+        errors.push(err);
+    }
 
     let mut resolved_profiles = Vec::new();
     for (file_name, profile) in &profiles {
         let resolved = merge(&base, Some(profile));
         if let Some(err) = duplicate_binding(file_name, &resolved) {
+            errors.push(err);
+        } else if let Some(err) = validate_layouts(file_name, &resolved) {
             errors.push(err);
         } else {
             resolved_profiles.push(ResolvedProfile {
@@ -404,6 +479,7 @@ snap-right = "ctrl+alt+left"
                 hotkeys: base.hotkeys.clone(),
                 gaps: base.gaps,
                 behavior: base.behavior.clone(),
+                layouts: base.layouts.clone(),
             }
         );
     }
