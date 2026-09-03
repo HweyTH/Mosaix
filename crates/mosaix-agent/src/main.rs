@@ -750,7 +750,32 @@ fn main() {
     tracing::info!("mosaix-agent stopped");
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+fn main() {
+    use mosaix_platform_api::PlatformAdapter;
+
+    tracing_subscriber::fmt::init();
+    tracing::info!("mosaix-agent starting on macOS");
+    let adapter = mosaix_platform_macos::MacosPlatformAdapter::new().unwrap_or_else(|error| {
+        eprintln!("mosaix-agent: {error}");
+        std::process::exit(1);
+    });
+    match mosaix_platform_macos::enumerate_displays() {
+        Ok(displays) => tracing::info!(count = displays.len(), "enumerated macOS displays"),
+        Err(error) => tracing::error!(%error, "failed to enumerate macOS displays"),
+    }
+    match adapter.enumerate_windows() {
+        Ok(windows) => tracing::info!(count = windows.len(), "enumerated manageable macOS windows"),
+        Err(error) => tracing::error!(%error, "failed to enumerate macOS windows"),
+    }
+    let shutdown = mosaix_platform_macos::register_shutdown_signal()
+        .expect("failed to register macOS shutdown signal handler");
+    tracing::info!("mosaix-agent ready; waiting for SIGINT or SIGTERM");
+    let _ = shutdown.recv();
+    tracing::info!("mosaix-agent stopped");
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 fn main() {
     eprintln!("mosaix-agent currently only supports Windows (no macOS platform adapter yet).");
     std::process::exit(1);

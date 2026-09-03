@@ -47,7 +47,7 @@ enum FocusDirection {
     Right,
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn main() {
     use mosaix_ipc::{send_request, IpcRequest, IpcResponse};
 
@@ -102,7 +102,7 @@ fn main() {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 fn main() {
     let _ = Cli::parse();
     eprintln!("mosaix currently only supports Windows");
