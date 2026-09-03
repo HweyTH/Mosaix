@@ -23,6 +23,21 @@
 
 use mosaix_domain::{allocate_edges, Gaps, NormalizedRect, Rect};
 
+/// Scales normalized saved-layout cells into pixel rectangles in `work_area`.
+pub fn resolve_layout_cells(work_area: Rect, cells: &[(f64, f64, f64, f64)]) -> Vec<Rect> {
+    cells
+        .iter()
+        .map(|&(x, y, width, height)| {
+            Rect::new(
+                work_area.x + (x * f64::from(work_area.width)).round() as i32,
+                work_area.y + (y * f64::from(work_area.height)).round() as i32,
+                (width * f64::from(work_area.width)).round() as i32,
+                (height * f64::from(work_area.height)).round() as i32,
+            )
+        })
+        .collect()
+}
+
 /// A named half-zone a window can be snapped to (architecture doc section
 /// 8.1, "Snap to named zone"; section 20, "Focused-window halves").
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -333,6 +348,17 @@ mod tests {
     use super::*;
 
     const WORK_AREA: Rect = Rect::new(0, 0, 1920, 1080);
+
+    #[test]
+    fn resolve_layout_cells_scales_normalized_cells_to_the_work_area() {
+        assert_eq!(
+            resolve_layout_cells(
+                Rect::new(-100, 20, 1000, 500),
+                &[(0.0, 0.0, 0.6, 1.0), (0.6, 0.0, 0.4, 1.0)]
+            ),
+            vec![Rect::new(-100, 20, 600, 500), Rect::new(500, 20, 400, 500)]
+        );
+    }
 
     #[test]
     fn left_half_takes_the_left_half_of_the_container() {
