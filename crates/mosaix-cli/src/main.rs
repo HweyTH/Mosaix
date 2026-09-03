@@ -22,11 +22,38 @@ enum Command {
     Pause,
     Resume,
     TogglePause,
+    Rearrange,
+    ToggleAutomaticTiling,
+    ToggleFloating,
+    FocusLeft,
+    FocusRight,
+    FocusUp,
+    FocusDown,
+    SwapLeft,
+    SwapRight,
+    SwapUp,
+    SwapDown,
+    /// Work with saved layouts.
+    Layout {
+        #[command(subcommand)]
+        action: LayoutAction,
+    },
     State {
         #[arg(long)]
         json: bool,
     },
     Ping,
+}
+
+#[derive(Debug, Subcommand)]
+enum LayoutAction {
+    /// Apply a saved layout to the focused window's display. Fails with
+    /// the agent's own reason if no managed window is focused or no layout
+    /// carries that name.
+    Apply {
+        /// The layout's name, as declared under `[layouts]` in config.
+        name: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -75,6 +102,20 @@ fn main() {
         Command::Pause => IpcRequest::Pause,
         Command::Resume => IpcRequest::Resume,
         Command::TogglePause => IpcRequest::TogglePause,
+        Command::Rearrange => IpcRequest::Rearrange,
+        Command::ToggleAutomaticTiling => IpcRequest::ToggleAutomaticTiling,
+        Command::ToggleFloating => IpcRequest::ToggleFloating,
+        Command::FocusLeft => IpcRequest::FocusLeft,
+        Command::FocusRight => IpcRequest::FocusRight,
+        Command::FocusUp => IpcRequest::FocusUp,
+        Command::FocusDown => IpcRequest::FocusDown,
+        Command::SwapLeft => IpcRequest::SwapLeft,
+        Command::SwapRight => IpcRequest::SwapRight,
+        Command::SwapUp => IpcRequest::SwapUp,
+        Command::SwapDown => IpcRequest::SwapDown,
+        Command::Layout {
+            action: LayoutAction::Apply { name },
+        } => IpcRequest::ApplyLayout { name },
         Command::State { .. } => IpcRequest::GetState,
         Command::Ping => IpcRequest::Ping,
     };

@@ -1,90 +1,81 @@
-# Mosaix
+![Mosaix -- tiling window management for Windows 11 and macOS](./assets/mosaix-banner.svg)
 
-![Rust](https://img.shields.io/badge/Rust-000000?style=flat-square&logo=rust&logoColor=white) ![Tauri](https://img.shields.io/badge/Tauri-24C8DB?style=flat-square&logo=tauri&logoColor=white) ![TypeScript](https://img.shields.io/badge/TypeScript-007ACC?style=flat-square&logo=typescript&logoColor=white) ![Windows](https://img.shields.io/badge/Windows-0078D6?style=flat-square&logo=windows&logoColor=white) ![macOS](https://img.shields.io/badge/macOS-000000?style=flat-square&logo=apple&logoColor=white)
+![Rust](https://img.shields.io/badge/Rust-000000?style=flat-square&logo=rust&logoColor=white) ![Tauri](https://img.shields.io/badge/Tauri_2-24C8DB?style=flat-square&logo=tauri&logoColor=white) ![TypeScript](https://img.shields.io/badge/TypeScript-007ACC?style=flat-square&logo=typescript&logoColor=white) ![Windows 11](https://img.shields.io/badge/Windows_11-supported-0078D6?style=flat-square&logo=windows&logoColor=white) ![macOS](https://img.shields.io/badge/macOS-planned-6E6E6E?style=flat-square&logo=apple&logoColor=white) ![License MIT](https://img.shields.io/badge/License-MIT-green?style=flat-square)
 
 A cross-platform window tiling application for Windows 11 and macOS.
 
-Mosaix augments your native desktop window manager with manual snapping,
-automatic tiling layouts, per-monitor workspaces, and a visual layout editor.
+## Features
 
-## Status
+- **Zone snapping with cycling** -- `Ctrl+Alt+Arrow` snaps the focused window to
+  a half zone; repeating a horizontal snap cycles half -> third -> two-thirds.
+- **Automatic tiling** -- a deterministic, aspect-aware balanced grid, opted into
+  per display topology, with runtime toggle, suspension, and `rearrange` recovery.
+- **Directional focus and swap** -- `Ctrl+Alt+H/J/K/L` moves focus across the
+  grid; add `Shift` to swap two windows' places.
+- **Multi-monitor handling** -- windows migrate off a disconnected display to
+  the nearest survivor, and topology is re-read across sleep, wake, and hotplug.
+- **Per-topology profiles** -- `profiles/*.toml` overlays matched by display
+  fingerprint, falling through to base config field by field.
+- **TOML config with hot reload** -- debounced, whole-directory atomic
+  validation; invalid edits keep the last known-good config instead of applying.
+- **Window rules** -- built-in dialog and tool-window floats plus user rules,
+  resolved by ordered precedence with a traceable explanation per window.
+- **Snap preview overlay** -- a click-through preview that flashes the committed
+  placement after a hotkey, and shows the target zone during an edge drag.
+- **Focus border** -- a click-through outline around the focused window while
+  automatic tiling is live, with configurable color and thickness.
+- **Tray and CLI control** -- pause/resume, open config folder, and quit from the
+  tray; the `mosaix` CLI drives every command over versioned named-pipe IPC,
+  including `mosaix state --json`.
+- **Saved layouts** -- named sets of normalized cells declared under
+  `[layouts]`, applied to the focused window's display with
+  `mosaix layout apply <name>` or a hotkey bound under
+  `[hotkeys.apply-layout]`. Gaps apply as they do to the grid; surplus cells
+  are left empty and surplus windows are reported rather than dropped.
+- **Visual layout editor** -- a Tauri 2 settings app for drafting and previewing
+  zone layouts, and for asking the agent to apply one.
+- **Failure containment** -- placement rejection detection with a per-window
+  circuit breaker, elevated-window skipping, and degraded-tiling diagnostics.
 
-**Early development** — the Windows agent and settings application are usable,
-while macOS support and several planned tiling policies are still in progress.
+Not yet built: the macOS adapter, workspaces, hotkey editing in the settings
+app, and saving a drafted layout back to configuration.
 
-## Available now
+## Installation
 
-- **Manual snapping** with configurable global hotkeys for halves, thirds, and
-  vertical halves; repeated horizontal snaps cycle through half, third, and
-  two-thirds placements.
-- **Focused-display controls** including drag-edge snap preview, window throw
-  between displays, and configurable inner and outer gaps.
-- **Saved layouts** authored in the Tauri settings editor. Save & apply writes
-  the layout to the base configuration and applies it to managed windows on
-  the focused window's display; Apply-only tries an unsaved draft without
-  changing configuration.
-- **Configuration profiles** selected by display-topology fingerprint, with
-  validation and live reload of config and hotkey changes.
-- **Background-agent controls** through the system tray and local IPC-backed
-  CLI, including pause/resume and state inspection.
+There are no binary releases yet -- build from source.
 
-## Roadmap
+**Prerequisites:** Windows 11, a stable Rust toolchain (MSVC), and Node.js with
+npm for the settings app.
 
-- Automatic tiling policies: BSP, tall/wide, columns, rows, stack, and monocle.
-- Window rules, exclusions, workspace restoration, and layout-hotkey bindings.
-- macOS Accessibility/AppKit implementation and broader integrations.
-
-## Architecture
-
-Mosaix is built in Rust with a Tauri + TypeScript settings UI. See
-[ARCHITECTURE.md](./ARCHITECTURE.md) for the full design document.
-
-### Workspace Structure
-
-```
-mosaix/
-|-- crates/
-|   |-- mosaix-domain/            # IDs, geometry, state, commands, events
-|   |-- mosaix-layout/            # Zones, trees, strategies, normalization
-|   |-- mosaix-rules/             # Matching, precedence, explanations
-|   |-- mosaix-engine/            # Reducer, reconciliation, transactions
-|   |-- mosaix-config/            # Schema, validation, migrations
-|   |-- mosaix-ipc/               # Protocol and local transports
-|   |-- mosaix-platform-api/      # Adapter traits and capability model
-|   |-- mosaix-platform-windows/  # Win32 implementation
-|   |-- mosaix-platform-macos/    # Accessibility/AppKit implementation
-|   |-- mosaix-agent/             # Background executable
-|   +-- mosaix-cli/               # Command-line client
-|-- apps/
-|   +-- mosaix-settings/          # Tauri/TypeScript settings UI
-|-- schemas/                      # Config and IPC schemas
-|-- fixtures/                     # Event traces and topology fixtures
-|-- tests/
-|   |-- contract/                 # Adapter contract tests
-|   |-- replay/                   # Recorded event replay tests
-|   +-- platform/                 # Platform integration tests
-+-- docs/
-    |-- architecture-decisions/   # ADRs
-    |-- permissions/              # Platform permission docs
-    +-- troubleshooting/          # Troubleshooting guides
+```powershell
+git clone https://github.com/HweyTH/Mosaix.git
+cd Mosaix
+cargo build --release
 ```
 
-## Building and verification
+Start the background agent. On first run it writes a default config to
+`%APPDATA%\Mosaix\config\config.toml` and adds a tray icon:
 
-```bash
-cargo build --workspace
-cargo test --workspace
-cargo clippy --workspace -- -D warnings
+```powershell
+.\target\release\mosaix-agent.exe
 ```
 
-For the settings application, install its JavaScript dependencies and use the
-Tauri development command:
+Drive it from the CLI while it runs:
 
-```bash
-cd apps/mosaix-settings
+```powershell
+.\target\release\mosaix.exe snap left-half
+.\target\release\mosaix.exe state --json
+```
+
+The settings app runs separately:
+
+```powershell
+cd apps\mosaix-settings
 npm install
 npm run tauri dev
 ```
+
+Run the test suite with `cargo test --workspace`.
 
 ## License
 

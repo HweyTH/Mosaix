@@ -35,17 +35,21 @@
 //!   [`CIRCUIT_BREAKER_THRESHOLD`] consecutive rejections.  A deliberate
 //!   zone-snap command from the user resets the breaker.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{sync_channel, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
-use mosaix_config::{ResolvedConfig, ResolvedConfigSet};
-use mosaix_domain::{topology_fingerprint, Display, DisplayId, Rect, WindowId};
-use mosaix_layout::{
-    apply_gaps, cycle_display, resolve_layout_cells, resolve_zone_cycle, snap_to_half,
-    throw_preserving_ratio, CycleStep, DisplayDirection, HalfZone, HorizontalDirection,
+use mosaix_config::{Command, ResolvedConfig, ResolvedConfigSet};
+use mosaix_domain::{
+    topology_fingerprint, Display, DisplayId, Rect, Window, WindowId, WindowLifecycle,
 };
+use mosaix_layout::{
+    apply_gaps, cycle_display, plan_balanced_grid, resolve_saved_layout, resolve_zone_cycle,
+    snap_to_half, throw_preserving_ratio, CycleStep, DisplayDirection, HalfZone,
+    HorizontalDirection,
+};
+use mosaix_rules::{builtin_rules, ManageAction, Rule, RuleEvaluator};
 
 /// Default bound on the event queue before a sender blocks. Chosen
 /// generously relative to expected event rates -- architecture doc section
@@ -60,12 +64,71 @@ pub const DEFAULT_QUEUE_CAPACITY: usize = 256;
 /// The breaker resets automatically on any explicit zone-snap command.
 pub const CIRCUIT_BREAKER_THRESHOLD: u8 = 3;
 
+/// A platform-neutral operation the engine has committed and an adapter must
+/// perform, in reducer order.  Effects contain no native handles or Win32
+/// structures so deterministic engine tests can observe intent directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EngineEffect {
+    PlaceWindow {
+        window_id: WindowId,
+        display_id: DisplayId,
+        bounds: Rect,
+    },
+    FocusWindow {
+        window_id: WindowId,
+    },
+    /// Requests a fresh native display/window observation before recovery.
+    ReconcileWindows,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CardinalDirection {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+/// Why an observed managed window currently can or cannot enter the active
+/// tiling set. These stable enums are safe to publish in machine-readable
+/// state and deliberately contain neither titles nor executable paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EligibilityReason {
+    Eligible,
+    FloatingRule,
+    NotTileable,
+    Elevated,
+    Minimized,
+    Maximized,
+    Fullscreen,
+    Hidden,
+    Cloaked,
+    CircuitOpen,
+    SessionFloating,
+}
+
+/// The engine-owned record for one observed window. `Exclude` windows are
+/// deliberately absent from this inventory; `Tile` and `Float` stay
+/// inspectable even when not currently eligible for a grid cell.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedWindow {
+    pub window: Window,
+    pub action: ManageAction,
+    pub eligibility: EligibilityReason,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InteractivePlacementSession {
+    pub window_id: WindowId,
+    pub display_id: DisplayId,
+}
+
 /// State the reducer owns and is the only writer of.
 ///
 /// Display topology and per-window placement exist as real domain state
 /// today; a full window registry, workspaces, and rules will extend this
 /// as those domain types land (architecture doc section 7).
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default)]
 pub struct EngineState {
     /// Bumped on every committed mutation (architecture doc section 13:
     /// "Monotonic state revision on every committed mutation").
@@ -77,6 +140,20 @@ pub struct EngineState {
     /// or, for a window seen focused before either of those ever fires,
     /// by [`Event::WindowFocused`] itself (with no `previous_placement`).
     pub windows: HashMap<WindowId, WindowPlacement>,
+    /// Authoritative managed-window inventory. The engine is its sole writer.
+    pub inventory: HashMap<WindowId, ManagedWindow>,
+    /// Latest normalized observations, including rule-excluded windows so a
+    /// rule reload can reconsider them without an adapter round-trip.
+    observed_windows: HashMap<WindowId, Window>,
+    /// Ordered rules currently used to resolve the inventory.
+    pub rules: Vec<Rule>,
+    /// Stable member order for each display's Balanced grid.
+    pub visual_window_order: HashMap<DisplayId, Vec<WindowId>>,
+    /// Session-only manual-placement overrides. They deliberately do not
+    /// mutate persistent rules and clear on engine restart.
+    pub session_floating: HashSet<WindowId>,
+    /// Session-only overrides that allow a rule-Float window to join the grid.
+    pub session_tiled: HashSet<WindowId>,
     /// The window that currently has OS foreground focus, `None` until the
     /// first [`Event::WindowFocused`] is observed. Sourced from the OS's
     /// foreground-change notification (architecture doc section 8.2).
@@ -105,6 +182,56 @@ pub struct EngineState {
     /// `ConfigChanged`) still process normally so state stays accurate for
     /// when the user resumes.
     pub paused: bool,
+    /// Whether the matched topology profile currently owns automatic tiling.
+    pub automatic_tiling_active: bool,
+    /// Session-only override over a tiling-enabled profile. It clears when
+    /// topology changes or the agent restarts (ADR 0012).
+    pub automatic_tiling_suspended: bool,
+    /// The one native move/resize session currently owned by the pointer.
+    pub interactive_placement: Option<InteractivePlacementSession>,
+    /// Displays whose final grid plan is waiting for interactive placement
+    /// to end. Other displays remain independently reflowable.
+    deferred_reflow_displays: HashSet<DisplayId>,
+    /// Ordered effects emitted by committed placement transitions. Consumers
+    /// retain a cursor; the log is part of the published deterministic state.
+    pub effects: Vec<EngineEffect>,
+    /// The saved layout most recently applied to each display, by name.
+    ///
+    /// Published state rather than an internal note: machine-readable
+    /// state carries the saved layouts and which one was last applied per
+    /// display, so tooling built on top can tell what a display is
+    /// currently arranged as.
+    ///
+    /// Recorded only for an application that actually placed something --
+    /// a rejected apply changes nothing, and claiming otherwise would
+    /// make this the one part of published state that lies. Entries for a
+    /// display that leaves the topology are dropped with it.
+    pub last_applied_layouts: HashMap<DisplayId, String>,
+    /// Whether a hotkey editor is open and every binding must therefore
+    /// stay unregistered (ADR 0021).
+    ///
+    /// A flag rather than an effect. The agent's hotkey-rebind poller --
+    /// the same path a profile switch already re-registers through --
+    /// reads it and registers nothing while it is set, which keeps hotkey
+    /// ownership in one place and adds no new effect kind.
+    pub hotkey_capture_suspended: bool,
+    /// How many editors currently hold suspension.
+    ///
+    /// A count, not a bool, so two settings windows behave: the second to
+    /// open does not re-suspend something already suspended, and the
+    /// first to close does not lift a suspension the other still needs
+    /// while its capture dialog is armed. `hotkey_capture_suspended` is
+    /// this reaching zero or not, and stays the published fact.
+    capture_holds: usize,
+    /// The bindings the most recent registration pass could not register,
+    /// in the spelling configuration files use.
+    ///
+    /// Re-registration after capture is partial-success, as registration
+    /// already is: a combination another application took while Mosaix was
+    /// suspended comes back failed. Recording which ones is what lets the
+    /// editor name them rather than leaving the user to discover a dead
+    /// shortcut (ADR 0021).
+    pub unregistered_bindings: Vec<Command>,
 }
 
 impl EngineState {
@@ -134,6 +261,21 @@ impl EngineState {
 pub struct WindowPlacement {
     pub display_id: DisplayId,
     pub bounds: Rect,
+    /// Where the OS last reported this window, as opposed to [`bounds`], the
+    /// placement Mosaix last *intended* (architecture doc section 8.3's
+    /// expected-vs-actual distinction).
+    ///
+    /// The two agree whenever Mosaix owns the window's position, and
+    /// diverge the moment anything else moves it -- an app repositioning
+    /// its own window, a native OS snap, a session-floating window dragged
+    /// by the user. `bounds` deliberately keeps holding the intent, because
+    /// comparing the two is exactly how [`Event::WindowBoundsObserved`]
+    /// detects an external move and resets cycle state (ADR 0001); readers
+    /// that want to know where the window actually *is* -- drawing on or
+    /// around it, say -- want this field instead.
+    ///
+    /// [`bounds`]: Self::bounds
+    pub observed_bounds: Rect,
     pub previous_placement: Option<(DisplayId, Rect)>,
     /// The horizontal zone command and step that produced this placement,
     /// if it came from [`Event::ZoneSnapRequested`] with a left/right
@@ -262,12 +404,6 @@ pub enum Event {
     ZoneSnapRequested {
         direction: ZoneSnapDirection,
     },
-    LayoutApplyRequested {
-        name: String,
-    },
-    LayoutApplyDraftRequested {
-        cells: Vec<(f64, f64, f64, f64)>,
-    },
 
     /// The OS reported `window_id`'s current display and bounds, following
     /// its own location-changed notification -- which fires for both
@@ -299,7 +435,12 @@ pub enum Event {
     /// 0007). The active profile is re-selected against [`EngineState`]'s
     /// current topology exactly the way [`Event::DisplayTopologyChanged`]
     /// re-selects it against the current config set (ADR 0004).
-    ConfigChanged(ResolvedConfigSet),
+    ///
+    /// Boxed because it dwarfs every other variant: a resolved config
+    /// carries three maps plus its provenance, and `Event` is moved
+    /// through the queue on every window message. One heap allocation per
+    /// config reload is cheaper than paying that width on every event.
+    ConfigChanged(Box<ResolvedConfigSet>),
 
     /// Pause all window management. Placement-related events become no-ops
     /// until [`Event::ResumeRequested`] fires. Idempotent — pausing when
@@ -309,6 +450,35 @@ pub enum Event {
     /// Resume window management after a pause. Idempotent — resuming when
     /// not paused is a no-op.
     ResumeRequested,
+
+    /// Toggles the session-only automatic-tiling suspension for the matched
+    /// tiling-enabled profile. Manual zone placement remains available.
+    ToggleAutomaticTilingRequested,
+
+    /// Toggles the focused managed window between session-floating and the
+    /// active tiling set.
+    ToggleFloatingRequested,
+
+    /// Focuses the nearest eligible managed window in the requested
+    /// display-local cardinal direction without changing visual order.
+    DirectionalFocusRequested {
+        direction: CardinalDirection,
+    },
+
+    /// Swaps the focused window with its nearest display-local cardinal
+    /// neighbor, then recomputes the affected Balanced grid.
+    DirectionalSwapRequested {
+        direction: CardinalDirection,
+    },
+
+    InteractivePlacementStarted {
+        window_id: WindowId,
+    },
+
+    InteractivePlacementEnded {
+        window_id: WindowId,
+        committed_manual_placement: bool,
+    },
 
     /// Bulk-register all windows that were already open when the agent
     /// started (feature 28 — startup reconciliation). Each entry is
@@ -336,7 +506,7 @@ pub enum Event {
     ///      doesn't know about yet.
     WakeReconciliation {
         displays: Vec<Display>,
-        windows: Vec<(WindowId, DisplayId, Rect)>,
+        windows: Option<Vec<Window>>,
     },
 
     /// The platform reported that the `SetWindowPos` call for `window_id`
@@ -351,6 +521,244 @@ pub enum Event {
     PlacementRejected {
         window_id: WindowId,
     },
+
+    /// Confirms a placement settled within tolerance and therefore breaks a
+    /// rejection streak without changing the committed geometry.
+    PlacementAccepted {
+        window_id: WindowId,
+    },
+
+    /// Clears every open placement circuit once and performs one fresh Grid
+    /// reflow. The agent performs its native display/window enumeration before
+    /// sending this recovery request.
+    RearrangeRequested,
+
+    /// Native observations collected in response to [`EngineEffect::ReconcileWindows`].
+    RearrangeReconciliationComplete {
+        windows: Vec<Window>,
+    },
+
+    /// A complete normalized observation batch. It is authoritative for the
+    /// observed windows: missing entries are removed, and `Exclude` results
+    /// do not enter the managed inventory.
+    WindowsObserved {
+        windows: Vec<Window>,
+    },
+
+    /// Replaces the ordered user rules; built-ins remain the low-priority
+    /// fallback rules. Every currently observed window is re-evaluated.
+    RulesChanged {
+        rules: Vec<Rule>,
+    },
+
+    /// Apply the saved layout called `name` (CONTEXT.md "Saved layout") to
+    /// the display of the focused managed window (ADR 0020), filling its
+    /// cells from that display's managed windows in visual window order.
+    ///
+    /// Carries no display id: like the directional commands, it resolves
+    /// its target at apply time. Every way it can change nothing is a
+    /// [`SavedLayoutRejection`] rather than a silent no-op, and
+    /// [`plan_saved_layout`] is where that verdict is reached -- a
+    /// synchronous caller asks it first so it can report the reason
+    /// instead of firing this event into the queue and hearing nothing
+    /// back.
+    SavedLayoutApplyRequested {
+        name: String,
+    },
+
+    /// The settings application opened its hotkey editor, so every
+    /// binding must stay unregistered until it closes (ADR 0021).
+    ///
+    /// Sets [`EngineState::hotkey_capture_suspended`]. Idempotent: a
+    /// second editor window sets a flag that is already set, and the
+    /// connection that closes last clears it.
+    HotkeyCaptureStarted,
+
+    /// The hotkey editor is gone -- closed, crashed, or killed -- so
+    /// bindings can be registered again.
+    ///
+    /// Emitted by the agent when the settings application's connection
+    /// ends for any reason, because Windows closes the pipe handle even on
+    /// a hard kill. That is what bounds suspension by the connection
+    /// rather than by a message that can be lost (ADR 0021).
+    HotkeyCaptureEnded,
+
+    /// The outcome of a registration pass: the bindings the platform
+    /// refused, in the spelling configuration files use.
+    ///
+    /// Sent by the agent after each pass, so a binding that did not come
+    /// back from capture can be named to the user rather than discovered
+    /// as a dead shortcut (ADR 0021).
+    HotkeyRegistrationReported {
+        unregistered: Vec<Command>,
+    },
+}
+
+/// Why applying a saved layout changes nothing. Every variant names
+/// something the user can act on: a layout command never silently does
+/// nothing, and never falls back to another display (ADR 0020).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SavedLayoutRejection {
+    /// Window management is paused, as it is for every other placement.
+    Paused,
+    /// No saved layout carries this name in the resolved config.
+    UnknownLayout { name: String },
+    /// Focus rests on the desktop, on an excluded window, or nowhere, so
+    /// there is no display to target.
+    NoFocusedManagedWindow,
+    /// The focused window's display left the topology between the command
+    /// being issued and being applied.
+    DisplayUnavailable { display_id: DisplayId },
+}
+
+impl std::fmt::Display for SavedLayoutRejection {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Paused => formatter.write_str("window management is paused"),
+            Self::UnknownLayout { name } => {
+                write!(formatter, "no saved layout named {name:?}")
+            }
+            Self::NoFocusedManagedWindow => formatter.write_str(
+                "no managed window is focused, so there is no display to apply a layout to",
+            ),
+            Self::DisplayUnavailable { display_id } => write!(
+                formatter,
+                "the focused window's display {} is no longer connected",
+                display_id.0
+            ),
+        }
+    }
+}
+
+/// What applying a saved layout would do to the target display right now.
+///
+/// Counts rarely match, and neither mismatch is a failure. Surplus cells
+/// simply go unfilled, which needs no reporting -- an empty cell is
+/// visible. Surplus *windows* do need reporting: a window the layout had
+/// no cell for stays exactly where it is, and the user is owed the count
+/// rather than left to notice the omission (spec #29 user story 15).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SavedLayoutPlan {
+    /// The one display every placement lands on: the focused managed
+    /// window's (ADR 0020). A field rather than a column repeated down
+    /// `placements`, because a plan touching two displays is not a thing
+    /// this type can represent.
+    pub display_id: DisplayId,
+    /// Cell *i* of the layout paired with window *i* of the target
+    /// display's visual window order, gaps already applied. Stops at
+    /// whichever of the two lists runs out.
+    pub placements: Vec<(WindowId, Rect)>,
+    /// Managed windows on the target display the layout had no cell for.
+    /// Zero whenever the layout has at least as many cells as the display
+    /// has windows.
+    pub unplaced: usize,
+}
+
+/// The placements applying saved layout `name` would commit against
+/// `state` right now, or the reason it would change nothing.
+///
+/// Pure over `state` so the reducer and a synchronous caller reach the
+/// same verdict from the same state: the IPC handler has to answer the CLI
+/// with a reason, and an event sent into the queue can only answer with
+/// silence.
+///
+/// Gaps are applied here, by the same [`apply_gaps`] post-processing step
+/// the balanced grid and every zone snap already run through, so
+/// [`resolve_saved_layout`] stays gap-unaware (ADR 0006).
+pub fn plan_saved_layout(
+    state: &EngineState,
+    name: &str,
+) -> Result<SavedLayoutPlan, SavedLayoutRejection> {
+    if state.paused {
+        return Err(SavedLayoutRejection::Paused);
+    }
+    let Some(layout) = state.resolved_config.layouts.get(name) else {
+        return Err(SavedLayoutRejection::UnknownLayout {
+            name: name.to_owned(),
+        });
+    };
+    let display_id = state
+        .focused_window
+        .and_then(|window_id| state.inventory.get(&window_id))
+        .map(|managed| managed.window.display_id)
+        .ok_or(SavedLayoutRejection::NoFocusedManagedWindow)?;
+    let Some(work_area) = work_area_of(&state.displays, display_id) else {
+        return Err(SavedLayoutRejection::DisplayUnavailable { display_id });
+    };
+
+    let windows = display_window_order(state, display_id);
+    let cells = resolve_saved_layout(work_area, &layout.cells);
+    let unplaced = windows.len().saturating_sub(cells.len());
+
+    Ok(SavedLayoutPlan {
+        display_id,
+        placements: windows
+            .into_iter()
+            .zip(cells)
+            .map(|(window_id, raw_bounds)| {
+                (
+                    window_id,
+                    apply_gaps(raw_bounds, work_area, state.resolved_config.gaps),
+                )
+            })
+            .collect(),
+        unplaced,
+    })
+}
+
+/// `display_id`'s managed windows in visual window order (CONTEXT.md
+/// "Visual window order"): whatever order the engine already recorded for
+/// that display, then any managed window that order doesn't mention,
+/// seeded top-to-bottom then left-to-right with the native window id
+/// breaking final ties -- the same seeding [`reconcile_balanced_grids`]
+/// performs.
+///
+/// A recorded order wins over the geometric seeding even when it disagrees
+/// with where the windows currently sit, and even after automatic tiling
+/// has been switched off. That is the point of the concept: the order is
+/// *stable*, changed deliberately by directional swap and by nothing else,
+/// so a layout applied twice puts the same window in the same cell. The
+/// recorded order only ever exists once tiling has run, so in a
+/// manual-only session the seeding half is the whole answer.
+///
+/// Two things differ from [`reconcile_balanced_grids`]' membership, both
+/// deliberately. A window with nothing on screen to place -- minimized,
+/// hidden, cloaked, full-screen -- is skipped rather than handed a cell.
+/// And a `Float` window *is* handed one: applying a saved layout is an
+/// explicit user command, and an explicit command places a managed window
+/// whatever its automatic-tiling eligibility, exactly as a zone snap
+/// places whichever window is focused.
+fn display_window_order(state: &EngineState, display_id: DisplayId) -> Vec<WindowId> {
+    let placeable = |window_id: &WindowId| {
+        state.inventory.get(window_id).is_some_and(|managed| {
+            managed.window.display_id == display_id
+                && matches!(
+                    managed.window.lifecycle,
+                    WindowLifecycle::Active | WindowLifecycle::Maximized
+                )
+        })
+    };
+
+    let mut ordered: Vec<WindowId> = state
+        .visual_window_order
+        .get(&display_id)
+        .map(|order| order.iter().copied().filter(placeable).collect())
+        .unwrap_or_default();
+    let mut unordered: Vec<_> = state
+        .inventory
+        .values()
+        .filter(|managed| placeable(&managed.window.id) && !ordered.contains(&managed.window.id))
+        .map(|managed| {
+            (
+                managed.window.bounds.y,
+                managed.window.bounds.x,
+                managed.window.id,
+            )
+        })
+        .collect();
+    unordered.sort_by_key(|(y, x, window_id)| (*y, *x, window_id.0));
+    ordered.extend(unordered.into_iter().map(|(_, _, window_id)| window_id));
+    ordered
 }
 
 /// Applies one event to `state`. Must never panic -- a single bad event
@@ -359,18 +767,37 @@ pub enum Event {
 fn apply(state: &mut EngineState, event: Event) {
     match event {
         Event::DisplayTopologyChanged(displays) => {
-            if topology_fingerprint(&displays) == topology_fingerprint(&state.displays) {
-                tracing::debug!("display topology event was not a real change; ignoring");
+            if displays.is_empty() {
+                tracing::warn!("empty display observation; retaining last usable topology");
                 return;
             }
+            if displays == state.displays {
+                tracing::debug!("display topology snapshot was unchanged; ignoring");
+                return;
+            }
+            let topology_identity_changed =
+                topology_fingerprint(&displays) != topology_fingerprint(&state.displays);
             tracing::info!(display_count = displays.len(), "display topology changed");
             // Feature 30 — display hotplug: migrate windows whose previous
             // display is no longer present in the new topology to the nearest
             // surviving display.  We do this *before* committing `displays` so
             // we can still read the old topology to compute the migration.
+            state.interactive_placement = None;
+            state.deferred_reflow_displays.clear();
             migrate_orphaned_windows(state, &displays);
             state.displays = displays;
-            state.resolved_config = select_resolved_config(&state.config_set, &state.displays);
+            // A display that is gone has no arrangement to report. Keeping
+            // its entry would leave published state naming a layout as
+            // current for a screen nobody can see.
+            state
+                .last_applied_layouts
+                .retain(|display_id, _| state.displays.iter().any(|d| d.id == *display_id));
+            if topology_identity_changed {
+                state.resolved_config = select_resolved_config(&state.config_set, &state.displays);
+                state.automatic_tiling_suspended = false;
+                state.automatic_tiling_active = state.resolved_config.automatic_tiling_enabled;
+            }
+            reconcile_balanced_grids(state);
             state.revision += 1;
         }
 
@@ -383,7 +810,11 @@ fn apply(state: &mut EngineState, event: Event) {
                 tracing::debug!("window placed while paused; ignoring");
                 return;
             }
+            if state.automatic_tiling_active {
+                set_session_floating(state, window_id, true);
+            }
             place_window(state, window_id, display_id, bounds, None);
+            reconcile_balanced_grids(state);
         }
 
         Event::WindowRestoreRequested { window_id } => {
@@ -404,6 +835,11 @@ fn apply(state: &mut EngineState, event: Event) {
             };
             placement.display_id = previous_display_id;
             placement.bounds = previous_bounds;
+            state.effects.push(EngineEffect::PlaceWindow {
+                window_id,
+                display_id: previous_display_id,
+                bounds: previous_bounds,
+            });
             state.revision += 1;
         }
 
@@ -450,7 +886,27 @@ fn apply(state: &mut EngineState, event: Event) {
             };
 
             let new_bounds = throw_preserving_ratio(bounds, from_work_area, to_work_area);
-            place_window(state, window_id, to_display_id, new_bounds, None);
+            if state.automatic_tiling_active && state.inventory.contains_key(&window_id) {
+                if let Some(order) = state.visual_window_order.get_mut(&from_display_id) {
+                    order.retain(|id| *id != window_id);
+                }
+                let target_order = state.visual_window_order.entry(to_display_id).or_default();
+                if !target_order.contains(&window_id) {
+                    target_order.push(window_id);
+                }
+                if let Some(placement) = state.windows.get_mut(&window_id) {
+                    placement.display_id = to_display_id;
+                    placement.bounds = new_bounds;
+                }
+                if let Some(managed) = state.inventory.get_mut(&window_id) {
+                    managed.window.display_id = to_display_id;
+                    managed.window.bounds = new_bounds;
+                }
+                reconcile_balanced_grids(state);
+                state.revision += 1;
+            } else {
+                place_window(state, window_id, to_display_id, new_bounds, None);
+            }
         }
 
         Event::WindowFocused {
@@ -461,6 +917,7 @@ fn apply(state: &mut EngineState, event: Event) {
             state.windows.entry(window_id).or_insert(WindowPlacement {
                 display_id,
                 bounds,
+                observed_bounds: bounds,
                 previous_placement: None,
                 cycle_step: None,
                 rejection_count: 0,
@@ -539,28 +996,11 @@ fn apply(state: &mut EngineState, event: Event) {
                 let bounds = apply_gaps(raw_bounds, work_area, state.resolved_config.gaps);
                 place_window(state, window_id, display_id, bounds, None);
             }
+            if state.automatic_tiling_active {
+                set_session_floating(state, window_id, true);
+                reconcile_balanced_grids(state);
+            }
         }
-
-        Event::LayoutApplyRequested { name } => {
-            let Some(layout) = state
-                .resolved_config
-                .layouts
-                .iter()
-                .find(|layout| layout.name.eq_ignore_ascii_case(&name))
-            else {
-                return;
-            };
-            apply_layout_cells(
-                state,
-                layout
-                    .cells
-                    .iter()
-                    .map(|cell| (cell.x, cell.y, cell.width, cell.height))
-                    .collect(),
-            );
-        }
-
-        Event::LayoutApplyDraftRequested { cells } => apply_layout_cells(state, cells),
 
         Event::WindowBoundsObserved {
             window_id,
@@ -574,11 +1014,19 @@ fn apply(state: &mut EngineState, event: Event) {
                 );
                 return;
             };
+            // `observed_bounds` tracks reality even when it agrees with the
+            // intended placement, so it is written before the correlation
+            // check below returns.
+            let moved = placement.observed_bounds != bounds;
+            placement.observed_bounds = bounds;
             if placement.display_id == display_id && placement.bounds == bounds {
                 tracing::debug!(
                     ?window_id,
                     "observed bounds match the last placement transaction; cycle state unaffected"
                 );
+                if moved {
+                    state.revision += 1;
+                }
                 return;
             }
             if placement.cycle_step.take().is_some() {
@@ -587,17 +1035,25 @@ fn apply(state: &mut EngineState, event: Event) {
                     "observed bounds don't match the last placement transaction; cycle step reset"
                 );
                 state.revision += 1;
+            } else if moved {
+                state.revision += 1;
             }
         }
 
         Event::ConfigChanged(config_set) => {
-            if config_set == state.config_set {
+            if *config_set == state.config_set {
                 tracing::debug!("config event was not a real change; ignoring");
                 return;
             }
             tracing::info!("resolved config changed");
             state.resolved_config = select_resolved_config(&config_set, &state.displays);
-            state.config_set = config_set;
+            if !state.resolved_config.automatic_tiling_enabled {
+                state.automatic_tiling_suspended = false;
+            }
+            state.automatic_tiling_active =
+                state.resolved_config.automatic_tiling_enabled && !state.automatic_tiling_suspended;
+            state.config_set = *config_set;
+            reconcile_balanced_grids(state);
             state.revision += 1;
         }
 
@@ -618,6 +1074,140 @@ fn apply(state: &mut EngineState, event: Event) {
             }
             tracing::info!("window management resumed");
             state.paused = false;
+            reconcile_balanced_grids(state);
+            state.revision += 1;
+        }
+
+        Event::ToggleAutomaticTilingRequested => {
+            if !state.resolved_config.automatic_tiling_enabled {
+                tracing::debug!(
+                    "automatic-tiling toggle requested for a manual topology; ignoring"
+                );
+                return;
+            }
+            state.automatic_tiling_suspended = !state.automatic_tiling_suspended;
+            state.automatic_tiling_active = !state.automatic_tiling_suspended;
+            if state.automatic_tiling_active {
+                reconcile_balanced_grids(state);
+            }
+            state.revision += 1;
+        }
+
+        Event::ToggleFloatingRequested => {
+            let Some(window_id) = state.focused_window else {
+                return;
+            };
+            if !state.inventory.contains_key(&window_id) {
+                return;
+            }
+            let action = state.inventory[&window_id].action;
+            if action == ManageAction::Float {
+                let force_tiled = !state.session_tiled.contains(&window_id);
+                if force_tiled {
+                    state.session_tiled.insert(window_id);
+                    state.session_floating.remove(&window_id);
+                } else {
+                    state.session_tiled.remove(&window_id);
+                }
+                if let Some(managed) = state.inventory.get_mut(&window_id) {
+                    managed.eligibility = if force_tiled {
+                        EligibilityReason::Eligible
+                    } else {
+                        EligibilityReason::FloatingRule
+                    };
+                }
+            } else {
+                let floating = !state.session_floating.contains(&window_id);
+                set_session_floating(state, window_id, floating);
+            }
+            reconcile_balanced_grids(state);
+            state.revision += 1;
+        }
+
+        Event::DirectionalFocusRequested { direction } => {
+            let Some(window_id) = directional_neighbor(state, direction) else {
+                return;
+            };
+            state.effects.push(EngineEffect::FocusWindow { window_id });
+            state.revision += 1;
+        }
+
+        Event::DirectionalSwapRequested { direction } => {
+            let Some(focused) = state.focused_window else {
+                return;
+            };
+            let Some(neighbor) = directional_neighbor(state, direction) else {
+                return;
+            };
+            let Some(display_id) = state
+                .inventory
+                .get(&focused)
+                .map(|managed| managed.window.display_id)
+            else {
+                return;
+            };
+            let Some(order) = state.visual_window_order.get_mut(&display_id) else {
+                return;
+            };
+            let Some(focused_index) = order.iter().position(|id| *id == focused) else {
+                return;
+            };
+            let Some(neighbor_index) = order.iter().position(|id| *id == neighbor) else {
+                return;
+            };
+            order.swap(focused_index, neighbor_index);
+            reconcile_balanced_grids(state);
+            state.revision += 1;
+        }
+
+        Event::InteractivePlacementStarted { window_id } => {
+            let display_id = state
+                .inventory
+                .get(&window_id)
+                .map(|managed| managed.window.display_id)
+                .or_else(|| {
+                    state
+                        .windows
+                        .get(&window_id)
+                        .map(|placement| placement.display_id)
+                });
+            let Some(display_id) = display_id else {
+                return;
+            };
+            state.interactive_placement = Some(InteractivePlacementSession {
+                window_id,
+                display_id,
+            });
+            state.revision += 1;
+        }
+
+        Event::InteractivePlacementEnded {
+            window_id,
+            committed_manual_placement,
+        } => {
+            if !state
+                .interactive_placement
+                .is_some_and(|session| session.window_id == window_id)
+            {
+                return;
+            }
+            state.interactive_placement = None;
+            state.deferred_reflow_displays.clear();
+            let effect_start = state.effects.len();
+            reconcile_balanced_grids(state);
+            if !committed_manual_placement
+                && !state.effects[effect_start..].iter().any(|effect| {
+                    matches!(effect, EngineEffect::PlaceWindow { window_id: id, .. } if *id == window_id)
+                })
+            {
+                if let Some(placement) = state.windows.get(&window_id) {
+                    state.effects.push(EngineEffect::PlaceWindow {
+                        window_id,
+                        display_id: placement.display_id,
+                        bounds: placement.bounds,
+                    });
+                }
+            }
             state.revision += 1;
         }
 
@@ -630,6 +1220,7 @@ fn apply(state: &mut EngineState, event: Event) {
                     WindowPlacement {
                         display_id,
                         bounds,
+                        observed_bounds: bounds,
                         previous_placement: None,
                         cycle_step: None,
                         rejection_count: 0,
@@ -651,60 +1242,478 @@ fn apply(state: &mut EngineState, event: Event) {
         Event::WakeReconciliation { displays, windows } => {
             tracing::info!(
                 display_count = displays.len(),
-                window_count = windows.len(),
+                window_count = windows.as_ref().map_or(0, Vec::len),
                 "wake reconciliation starting"
             );
             // Step 1: migrate orphaned windows using the old topology before
             // committing the new one (same as the hotplug path in
             // DisplayTopologyChanged).
-            if topology_fingerprint(&displays) != topology_fingerprint(&state.displays) {
+            if displays.is_empty() {
+                tracing::warn!("empty wake display observation; retaining last usable topology");
+            } else if topology_fingerprint(&displays) != topology_fingerprint(&state.displays) {
                 migrate_orphaned_windows(state, &displays);
                 state.displays = displays;
                 state.resolved_config = select_resolved_config(&state.config_set, &state.displays);
+                state.automatic_tiling_suspended = false;
+                state.automatic_tiling_active = state.resolved_config.automatic_tiling_enabled;
             }
-            // Step 2: bulk-register any newly observed windows.
-            let mut registered = 0usize;
-            for (window_id, display_id, bounds) in windows {
-                state.windows.entry(window_id).or_insert_with(|| {
-                    registered += 1;
-                    WindowPlacement {
-                        display_id,
-                        bounds,
-                        previous_placement: None,
-                        cycle_step: None,
-                        rejection_count: 0,
-                    }
-                });
+            if let Some(windows) = windows {
+                state.observed_windows = windows
+                    .iter()
+                    .cloned()
+                    .map(|window| (window.id, window))
+                    .collect();
+                replace_inventory_from_observations(state, windows);
             }
-            tracing::info!(registered, "wake reconciliation complete");
+            tracing::info!("wake reconciliation complete");
+            reconcile_balanced_grids(state);
             state.revision += 1;
         }
 
         // Feature 31 — per-window circuit breaker.
         Event::PlacementRejected { window_id } => {
-            let Some(placement) = state.windows.get_mut(&window_id) else {
+            let Some(rejection_count) = state.windows.get_mut(&window_id).map(|placement| {
+                placement.rejection_count = placement.rejection_count.saturating_add(1);
+                placement.rejection_count
+            }) else {
                 tracing::debug!(
                     ?window_id,
                     "placement rejection for an untracked window; ignoring"
                 );
                 return;
             };
-            placement.rejection_count = placement.rejection_count.saturating_add(1);
-            if placement.rejection_count == CIRCUIT_BREAKER_THRESHOLD {
+            if rejection_count == CIRCUIT_BREAKER_THRESHOLD {
                 tracing::warn!(
                     ?window_id,
                     threshold = CIRCUIT_BREAKER_THRESHOLD,
                     "circuit breaker opened: window repeatedly rejected placement; \
                      stopping automatic management until user resets with a zone-snap command"
                 );
+                if let Some(managed) = state.inventory.get_mut(&window_id) {
+                    managed.eligibility = EligibilityReason::CircuitOpen;
+                }
+                reconcile_balanced_grids(state);
                 state.revision += 1;
             } else {
                 tracing::debug!(
                     ?window_id,
-                    rejection_count = placement.rejection_count,
+                    rejection_count,
                     threshold = CIRCUIT_BREAKER_THRESHOLD,
                     "placement rejection recorded"
                 );
+            }
+        }
+
+        Event::PlacementAccepted { window_id } => {
+            let Some(placement) = state.windows.get_mut(&window_id) else {
+                return;
+            };
+            if placement.rejection_count == 0 {
+                return;
+            }
+            placement.rejection_count = 0;
+            if let Some(managed) = state.inventory.get_mut(&window_id) {
+                managed.eligibility = eligibility_for(&managed.window, managed.action, false);
+            }
+            state.revision += 1;
+        }
+
+        Event::RearrangeRequested => {
+            state.effects.push(EngineEffect::ReconcileWindows);
+            state.revision += 1;
+        }
+
+        Event::RearrangeReconciliationComplete { windows } => {
+            state.observed_windows = windows
+                .iter()
+                .cloned()
+                .map(|window| (window.id, window))
+                .collect();
+            replace_inventory_from_observations(state, windows);
+            let mut reset = 0usize;
+            for placement in state.windows.values_mut() {
+                if placement.circuit_open() {
+                    placement.rejection_count = 0;
+                    reset += 1;
+                }
+            }
+            for managed in state.inventory.values_mut() {
+                if managed.eligibility == EligibilityReason::CircuitOpen {
+                    managed.eligibility = eligibility_for(&managed.window, managed.action, false);
+                }
+            }
+            tracing::info!(reset, "rearrange reset open placement circuits");
+            reconcile_balanced_grids(state);
+            state.revision += 1;
+        }
+
+        Event::WindowsObserved { windows } => {
+            if state.automatic_tiling_active {
+                for window in &windows {
+                    let was_tiled_and_normal =
+                        state.inventory.get(&window.id).is_some_and(|managed| {
+                            managed.action == ManageAction::Tile
+                                && managed.window.lifecycle != WindowLifecycle::Maximized
+                        });
+                    if was_tiled_and_normal && window.lifecycle == WindowLifecycle::Maximized {
+                        state.session_floating.insert(window.id);
+                    }
+                }
+            }
+            state.observed_windows = windows
+                .iter()
+                .cloned()
+                .map(|window| (window.id, window))
+                .collect();
+            if replace_inventory_from_observations(state, windows) {
+                reconcile_balanced_grids(state);
+                state.revision += 1;
+            }
+        }
+
+        Event::RulesChanged { rules } => {
+            state.rules = rules;
+            let observed: Vec<Window> = state.observed_windows.values().cloned().collect();
+            replace_inventory_from_observations(state, observed);
+            reconcile_balanced_grids(state);
+            state.revision += 1;
+        }
+
+        Event::SavedLayoutApplyRequested { name } => {
+            // The verdict is re-reached here rather than trusted from
+            // whoever sent the event: state can have moved on between the
+            // two, and a hotkey has no synchronous caller to ask at all.
+            match plan_saved_layout(state, &name) {
+                Ok(plan) => {
+                    if plan.unplaced > 0 {
+                        tracing::info!(
+                            layout = %name,
+                            unplaced = plan.unplaced,
+                            "saved layout has fewer cells than the display has windows; \
+                             the surplus windows were left where they are"
+                        );
+                    }
+                    // Only windows the placement actually reached are
+                    // taken out of the tiling set: a window whose circuit
+                    // breaker suppressed its placement was not moved, so
+                    // floating it would drop it from the grid for nothing.
+                    let mut placed = Vec::new();
+                    for (window_id, bounds) in plan.placements {
+                        if place_window(state, window_id, plan.display_id, bounds, None) {
+                            placed.push(window_id);
+                        }
+                    }
+                    if !placed.is_empty() {
+                        state
+                            .last_applied_layouts
+                            .insert(plan.display_id, name.clone());
+                    }
+                    // Applying a layout is an explicit placement, so it
+                    // session-floats what it placed exactly as a zone snap
+                    // does, and the rest of the tiling set reflows around
+                    // the result in one pass (ADR 0011).
+                    if state.automatic_tiling_active && !placed.is_empty() {
+                        for window_id in placed {
+                            set_session_floating(state, window_id, true);
+                        }
+                        reconcile_balanced_grids(state);
+                    }
+                }
+                Err(rejection) => {
+                    tracing::warn!(
+                        layout = %name,
+                        reason = %rejection,
+                        "saved layout not applied"
+                    );
+                }
+            }
+        }
+
+        Event::HotkeyCaptureStarted => {
+            state.capture_holds += 1;
+            if state.hotkey_capture_suspended {
+                tracing::debug!(
+                    holds = state.capture_holds,
+                    "another editor already holds hotkey capture"
+                );
+                return;
+            }
+            tracing::info!("hotkey editor opened; hotkey registration suspended");
+            state.hotkey_capture_suspended = true;
+            // What did not come back from the *last* capture is
+            // deliberately left standing. It is only known once
+            // registration resumes, by which time the editor that caused
+            // it has closed -- so the next editor to open is the only one
+            // that can tell the user (ADR 0021).
+            state.revision += 1;
+        }
+
+        Event::HotkeyCaptureEnded => {
+            if state.capture_holds == 0 {
+                tracing::debug!("hotkey capture ended but no editor held it");
+                return;
+            }
+            state.capture_holds -= 1;
+            if state.capture_holds > 0 {
+                tracing::debug!(
+                    holds = state.capture_holds,
+                    "an editor closed but another still holds hotkey capture"
+                );
+                return;
+            }
+            tracing::info!("hotkey editor closed; hotkey registration resumed");
+            state.hotkey_capture_suspended = false;
+            state.revision += 1;
+        }
+
+        Event::HotkeyRegistrationReported { unregistered } => {
+            if state.unregistered_bindings == unregistered {
+                return;
+            }
+            if !unregistered.is_empty() {
+                tracing::warn!(
+                    count = unregistered.len(),
+                    "some hotkey bindings did not register; another application may own them"
+                );
+            }
+            state.unregistered_bindings = unregistered;
+            state.revision += 1;
+        }
+    }
+}
+
+fn eligibility_for(window: &Window, action: ManageAction, circuit_open: bool) -> EligibilityReason {
+    if action == ManageAction::Float {
+        return EligibilityReason::FloatingRule;
+    }
+    if !window.capabilities.is_tileable() {
+        return EligibilityReason::NotTileable;
+    }
+    if window.elevated {
+        return EligibilityReason::Elevated;
+    }
+    if circuit_open {
+        return EligibilityReason::CircuitOpen;
+    }
+    match window.lifecycle {
+        WindowLifecycle::Active => EligibilityReason::Eligible,
+        WindowLifecycle::Minimized => EligibilityReason::Minimized,
+        WindowLifecycle::Maximized => EligibilityReason::Maximized,
+        WindowLifecycle::Fullscreen => EligibilityReason::Fullscreen,
+        WindowLifecycle::Hidden => EligibilityReason::Hidden,
+        WindowLifecycle::Cloaked => EligibilityReason::Cloaked,
+    }
+}
+
+fn directional_neighbor(state: &EngineState, direction: CardinalDirection) -> Option<WindowId> {
+    let focused = state.focused_window?;
+    let source = state.inventory.get(&focused)?;
+    if source.eligibility != EligibilityReason::Eligible {
+        return None;
+    }
+    let source_bounds = state.windows.get(&focused)?.bounds;
+    let source_center = (
+        i64::from(source_bounds.x) * 2 + i64::from(source_bounds.width),
+        i64::from(source_bounds.y) * 2 + i64::from(source_bounds.height),
+    );
+
+    state
+        .visual_window_order
+        .get(&source.window.display_id)?
+        .iter()
+        .enumerate()
+        .filter_map(|(order_index, candidate_id)| {
+            if *candidate_id == focused {
+                return None;
+            }
+            let managed = state.inventory.get(candidate_id)?;
+            if managed.eligibility != EligibilityReason::Eligible
+                || managed.window.display_id != source.window.display_id
+            {
+                return None;
+            }
+            let bounds = state.windows.get(candidate_id)?.bounds;
+            let center = (
+                i64::from(bounds.x) * 2 + i64::from(bounds.width),
+                i64::from(bounds.y) * 2 + i64::from(bounds.height),
+            );
+            let (primary, perpendicular) = match direction {
+                CardinalDirection::Left if center.0 < source_center.0 => (
+                    source_center.0 - center.0,
+                    (source_center.1 - center.1).abs(),
+                ),
+                CardinalDirection::Right if center.0 > source_center.0 => (
+                    center.0 - source_center.0,
+                    (source_center.1 - center.1).abs(),
+                ),
+                CardinalDirection::Up if center.1 < source_center.1 => (
+                    source_center.1 - center.1,
+                    (source_center.0 - center.0).abs(),
+                ),
+                CardinalDirection::Down if center.1 > source_center.1 => (
+                    center.1 - source_center.1,
+                    (source_center.0 - center.0).abs(),
+                ),
+                _ => return None,
+            };
+            Some(((primary, perpendicular, order_index), *candidate_id))
+        })
+        .min_by_key(|(distance, _)| *distance)
+        .map(|(_, id)| id)
+}
+
+fn set_session_floating(state: &mut EngineState, window_id: WindowId, floating: bool) {
+    if floating {
+        state.session_floating.insert(window_id);
+    } else {
+        state.session_floating.remove(&window_id);
+    }
+    if let Some(managed) = state.inventory.get_mut(&window_id) {
+        managed.eligibility = if floating {
+            EligibilityReason::SessionFloating
+        } else {
+            let circuit_open = state
+                .windows
+                .get(&window_id)
+                .is_some_and(WindowPlacement::circuit_open);
+            eligibility_for(&managed.window, managed.action, circuit_open)
+        };
+    }
+}
+
+/// Rebuilds the inspectable inventory from one normalized observation batch.
+/// The evaluator never logs the `Window`, protecting title/path metadata from
+/// diagnostics while still retaining it in engine-owned state for reloads.
+fn replace_inventory_from_observations(state: &mut EngineState, observed: Vec<Window>) -> bool {
+    let evaluator =
+        RuleEvaluator::new(state.rules.iter().cloned().chain(builtin_rules()).collect());
+    let mut next = HashMap::new();
+    for window in observed {
+        let action = evaluator.evaluate(&window).actions.manage;
+        if action == ManageAction::Exclude {
+            continue;
+        }
+        let circuit_open = state
+            .windows
+            .get(&window.id)
+            .is_some_and(WindowPlacement::circuit_open);
+        let eligibility = if state.session_tiled.contains(&window.id) {
+            eligibility_for(&window, ManageAction::Tile, circuit_open)
+        } else if state.session_floating.contains(&window.id) {
+            EligibilityReason::SessionFloating
+        } else {
+            eligibility_for(&window, action, circuit_open)
+        };
+        state.windows.entry(window.id).or_insert(WindowPlacement {
+            display_id: window.display_id,
+            bounds: window.bounds,
+            observed_bounds: window.bounds,
+            previous_placement: None,
+            cycle_step: None,
+            rejection_count: 0,
+        });
+        next.insert(
+            window.id,
+            ManagedWindow {
+                window,
+                action,
+                eligibility,
+            },
+        );
+    }
+    let inventory_changed = next != state.inventory;
+    let managed_ids: HashSet<_> = next.keys().copied().collect();
+    let placements_changed = state.windows.keys().any(|id| !managed_ids.contains(id));
+    state.windows.retain(|id, _| managed_ids.contains(id));
+    state.session_floating.retain(|id| managed_ids.contains(id));
+    state.session_tiled.retain(|id| managed_ids.contains(id));
+    if state
+        .focused_window
+        .is_some_and(|id| !managed_ids.contains(&id))
+    {
+        state.focused_window = None;
+    }
+    state.inventory = next;
+    inventory_changed || placements_changed
+}
+
+/// Updates visual order and emits one final Balanced-grid plan per affected
+/// display. It is intentionally a no-op in manual mode, leaving current
+/// bounds untouched on profile deactivation (ADR 0015).
+fn reconcile_balanced_grids(state: &mut EngineState) {
+    if !state.automatic_tiling_active || state.paused {
+        return;
+    }
+
+    for (display_id, order) in &mut state.visual_window_order {
+        order.retain(|id| {
+            state.inventory.get(id).is_some_and(|managed| {
+                (managed.action == ManageAction::Tile || state.session_tiled.contains(id))
+                    && managed.window.display_id == *display_id
+            })
+        });
+    }
+    let mut candidates: Vec<_> = state
+        .inventory
+        .values()
+        .filter(|managed| {
+            managed.action == ManageAction::Tile || state.session_tiled.contains(&managed.window.id)
+        })
+        .map(|managed| {
+            (
+                managed.window.display_id,
+                managed.window.id,
+                managed.window.bounds,
+            )
+        })
+        .collect();
+    candidates.sort_by_key(|(display, id, bounds)| (display.0, bounds.y, bounds.x, id.0));
+    for (display_id, window_id, _) in candidates {
+        let order = state.visual_window_order.entry(display_id).or_default();
+        if !order.contains(&window_id) {
+            order.push(window_id);
+        }
+    }
+
+    let plans: Vec<_> = state
+        .displays
+        .iter()
+        .map(|display| {
+            let ids = state
+                .visual_window_order
+                .get(&display.id)
+                .cloned()
+                .unwrap_or_default();
+            let active: Vec<_> = ids
+                .into_iter()
+                .filter(|id| {
+                    state.inventory.get(id).is_some_and(|managed| {
+                        managed.window.display_id == display.id
+                            && (managed.action == ManageAction::Tile
+                                || state.session_tiled.contains(id))
+                            && managed.eligibility == EligibilityReason::Eligible
+                    })
+                })
+                .collect();
+            (display.id, display.work_area, active)
+        })
+        .collect();
+    for (display_id, work_area, active) in plans {
+        if state
+            .interactive_placement
+            .is_some_and(|session| session.display_id == display_id)
+        {
+            state.deferred_reflow_displays.insert(display_id);
+            continue;
+        }
+        let cells = plan_balanced_grid(work_area, active.len());
+        for (window_id, raw_bounds) in active.into_iter().zip(cells) {
+            let bounds = apply_gaps(raw_bounds, work_area, state.resolved_config.gaps);
+            let unchanged = state.windows.get(&window_id).is_some_and(|placement| {
+                placement.display_id == display_id && placement.bounds == bounds
+            });
+            if !unchanged {
+                place_window(state, window_id, display_id, bounds, None);
             }
         }
     }
@@ -812,46 +1821,25 @@ fn place_window(
         WindowPlacement {
             display_id,
             bounds,
+            // Assume the placement lands; `WindowBoundsObserved` corrects
+            // this the moment the OS says otherwise.
+            observed_bounds: bounds,
             previous_placement,
             cycle_step,
             rejection_count,
         },
     );
+    if let Some(managed) = state.inventory.get_mut(&window_id) {
+        managed.window.display_id = display_id;
+        managed.window.bounds = bounds;
+    }
+    state.effects.push(EngineEffect::PlaceWindow {
+        window_id,
+        display_id,
+        bounds,
+    });
     state.revision += 1;
     true
-}
-
-fn apply_layout_cells(state: &mut EngineState, cells: Vec<(f64, f64, f64, f64)>) {
-    if state.paused {
-        return;
-    }
-    let Some(focused) = state.focused_window else {
-        return;
-    };
-    let Some(display_id) = state
-        .windows
-        .get(&focused)
-        .map(|placement| placement.display_id)
-    else {
-        return;
-    };
-    let Some(work_area) = work_area_of(&state.displays, display_id) else {
-        return;
-    };
-    let mut windows: Vec<(WindowId, Rect)> = state
-        .windows
-        .iter()
-        .filter(|(_, placement)| placement.display_id == display_id && !placement.circuit_open())
-        .map(|(id, placement)| (*id, placement.bounds))
-        .collect();
-    windows.sort_by_key(|(id, bounds)| (bounds.y, bounds.x, id.0));
-    for ((window_id, _), raw) in windows
-        .into_iter()
-        .zip(resolve_layout_cells(work_area, &cells))
-    {
-        let bounds = apply_gaps(raw, work_area, state.resolved_config.gaps);
-        place_window(state, window_id, display_id, bounds, None);
-    }
 }
 
 /// Migrate windows whose current `display_id` is absent from `new_displays`
@@ -872,6 +1860,7 @@ fn migrate_orphaned_windows(state: &mut EngineState, new_displays: &[Display]) {
     }
 
     let mut migrated = 0usize;
+    let mut effects = Vec::new();
     // Collect the set of display IDs that are *leaving* the topology.
     let vanished_ids: Vec<DisplayId> = state
         .displays
@@ -891,7 +1880,7 @@ fn migrate_orphaned_windows(state: &mut EngineState, new_displays: &[Display]) {
 
     // For each window on a vanished display, find the nearest surviving
     // display by comparing display center-points, then throw the window to it.
-    for placement in state.windows.values_mut() {
+    for (window_id, placement) in state.windows.iter_mut() {
         if !vanished_ids.contains(&placement.display_id) {
             continue;
         }
@@ -927,8 +1916,29 @@ fn migrate_orphaned_windows(state: &mut EngineState, new_displays: &[Display]) {
 
         placement.display_id = nearest.id;
         placement.bounds = new_bounds;
+        effects.push(EngineEffect::PlaceWindow {
+            window_id: *window_id,
+            display_id: nearest.id,
+            bounds: new_bounds,
+        });
         migrated += 1;
     }
+
+    for effect in &effects {
+        let EngineEffect::PlaceWindow {
+            window_id,
+            display_id,
+            bounds,
+        } = effect
+        else {
+            continue;
+        };
+        if let Some(managed) = state.inventory.get_mut(window_id) {
+            managed.window.display_id = *display_id;
+            managed.window.bounds = *bounds;
+        }
+    }
+    state.effects.extend(effects);
 
     if migrated > 0 {
         tracing::info!(migrated, "window migration complete");
@@ -1045,6 +2055,20 @@ impl StateReader {
             .expect("engine state mutex poisoned")
             .clone()
     }
+
+    /// Just the current revision, without cloning the whole state.
+    ///
+    /// [`snapshot`](Self::snapshot) deep-clones every window, display, and
+    /// rule, which is far too costly for a reader that polls to find out
+    /// *whether* anything changed. Such readers -- the focus-border
+    /// controller is the first -- watch this and take a snapshot only when
+    /// it advances.
+    pub fn revision(&self) -> u64 {
+        self.state
+            .lock()
+            .expect("engine state mutex poisoned")
+            .revision
+    }
 }
 
 /// Spawns the reducer thread with `initial_displays` and `initial_config_set`
@@ -1069,14 +2093,30 @@ pub fn spawn_engine_with_capacity(
 ) -> EngineHandle {
     let (tx, rx) = sync_channel::<Message>(capacity);
     let initial_resolved_config = select_resolved_config(&initial_config_set, &initial_displays);
+    let initial_automatic_tiling_active = initial_resolved_config.automatic_tiling_enabled;
     let initial_state = EngineState {
         revision: 0,
         displays: initial_displays,
         windows: HashMap::new(),
+        inventory: HashMap::new(),
+        observed_windows: HashMap::new(),
+        rules: Vec::new(),
+        visual_window_order: HashMap::new(),
+        session_floating: HashSet::new(),
+        session_tiled: HashSet::new(),
         focused_window: None,
         resolved_config: initial_resolved_config,
         config_set: initial_config_set,
         paused: false,
+        automatic_tiling_active: initial_automatic_tiling_active,
+        automatic_tiling_suspended: false,
+        interactive_placement: None,
+        deferred_reflow_displays: HashSet::new(),
+        effects: Vec::new(),
+        last_applied_layouts: HashMap::new(),
+        hotkey_capture_suspended: false,
+        capture_holds: 0,
+        unregistered_bindings: Vec::new(),
     };
     let state = Arc::new(Mutex::new(initial_state.clone()));
 
@@ -1181,6 +2221,31 @@ mod tests {
 
         assert_eq!(state.revision, 2);
         assert_eq!(state.displays.len(), 2);
+    }
+
+    #[test]
+    fn work_area_change_reflows_without_clearing_tiling_suspension() {
+        let mut state = EngineState {
+            displays: vec![display(1, "primary", 0)],
+            resolved_config: ResolvedConfig {
+                automatic_tiling_enabled: true,
+                ..ResolvedConfig::default()
+            },
+            automatic_tiling_suspended: true,
+            automatic_tiling_active: false,
+            ..EngineState::default()
+        };
+        let mut changed = state.displays[0].clone();
+        changed.work_area = Rect::new(0, 40, 1920, 1040);
+
+        apply(
+            &mut state,
+            Event::DisplayTopologyChanged(vec![changed.clone()]),
+        );
+
+        assert_eq!(state.displays, vec![changed]);
+        assert!(state.automatic_tiling_suspended);
+        assert!(!state.automatic_tiling_active);
     }
 
     #[test]
@@ -1646,6 +2711,37 @@ mod tests {
     }
 
     #[test]
+    fn zone_snap_emits_one_platform_neutral_placement_effect() {
+        let mut state = EngineState {
+            displays: vec![display(1, "primary", 0)],
+            ..EngineState::default()
+        };
+        apply(
+            &mut state,
+            Event::WindowFocused {
+                window_id: WindowId(7),
+                display_id: DisplayId(1),
+                bounds: Rect::new(10, 10, 500, 500),
+            },
+        );
+        apply(
+            &mut state,
+            Event::ZoneSnapRequested {
+                direction: ZoneSnapDirection::Left,
+            },
+        );
+
+        assert_eq!(
+            state.effects,
+            vec![EngineEffect::PlaceWindow {
+                window_id: WindowId(7),
+                display_id: DisplayId(1),
+                bounds: Rect::new(0, 0, 960, 1080),
+            }]
+        );
+    }
+
+    #[test]
     fn apply_zone_snap_left_repeated_advances_half_third_two_thirds_then_wraps() {
         let mut state = EngineState::default();
         apply(
@@ -1886,7 +2982,9 @@ mod tests {
         );
         apply(
             &mut state,
-            Event::ConfigChanged(config_set_with_gaps(mosaix_domain::Gaps::new(10, 4))),
+            Event::ConfigChanged(Box::new(config_set_with_gaps(mosaix_domain::Gaps::new(
+                10, 4,
+            )))),
         );
         apply(
             &mut state,
@@ -1921,7 +3019,9 @@ mod tests {
         );
         apply(
             &mut state,
-            Event::ConfigChanged(config_set_with_gaps(mosaix_domain::Gaps::new(10, 4))),
+            Event::ConfigChanged(Box::new(config_set_with_gaps(mosaix_domain::Gaps::new(
+                10, 4,
+            )))),
         );
         apply(
             &mut state,
@@ -1962,7 +3062,9 @@ mod tests {
         );
         apply(
             &mut state,
-            Event::ConfigChanged(config_set_with_gaps(mosaix_domain::Gaps::new(10, 4))),
+            Event::ConfigChanged(Box::new(config_set_with_gaps(mosaix_domain::Gaps::new(
+                10, 4,
+            )))),
         );
         apply(
             &mut state,
@@ -1987,7 +3089,9 @@ mod tests {
         // delivers new gap values with no restart.
         apply(
             &mut state,
-            Event::ConfigChanged(config_set_with_gaps(mosaix_domain::Gaps::new(20, 8))),
+            Event::ConfigChanged(Box::new(config_set_with_gaps(mosaix_domain::Gaps::new(
+                20, 8,
+            )))),
         );
         apply(
             &mut state,
@@ -2342,7 +3446,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_bounds_observed_mismatch_with_no_cycle_step_does_not_bump_the_revision() {
+    fn apply_bounds_observed_mismatch_with_no_cycle_step_records_the_move() {
         let mut state = EngineState::default();
         apply(
             &mut state,
@@ -2370,8 +3474,19 @@ mod tests {
         let placement = state.windows.get(&WindowId(1)).unwrap();
         assert_eq!(placement.cycle_step, None);
         assert_eq!(
-            state.revision, revision_before,
-            "resetting an already-None cycle step is not a real change, so must not bump the revision"
+            placement.bounds,
+            Rect::new(0, 0, 1920, 1080),
+            "the intended placement is unchanged by an observation"
+        );
+        assert_eq!(
+            placement.observed_bounds,
+            Rect::new(100, 100, 400, 400),
+            "but where the window actually is must be recorded"
+        );
+        assert!(
+            state.revision > revision_before,
+            "the window really moved, so watchers of the revision -- the focus \
+             border among them -- must be able to notice"
         );
     }
 
@@ -2384,8 +3499,7 @@ mod tests {
         ResolvedConfig {
             hotkeys,
             gaps: mosaix_domain::Gaps::default(),
-            behavior: mosaix_config::BehaviorSection::default(),
-            layouts: Vec::new(),
+            ..ResolvedConfig::default()
         }
     }
 
@@ -2399,13 +3513,195 @@ mod tests {
     fn config_set_with_gaps(gaps: mosaix_domain::Gaps) -> ResolvedConfigSet {
         ResolvedConfigSet {
             base: ResolvedConfig {
-                hotkeys: std::collections::BTreeMap::new(),
                 gaps,
-                behavior: mosaix_config::BehaviorSection::default(),
-                layouts: Vec::new(),
+                ..ResolvedConfig::default()
             },
             profiles: Vec::new(),
         }
+    }
+
+    fn observed_window(
+        id: isize,
+        role: mosaix_domain::WindowRole,
+        lifecycle: WindowLifecycle,
+    ) -> Window {
+        Window {
+            id: WindowId(id),
+            process_id: 1,
+            application_id: mosaix_domain::ApplicationId("test".to_string()),
+            executable_path: None,
+            title: "non-sensitive-test-title".to_string(),
+            native_class: None,
+            role,
+            bounds: Rect::new(0, 0, 400, 300),
+            display_id: DisplayId(1),
+            capabilities: mosaix_domain::WindowCapabilities {
+                can_move: true,
+                can_resize: true,
+                can_minimize: true,
+                can_maximize: true,
+            },
+            elevated: false,
+            lifecycle,
+        }
+    }
+
+    #[test]
+    fn observed_windows_publish_tile_float_and_exclude_rule_outcomes() {
+        let mut state = EngineState::default();
+        apply(
+            &mut state,
+            Event::WindowsObserved {
+                windows: vec![
+                    observed_window(
+                        1,
+                        mosaix_domain::WindowRole::Normal,
+                        WindowLifecycle::Active,
+                    ),
+                    observed_window(
+                        2,
+                        mosaix_domain::WindowRole::Dialog,
+                        WindowLifecycle::Active,
+                    ),
+                    observed_window(3, mosaix_domain::WindowRole::Popup, WindowLifecycle::Active),
+                ],
+            },
+        );
+
+        assert_eq!(state.inventory.len(), 2);
+        assert_eq!(state.inventory[&WindowId(1)].action, ManageAction::Tile);
+        assert_eq!(
+            state.inventory[&WindowId(1)].eligibility,
+            EligibilityReason::Eligible
+        );
+        assert_eq!(state.inventory[&WindowId(2)].action, ManageAction::Float);
+        assert_eq!(
+            state.inventory[&WindowId(2)].eligibility,
+            EligibilityReason::FloatingRule
+        );
+        assert!(!state.inventory.contains_key(&WindowId(3)));
+    }
+
+    #[test]
+    fn elevated_windows_remain_in_inventory_with_an_ineligible_reason() {
+        let mut state = EngineState::default();
+        let mut elevated = observed_window(
+            8,
+            mosaix_domain::WindowRole::Normal,
+            WindowLifecycle::Active,
+        );
+        elevated.elevated = true;
+
+        apply(
+            &mut state,
+            Event::WindowsObserved {
+                windows: vec![elevated],
+            },
+        );
+
+        assert_eq!(
+            state.inventory[&WindowId(8)].eligibility,
+            EligibilityReason::Elevated
+        );
+    }
+
+    #[test]
+    fn active_profile_reflows_eligible_inventory_into_balanced_grid_effects() {
+        let mut state = EngineState {
+            displays: vec![display(1, "primary", 0)],
+            automatic_tiling_active: true,
+            ..EngineState::default()
+        };
+        let mut left = observed_window(
+            1,
+            mosaix_domain::WindowRole::Normal,
+            WindowLifecycle::Active,
+        );
+        left.bounds = Rect::new(100, 200, 400, 300);
+        let mut right = observed_window(
+            2,
+            mosaix_domain::WindowRole::Normal,
+            WindowLifecycle::Active,
+        );
+        right.bounds = Rect::new(800, 200, 400, 300);
+
+        apply(
+            &mut state,
+            Event::WindowsObserved {
+                windows: vec![right, left],
+            },
+        );
+
+        assert_eq!(
+            state.visual_window_order[&DisplayId(1)],
+            vec![WindowId(1), WindowId(2)]
+        );
+        assert_eq!(
+            state.effects,
+            vec![
+                EngineEffect::PlaceWindow {
+                    window_id: WindowId(1),
+                    display_id: DisplayId(1),
+                    bounds: Rect::new(0, 0, 960, 1080)
+                },
+                EngineEffect::PlaceWindow {
+                    window_id: WindowId(2),
+                    display_id: DisplayId(1),
+                    bounds: Rect::new(960, 0, 960, 1080)
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn temporary_lifecycle_ineligibility_keeps_visual_order_and_reflows_once() {
+        let mut state = EngineState {
+            displays: vec![display(1, "primary", 0)],
+            automatic_tiling_active: true,
+            ..EngineState::default()
+        };
+        let windows = vec![
+            observed_window(
+                1,
+                mosaix_domain::WindowRole::Normal,
+                WindowLifecycle::Active,
+            ),
+            observed_window(
+                2,
+                mosaix_domain::WindowRole::Normal,
+                WindowLifecycle::Active,
+            ),
+            observed_window(
+                3,
+                mosaix_domain::WindowRole::Normal,
+                WindowLifecycle::Active,
+            ),
+        ];
+        apply(
+            &mut state,
+            Event::WindowsObserved {
+                windows: windows.clone(),
+            },
+        );
+        state.effects.clear();
+
+        let mut minimized = windows.clone();
+        minimized[1].lifecycle = WindowLifecycle::Minimized;
+        apply(&mut state, Event::WindowsObserved { windows: minimized });
+
+        assert_eq!(
+            state.visual_window_order[&DisplayId(1)],
+            vec![WindowId(1), WindowId(2), WindowId(3)]
+        );
+        assert_eq!(
+            state.inventory[&WindowId(2)].eligibility,
+            EligibilityReason::Minimized
+        );
+        assert_eq!(
+            state.effects.len(),
+            2,
+            "only the two active members receive the settled plan"
+        );
     }
 
     #[test]
@@ -2414,7 +3710,10 @@ mod tests {
         assert_eq!(state.resolved_config, ResolvedConfig::default());
 
         let new_config_set = config_set_with_left_binding("ctrl+alt+left");
-        apply(&mut state, Event::ConfigChanged(new_config_set.clone()));
+        apply(
+            &mut state,
+            Event::ConfigChanged(Box::new(new_config_set.clone())),
+        );
 
         assert_eq!(state.resolved_config, new_config_set.base);
         assert_eq!(state.config_set, new_config_set);
@@ -2425,10 +3724,13 @@ mod tests {
     fn apply_config_changed_ignores_an_identical_resolved_config() {
         let mut state = EngineState::default();
         let config_set = config_set_with_left_binding("ctrl+alt+left");
-        apply(&mut state, Event::ConfigChanged(config_set.clone()));
+        apply(
+            &mut state,
+            Event::ConfigChanged(Box::new(config_set.clone())),
+        );
         let revision_after_first = state.revision;
 
-        apply(&mut state, Event::ConfigChanged(config_set));
+        apply(&mut state, Event::ConfigChanged(Box::new(config_set)));
 
         assert_eq!(
             state.revision, revision_after_first,
@@ -2441,12 +3743,15 @@ mod tests {
         let mut state = EngineState::default();
         apply(
             &mut state,
-            Event::ConfigChanged(config_set_with_left_binding("ctrl+alt+left")),
+            Event::ConfigChanged(Box::new(config_set_with_left_binding("ctrl+alt+left"))),
         );
         let revision_after_first = state.revision;
 
         let second_config_set = config_set_with_left_binding("ctrl+shift+left");
-        apply(&mut state, Event::ConfigChanged(second_config_set.clone()));
+        apply(
+            &mut state,
+            Event::ConfigChanged(Box::new(second_config_set.clone())),
+        );
 
         assert_eq!(state.resolved_config, second_config_set.base);
         assert_eq!(state.revision, revision_after_first + 1);
@@ -2464,7 +3769,7 @@ mod tests {
             base: ResolvedConfig::default(),
             profiles: vec![profile.clone()],
         };
-        apply(&mut state, Event::ConfigChanged(config_set));
+        apply(&mut state, Event::ConfigChanged(Box::new(config_set)));
         assert_eq!(
             state.resolved_config,
             ResolvedConfig::default(),
@@ -2480,6 +3785,59 @@ mod tests {
     }
 
     #[test]
+    fn moving_to_a_desk_with_a_profile_swaps_in_that_profiles_saved_layouts() {
+        // Per-topology saved layouts ride the same profile selection every
+        // other setting does, so a docked desk and a laptop alone can offer
+        // different layout sets with no restart and no new mechanism.
+        let mut state = EngineState::default();
+        let laptop = vec![display(1, "MON-A", 0)];
+        let desk = vec![display(1, "MON-A", 0), display(2, "MON-B", 1920)];
+        let mut docked_layouts = std::collections::BTreeMap::new();
+        docked_layouts.insert(
+            "docked".to_owned(),
+            mosaix_config::SavedLayout {
+                cells: vec![mosaix_domain::NormalizedRect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 1.0,
+                    height: 1.0,
+                }],
+            },
+        );
+        let mut base_layouts = std::collections::BTreeMap::new();
+        base_layouts.insert("writing".to_owned(), mosaix_config::SavedLayout::default());
+        let config_set = ResolvedConfigSet {
+            base: ResolvedConfig {
+                layouts: base_layouts,
+                ..ResolvedConfig::default()
+            },
+            profiles: vec![ResolvedProfile {
+                fingerprint: topology_fingerprint(&desk),
+                config: ResolvedConfig {
+                    layouts: docked_layouts,
+                    ..ResolvedConfig::default()
+                },
+            }],
+        };
+        apply(&mut state, Event::ConfigChanged(Box::new(config_set)));
+        apply(&mut state, Event::DisplayTopologyChanged(laptop));
+
+        assert_eq!(
+            state.resolved_config.layouts.keys().collect::<Vec<_>>(),
+            vec!["writing"],
+            "a topology matching no profile offers the base layouts"
+        );
+
+        apply(&mut state, Event::DisplayTopologyChanged(desk));
+
+        assert_eq!(
+            state.resolved_config.layouts.keys().collect::<Vec<_>>(),
+            vec!["docked"],
+            "docking makes the matched profile's layouts the ones on offer"
+        );
+    }
+
+    #[test]
     fn apply_topology_change_with_no_matching_profile_falls_back_to_base() {
         let mut state = EngineState::default();
         let base = resolved_config_with_left_binding("ctrl+alt+left");
@@ -2491,7 +3849,7 @@ mod tests {
             base: base.clone(),
             profiles: vec![profile],
         };
-        apply(&mut state, Event::ConfigChanged(config_set));
+        apply(&mut state, Event::ConfigChanged(Box::new(config_set)));
 
         apply(
             &mut state,
@@ -2521,7 +3879,7 @@ mod tests {
             base: ResolvedConfig::default(),
             profiles: vec![profile_a.clone(), profile_b.clone()],
         };
-        apply(&mut state, Event::ConfigChanged(config_set));
+        apply(&mut state, Event::ConfigChanged(Box::new(config_set)));
 
         apply(
             &mut state,
@@ -2583,6 +3941,7 @@ mod tests {
             WindowPlacement {
                 display_id: DisplayId(1),
                 bounds: Rect::new(0, 0, 960, 1080),
+                observed_bounds: Rect::new(0, 0, 960, 1080),
                 previous_placement: None,
                 cycle_step: None,
                 rejection_count: 0,
@@ -2597,6 +3956,7 @@ mod tests {
         let unchanged = WindowPlacement {
             display_id: DisplayId(1),
             bounds: Rect::new(0, 0, 960, 1080),
+            observed_bounds: Rect::new(0, 0, 960, 1080),
             previous_placement: None,
             cycle_step: None,
             rejection_count: 0,
@@ -2706,8 +4066,10 @@ mod tests {
 
     #[test]
     fn apply_resume_clears_paused_and_bumps_revision() {
-        let mut state = EngineState::default();
-        state.paused = true;
+        let mut state = EngineState {
+            paused: true,
+            ..Default::default()
+        };
         apply(&mut state, Event::ResumeRequested);
         assert!(!state.paused);
         assert_eq!(state.revision, 1);
@@ -2723,9 +4085,11 @@ mod tests {
 
     #[test]
     fn apply_zone_snap_is_suppressed_while_paused() {
-        let mut state = EngineState::default();
-        state.paused = true;
-        state.focused_window = Some(WindowId(1));
+        let mut state = EngineState {
+            paused: true,
+            focused_window: Some(WindowId(1)),
+            ..Default::default()
+        };
         apply(
             &mut state,
             Event::ZoneSnapRequested {
@@ -2737,8 +4101,10 @@ mod tests {
 
     #[test]
     fn apply_window_placed_is_suppressed_while_paused() {
-        let mut state = EngineState::default();
-        state.paused = true;
+        let mut state = EngineState {
+            paused: true,
+            ..Default::default()
+        };
         apply(
             &mut state,
             Event::WindowPlaced {
@@ -2752,8 +4118,10 @@ mod tests {
 
     #[test]
     fn apply_throw_is_suppressed_while_paused() {
-        let mut state = EngineState::default();
-        state.paused = true;
+        let mut state = EngineState {
+            paused: true,
+            ..Default::default()
+        };
         apply(
             &mut state,
             Event::WindowThrowToDisplayRequested {
@@ -2766,8 +4134,10 @@ mod tests {
 
     #[test]
     fn apply_display_topology_still_processes_while_paused() {
-        let mut state = EngineState::default();
-        state.paused = true;
+        let mut state = EngineState {
+            paused: true,
+            ..Default::default()
+        };
         apply(
             &mut state,
             Event::DisplayTopologyChanged(vec![display(1, "MON-A", 0)]),
@@ -2777,8 +4147,10 @@ mod tests {
 
     #[test]
     fn apply_focus_still_processes_while_paused() {
-        let mut state = EngineState::default();
-        state.paused = true;
+        let mut state = EngineState {
+            paused: true,
+            ..Default::default()
+        };
         apply(
             &mut state,
             Event::WindowFocused {
@@ -2791,14 +4163,57 @@ mod tests {
     }
 
     #[test]
-    fn apply_config_still_processes_while_paused() {
+    fn bounds_observed_updates_observed_bounds_but_leaves_the_intended_placement() {
         let mut state = EngineState::default();
-        state.paused = true;
+        apply(
+            &mut state,
+            Event::WindowFocused {
+                window_id: WindowId(1),
+                display_id: DisplayId(1),
+                bounds: Rect::new(0, 0, 100, 100),
+            },
+        );
+        let revision_before = state.revision;
+
+        // Something other than Mosaix moved the window.
+        apply(
+            &mut state,
+            Event::WindowBoundsObserved {
+                window_id: WindowId(1),
+                display_id: DisplayId(1),
+                bounds: Rect::new(400, 300, 100, 100),
+            },
+        );
+
+        let placement = state.windows.get(&WindowId(1)).unwrap();
+        assert_eq!(
+            placement.observed_bounds,
+            Rect::new(400, 300, 100, 100),
+            "observed bounds must track where the window actually is"
+        );
+        assert_eq!(
+            placement.bounds,
+            Rect::new(0, 0, 100, 100),
+            "the intended placement stays put -- comparing the two is how an \
+             external move is detected (ADR 0001)"
+        );
+        assert!(
+            state.revision > revision_before,
+            "readers watching the revision must be able to notice the move"
+        );
+    }
+
+    #[test]
+    fn apply_config_still_processes_while_paused() {
+        let mut state = EngineState {
+            paused: true,
+            ..Default::default()
+        };
         let config_set = ResolvedConfigSet {
             base: ResolvedConfig::default(),
             profiles: vec![],
         };
-        apply(&mut state, Event::ConfigChanged(config_set));
+        apply(&mut state, Event::ConfigChanged(Box::new(config_set)));
         assert!(state.paused);
     }
 
@@ -2963,15 +4378,25 @@ mod tests {
 
         // After wake: a new display appears and a new window opened while asleep.
         let new_displays = vec![display(1, "MON-A", 0), display(2, "MON-B", 1920)];
-        let new_windows = vec![
-            (WindowId(1), DisplayId(1), Rect::new(0, 0, 960, 1080)), // already tracked
-            (WindowId(99), DisplayId(2), Rect::new(1920, 0, 960, 1080)), // new
-        ];
+        let mut first = observed_window(
+            1,
+            mosaix_domain::WindowRole::Normal,
+            WindowLifecycle::Active,
+        );
+        first.bounds = Rect::new(0, 0, 960, 1080);
+        let mut second = observed_window(
+            99,
+            mosaix_domain::WindowRole::Normal,
+            WindowLifecycle::Active,
+        );
+        second.display_id = DisplayId(2);
+        second.bounds = Rect::new(1920, 0, 960, 1080);
+        let new_windows = vec![first, second];
         apply(
             &mut state,
             Event::WakeReconciliation {
                 displays: new_displays,
-                windows: new_windows,
+                windows: Some(new_windows),
             },
         );
 
@@ -3027,6 +4452,31 @@ mod tests {
             !state.windows.get(&WindowId(1)).unwrap().circuit_open(),
             "circuit must not open before threshold is reached"
         );
+    }
+
+    #[test]
+    fn accepted_placement_breaks_a_rejection_streak() {
+        let mut state = EngineState::default();
+        state.windows.insert(
+            WindowId(1),
+            WindowPlacement {
+                display_id: DisplayId(1),
+                bounds: Rect::new(0, 0, 100, 100),
+                observed_bounds: Rect::new(0, 0, 100, 100),
+                previous_placement: None,
+                cycle_step: None,
+                rejection_count: 2,
+            },
+        );
+
+        apply(
+            &mut state,
+            Event::PlacementAccepted {
+                window_id: WindowId(1),
+            },
+        );
+
+        assert_eq!(state.windows[&WindowId(1)].rejection_count, 0);
     }
 
     #[test]
@@ -3182,6 +4632,410 @@ mod tests {
     }
 
     #[test]
+    fn rearrange_resets_open_circuits_and_reflows_healthy_windows_once() {
+        let mut state = EngineState {
+            displays: vec![display(1, "primary", 0)],
+            automatic_tiling_active: true,
+            ..EngineState::default()
+        };
+        apply(
+            &mut state,
+            Event::WindowsObserved {
+                windows: vec![
+                    observed_window(
+                        1,
+                        mosaix_domain::WindowRole::Normal,
+                        WindowLifecycle::Active,
+                    ),
+                    observed_window(
+                        2,
+                        mosaix_domain::WindowRole::Normal,
+                        WindowLifecycle::Active,
+                    ),
+                ],
+            },
+        );
+        for _ in 0..CIRCUIT_BREAKER_THRESHOLD {
+            apply(
+                &mut state,
+                Event::PlacementRejected {
+                    window_id: WindowId(1),
+                },
+            );
+        }
+        state.effects.clear();
+
+        apply(&mut state, Event::RearrangeRequested);
+
+        assert_eq!(state.effects, vec![EngineEffect::ReconcileWindows]);
+        state.effects.clear();
+        apply(
+            &mut state,
+            Event::RearrangeReconciliationComplete {
+                windows: vec![
+                    observed_window(
+                        1,
+                        mosaix_domain::WindowRole::Normal,
+                        WindowLifecycle::Active,
+                    ),
+                    observed_window(
+                        2,
+                        mosaix_domain::WindowRole::Normal,
+                        WindowLifecycle::Active,
+                    ),
+                ],
+            },
+        );
+
+        assert_eq!(state.circuit_breaker_count(), 0);
+        assert_eq!(
+            state.inventory[&WindowId(1)].eligibility,
+            EligibilityReason::Eligible
+        );
+        assert_eq!(
+            state.effects,
+            vec![EngineEffect::PlaceWindow {
+                window_id: WindowId(2),
+                display_id: DisplayId(1),
+                bounds: Rect::new(960, 0, 960, 1080),
+            }],
+            "one reflow should restore the healthy window's balanced cell"
+        );
+    }
+
+    #[test]
+    fn automatic_tiling_suspension_preserves_manual_placement_and_clears_on_topology_change() {
+        let mut state = EngineState {
+            displays: vec![display(1, "primary", 0)],
+            resolved_config: ResolvedConfig {
+                automatic_tiling_enabled: true,
+                ..ResolvedConfig::default()
+            },
+            automatic_tiling_active: true,
+            ..EngineState::default()
+        };
+
+        apply(&mut state, Event::ToggleAutomaticTilingRequested);
+        assert!(state.automatic_tiling_suspended);
+        assert!(!state.automatic_tiling_active);
+
+        apply(
+            &mut state,
+            Event::WindowPlaced {
+                window_id: WindowId(1),
+                display_id: DisplayId(1),
+                bounds: Rect::new(0, 0, 400, 300),
+            },
+        );
+        assert!(state.windows.contains_key(&WindowId(1)));
+
+        state.config_set.base = state.resolved_config.clone();
+        apply(
+            &mut state,
+            Event::DisplayTopologyChanged(vec![display(2, "secondary", 1920)]),
+        );
+        assert!(!state.automatic_tiling_suspended);
+        assert!(state.automatic_tiling_active);
+    }
+
+    #[test]
+    fn zone_snap_session_floats_the_focused_window_and_reflows_the_remainder() {
+        let mut state = EngineState {
+            displays: vec![display(1, "primary", 0)],
+            automatic_tiling_active: true,
+            ..EngineState::default()
+        };
+        apply(
+            &mut state,
+            Event::WindowsObserved {
+                windows: vec![
+                    observed_window(
+                        1,
+                        mosaix_domain::WindowRole::Normal,
+                        WindowLifecycle::Active,
+                    ),
+                    observed_window(
+                        2,
+                        mosaix_domain::WindowRole::Normal,
+                        WindowLifecycle::Active,
+                    ),
+                ],
+            },
+        );
+        state.effects.clear();
+        state.focused_window = Some(WindowId(1));
+
+        apply(
+            &mut state,
+            Event::ZoneSnapRequested {
+                direction: ZoneSnapDirection::Left,
+            },
+        );
+
+        assert!(state.session_floating.contains(&WindowId(1)));
+        assert_eq!(
+            state.inventory[&WindowId(1)].eligibility,
+            EligibilityReason::SessionFloating
+        );
+        assert_eq!(
+            state.windows[&WindowId(2)].bounds,
+            Rect::new(0, 0, 1920, 1080)
+        );
+    }
+
+    #[test]
+    fn directional_focus_emits_the_nearest_display_local_neighbor() {
+        let mut state = EngineState {
+            displays: vec![display(1, "primary", 0), display(2, "secondary", 1920)],
+            automatic_tiling_active: true,
+            ..EngineState::default()
+        };
+        apply(
+            &mut state,
+            Event::WindowsObserved {
+                windows: vec![
+                    observed_window(
+                        1,
+                        mosaix_domain::WindowRole::Normal,
+                        WindowLifecycle::Active,
+                    ),
+                    observed_window(
+                        2,
+                        mosaix_domain::WindowRole::Normal,
+                        WindowLifecycle::Active,
+                    ),
+                ],
+            },
+        );
+        state.focused_window = Some(WindowId(1));
+        state.effects.clear();
+
+        apply(
+            &mut state,
+            Event::DirectionalFocusRequested {
+                direction: CardinalDirection::Right,
+            },
+        );
+
+        assert_eq!(
+            state.effects,
+            vec![EngineEffect::FocusWindow {
+                window_id: WindowId(2)
+            }]
+        );
+    }
+
+    #[test]
+    fn directional_swap_exchanges_visual_order_and_reflows_changed_cells() {
+        let mut state = EngineState {
+            displays: vec![display(1, "primary", 0)],
+            automatic_tiling_active: true,
+            ..EngineState::default()
+        };
+        apply(
+            &mut state,
+            Event::WindowsObserved {
+                windows: vec![
+                    observed_window(
+                        1,
+                        mosaix_domain::WindowRole::Normal,
+                        WindowLifecycle::Active,
+                    ),
+                    observed_window(
+                        2,
+                        mosaix_domain::WindowRole::Normal,
+                        WindowLifecycle::Active,
+                    ),
+                ],
+            },
+        );
+        state.focused_window = Some(WindowId(1));
+        state.effects.clear();
+
+        apply(
+            &mut state,
+            Event::DirectionalSwapRequested {
+                direction: CardinalDirection::Right,
+            },
+        );
+
+        assert_eq!(
+            state.visual_window_order[&DisplayId(1)],
+            vec![WindowId(2), WindowId(1)]
+        );
+        assert_eq!(state.effects.len(), 2);
+    }
+
+    #[test]
+    fn interactive_placement_defers_its_display_until_session_end() {
+        let mut state = EngineState {
+            displays: vec![display(1, "primary", 0)],
+            automatic_tiling_active: true,
+            ..EngineState::default()
+        };
+        apply(
+            &mut state,
+            Event::WindowsObserved {
+                windows: vec![observed_window(
+                    1,
+                    mosaix_domain::WindowRole::Normal,
+                    WindowLifecycle::Active,
+                )],
+            },
+        );
+        apply(
+            &mut state,
+            Event::InteractivePlacementStarted {
+                window_id: WindowId(1),
+            },
+        );
+        state.effects.clear();
+        let mut second = observed_window(
+            2,
+            mosaix_domain::WindowRole::Normal,
+            WindowLifecycle::Active,
+        );
+        second.bounds = Rect::new(100, 100, 800, 600);
+        apply(
+            &mut state,
+            Event::WindowsObserved {
+                windows: vec![
+                    observed_window(
+                        1,
+                        mosaix_domain::WindowRole::Normal,
+                        WindowLifecycle::Active,
+                    ),
+                    second,
+                ],
+            },
+        );
+        assert!(state.effects.is_empty());
+
+        apply(
+            &mut state,
+            Event::InteractivePlacementEnded {
+                window_id: WindowId(1),
+                committed_manual_placement: false,
+            },
+        );
+
+        assert_eq!(state.effects.len(), 2);
+        assert!(state.interactive_placement.is_none());
+    }
+
+    #[test]
+    fn explicit_maximize_session_floats_until_the_user_toggles_it_back() {
+        let mut state = EngineState {
+            displays: vec![display(1, "primary", 0)],
+            automatic_tiling_active: true,
+            ..EngineState::default()
+        };
+        let active = observed_window(
+            1,
+            mosaix_domain::WindowRole::Normal,
+            WindowLifecycle::Active,
+        );
+        apply(
+            &mut state,
+            Event::WindowsObserved {
+                windows: vec![active.clone()],
+            },
+        );
+
+        let mut maximized = active.clone();
+        maximized.lifecycle = WindowLifecycle::Maximized;
+        apply(
+            &mut state,
+            Event::WindowsObserved {
+                windows: vec![maximized],
+            },
+        );
+        assert!(state.session_floating.contains(&WindowId(1)));
+        assert_eq!(
+            state.inventory[&WindowId(1)].eligibility,
+            EligibilityReason::SessionFloating
+        );
+
+        apply(
+            &mut state,
+            Event::WindowsObserved {
+                windows: vec![active],
+            },
+        );
+        assert_eq!(
+            state.inventory[&WindowId(1)].eligibility,
+            EligibilityReason::SessionFloating,
+            "restoring a maximized window must not silently return it to the grid"
+        );
+    }
+
+    #[test]
+    fn authoritative_observation_removes_closed_windows_and_session_state() {
+        let mut state = EngineState {
+            displays: vec![display(1, "primary", 0)],
+            automatic_tiling_active: true,
+            ..EngineState::default()
+        };
+        apply(
+            &mut state,
+            Event::WindowsObserved {
+                windows: vec![observed_window(
+                    1,
+                    mosaix_domain::WindowRole::Normal,
+                    WindowLifecycle::Active,
+                )],
+            },
+        );
+        state.focused_window = Some(WindowId(1));
+        state.session_floating.insert(WindowId(1));
+
+        apply(
+            &mut state,
+            Event::WindowsObserved {
+                windows: Vec::new(),
+            },
+        );
+
+        assert!(!state.inventory.contains_key(&WindowId(1)));
+        assert!(!state.windows.contains_key(&WindowId(1)));
+        assert!(!state.session_floating.contains(&WindowId(1)));
+        assert_eq!(state.focused_window, None);
+        assert!(state.visual_window_order[&DisplayId(1)].is_empty());
+    }
+
+    #[test]
+    fn resuming_global_pause_reflows_the_current_active_set() {
+        let mut state = EngineState {
+            displays: vec![display(1, "primary", 0)],
+            automatic_tiling_active: true,
+            paused: true,
+            ..EngineState::default()
+        };
+        apply(
+            &mut state,
+            Event::WindowsObserved {
+                windows: vec![observed_window(
+                    1,
+                    mosaix_domain::WindowRole::Normal,
+                    WindowLifecycle::Active,
+                )],
+            },
+        );
+        assert!(state.effects.is_empty());
+
+        apply(&mut state, Event::ResumeRequested);
+
+        assert_eq!(
+            state.effects,
+            vec![EngineEffect::PlaceWindow {
+                window_id: WindowId(1),
+                display_id: DisplayId(1),
+                bounds: Rect::new(0, 0, 1920, 1080),
+            }]
+        );
+    }
+
+    #[test]
     fn diff_placements_excludes_open_circuit_windows() {
         // Windows whose circuit is open must not appear in the diff so the
         // executor never tries to `SetWindowPos` them again.
@@ -3189,6 +5043,7 @@ mod tests {
         let open_circuit = WindowPlacement {
             display_id: DisplayId(1),
             bounds: Rect::new(0, 0, 100, 100),
+            observed_bounds: Rect::new(0, 0, 100, 100),
             previous_placement: None,
             cycle_step: None,
             rejection_count: CIRCUIT_BREAKER_THRESHOLD,
@@ -3196,6 +5051,7 @@ mod tests {
         let healthy = WindowPlacement {
             display_id: DisplayId(1),
             bounds: Rect::new(100, 100, 200, 200),
+            observed_bounds: Rect::new(100, 100, 200, 200),
             previous_placement: None,
             cycle_step: None,
             rejection_count: 0,
@@ -3218,6 +5074,917 @@ mod tests {
         assert!(
             ids.contains(&WindowId(2)),
             "healthy window with changed bounds must appear in the diff"
+        );
+    }
+
+    fn saved_layout(cells: &[(f64, f64, f64, f64)]) -> mosaix_config::SavedLayout {
+        mosaix_config::SavedLayout {
+            cells: cells
+                .iter()
+                .map(|(x, y, width, height)| mosaix_domain::NormalizedRect {
+                    x: *x,
+                    y: *y,
+                    width: *width,
+                    height: *height,
+                })
+                .collect(),
+        }
+    }
+
+    /// One 1920x1080 display at the origin carrying a saved layout under
+    /// `name`, with nothing observed and nothing focused yet.
+    fn state_with_saved_layout(name: &str, cells: &[(f64, f64, f64, f64)]) -> EngineState {
+        let mut layouts = std::collections::BTreeMap::new();
+        layouts.insert(name.to_owned(), saved_layout(cells));
+        EngineState {
+            displays: vec![display(1, "primary", 0)],
+            resolved_config: ResolvedConfig {
+                layouts,
+                ..ResolvedConfig::default()
+            },
+            ..EngineState::default()
+        }
+    }
+
+    fn window_at(id: isize, display_id: isize, bounds: Rect) -> Window {
+        let mut window = observed_window(
+            id,
+            mosaix_domain::WindowRole::Normal,
+            WindowLifecycle::Active,
+        );
+        window.display_id = DisplayId(display_id);
+        window.bounds = bounds;
+        window
+    }
+
+    fn placements(state: &EngineState) -> Vec<(WindowId, DisplayId, Rect)> {
+        state
+            .effects
+            .iter()
+            .filter_map(|effect| match effect {
+                EngineEffect::PlaceWindow {
+                    window_id,
+                    display_id,
+                    bounds,
+                } => Some((*window_id, *display_id, *bounds)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn applying_a_saved_layout_places_the_displays_windows_into_its_cells() {
+        let mut state =
+            state_with_saved_layout("writing", &[(0.0, 0.0, 0.6, 1.0), (0.6, 0.0, 0.4, 1.0)]);
+        apply(
+            &mut state,
+            Event::WindowsObserved {
+                windows: vec![
+                    window_at(1, 1, Rect::new(0, 0, 400, 300)),
+                    window_at(2, 1, Rect::new(900, 0, 400, 300)),
+                ],
+            },
+        );
+        state.focused_window = Some(WindowId(1));
+        state.effects.clear();
+
+        apply(
+            &mut state,
+            Event::SavedLayoutApplyRequested {
+                name: "writing".to_owned(),
+            },
+        );
+
+        assert_eq!(
+            placements(&state),
+            vec![
+                (WindowId(1), DisplayId(1), Rect::new(0, 0, 1152, 1080)),
+                (WindowId(2), DisplayId(1), Rect::new(1152, 0, 768, 1080)),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_saved_layout_fills_its_cells_in_visual_window_order() {
+        let mut state =
+            state_with_saved_layout("stack", &[(0.0, 0.0, 1.0, 0.5), (0.0, 0.5, 1.0, 0.5)]);
+        apply(
+            &mut state,
+            Event::WindowsObserved {
+                windows: vec![
+                    // Observed first, but sitting lower on screen, so
+                    // visual window order puts it in the second cell.
+                    window_at(9, 1, Rect::new(0, 600, 400, 300)),
+                    window_at(4, 1, Rect::new(0, 100, 400, 300)),
+                ],
+            },
+        );
+        state.focused_window = Some(WindowId(9));
+        state.effects.clear();
+
+        apply(
+            &mut state,
+            Event::SavedLayoutApplyRequested {
+                name: "stack".to_owned(),
+            },
+        );
+
+        assert_eq!(
+            placements(&state),
+            vec![
+                (WindowId(4), DisplayId(1), Rect::new(0, 0, 1920, 540)),
+                (WindowId(9), DisplayId(1), Rect::new(0, 540, 1920, 540)),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_saved_layout_targets_the_focused_windows_display_and_leaves_the_others_alone() {
+        let mut state = state_with_saved_layout("half", &[(0.0, 0.0, 0.5, 1.0)]);
+        state.displays.push(display(2, "secondary", 1920));
+        apply(
+            &mut state,
+            Event::WindowsObserved {
+                windows: vec![
+                    window_at(1, 1, Rect::new(0, 0, 400, 300)),
+                    window_at(2, 2, Rect::new(1920, 0, 400, 300)),
+                ],
+            },
+        );
+        state.focused_window = Some(WindowId(2));
+        state.effects.clear();
+
+        apply(
+            &mut state,
+            Event::SavedLayoutApplyRequested {
+                name: "half".to_owned(),
+            },
+        );
+
+        assert_eq!(
+            placements(&state),
+            vec![(WindowId(2), DisplayId(2), Rect::new(1920, 0, 960, 1080))],
+            "only the focused window's display is rearranged"
+        );
+    }
+
+    #[test]
+    fn applying_a_saved_layout_with_no_focused_managed_window_is_rejected_and_places_nothing() {
+        let mut state = state_with_saved_layout("half", &[(0.0, 0.0, 0.5, 1.0)]);
+        apply(
+            &mut state,
+            Event::WindowsObserved {
+                windows: vec![window_at(1, 1, Rect::new(0, 0, 400, 300))],
+            },
+        );
+        state.effects.clear();
+        let revision = state.revision;
+
+        assert_eq!(
+            plan_saved_layout(&state, "half"),
+            Err(SavedLayoutRejection::NoFocusedManagedWindow)
+        );
+
+        apply(
+            &mut state,
+            Event::SavedLayoutApplyRequested {
+                name: "half".to_owned(),
+            },
+        );
+
+        assert!(placements(&state).is_empty());
+        assert_eq!(
+            state.revision, revision,
+            "a rejected command commits nothing"
+        );
+    }
+
+    #[test]
+    fn focus_on_a_window_outside_the_managed_inventory_is_not_a_layout_target() {
+        let mut state = state_with_saved_layout("half", &[(0.0, 0.0, 0.5, 1.0)]);
+        apply(
+            &mut state,
+            Event::WindowsObserved {
+                windows: vec![window_at(1, 1, Rect::new(0, 0, 400, 300))],
+            },
+        );
+        // An excluded window -- a popup, say -- can hold OS focus without
+        // ever entering the managed inventory.
+        state.focused_window = Some(WindowId(77));
+
+        assert_eq!(
+            plan_saved_layout(&state, "half"),
+            Err(SavedLayoutRejection::NoFocusedManagedWindow)
+        );
+    }
+
+    #[test]
+    fn applying_an_unknown_saved_layout_is_rejected_naming_it() {
+        let mut state = state_with_saved_layout("writing", &[(0.0, 0.0, 1.0, 1.0)]);
+        apply(
+            &mut state,
+            Event::WindowsObserved {
+                windows: vec![window_at(1, 1, Rect::new(0, 0, 400, 300))],
+            },
+        );
+        state.focused_window = Some(WindowId(1));
+        state.effects.clear();
+
+        let rejection = plan_saved_layout(&state, "wrtiing").unwrap_err();
+
+        assert_eq!(
+            rejection,
+            SavedLayoutRejection::UnknownLayout {
+                name: "wrtiing".to_owned()
+            }
+        );
+        assert!(rejection.to_string().contains("wrtiing"));
+
+        apply(
+            &mut state,
+            Event::SavedLayoutApplyRequested {
+                name: "wrtiing".to_owned(),
+            },
+        );
+        assert!(placements(&state).is_empty());
+    }
+
+    #[test]
+    fn a_saved_layout_with_more_windows_than_cells_places_only_what_fits() {
+        let mut state = state_with_saved_layout("single", &[(0.0, 0.0, 1.0, 1.0)]);
+        apply(
+            &mut state,
+            Event::WindowsObserved {
+                windows: vec![
+                    window_at(1, 1, Rect::new(0, 0, 400, 300)),
+                    window_at(2, 1, Rect::new(0, 500, 400, 300)),
+                ],
+            },
+        );
+        state.focused_window = Some(WindowId(1));
+        state.effects.clear();
+
+        apply(
+            &mut state,
+            Event::SavedLayoutApplyRequested {
+                name: "single".to_owned(),
+            },
+        );
+
+        assert_eq!(
+            placements(&state),
+            vec![(WindowId(1), DisplayId(1), Rect::new(0, 0, 1920, 1080))]
+        );
+    }
+
+    #[test]
+    fn a_saved_layout_with_more_cells_than_windows_leaves_the_surplus_empty() {
+        let mut state = state_with_saved_layout(
+            "three-up",
+            &[
+                (0.0, 0.0, 0.34, 1.0),
+                (0.34, 0.0, 0.33, 1.0),
+                (0.67, 0.0, 0.33, 1.0),
+            ],
+        );
+        apply(
+            &mut state,
+            Event::WindowsObserved {
+                windows: vec![window_at(1, 1, Rect::new(0, 0, 400, 300))],
+            },
+        );
+        state.focused_window = Some(WindowId(1));
+        state.effects.clear();
+
+        apply(
+            &mut state,
+            Event::SavedLayoutApplyRequested {
+                name: "three-up".to_owned(),
+            },
+        );
+
+        assert_eq!(placements(&state).len(), 1);
+    }
+
+    #[test]
+    fn a_minimized_window_is_not_given_a_cell() {
+        let mut state =
+            state_with_saved_layout("pair", &[(0.0, 0.0, 0.5, 1.0), (0.5, 0.0, 0.5, 1.0)]);
+        let mut minimized = window_at(2, 1, Rect::new(0, 500, 400, 300));
+        minimized.lifecycle = WindowLifecycle::Minimized;
+        apply(
+            &mut state,
+            Event::WindowsObserved {
+                windows: vec![window_at(1, 1, Rect::new(0, 0, 400, 300)), minimized],
+            },
+        );
+        state.focused_window = Some(WindowId(1));
+        state.effects.clear();
+
+        apply(
+            &mut state,
+            Event::SavedLayoutApplyRequested {
+                name: "pair".to_owned(),
+            },
+        );
+
+        assert_eq!(
+            placements(&state),
+            vec![(WindowId(1), DisplayId(1), Rect::new(0, 0, 960, 1080))]
+        );
+    }
+
+    #[test]
+    fn applying_a_saved_layout_while_paused_is_rejected() {
+        let mut state = state_with_saved_layout("half", &[(0.0, 0.0, 0.5, 1.0)]);
+        apply(
+            &mut state,
+            Event::WindowsObserved {
+                windows: vec![window_at(1, 1, Rect::new(0, 0, 400, 300))],
+            },
+        );
+        state.focused_window = Some(WindowId(1));
+        apply(&mut state, Event::PauseRequested);
+        state.effects.clear();
+
+        assert_eq!(
+            plan_saved_layout(&state, "half"),
+            Err(SavedLayoutRejection::Paused)
+        );
+
+        apply(
+            &mut state,
+            Event::SavedLayoutApplyRequested {
+                name: "half".to_owned(),
+            },
+        );
+        assert!(placements(&state).is_empty());
+    }
+
+    /// [`state_with_saved_layout`] plus gaps, for the ADR 0006
+    /// post-processing step.
+    fn state_with_saved_layout_and_gaps(
+        name: &str,
+        cells: &[(f64, f64, f64, f64)],
+        gaps: mosaix_domain::Gaps,
+    ) -> EngineState {
+        let mut state = state_with_saved_layout(name, cells);
+        state.resolved_config.gaps = gaps;
+        state
+    }
+
+    /// [`state_with_saved_layout`] with automatic tiling running, so an
+    /// applied layout has an active tiling set to be pulled out of.
+    fn tiling_state_with_saved_layout(name: &str, cells: &[(f64, f64, f64, f64)]) -> EngineState {
+        let mut state = state_with_saved_layout(name, cells);
+        state.resolved_config.automatic_tiling_enabled = true;
+        state.automatic_tiling_active = true;
+        state
+    }
+
+    #[test]
+    fn gaps_inset_a_restored_layouts_rectangles_the_same_way_they_inset_the_grid() {
+        let mut state = state_with_saved_layout_and_gaps(
+            "writing",
+            &[(0.0, 0.0, 0.5, 1.0), (0.5, 0.0, 0.5, 1.0)],
+            mosaix_domain::Gaps::new(10, 4),
+        );
+        apply(
+            &mut state,
+            Event::WindowsObserved {
+                windows: vec![
+                    window_at(1, 1, Rect::new(0, 0, 400, 300)),
+                    window_at(2, 1, Rect::new(900, 0, 400, 300)),
+                ],
+            },
+        );
+        state.focused_window = Some(WindowId(1));
+        state.effects.clear();
+
+        apply(
+            &mut state,
+            Event::SavedLayoutApplyRequested {
+                name: "writing".to_owned(),
+            },
+        );
+
+        // Outer gap on the three work-area edges each cell touches, inner
+        // gap on the seam between them -- byte for byte what `apply_gaps`
+        // does to a two-cell balanced grid on this display.
+        let work_area = state.displays[0].work_area;
+        let expected: Vec<Rect> = plan_balanced_grid(work_area, 2)
+            .into_iter()
+            .map(|raw| apply_gaps(raw, work_area, mosaix_domain::Gaps::new(10, 4)))
+            .collect();
+        assert_eq!(
+            placements(&state),
+            vec![
+                (WindowId(1), DisplayId(1), expected[0]),
+                (WindowId(2), DisplayId(1), expected[1]),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_cells_to_rectangles_function_itself_stays_gap_unaware() {
+        let work_area = Rect::new(0, 0, 1920, 1080);
+        let cells = [mosaix_domain::NormalizedRect {
+            x: 0.0,
+            y: 0.0,
+            width: 0.5,
+            height: 1.0,
+        }];
+
+        // Same input, and gaps live in `resolved_config`, nowhere this
+        // call can see -- so the ungapped rectangle is the only thing it
+        // can produce (ADR 0006).
+        assert_eq!(
+            resolve_saved_layout(work_area, &cells),
+            vec![Rect::new(0, 0, 960, 1080)]
+        );
+    }
+
+    #[test]
+    fn applying_a_layout_under_automatic_tiling_session_floats_what_it_placed() {
+        let mut state = tiling_state_with_saved_layout(
+            "writing",
+            &[(0.0, 0.0, 0.6, 1.0), (0.6, 0.0, 0.4, 1.0)],
+        );
+        apply(
+            &mut state,
+            Event::WindowsObserved {
+                windows: vec![
+                    window_at(1, 1, Rect::new(0, 0, 400, 300)),
+                    window_at(2, 1, Rect::new(900, 0, 400, 300)),
+                ],
+            },
+        );
+        state.focused_window = Some(WindowId(1));
+        state.effects.clear();
+
+        apply(
+            &mut state,
+            Event::SavedLayoutApplyRequested {
+                name: "writing".to_owned(),
+            },
+        );
+
+        assert!(state.session_floating.contains(&WindowId(1)));
+        assert!(state.session_floating.contains(&WindowId(2)));
+        assert_eq!(
+            state.inventory[&WindowId(1)].eligibility,
+            EligibilityReason::SessionFloating
+        );
+        assert_eq!(
+            placements(&state),
+            vec![
+                (WindowId(1), DisplayId(1), Rect::new(0, 0, 1152, 1080)),
+                (WindowId(2), DisplayId(1), Rect::new(1152, 0, 768, 1080)),
+            ],
+            "the reflow that follows must not overwrite the cells just committed"
+        );
+    }
+
+    #[test]
+    fn the_remaining_tiling_set_reflows_around_a_layout_in_one_pass() {
+        // A one-cell layout on a three-window display: window 1 takes the
+        // cell and floats, and 2 and 3 -- still tiled -- must end up
+        // sharing the whole work area as a two-window grid.
+        let mut state = tiling_state_with_saved_layout("solo", &[(0.0, 0.0, 0.5, 1.0)]);
+        apply(
+            &mut state,
+            Event::WindowsObserved {
+                windows: vec![
+                    window_at(1, 1, Rect::new(0, 0, 400, 300)),
+                    window_at(2, 1, Rect::new(0, 400, 400, 300)),
+                    window_at(3, 1, Rect::new(0, 800, 400, 300)),
+                ],
+            },
+        );
+        state.focused_window = Some(WindowId(1));
+        state.effects.clear();
+
+        apply(
+            &mut state,
+            Event::SavedLayoutApplyRequested {
+                name: "solo".to_owned(),
+            },
+        );
+
+        let committed = placements(&state);
+        assert_eq!(
+            committed
+                .iter()
+                .filter(|(window_id, _, _)| *window_id == WindowId(2))
+                .count(),
+            1,
+            "the reflow around the layout must be a single pass, got {committed:?}"
+        );
+        let grid = plan_balanced_grid(state.displays[0].work_area, 2);
+        assert_eq!(
+            state.windows[&WindowId(2)].bounds,
+            grid[0],
+            "the still-tiled windows reflow as a two-window grid"
+        );
+        assert_eq!(state.windows[&WindowId(3)].bounds, grid[1]);
+        assert_eq!(
+            state.windows[&WindowId(1)].bounds,
+            Rect::new(0, 0, 960, 1080),
+            "the window the layout placed keeps its cell"
+        );
+    }
+
+    #[test]
+    fn toggle_floating_returns_a_layout_placed_window_to_the_tiling_set() {
+        let mut state = tiling_state_with_saved_layout("solo", &[(0.0, 0.0, 0.5, 1.0)]);
+        apply(
+            &mut state,
+            Event::WindowsObserved {
+                windows: vec![
+                    window_at(1, 1, Rect::new(0, 0, 400, 300)),
+                    window_at(2, 1, Rect::new(0, 400, 400, 300)),
+                ],
+            },
+        );
+        state.focused_window = Some(WindowId(1));
+        apply(
+            &mut state,
+            Event::SavedLayoutApplyRequested {
+                name: "solo".to_owned(),
+            },
+        );
+        assert!(state.session_floating.contains(&WindowId(1)));
+        state.effects.clear();
+
+        apply(&mut state, Event::ToggleFloatingRequested);
+
+        assert!(!state.session_floating.contains(&WindowId(1)));
+        assert_eq!(
+            state.inventory[&WindowId(1)].eligibility,
+            EligibilityReason::Eligible
+        );
+        let grid = plan_balanced_grid(state.displays[0].work_area, 2);
+        assert_eq!(state.windows[&WindowId(1)].bounds, grid[0]);
+        assert_eq!(state.windows[&WindowId(2)].bounds, grid[1]);
+    }
+
+    #[test]
+    fn applying_a_layout_with_tiling_off_floats_nothing() {
+        let mut state = state_with_saved_layout("solo", &[(0.0, 0.0, 0.5, 1.0)]);
+        apply(
+            &mut state,
+            Event::WindowsObserved {
+                windows: vec![window_at(1, 1, Rect::new(0, 0, 400, 300))],
+            },
+        );
+        state.focused_window = Some(WindowId(1));
+
+        apply(
+            &mut state,
+            Event::SavedLayoutApplyRequested {
+                name: "solo".to_owned(),
+            },
+        );
+
+        assert!(
+            state.session_floating.is_empty(),
+            "with no grid to be pulled out of, there is nothing to float"
+        );
+    }
+
+    #[test]
+    fn more_cells_than_windows_reports_nothing_unplaced_and_succeeds() {
+        let mut state = state_with_saved_layout(
+            "three-up",
+            &[
+                (0.0, 0.0, 0.34, 1.0),
+                (0.34, 0.0, 0.33, 1.0),
+                (0.67, 0.0, 0.33, 1.0),
+            ],
+        );
+        apply(
+            &mut state,
+            Event::WindowsObserved {
+                windows: vec![window_at(1, 1, Rect::new(0, 0, 400, 300))],
+            },
+        );
+        state.focused_window = Some(WindowId(1));
+
+        let plan =
+            plan_saved_layout(&state, "three-up").expect("a surplus of cells is not a failure");
+
+        assert_eq!(plan.placements.len(), 1);
+        assert_eq!(plan.unplaced, 0, "empty cells are not unplaced windows");
+    }
+
+    #[test]
+    fn more_windows_than_cells_reports_how_many_it_could_not_place() {
+        let mut state = state_with_saved_layout("single", &[(0.0, 0.0, 1.0, 1.0)]);
+        apply(
+            &mut state,
+            Event::WindowsObserved {
+                windows: vec![
+                    window_at(1, 1, Rect::new(0, 0, 400, 300)),
+                    window_at(2, 1, Rect::new(0, 400, 400, 300)),
+                    window_at(3, 1, Rect::new(0, 800, 400, 300)),
+                ],
+            },
+        );
+        state.focused_window = Some(WindowId(1));
+        state.effects.clear();
+
+        let plan =
+            plan_saved_layout(&state, "single").expect("a surplus of windows is not a failure");
+        assert_eq!(plan.placements.len(), 1);
+        assert_eq!(plan.unplaced, 2);
+
+        apply(
+            &mut state,
+            Event::SavedLayoutApplyRequested {
+                name: "single".to_owned(),
+            },
+        );
+
+        // The two it could not place are left exactly where they were,
+        // not dropped, shrunk, or stacked somewhere.
+        assert_eq!(placements(&state).len(), 1);
+        assert_eq!(
+            state.inventory[&WindowId(2)].window.bounds,
+            Rect::new(0, 400, 400, 300)
+        );
+        assert_eq!(
+            state.inventory[&WindowId(3)].window.bounds,
+            Rect::new(0, 800, 400, 300)
+        );
+    }
+
+    #[test]
+    fn an_open_circuit_breaker_suppresses_a_layout_placement_without_floating_the_window() {
+        let mut state =
+            tiling_state_with_saved_layout("pair", &[(0.0, 0.0, 0.5, 1.0), (0.5, 0.0, 0.5, 1.0)]);
+        apply(
+            &mut state,
+            Event::WindowsObserved {
+                windows: vec![
+                    window_at(1, 1, Rect::new(0, 0, 400, 300)),
+                    window_at(2, 1, Rect::new(0, 400, 400, 300)),
+                ],
+            },
+        );
+        state.focused_window = Some(WindowId(1));
+        state.windows.get_mut(&WindowId(2)).unwrap().rejection_count = CIRCUIT_BREAKER_THRESHOLD;
+        state.effects.clear();
+
+        apply(
+            &mut state,
+            Event::SavedLayoutApplyRequested {
+                name: "pair".to_owned(),
+            },
+        );
+
+        let committed = placements(&state);
+        assert!(
+            committed
+                .iter()
+                .all(|(window_id, _, _)| *window_id != WindowId(2)),
+            "an open circuit still suppresses the placement, got {committed:?}"
+        );
+        assert!(
+            !state.session_floating.contains(&WindowId(2)),
+            "a window that was never moved must not be pulled out of the tiling set"
+        );
+        assert!(state.session_floating.contains(&WindowId(1)));
+    }
+
+    #[test]
+    fn a_saved_layout_is_rejected_when_the_focused_windows_display_has_gone() {
+        let mut state = state_with_saved_layout("half", &[(0.0, 0.0, 0.5, 1.0)]);
+        apply(
+            &mut state,
+            Event::WindowsObserved {
+                windows: vec![window_at(1, 1, Rect::new(0, 0, 400, 300))],
+            },
+        );
+        state.focused_window = Some(WindowId(1));
+        state.displays.clear();
+
+        assert_eq!(
+            plan_saved_layout(&state, "half"),
+            Err(SavedLayoutRejection::DisplayUnavailable {
+                display_id: DisplayId(1)
+            })
+        );
+    }
+
+    #[test]
+    fn hotkey_capture_start_suspends_registration_and_end_restores_it() {
+        let mut state = EngineState::default();
+
+        apply(&mut state, Event::HotkeyCaptureStarted);
+        assert!(state.hotkey_capture_suspended);
+        assert_eq!(state.revision, 1);
+
+        apply(&mut state, Event::HotkeyCaptureEnded);
+        assert!(!state.hotkey_capture_suspended);
+        assert_eq!(state.revision, 2);
+    }
+
+    #[test]
+    fn a_second_editor_does_not_re_suspend_what_is_already_suspended() {
+        let mut state = EngineState::default();
+        apply(&mut state, Event::HotkeyCaptureStarted);
+
+        apply(&mut state, Event::HotkeyCaptureStarted);
+
+        assert!(state.hotkey_capture_suspended);
+        assert_eq!(
+            state.revision, 1,
+            "a second editor window is not a second suspension"
+        );
+    }
+
+    #[test]
+    fn suspension_lasts_until_the_editor_that_closes_last() {
+        let mut state = EngineState::default();
+        apply(&mut state, Event::HotkeyCaptureStarted);
+        apply(&mut state, Event::HotkeyCaptureStarted);
+
+        apply(&mut state, Event::HotkeyCaptureEnded);
+
+        assert!(
+            state.hotkey_capture_suspended,
+            "one editor closing must not re-register under another whose capture dialog is armed"
+        );
+
+        apply(&mut state, Event::HotkeyCaptureEnded);
+
+        assert!(!state.hotkey_capture_suspended);
+    }
+
+    #[test]
+    fn a_stray_capture_end_cannot_drive_the_hold_count_below_zero() {
+        let mut state = EngineState::default();
+        apply(&mut state, Event::HotkeyCaptureEnded);
+        apply(&mut state, Event::HotkeyCaptureStarted);
+
+        apply(&mut state, Event::HotkeyCaptureEnded);
+
+        assert!(
+            !state.hotkey_capture_suspended,
+            "the one editor that opened has closed, so nothing holds suspension"
+        );
+    }
+
+    #[test]
+    fn capture_end_without_a_capture_changes_nothing() {
+        let mut state = EngineState::default();
+
+        apply(&mut state, Event::HotkeyCaptureEnded);
+
+        assert!(!state.hotkey_capture_suspended);
+        assert_eq!(state.revision, 0);
+    }
+
+    #[test]
+    fn a_config_reload_during_capture_leaves_registration_suspended() {
+        let mut state = EngineState::default();
+        apply(&mut state, Event::HotkeyCaptureStarted);
+
+        apply(&mut state, Event::ConfigChanged(Box::default()));
+
+        assert!(
+            state.hotkey_capture_suspended,
+            "a configuration change must not lift the editor's suspension"
+        );
+    }
+
+    #[test]
+    fn a_registration_pass_records_the_bindings_that_did_not_come_back() {
+        let mut state = EngineState::default();
+
+        apply(
+            &mut state,
+            Event::HotkeyRegistrationReported {
+                unregistered: vec![Command::SnapLeft],
+            },
+        );
+
+        assert_eq!(state.unregistered_bindings, vec![Command::SnapLeft]);
+        assert_eq!(state.revision, 1);
+    }
+
+    #[test]
+    fn opening_the_editor_keeps_the_previous_passs_failures_to_report() {
+        let mut state = EngineState::default();
+        apply(
+            &mut state,
+            Event::HotkeyRegistrationReported {
+                unregistered: vec![Command::SnapLeft],
+            },
+        );
+
+        apply(&mut state, Event::HotkeyCaptureStarted);
+
+        assert_eq!(
+            state.unregistered_bindings,
+            vec![Command::SnapLeft],
+            "a binding that did not come back is only known after the editor that \
+             caused it has closed, so the next editor to open is the only one that \
+             can tell the user"
+        );
+    }
+
+    #[test]
+    fn an_unchanged_registration_report_does_not_bump_the_revision() {
+        let mut state = EngineState::default();
+        apply(
+            &mut state,
+            Event::HotkeyRegistrationReported {
+                unregistered: vec![Command::SnapLeft],
+            },
+        );
+        let revision = state.revision;
+
+        apply(
+            &mut state,
+            Event::HotkeyRegistrationReported {
+                unregistered: vec![Command::SnapLeft],
+            },
+        );
+
+        assert_eq!(state.revision, revision);
+    }
+
+    #[test]
+    fn applying_a_layout_records_it_as_that_displays_current_arrangement() {
+        let mut state = state_with_saved_layout("half", &[(0.0, 0.0, 0.5, 1.0)]);
+        apply(
+            &mut state,
+            Event::WindowsObserved {
+                windows: vec![window_at(1, 1, Rect::new(0, 0, 400, 300))],
+            },
+        );
+        state.focused_window = Some(WindowId(1));
+
+        apply(
+            &mut state,
+            Event::SavedLayoutApplyRequested {
+                name: "half".to_owned(),
+            },
+        );
+
+        assert_eq!(
+            state.last_applied_layouts.get(&DisplayId(1)),
+            Some(&"half".to_owned()),
+            "machine-readable state has to say what a display is currently arranged as"
+        );
+    }
+
+    #[test]
+    fn a_rejected_layout_apply_records_nothing() {
+        let mut state = state_with_saved_layout("half", &[(0.0, 0.0, 0.5, 1.0)]);
+        // Nothing focused, so the apply is rejected with a reason and
+        // changes nothing (ADR 0020).
+
+        apply(
+            &mut state,
+            Event::SavedLayoutApplyRequested {
+                name: "half".to_owned(),
+            },
+        );
+
+        assert!(
+            state.last_applied_layouts.is_empty(),
+            "an apply that placed nothing must not claim a display is arranged as it"
+        );
+    }
+
+    #[test]
+    fn a_display_that_leaves_the_topology_takes_its_recorded_layout_with_it() {
+        let mut state = state_with_saved_layout("half", &[(0.0, 0.0, 0.5, 1.0)]);
+        apply(
+            &mut state,
+            Event::WindowsObserved {
+                windows: vec![window_at(1, 1, Rect::new(0, 0, 400, 300))],
+            },
+        );
+        state.focused_window = Some(WindowId(1));
+        apply(
+            &mut state,
+            Event::SavedLayoutApplyRequested {
+                name: "half".to_owned(),
+            },
+        );
+        assert!(!state.last_applied_layouts.is_empty());
+
+        apply(
+            &mut state,
+            Event::DisplayTopologyChanged(vec![display(2, "MON-B", 1920)]),
+        );
+
+        assert!(
+            state.last_applied_layouts.is_empty(),
+            "a display nobody can see has no current arrangement to report"
         );
     }
 }

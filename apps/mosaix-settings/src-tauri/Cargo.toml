@@ -19,5 +19,17 @@ tauri-build = { version = "2.6.3", features = [] }
 
 [dependencies]
 serde = { workspace = true }
+serde_json = { workspace = true }
 tauri = { version = "2.11.5", features = [] }
+mosaix-config = { path = "../../../crates/mosaix-config" }
+mosaix-domain = { path = "../../../crates/mosaix-domain" }
+mosaix-platform-windows = { path = "../../../crates/mosaix-platform-windows" }
+# Not gated to Windows: only `client`/`pipe` are, and the settings
+# application needs `StateSnapshot` and the request enumeration to compile
+# its own platform-neutral editor session and its tests.
 mosaix-ipc = { path = "../../../crates/mosaix-ipc" }
+tracing = { workspace = true }
+
+[dev-dependencies]
+# Only to build a `StateSnapshot` fixture, which is `From<EngineState>`.
+mosaix-engine = { path = "../../../crates/mosaix-engine" }

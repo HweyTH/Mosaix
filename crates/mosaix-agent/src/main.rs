@@ -25,10 +25,15 @@ mod overlay;
 /// Starts `RegisterHotKey` registration for `bindings` and a forwarder
 /// thread translating each firing into `Event::ZoneSnapRequested`,
 /// mirroring the shape of every other OS-event forwarder in this file.
-/// Per-binding registration failures are logged and otherwise ignored (ADR
-/// 0002's partial-success posture, preserved through every re-registration,
-/// not just the first); only a failure to start the registration thread
-/// itself is reported to the caller.
+/// Registration stays partial-success (ADR 0002), preserved through every
+/// re-registration and not just the first; only a failure to start the
+/// registration thread itself is reported to the caller.
+///
+/// Which bindings the platform refused travels back into engine state as
+/// [`mosaix_engine::Event::HotkeyRegistrationReported`], so a combination
+/// another application took while hotkey capture held registration
+/// suspended is named to the user rather than left as a shortcut that
+/// silently stopped working (ADR 0021).
 ///
 /// When `overlay_tx` is present, each successful enqueue also signals the
 /// snap-preview controller (Feature 34) with the pre-send revision so it
@@ -36,6 +41,7 @@ mod overlay;
 #[cfg(windows)]
 fn start_hotkeys_and_forward(
     bindings: Vec<mosaix_platform_windows::HotkeyBinding>,
+    mut registry: hotkeys::HotkeyRegistry,
     events: mosaix_engine::EventSender,
     state_reader: mosaix_engine::StateReader,
     overlay_tx: Option<std::sync::mpsc::Sender<overlay::OverlayRequest>>,
@@ -44,43 +50,70 @@ fn start_hotkeys_and_forward(
     std::thread::JoinHandle<()>,
 )> {
     let (registrations, hotkey_events) = mosaix_platform_windows::start_hotkeys(bindings)?;
+    let mut unregistered = Vec::new();
     for result in &registrations.results {
         if let Err(err) = &result.outcome {
-            let command = hotkeys::command_for_hotkey_id(result.id);
+            // A binding the OS refused holds no registry entry, so its id
+            // resolves to nothing rather than to a command that never
+            // actually got a hotkey.
+            let command = registry.forget(result.id);
             tracing::error!(
                 hotkey_id = result.id,
                 ?command,
                 %err,
                 "failed to register hotkey; that binding will not work, the rest still will"
             );
+            unregistered.extend(command);
         }
     }
+    // Sent on every pass, including the one that reports nothing: an
+    // empty report is what clears a previous pass's failures once the
+    // combination comes back.
+    let _ = events.send(mosaix_engine::Event::HotkeyRegistrationReported { unregistered });
     let forwarder = std::thread::spawn(move || {
         for fired in hotkey_events {
-            let Some(command) = hotkeys::command_for_hotkey_id(fired.id) else {
+            let Some(command) = registry.command_for(fired.id) else {
                 tracing::warn!(
                     hotkey_id = fired.id,
                     "hotkey fired for an unknown id; ignoring"
                 );
                 continue;
             };
-            let direction = hotkeys::direction_for_command(command);
-            let pre_revision = state_reader.snapshot().revision;
-            if events
-                .send(mosaix_engine::Event::ZoneSnapRequested { direction })
-                .is_err()
-            {
+            // One snapshot for both reads, so the revision the overlay
+            // flashes from and the pause state `toggle-pause` inverts
+            // describe the same instant.
+            let snapshot = state_reader.snapshot();
+            let pre_revision = snapshot.revision;
+            let event = hotkeys::event_for_command(&command, snapshot.paused);
+            if events.send(event).is_err() {
                 tracing::warn!("reducer stopped; hotkey forwarder exiting");
                 break;
             }
-            if let Some(tx) = &overlay_tx {
-                let _ = tx.send(overlay::OverlayRequest::FlashAfterSnap {
-                    revision: pre_revision,
-                });
+            if hotkeys::is_zone_snap(&command) {
+                if let Some(tx) = &overlay_tx {
+                    let _ = tx.send(overlay::OverlayRequest::FlashAfterSnap {
+                        revision: pre_revision,
+                    });
+                }
             }
         }
     });
     Ok((registrations, forwarder))
+}
+
+#[cfg(windows)]
+fn retry_empty_topology(mut displays: Vec<mosaix_domain::Display>) -> Vec<mosaix_domain::Display> {
+    const RETRIES: usize = 3;
+    const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
+    for attempt in 1..=RETRIES {
+        if !displays.is_empty() {
+            break;
+        }
+        tracing::warn!(attempt, "empty topology observation; retrying enumeration");
+        std::thread::sleep(RETRY_DELAY);
+        displays = mosaix_platform_windows::enumerate_displays().unwrap_or_default();
+    }
+    displays
 }
 
 #[cfg(windows)]
@@ -181,39 +214,77 @@ fn main() {
                 Vec::new()
             }
         };
-        let placements: Vec<_> = windows
-            .iter()
-            .filter_map(|window| {
-                let handle = mosaix_platform_windows::window_handle_from_id(window.id);
-                let (display_id, bounds) = mosaix_platform_windows::observed_window_state(handle)?;
-                Some((window.id, display_id, bounds))
-            })
-            .collect();
         tracing::info!(
-            window_count = placements.len(),
-            "sending startup reconciliation with pre-existing windows"
+            window_count = windows.len(),
+            "sending normalized startup window observations"
         );
         if engine
             .events()
-            .send(mosaix_engine::Event::StartupReconciliation {
-                windows: placements,
-            })
+            .send(mosaix_engine::Event::WindowsObserved { windows })
             .is_err()
         {
             tracing::error!("reducer stopped before startup reconciliation could be sent");
         }
+
+        // The engine otherwise only learns about focus from a
+        // foreground-*change* notification, so a freshly started agent has
+        // no focus anchor until the user next switches windows -- leaving
+        // directional focus/swap silent no-ops and the Focus border hidden
+        // while automatic tiling is already active.  Seed it from whatever
+        // owns the foreground right now, as an ordinary observation.
+        match mosaix_platform_windows::foreground_window_handle() {
+            Some(handle) => {
+                let window_id = mosaix_platform_windows::window_id_from_handle(handle);
+                match mosaix_platform_windows::observed_window_state(handle) {
+                    Some((display_id, bounds)) => {
+                        tracing::info!(?window_id, "seeding the initial focused window");
+                        if engine
+                            .events()
+                            .send(mosaix_engine::Event::WindowFocused {
+                                window_id,
+                                display_id,
+                                bounds,
+                            })
+                            .is_err()
+                        {
+                            tracing::error!(
+                                "reducer stopped before the initial focus could be sent"
+                            );
+                        }
+                    }
+                    None => tracing::debug!(
+                        ?window_id,
+                        "could not read bounds/display for the foreground window; not seeding focus"
+                    ),
+                }
+            }
+            None => tracing::debug!("no window owns the foreground at startup; not seeding focus"),
+        }
     }
 
-    let ipc_server = match config_dir
-        .clone()
-        .map(|dir| mosaix_ipc::IpcServer::start(engine.events(), engine.state_reader(), dir))
-    {
-        Some(Ok(server)) => Some(server),
-        Some(Err(err)) => {
+    // Configuration writes requested over IPC go through the same
+    // directory the watcher is reading. An agent that never found a
+    // directory refuses them with that reason rather than reporting a
+    // save it did not make.
+    let config_store: std::sync::Arc<dyn mosaix_ipc::ConfigStore> = match &watchable_config_dir {
+        Some(dir) => std::sync::Arc::new(DirectoryConfigStore { dir: dir.clone() }),
+        None => std::sync::Arc::new(mosaix_ipc::UnavailableConfigStore {
+            reason: "Mosaix could not open its configuration directory, so it cannot save changes"
+                .to_owned(),
+        }),
+    };
+
+    let ipc_server = match mosaix_ipc::IpcServer::start(
+        engine.events(),
+        engine.state_reader(),
+        config_store,
+        std::sync::Arc::new(PlatformHotkeyProbe),
+    ) {
+        Ok(server) => Some(server),
+        Err(err) => {
             tracing::error!(%err, "failed to start IPC server; the mosaix CLI will be unavailable");
             None
         }
-        None => None,
     };
 
     // Watches `config_dir` for hot-edits and forwards each successfully
@@ -230,7 +301,7 @@ fn main() {
                 for event in config_events {
                     if let mosaix_config::ConfigEvent::Changed(set) = event {
                         if events
-                            .send(mosaix_engine::Event::ConfigChanged(set))
+                            .send(mosaix_engine::Event::ConfigChanged(Box::new(set)))
                             .is_err()
                         {
                             tracing::warn!("reducer stopped; config forwarder exiting");
@@ -258,6 +329,7 @@ fn main() {
                 for event in topology_events {
                     match event {
                         mosaix_platform_windows::TopologyEvent::Changed(displays) => {
+                            let displays = retry_empty_topology(displays);
                             if events
                                 .send(mosaix_engine::Event::DisplayTopologyChanged(displays))
                                 .is_err()
@@ -275,32 +347,23 @@ fn main() {
                         // windows here because the platform layer's hidden
                         // window only sees display events, not window events.
                         mosaix_platform_windows::TopologyEvent::WakeFromSleep(displays) => {
+                            let displays = retry_empty_topology(displays);
                             let windows = match mosaix_platform_windows::enumerate_windows() {
-                                Ok(w) => w,
+                                Ok(w) => Some(w),
                                 Err(err) => {
-                                    tracing::error!(%err, "failed to enumerate windows after wake; sending display-only reconciliation");
-                                    Vec::new()
+                                    tracing::error!(%err, "failed to enumerate windows after wake; retaining the last window inventory");
+                                    None
                                 }
                             };
-                            let placements: Vec<_> = windows
-                                .iter()
-                                .filter_map(|window| {
-                                    let handle =
-                                        mosaix_platform_windows::window_handle_from_id(window.id);
-                                    let (display_id, bounds) =
-                                        mosaix_platform_windows::observed_window_state(handle)?;
-                                    Some((window.id, display_id, bounds))
-                                })
-                                .collect();
                             tracing::info!(
                                 display_count = displays.len(),
-                                window_count = placements.len(),
+                                window_count = windows.as_ref().map_or(0, Vec::len),
                                 "forwarding wake reconciliation to engine"
                             );
                             if events
                                 .send(mosaix_engine::Event::WakeReconciliation {
                                     displays,
-                                    windows: placements,
+                                    windows,
                                 })
                                 .is_err()
                             {
@@ -342,15 +405,145 @@ fn main() {
         }
     };
 
+    let focus_border_and_controller = match mosaix_platform_windows::start_focus_border() {
+        Ok(border) => {
+            let state_reader = engine.state_reader();
+            let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+            let controller = std::thread::spawn(move || {
+                const POLL: std::time::Duration = std::time::Duration::from_millis(50);
+                let mut last_visible: Option<(
+                    mosaix_domain::Rect,
+                    mosaix_platform_windows::FocusBorderStyle,
+                )> = None;
+                loop {
+                    match stop_rx.recv_timeout(POLL) {
+                        Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    }
+                    let state = state_reader.snapshot();
+                    let desired = if state.automatic_tiling_active
+                        && !state.paused
+                        && state.resolved_config.focus_border.enabled
+                    {
+                        state.focused_window.and_then(|window_id| {
+                            let managed = state.inventory.get(&window_id)?;
+                            // The inventory keeps minimized, hidden, and
+                            // cloaked windows -- they are temporarily
+                            // ineligible, not unmanaged -- so membership
+                            // alone would leave a border on bare desktop
+                            // after a minimize. Maximized and full-screen
+                            // are ineligible for a cell but plainly visible.
+                            if !matches!(
+                                managed.window.lifecycle,
+                                mosaix_domain::WindowLifecycle::Active
+                                    | mosaix_domain::WindowLifecycle::Maximized
+                                    | mosaix_domain::WindowLifecycle::Fullscreen
+                            ) {
+                                return None;
+                            }
+                            // The engine defers placement for a window being
+                            // dragged (ADR 0016), so anything drawn now would
+                            // trail it under the cursor until the drop.
+                            if state
+                                .interactive_placement
+                                .is_some_and(|session| session.window_id == window_id)
+                            {
+                                return None;
+                            }
+                            // `observed_bounds`, not `bounds`: the latter is
+                            // the placement Mosaix last *intended*, kept stale
+                            // on purpose so the engine can detect an external
+                            // move by comparing the two (ADR 0001). Drawing
+                            // from it leaves the border behind any window
+                            // something else repositioned.
+                            let bounds = state
+                                .windows
+                                .get(&window_id)
+                                .map(|placement| placement.observed_bounds)
+                                .unwrap_or(managed.window.bounds);
+                            let config = state.resolved_config.focus_border;
+                            let scale = state
+                                .displays
+                                .iter()
+                                .find(|display| display.id == managed.window.display_id)
+                                .map_or(1.0, |display| display.scale_factor);
+                            Some((
+                                bounds,
+                                mosaix_platform_windows::FocusBorderStyle {
+                                    red: config.color.red,
+                                    green: config.color.green,
+                                    blue: config.color.blue,
+                                    alpha: config.color.alpha,
+                                    thickness: (f64::from(config.thickness) * scale)
+                                        .round()
+                                        .clamp(1.0, f64::from(u16::MAX))
+                                        as u16,
+                                },
+                            ))
+                        })
+                    } else {
+                        None
+                    };
+                    if desired == last_visible {
+                        continue;
+                    }
+                    if let Some((bounds, style)) = desired {
+                        border.show(bounds, style);
+                    } else {
+                        border.hide();
+                    }
+                    last_visible = desired;
+                }
+                border.stop();
+            });
+            Some((stop_tx, controller))
+        }
+        Err(err) => {
+            tracing::error!(%err, "failed to start focus border; automatic tiling will continue without focus decoration");
+            None
+        }
+    };
+
     let event_hooks_and_forwarder = match mosaix_platform_windows::start_event_hooks() {
         Ok((hooks, raw_events)) => {
             let events = engine.events();
             let overlay_tx = overlay_tx.clone();
+            let (inventory_refresh_tx, inventory_refresh_rx) = std::sync::mpsc::sync_channel(1);
+            let inventory_events = events.clone();
+            let inventory_refresher = std::thread::spawn(move || {
+                const SETTLE: std::time::Duration = std::time::Duration::from_millis(50);
+                loop {
+                    if inventory_refresh_rx.recv().is_err() {
+                        break;
+                    }
+                    while inventory_refresh_rx.recv_timeout(SETTLE).is_ok() {}
+                    let windows = match mosaix_platform_windows::enumerate_windows() {
+                        Ok(windows) => windows,
+                        Err(err) => {
+                            tracing::debug!(%err, "could not refresh normalized window inventory");
+                            continue;
+                        }
+                    };
+                    if inventory_events
+                        .send(mosaix_engine::Event::WindowsObserved { windows })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            });
             let forwarder = std::thread::spawn(move || {
                 // Focus and location changes feed the engine; move/resize
                 // start/end feed the snap-preview drag controller (Feature 34).
                 for event in raw_events {
                     match event {
+                        mosaix_platform_windows::RawEvent::WindowCreated(_)
+                        | mosaix_platform_windows::RawEvent::WindowDestroyed(_) => {
+                            // Coalesce noisy lifecycle bursts into one complete
+                            // authoritative observation and therefore one final
+                            // grid plan.
+                            let _ = inventory_refresh_tx.try_send(());
+                        }
                         mosaix_platform_windows::RawEvent::Focused(handle) => {
                             let window_id = mosaix_platform_windows::window_id_from_handle(handle);
                             let Some((display_id, bounds)) =
@@ -398,26 +591,34 @@ fn main() {
                                 );
                                 break;
                             }
+                            let _ = inventory_refresh_tx.try_send(());
                         }
                         mosaix_platform_windows::RawEvent::MoveResizeStart(handle) => {
+                            let window_id = mosaix_platform_windows::window_id_from_handle(handle);
                             if let Some(tx) = &overlay_tx {
-                                let window_id =
-                                    mosaix_platform_windows::window_id_from_handle(handle);
                                 let _ = tx.send(overlay::OverlayRequest::DragStarted { window_id });
+                            } else {
+                                let _ = events.send(
+                                    mosaix_engine::Event::InteractivePlacementStarted { window_id },
+                                );
                             }
                         }
                         mosaix_platform_windows::RawEvent::MoveResizeEnd(handle) => {
+                            let window_id = mosaix_platform_windows::window_id_from_handle(handle);
                             if let Some(tx) = &overlay_tx {
-                                let window_id =
-                                    mosaix_platform_windows::window_id_from_handle(handle);
                                 let _ = tx.send(overlay::OverlayRequest::DragEnded { window_id });
+                            } else {
+                                let _ =
+                                    events.send(mosaix_engine::Event::InteractivePlacementEnded {
+                                        window_id,
+                                        committed_manual_placement: false,
+                                    });
                             }
                         }
-                        _ => {}
                     }
                 }
             });
-            Some((hooks, forwarder))
+            Some((hooks, forwarder, inventory_refresher))
         }
         Err(err) => {
             tracing::error!(%err, "failed to start OS event hooks; the agent will not observe focus changes");
@@ -431,9 +632,13 @@ fn main() {
     // superseded by ADR 0005). The hotkey-rebind poller further down keeps
     // this in sync with `EngineState`'s resolved config for the rest of the
     // agent's lifetime.
-    let last_registered_hotkeys = engine.state_reader().snapshot().resolved_config.hotkeys;
+    let last_registered_hotkeys =
+        hotkeys::runtime_hotkeys(&engine.state_reader().snapshot().resolved_config);
+    let (initial_bindings, initial_registry) =
+        hotkeys::bindings_from_resolved(&last_registered_hotkeys);
     let initial_hotkey_registration = match start_hotkeys_and_forward(
-        hotkeys::bindings_from_resolved(&last_registered_hotkeys),
+        initial_bindings,
+        initial_registry,
         engine.events(),
         engine.state_reader(),
         overlay_tx.clone(),
@@ -453,6 +658,13 @@ fn main() {
     // (ADR 0005). A hot-edited `config.toml` (ticket 03) and a
     // topology-triggered profile switch (ticket 04) both flow through the
     // same `EngineState::resolved_config`, so this one poller covers both.
+    //
+    // It is also the one place that reads
+    // `EngineState::hotkey_capture_suspended`: while the settings
+    // application's hotkey editor is open, this registers nothing, so a
+    // combination the user is about to press reaches the editor instead
+    // of firing a command. Keeping that here rather than in a new engine
+    // effect is what keeps hotkey ownership in one place (ADR 0021).
     const HOTKEY_REBIND_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
     let (hotkey_rebind_stop_tx, hotkey_rebind_stop_rx) = std::sync::mpsc::channel::<()>();
     let hotkey_rebind_forwarder = {
@@ -462,35 +674,59 @@ fn main() {
         std::thread::spawn(move || {
             let mut previous_hotkeys = last_registered_hotkeys;
             let mut current_registration = initial_hotkey_registration;
+            // What the current registration was made under, so lifting or
+            // entering suspension is itself a reason to act -- the
+            // bindings need not have changed for the answer to.
+            let mut previously_suspended = false;
             loop {
                 match hotkey_rebind_stop_rx.recv_timeout(HOTKEY_REBIND_POLL_INTERVAL) {
                     Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                 }
 
-                let current_hotkeys = state_reader.snapshot().resolved_config.hotkeys;
-                if mosaix_config::diff_bindings(&previous_hotkeys, &current_hotkeys).is_empty() {
+                // One snapshot for both reads, so a capture that starts
+                // between them cannot leave this pass registering
+                // bindings the editor is about to need.
+                let state = state_reader.snapshot();
+                let suspended = state.hotkey_capture_suspended;
+                let current_hotkeys = hotkeys::runtime_hotkeys(&state.resolved_config);
+                let bindings_changed =
+                    !mosaix_config::diff_bindings(&previous_hotkeys, &current_hotkeys).is_empty();
+                if !bindings_changed && suspended == previously_suspended {
                     continue;
                 }
-                tracing::info!("resolved hotkey bindings changed; re-registering hotkeys");
 
                 if let Some((registrations, forwarder)) = current_registration.take() {
                     registrations.stop();
                     let _ = forwarder.join();
                 }
-                current_registration = match start_hotkeys_and_forward(
-                    hotkeys::bindings_from_resolved(&current_hotkeys),
-                    events.clone(),
-                    state_reader.clone(),
-                    overlay_tx.clone(),
-                ) {
-                    Ok(pair) => Some(pair),
-                    Err(err) => {
-                        tracing::error!(%err, "failed to re-register hotkeys after a binding change; hotkeys are unregistered until the next change");
-                        None
+                current_registration = if suspended {
+                    // A config reload arriving mid-capture updates what
+                    // will be registered when the editor closes, and
+                    // registers nothing now.
+                    tracing::info!("hotkey capture is active; leaving every binding unregistered");
+                    None
+                } else {
+                    tracing::info!("registering hotkeys for the current resolved bindings");
+                    // A fresh registry every time: an id the previous
+                    // registration owned cannot survive into this one.
+                    let (bindings, registry) = hotkeys::bindings_from_resolved(&current_hotkeys);
+                    match start_hotkeys_and_forward(
+                        bindings,
+                        registry,
+                        events.clone(),
+                        state_reader.clone(),
+                        overlay_tx.clone(),
+                    ) {
+                        Ok(pair) => Some(pair),
+                        Err(err) => {
+                            tracing::error!(%err, "failed to re-register hotkeys after a binding change; hotkeys are unregistered until the next change");
+                            None
+                        }
                     }
                 };
                 previous_hotkeys = current_hotkeys;
+                previously_suspended = suspended;
             }
 
             if let Some((registrations, forwarder)) = current_registration {
@@ -500,12 +736,10 @@ fn main() {
         })
     };
 
-    // Polls committed engine state for placements that haven't reached the
-    // real window yet, and applies them via `SetWindowPos` (architecture
-    // doc section 6's Diff -> Executor stage). Nothing else in this binary
-    // ever calls `move_resize_window`, and the reducer deliberately never
-    // touches the OS itself -- without this, a snap hotkey updates
-    // `EngineState` but the window on screen never moves.
+    // Applies the engine's ordered, platform-neutral effect stream via
+    // `SetWindowPos`. The reducer never touches the OS; this is the sole
+    // Windows execution boundary and reports rejections back as normalized
+    // engine events.
     //
     // Feature 31 — after each `SetWindowPos` call, the executor waits
     // briefly and re-reads the window's actual bounds.  If they differ
@@ -514,17 +748,17 @@ fn main() {
     const PLACEMENT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
     /// How long to wait after a `SetWindowPos` before re-reading the
     /// window's actual bounds to detect rejection (Feature 31).
-    const REJECTION_SETTLE_MILLIS: u64 = 100;
+    const REJECTION_SETTLE_MILLIS: u64 = 500;
     /// Absolute pixel tolerance for rejection detection — if the observed
     /// bounds differ from the target by more than this in *any* axis, the
     /// placement is considered rejected.
-    const REJECTION_TOLERANCE_PX: i32 = 10;
+    const REJECTION_TOLERANCE_PX: i32 = 2;
     let (executor_stop_tx, executor_stop_rx) = std::sync::mpsc::channel::<()>();
     let executor_forwarder = {
         let state_reader = engine.state_reader();
         let rejection_events = engine.events();
         std::thread::spawn(move || {
-            let mut previous = std::collections::HashMap::new();
+            let mut next_effect = 0usize;
             loop {
                 let snapshot = state_reader.snapshot();
                 if snapshot.paused {
@@ -533,27 +767,53 @@ fn main() {
                         Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                     }
                 }
-                let current = snapshot.windows;
-                for (window_id, _display_id, bounds) in
-                    mosaix_engine::diff_placements(&previous, &current)
-                {
+                for effect in snapshot.effects.iter().skip(next_effect) {
+                    let mosaix_engine::EngineEffect::PlaceWindow {
+                        window_id, bounds, ..
+                    } = *effect
+                    else {
+                        match *effect {
+                            mosaix_engine::EngineEffect::FocusWindow { window_id } => {
+                                if let Err(err) =
+                                    mosaix_platform_windows::focus_window_by_id(window_id)
+                                {
+                                    tracing::warn!(?window_id, %err, "failed to focus directional neighbor");
+                                }
+                            }
+                            mosaix_engine::EngineEffect::ReconcileWindows => {
+                                match mosaix_platform_windows::enumerate_windows() {
+                                    Ok(windows) => {
+                                        let _ = rejection_events.send(
+                                            mosaix_engine::Event::RearrangeReconciliationComplete {
+                                                windows,
+                                            },
+                                        );
+                                    }
+                                    Err(err) => {
+                                        tracing::warn!(%err, "rearrange could not enumerate windows");
+                                    }
+                                }
+                            }
+                            mosaix_engine::EngineEffect::PlaceWindow { .. } => unreachable!(),
+                        }
+                        continue;
+                    };
                     if let Err(err) =
                         mosaix_platform_windows::move_resize_window_by_id(window_id, bounds)
                     {
                         tracing::warn!(?window_id, %err, "failed to apply computed placement to the real window");
 
-                        // Feature 32 — if the window is elevated we cannot
-                        // manage it at all; emit a PlacementRejected to open
-                        // the circuit breaker quickly rather than retrying.
+                        // Any failed platform call is a placement rejection;
+                        // elevation is only useful extra diagnostics.
                         let handle = mosaix_platform_windows::window_handle_from_id(window_id);
                         if mosaix_platform_windows::is_window_elevated(handle) {
                             tracing::warn!(
                                 ?window_id,
                                 "window is elevated (Administrator); emitting PlacementRejected"
                             );
-                            let _ = rejection_events
-                                .send(mosaix_engine::Event::PlacementRejected { window_id });
                         }
+                        let _ = rejection_events
+                            .send(mosaix_engine::Event::PlacementRejected { window_id });
                         continue;
                     }
 
@@ -585,10 +845,16 @@ fn main() {
                             );
                             let _ = rejection_events
                                 .send(mosaix_engine::Event::PlacementRejected { window_id });
+                        } else {
+                            let _ = rejection_events
+                                .send(mosaix_engine::Event::PlacementAccepted { window_id });
                         }
+                    } else {
+                        let _ = rejection_events
+                            .send(mosaix_engine::Event::PlacementRejected { window_id });
                     }
                 }
-                previous = current;
+                next_effect = snapshot.effects.len();
 
                 match executor_stop_rx.recv_timeout(PLACEMENT_POLL_INTERVAL) {
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
@@ -610,15 +876,24 @@ fn main() {
             let quit_tx = quit_tx.clone();
             let config_dir_for_tray = config_dir.clone();
             let tray_for_status = engine.state_reader();
-            // Status updates need the handle; share via a channel of bools
-            // that the forwarder pushes and a tiny status thread applies —
-            // simpler: keep handle in the forwarder and use a stop channel
-            // from main so console quit unblocks without hanging.
             let (tray_stop_tx, tray_stop_rx) = std::sync::mpsc::channel::<()>();
             let forwarder = std::thread::spawn(move || {
                 const TRAY_STATUS_POLL: std::time::Duration = std::time::Duration::from_millis(250);
-                let mut last_paused = state_reader.snapshot().paused;
-                tray.set_paused(last_paused);
+                let status_for = |state: &mosaix_engine::EngineState| {
+                    if state.paused {
+                        mosaix_platform_windows::TrayStatus::Paused
+                    } else if state.automatic_tiling_suspended {
+                        mosaix_platform_windows::TrayStatus::Suspended
+                    } else if state.automatic_tiling_active && state.circuit_breaker_count() > 0 {
+                        mosaix_platform_windows::TrayStatus::Degraded
+                    } else if state.automatic_tiling_active {
+                        mosaix_platform_windows::TrayStatus::Active
+                    } else {
+                        mosaix_platform_windows::TrayStatus::Manual
+                    }
+                };
+                let mut last_status = status_for(&state_reader.snapshot());
+                tray.set_status(last_status);
                 loop {
                     // Prefer an explicit stop from main (console quit path).
                     match tray_stop_rx.try_recv() {
@@ -663,10 +938,10 @@ fn main() {
                             break;
                         }
                         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                            let paused = tray_for_status.snapshot().paused;
-                            if paused != last_paused {
-                                tray.set_paused(paused);
-                                last_paused = paused;
+                            let status = status_for(&tray_for_status.snapshot());
+                            if status != last_status {
+                                tray.set_status(status);
+                                last_status = status;
                             }
                         }
                         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
@@ -709,6 +984,10 @@ fn main() {
         let _ = tray_stop_tx.send(());
         let _ = forwarder.join();
     }
+    if let Some((stop_tx, controller)) = focus_border_and_controller {
+        let _ = stop_tx.send(());
+        let _ = controller.join();
+    }
     if let Some((watcher, forwarder)) = watcher_and_forwarder {
         watcher.stop();
         let _ = forwarder.join();
@@ -717,9 +996,10 @@ fn main() {
         watcher.stop();
         let _ = forwarder.join();
     }
-    if let Some((hooks, forwarder)) = event_hooks_and_forwarder {
+    if let Some((hooks, forwarder, inventory_refresher)) = event_hooks_and_forwarder {
         hooks.stop();
         let _ = forwarder.join();
+        let _ = inventory_refresher.join();
     }
     let _ = hotkey_rebind_stop_tx.send(());
     let _ = hotkey_rebind_forwarder.join();
@@ -749,4 +1029,62 @@ fn main() {
 fn main() {
     eprintln!("mosaix-agent currently only supports Windows (no macOS platform adapter yet).");
     std::process::exit(1);
+}
+
+/// The agent's configuration directory, as the IPC handler sees it.
+///
+/// The whole implementation is `mosaix_config`'s two edit functions; what
+/// this adds is the directory the agent resolved at startup and the
+/// translation of a config error into the sentence the person who asked
+/// for the change reads.
+#[derive(Debug)]
+struct DirectoryConfigStore {
+    dir: std::path::PathBuf,
+}
+
+impl mosaix_ipc::ConfigStore for DirectoryConfigStore {
+    fn edit_layouts(
+        &self,
+        fingerprint: &str,
+        edit: mosaix_config::LayoutEdit,
+    ) -> Result<mosaix_config::LayoutWrite, mosaix_ipc::ConfigError> {
+        mosaix_config::edit_layouts(&self.dir, fingerprint, edit)
+            .map_err(|error| mosaix_ipc::ConfigError(error.to_string()))
+    }
+
+    fn edit_bindings(
+        &self,
+        fingerprint: &str,
+        edit: mosaix_config::BindingEdit,
+    ) -> Result<mosaix_config::BindingWrite, mosaix_ipc::ConfigError> {
+        mosaix_config::edit_bindings(&self.dir, fingerprint, edit)
+            .map_err(|error| mosaix_ipc::ConfigError(error.to_string()))
+    }
+}
+
+/// The real `RegisterHotKey` probe, behind the handler's platform-neutral
+/// trait.
+///
+/// Translating a `KeyCombo` into modifier flags and a virtual-key code is
+/// the same translation registration already goes through, so a
+/// combination that probes as available is one that can actually be
+/// registered -- and a key name with no virtual-key code behind it is
+/// reported as unsupported rather than as taken.
+#[derive(Debug)]
+struct PlatformHotkeyProbe;
+
+impl mosaix_ipc::HotkeyProbe for PlatformHotkeyProbe {
+    fn probe(&self, combo: &mosaix_config::KeyCombo) -> mosaix_ipc::ProbeOutcome {
+        let Some((modifiers, vk)) = hotkeys::binding_parts(combo) else {
+            return mosaix_ipc::ProbeOutcome::Unsupported {
+                reason: format!("Mosaix has no key named {:?}", combo.key),
+            };
+        };
+        match mosaix_platform_windows::probe_hotkey(modifiers, vk) {
+            mosaix_platform_windows::HotkeyAvailability::Available => {
+                mosaix_ipc::ProbeOutcome::Available
+            }
+            mosaix_platform_windows::HotkeyAvailability::Taken => mosaix_ipc::ProbeOutcome::Taken,
+        }
+    }
 }

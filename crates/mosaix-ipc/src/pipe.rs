@@ -1,12 +1,13 @@
 //! Windows named-pipe transport for the local Mosaix agent.
 
+use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::windows::io::{FromRawHandle, IntoRawHandle, RawHandle};
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use mosaix_engine::{EventSender, StateReader};
 use windows::core::{PCWSTR, PWSTR};
@@ -29,12 +30,20 @@ use windows::Win32::System::Pipes::{
 };
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
-use crate::handler::handle_request;
-use crate::protocol::{wrap_response, IpcEnvelope, IpcPayload, IpcResponse, PROTOCOL_VERSION};
+use crate::handler::{handle_request, CaptureHold, ConfigStore, HotkeyProbe};
+use crate::protocol::{decode_request, wrap_response, IpcResponse};
 
 pub const PIPE_NAME_PREFIX: &str = r"\\.\pipe\mosaix-";
 const MAX_MESSAGE_BYTES: usize = 64 * 1024;
-const MAX_REQUESTS_PER_CONNECTION: usize = 100;
+/// How many requests one connection may make inside
+/// [`RATE_LIMIT_WINDOW`] before the server hangs up on it.
+///
+/// A cap on a connection's *lifetime* request count would be simpler, but
+/// the settings application holds one connection for its whole window
+/// lifetime, so a lifetime cap eventually disconnects a well-behaved
+/// client. A sliding window keeps the protection and drops that ceiling.
+const MAX_REQUESTS_PER_WINDOW: usize = 100;
+const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(10);
 
 /// The current user's private Mosaix pipe name.
 pub fn pipe_name() -> String {
@@ -50,16 +59,21 @@ pub struct IpcServer {
 }
 
 impl IpcServer {
+    /// `config` is what a request that changes configuration is performed
+    /// through, and `hotkeys` is what a combination-availability probe
+    /// asks. Both are shared across client threads, so both are behind an
+    /// `Arc`.
     pub fn start(
         events: EventSender,
         state_reader: StateReader,
-        config_dir: PathBuf,
+        config: Arc<dyn ConfigStore>,
+        hotkeys: Arc<dyn HotkeyProbe>,
     ) -> std::io::Result<Self> {
         let stop_flag = Arc::new(AtomicBool::new(false));
         let thread_flag = Arc::clone(&stop_flag);
         let join_handle = thread::Builder::new()
             .name("mosaix-ipc".to_owned())
-            .spawn(move || server_loop(events, state_reader, config_dir, thread_flag))?;
+            .spawn(move || server_loop(events, state_reader, config, hotkeys, thread_flag))?;
         Ok(Self {
             stop_flag,
             join_handle: Some(join_handle),
@@ -96,7 +110,8 @@ impl IpcServer {
 fn server_loop(
     events: EventSender,
     state_reader: StateReader,
-    config_dir: PathBuf,
+    config: Arc<dyn ConfigStore>,
+    hotkeys: Arc<dyn HotkeyProbe>,
     stop_flag: Arc<AtomicBool>,
 ) {
     let name = wide(&pipe_name());
@@ -134,36 +149,86 @@ fn server_loop(
             }
             break;
         }
-        if connected {
-            handle_client(pipe, &events, &state_reader, &config_dir);
+        if !connected {
+            unsafe {
+                let _ = DisconnectNamedPipe(pipe);
+                let _ = CloseHandle(pipe);
+            }
+            continue;
         }
-        unsafe {
-            let _ = DisconnectNamedPipe(pipe);
-            let _ = CloseHandle(pipe);
+
+        // Each client gets its own thread so a connection held open for a
+        // window's lifetime (the settings application) cannot stop the
+        // one-shot CLI clients from being served. The thread owns its
+        // pipe instance and tears it down when the client goes away, so
+        // there is nothing here to join: the acceptor loop's job is only
+        // to keep an instance available for the next connection.
+        let events = events.clone();
+        let state_reader = state_reader.clone();
+        let config = Arc::clone(&config);
+        let hotkeys = Arc::clone(&hotkeys);
+        let client = ClientPipe(pipe);
+        if let Err(error) = thread::Builder::new()
+            .name("mosaix-ipc-client".to_owned())
+            .spawn(move || {
+                // Unwrapped through a by-value method so the closure
+                // captures the whole `ClientPipe`, which is `Send`.
+                // Reading the field directly would capture the bare
+                // `HANDLE` instead, which isn't.
+                let pipe = client.into_handle();
+                handle_client(
+                    pipe,
+                    &events,
+                    &state_reader,
+                    config.as_ref(),
+                    hotkeys.as_ref(),
+                );
+                unsafe {
+                    let _ = DisconnectNamedPipe(pipe);
+                    let _ = CloseHandle(pipe);
+                }
+            })
+        {
+            tracing::error!(%error, "failed to start an IPC client thread; dropping the client");
+            unsafe {
+                let _ = DisconnectNamedPipe(pipe);
+                let _ = CloseHandle(pipe);
+            }
         }
     }
 }
+
+/// One connected pipe instance on its way to the thread that will serve
+/// it. `HANDLE` is a raw pointer, so it isn't `Send` on its own; a kernel
+/// handle is nonetheless valid in any thread of the process, and exactly
+/// one thread owns this one at a time.
+struct ClientPipe(HANDLE);
+
+impl ClientPipe {
+    fn into_handle(self) -> HANDLE {
+        self.0
+    }
+}
+
+unsafe impl Send for ClientPipe {}
 
 fn handle_client(
     pipe: HANDLE,
     events: &EventSender,
     state_reader: &StateReader,
-    config_dir: &std::path::Path,
+    config: &dyn ConfigStore,
+    hotkeys: &dyn HotkeyProbe,
 ) {
     let file = unsafe { File::from_raw_handle(pipe.0 as RawHandle) };
     let mut reader = BufReader::new(file);
-    let mut request_count = 0;
+    let mut recent_requests: VecDeque<Instant> = VecDeque::new();
+    // What this connection owes the engine when it ends, however it ends.
+    // A settings application that is killed rather than closed never sends
+    // capture-end; the operating system closing this pipe handle is what
+    // breaks the read loop below, and releasing the hold there is what
+    // brings the hotkeys back without an agent restart (ADR 0021).
+    let mut capture = CaptureHold::default();
     loop {
-        request_count += 1;
-        if request_count > MAX_REQUESTS_PER_CONNECTION {
-            let _ = write_response(
-                &mut reader,
-                IpcResponse::Error {
-                    message: "IPC request rate limit exceeded".to_owned(),
-                },
-            );
-            break;
-        }
         let mut bytes = Vec::with_capacity(1024);
         match reader
             .by_ref()
@@ -183,29 +248,50 @@ fn handle_client(
             );
             break;
         }
-        let response = match serde_json::from_slice::<IpcEnvelope>(&bytes) {
-            Ok(envelope) if envelope.version != PROTOCOL_VERSION => IpcResponse::VersionMismatch {
-                server_version: PROTOCOL_VERSION,
-            },
-            Ok(IpcEnvelope {
-                payload: IpcPayload::Request(request),
-                ..
-            }) => handle_request(&request, events, state_reader, config_dir),
-            Ok(_) => IpcResponse::Error {
-                message: "expected an IPC request".to_owned(),
-            },
-            Err(error) => IpcResponse::Error {
-                message: format!("invalid IPC message: {error}"),
-            },
+        if exceeds_rate_limit(&mut recent_requests, Instant::now()) {
+            let _ = write_response(
+                &mut reader,
+                IpcResponse::Error {
+                    message: "IPC request rate limit exceeded".to_owned(),
+                },
+            );
+            break;
+        }
+        let response = match decode_request(&bytes) {
+            Ok(request) => {
+                let response = handle_request(&request, events, state_reader, config, hotkeys);
+                capture.observe(&request, &response);
+                response
+            }
+            Err(response) => response,
         };
         if !write_response(&mut reader, response) {
             break;
         }
     }
+    if let Some(event) = capture.release() {
+        tracing::info!("settings connection ended while holding hotkey capture; re-registering");
+        let _ = events.send(event);
+    }
     // The outer loop owns close/disconnect. Avoid File closing the handle
     // before that cleanup is performed.
     let file = reader.into_inner();
     let _ = file.into_raw_handle();
+}
+
+/// Records a request at `now` and reports whether the connection has now
+/// made more than [`MAX_REQUESTS_PER_WINDOW`] of them inside
+/// [`RATE_LIMIT_WINDOW`]. Entries older than the window are dropped, so a
+/// connection that stays under the rate can stay open indefinitely.
+fn exceeds_rate_limit(recent: &mut VecDeque<Instant>, now: Instant) -> bool {
+    while recent
+        .front()
+        .is_some_and(|at| now.duration_since(*at) >= RATE_LIMIT_WINDOW)
+    {
+        recent.pop_front();
+    }
+    recent.push_back(now);
+    recent.len() > MAX_REQUESTS_PER_WINDOW
 }
 
 fn write_response(reader: &mut BufReader<File>, response: IpcResponse) -> bool {
@@ -279,4 +365,50 @@ impl Drop for PipeSecurity {
 
 fn wide(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(Some(0)).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_burst_past_the_limit_within_the_window_is_refused() {
+        let mut recent = VecDeque::new();
+        let start = Instant::now();
+
+        for request in 0..MAX_REQUESTS_PER_WINDOW {
+            assert!(
+                !exceeds_rate_limit(&mut recent, start),
+                "request {request} is inside the limit"
+            );
+        }
+
+        assert!(exceeds_rate_limit(&mut recent, start));
+    }
+
+    #[test]
+    fn a_long_lived_connection_staying_under_the_rate_is_never_refused() {
+        let mut recent = VecDeque::new();
+        let start = Instant::now();
+
+        // Ten times the old lifetime cap, paced one per second: the shape
+        // of a settings window left open all afternoon.
+        for second in 0..1000 {
+            assert!(
+                !exceeds_rate_limit(&mut recent, start + Duration::from_secs(second)),
+                "a steady one request per second must never be rate limited"
+            );
+        }
+    }
+
+    #[test]
+    fn the_window_forgets_requests_older_than_itself() {
+        let mut recent = VecDeque::new();
+        let start = Instant::now();
+        for _ in 0..MAX_REQUESTS_PER_WINDOW {
+            exceeds_rate_limit(&mut recent, start);
+        }
+
+        assert!(!exceeds_rate_limit(&mut recent, start + RATE_LIMIT_WINDOW));
+    }
 }

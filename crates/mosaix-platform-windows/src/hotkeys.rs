@@ -63,6 +63,55 @@ fn register_bindings(bindings: &[HotkeyBinding]) -> Vec<HotkeyRegistrationResult
         .collect()
 }
 
+/// Whether a combination can be registered right now.
+///
+/// Deliberately two answers, not three. The probe cannot tell a
+/// combination the operating system reserves from one another application
+/// registered first -- both come back as a refusal -- and it cannot see
+/// `Win+L` or `Ctrl+Alt+Del` at all, because those are never registered
+/// hotkeys. Naming the owner is the caller's job: it knows Mosaix's own
+/// bindings, and it holds the short reserved list (ADR 0021).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HotkeyAvailability {
+    /// `RegisterHotKey` accepted it, and the registration was released
+    /// again immediately.
+    Available,
+    /// `RegisterHotKey` refused it. Something already owns it.
+    Taken,
+}
+
+/// Asks the operating system whether `modifiers`+`vk` is free, by
+/// registering it and releasing it again (ADR 0021).
+///
+/// The registration is undone before this returns, whether it succeeded
+/// or not, so probing never leaves a combination held -- which matters
+/// because the whole point of probing is to answer a question while the
+/// user still has the dialog open.
+///
+/// `RegisterHotKey` associates a hotkey with the calling thread and does
+/// not need a message pump to accept one, so unlike [`start_hotkeys`]
+/// this needs no thread of its own. The id is a fixed one outside the
+/// range the registry hands out, and it is unregistered on the same
+/// thread that took it.
+pub fn probe_hotkey(modifiers: HOT_KEY_MODIFIERS, vk: u32) -> HotkeyAvailability {
+    match unsafe { RegisterHotKey(None, PROBE_HOTKEY_ID, modifiers, vk) } {
+        Ok(()) => {
+            unsafe {
+                let _ = UnregisterHotKey(None, PROBE_HOTKEY_ID);
+            }
+            HotkeyAvailability::Available
+        }
+        Err(error) => {
+            tracing::debug!(%error, "combination refused by RegisterHotKey; reporting it as taken");
+            HotkeyAvailability::Taken
+        }
+    }
+}
+
+/// The id [`probe_hotkey`] borrows. Negative, so it can never collide
+/// with an id the binding registry allocated for a real registration.
+const PROBE_HOTKEY_ID: i32 = -1;
+
 /// A running set of hotkey registrations, owned by a dedicated thread.
 ///
 /// `results` reports the per-binding outcome of registration, in the same
@@ -174,38 +223,10 @@ mod tests {
     use super::*;
     use crate::test_support::wait_for;
     use std::time::Duration;
-    use windows::Win32::UI::Input::KeyboardAndMouse::{
-        SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, VIRTUAL_KEY,
-        VK_F13, VK_F16,
-    };
-
-    fn send_key_press(vk: VIRTUAL_KEY) {
-        let down = INPUT {
-            r#type: INPUT_KEYBOARD,
-            Anonymous: INPUT_0 {
-                ki: KEYBDINPUT {
-                    wVk: vk,
-                    wScan: 0,
-                    dwFlags: Default::default(),
-                    time: 0,
-                    dwExtraInfo: 0,
-                },
-            },
-        };
-        let mut up = down;
-        up.Anonymous.ki.dwFlags = KEYEVENTF_KEYUP;
-
-        let inputs = [down, up];
-        let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
-        assert_eq!(
-            sent,
-            inputs.len() as u32,
-            "SendInput should submit both events"
-        );
-    }
+    use windows::Win32::UI::Input::KeyboardAndMouse::{VK_F13, VK_F14, VK_F15, VK_F16, VK_F17};
 
     #[test]
-    fn registers_and_delivers_a_real_hotkey_firing() {
+    fn registers_and_delivers_a_hotkey_message() {
         let binding = HotkeyBinding {
             id: 1,
             modifiers: HOT_KEY_MODIFIERS(0),
@@ -220,7 +241,18 @@ mod tests {
             registrations.results[0].outcome
         );
 
-        send_key_press(VK_F13);
+        // SendInput is denied on non-interactive Windows desktops used by CI.
+        // Posting the native message directly keeps this message-pump test
+        // deterministic; registration success is asserted independently above.
+        unsafe {
+            PostThreadMessageW(
+                registrations.thread_id,
+                WM_HOTKEY,
+                WPARAM(binding.id as usize),
+                LPARAM(0),
+            )
+        }
+        .expect("WM_HOTKEY should reach the registration thread");
 
         assert!(
             wait_for(&rx, |fired| fired.id == 1, Duration::from_secs(2)),
@@ -262,5 +294,76 @@ mod tests {
         );
 
         registrations.stop();
+    }
+
+    #[test]
+    fn a_free_combination_probes_as_available_and_is_left_free() {
+        let probe = probe_hotkey(HOT_KEY_MODIFIERS(0), VK_F14.0 as u32);
+
+        assert_eq!(probe, HotkeyAvailability::Available);
+        // Released, or this would come back Taken by the probe itself --
+        // and a dialog that made a combination unavailable by asking
+        // about it would be worse than not asking.
+        assert_eq!(
+            probe_hotkey(HOT_KEY_MODIFIERS(0), VK_F14.0 as u32),
+            HotkeyAvailability::Available,
+            "probing must release whatever it registered"
+        );
+    }
+
+    #[test]
+    fn a_combination_something_else_owns_probes_as_taken() {
+        let binding = HotkeyBinding {
+            id: 20,
+            modifiers: HOT_KEY_MODIFIERS(0),
+            vk: VK_F15.0 as u32,
+        };
+        let (registrations, _rx) = start_hotkeys(vec![binding]).expect("thread should start");
+        assert!(registrations.results[0].outcome.is_ok());
+
+        assert_eq!(
+            probe_hotkey(HOT_KEY_MODIFIERS(0), VK_F15.0 as u32),
+            HotkeyAvailability::Taken
+        );
+
+        registrations.stop();
+    }
+
+    #[test]
+    fn a_combination_comes_back_free_once_its_owner_releases_it() {
+        let binding = HotkeyBinding {
+            id: 21,
+            modifiers: HOT_KEY_MODIFIERS(0),
+            vk: VK_F17.0 as u32,
+        };
+        let (registrations, _rx) = start_hotkeys(vec![binding]).expect("thread should start");
+        registrations.stop();
+
+        assert!(
+            wait_until(
+                || probe_hotkey(HOT_KEY_MODIFIERS(0), VK_F17.0 as u32)
+                    == HotkeyAvailability::Available,
+                Duration::from_secs(2)
+            ),
+            "a combination Mosaix gave up has to read as free, or capture would \
+             report every binding as conflicting with itself"
+        );
+    }
+
+    /// Polls `condition` until it holds or `timeout` elapses.
+    ///
+    /// `UnregisterHotKey` takes effect on the owning thread, which
+    /// [`HotkeyRegistrations::stop`] has to reach through the message
+    /// loop, so a probe issued immediately afterwards can still see the
+    /// old registration.
+    fn wait_until(mut condition: impl FnMut() -> bool, timeout: Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        while std::time::Instant::now() < deadline {
+            if condition() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        condition()
     }
 }

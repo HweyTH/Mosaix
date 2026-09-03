@@ -28,12 +28,12 @@ pub fn diff_bindings(
 
     for (command, combo) in current {
         if previous.get(command) != Some(combo) {
-            changed.push((*command, Some(combo.clone())));
+            changed.push((command.clone(), Some(combo.clone())));
         }
     }
     for command in previous.keys() {
         if !current.contains_key(command) {
-            changed.push((*command, None));
+            changed.push((command.clone(), None));
         }
     }
 
@@ -51,7 +51,7 @@ mod tests {
     fn bindings(pairs: &[(Command, &str)]) -> BTreeMap<Command, KeyCombo> {
         pairs
             .iter()
-            .map(|(command, raw)| (*command, combo(raw)))
+            .map(|(command, raw)| (command.clone(), combo(raw)))
             .collect()
     }
 
@@ -108,14 +108,14 @@ mod tests {
         ]);
 
         let mut result = diff_bindings(&previous, &current);
-        result.sort_by_key(|(command, _)| *command);
+        result.sort_by(|(left, _), (right, _)| left.cmp(right));
 
         let mut expected = vec![
             (Command::SnapRight, Some(combo("ctrl+shift+right"))),
             (Command::SnapTop, None),
             (Command::SnapBottom, Some(combo("ctrl+alt+down"))),
         ];
-        expected.sort_by_key(|(command, _)| *command);
+        expected.sort_by(|(left, _), (right, _)| left.cmp(right));
 
         assert_eq!(result, expected);
     }

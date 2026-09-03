@@ -25,6 +25,13 @@ fn arrow_combo(key: &str) -> KeyCombo {
     }
 }
 
+fn shifted_combo(key: &str) -> KeyCombo {
+    KeyCombo {
+        shift: true,
+        ..arrow_combo(key)
+    }
+}
+
 /// The default `config.toml` content, as a fully-populated [`BaseConfig`]
 /// value rather than a hand-written string -- guarantees the generated
 /// TOML and this crate's own schema/parsing never drift apart.
@@ -34,13 +41,28 @@ pub fn default_base_config() -> BaseConfig {
     hotkeys.insert(Command::SnapRight, arrow_combo("RIGHT"));
     hotkeys.insert(Command::SnapTop, arrow_combo("UP"));
     hotkeys.insert(Command::SnapBottom, arrow_combo("DOWN"));
+    hotkeys.insert(Command::Rearrange, arrow_combo("R"));
+    hotkeys.insert(Command::ToggleAutomaticTiling, arrow_combo("T"));
+    hotkeys.insert(Command::ToggleFloating, arrow_combo("SPACE"));
+    hotkeys.insert(Command::FocusLeft, arrow_combo("H"));
+    hotkeys.insert(Command::FocusDown, arrow_combo("J"));
+    hotkeys.insert(Command::FocusUp, arrow_combo("K"));
+    hotkeys.insert(Command::FocusRight, arrow_combo("L"));
+    hotkeys.insert(Command::SwapLeft, shifted_combo("H"));
+    hotkeys.insert(Command::SwapDown, shifted_combo("J"));
+    hotkeys.insert(Command::SwapUp, shifted_combo("K"));
+    hotkeys.insert(Command::SwapRight, shifted_combo("L"));
+    hotkeys.insert(Command::TogglePause, arrow_combo("P"));
 
     BaseConfig {
         version: CURRENT_VERSION,
         hotkeys,
         gaps: Gaps::default(),
         behavior: BehaviorSection::default(),
-        layouts: Vec::new(),
+        focus_border: crate::schema::FocusBorderSection::default(),
+        // No layouts ship as defaults: a saved layout describes a shape one
+        // user chose, so Mosaix has nothing to guess at (ADR 0018).
+        layouts: BTreeMap::new(),
     }
 }
 
@@ -89,6 +111,21 @@ mod tests {
             Some(&arrow_combo("DOWN"))
         );
         assert_eq!(base.gaps, Gaps::default());
+        assert!(base.focus_border.enabled);
+        assert_eq!(base.focus_border.color, crate::schema::RgbaColor::default());
+        assert_eq!(base.focus_border.thickness, 2);
+        assert_eq!(
+            base.hotkeys.get(&Command::Rearrange),
+            Some(&arrow_combo("R"))
+        );
+        assert_eq!(
+            base.hotkeys.get(&Command::FocusLeft),
+            Some(&arrow_combo("H"))
+        );
+        assert_eq!(
+            base.hotkeys.get(&Command::SwapRight),
+            Some(&KeyCombo::parse("ctrl+alt+shift+l").unwrap())
+        );
         assert_eq!(base.behavior, BehaviorSection::default());
     }
 

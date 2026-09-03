@@ -21,6 +21,8 @@
 //! deterministic edge-allocation algorithm" the doc requires so adjacent
 //! tiles neither overlap nor leave cumulative gaps.
 
+use serde::{Deserialize, Serialize};
+
 use crate::Rect;
 
 /// Rounds ties away from zero -- the one rounding rule every conversion in
@@ -81,7 +83,14 @@ impl Rect {
 /// width/height -- the persisted-zone format from architecture doc section
 /// 10, e.g. `{ "x": 0.0, "y": 0.0, "width": 0.5, "height": 1.0 }` for the
 /// left half of a display's work area.
-#[derive(Debug, Clone, Copy, PartialEq)]
+///
+/// Being the persisted form, this is the type a saved layout's cells are
+/// written and read as (`mosaix_config::SavedLayout`), the same way
+/// [`Gaps`](crate::Gaps) is the type a config file's `[gaps]` table is
+/// read as. `deny_unknown_fields` so a misspelled cell field is rejected
+/// where it is written rather than silently defaulting to zero.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NormalizedRect {
     pub x: f64,
     pub y: f64,
@@ -154,7 +163,10 @@ pub fn allocate_edges(total: i32, weights: &[f64]) -> Vec<(i32, i32)> {
     }
 
     debug_assert!(total >= 0, "total must be non-negative");
-    debug_assert!(weights.iter().all(|w| *w >= 0.0), "weights must be non-negative");
+    debug_assert!(
+        weights.iter().all(|w| *w >= 0.0),
+        "weights must be non-negative"
+    );
     let sum: f64 = weights.iter().sum();
     debug_assert!(sum > 0.0, "weights must not all be zero");
 
@@ -169,7 +181,10 @@ pub fn allocate_edges(total: i32, weights: &[f64]) -> Vec<(i32, i32)> {
     // error in the cumulative sum drifting it off by a pixel.
     *boundaries.last_mut().unwrap() = total;
 
-    boundaries.windows(2).map(|pair| (pair[0], pair[1])).collect()
+    boundaries
+        .windows(2)
+        .map(|pair| (pair[0], pair[1]))
+        .collect()
 }
 
 #[cfg(test)]
@@ -314,8 +329,16 @@ mod tests {
         }
         .to_rect(container);
 
-        assert_eq!(left.x + left.width, right.x, "halves must share an exact edge");
-        assert_eq!(left.width + right.width, container.width, "halves must cover the container exactly");
+        assert_eq!(
+            left.x + left.width,
+            right.x,
+            "halves must share an exact edge"
+        );
+        assert_eq!(
+            left.width + right.width,
+            container.width,
+            "halves must cover the container exactly"
+        );
     }
 
     #[test]
@@ -324,13 +347,19 @@ mod tests {
         assert_eq!(segments.len(), 3);
 
         for pair in segments.windows(2) {
-            assert_eq!(pair[0].1, pair[1].0, "segments must be contiguous: {segments:?}");
+            assert_eq!(
+                pair[0].1, pair[1].0,
+                "segments must be contiguous: {segments:?}"
+            );
         }
         assert_eq!(segments.first().unwrap().0, 0);
         assert_eq!(segments.last().unwrap().1, 100);
 
         let total_width: i32 = segments.iter().map(|(start, end)| end - start).sum();
-        assert_eq!(total_width, 100, "widths must sum to the full span, not fall short by rounding");
+        assert_eq!(
+            total_width, 100,
+            "widths must sum to the full span, not fall short by rounding"
+        );
     }
 
     #[test]
@@ -348,10 +377,17 @@ mod tests {
             let segments = allocate_edges(total, weights);
             assert_eq!(segments.len(), weights.len());
             assert_eq!(segments.first().unwrap().0, 0, "case {total}/{weights:?}");
-            assert_eq!(segments.last().unwrap().1, total, "case {total}/{weights:?}");
+            assert_eq!(
+                segments.last().unwrap().1,
+                total,
+                "case {total}/{weights:?}"
+            );
 
             for pair in segments.windows(2) {
-                assert_eq!(pair[0].1, pair[1].0, "case {total}/{weights:?}: {segments:?}");
+                assert_eq!(
+                    pair[0].1, pair[1].0,
+                    "case {total}/{weights:?}: {segments:?}"
+                );
             }
             for &(start, end) in &segments {
                 assert!(end >= start, "case {total}/{weights:?}: {segments:?}");

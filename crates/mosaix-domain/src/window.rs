@@ -58,6 +58,10 @@ pub enum WindowLifecycle {
     Minimized,
     /// Maximized to fill the work area.
     Maximized,
+    /// Application-controlled full-screen presentation. Unlike maximize,
+    /// this is temporarily ineligible and restores its visual-order slot on
+    /// exit (ADR 0014).
+    Fullscreen,
     /// Not visible (hidden by the application or system).
     Hidden,
     /// Cloaked by DWM (e.g. on another virtual desktop).
@@ -68,7 +72,7 @@ pub enum WindowLifecycle {
 ///
 /// Platform adapters populate this from native APIs. Native handles are
 /// stored only in `WindowId` and must never be persisted across sessions.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Window {
     /// Ephemeral native handle.
     pub id: WindowId,
@@ -90,6 +94,10 @@ pub struct Window {
     pub display_id: DisplayId,
     /// What the platform allows us to do with this window.
     pub capabilities: WindowCapabilities,
+    /// Whether the owning process has a higher integrity level than Mosaix.
+    /// Elevated windows remain observable for diagnostics and rules, but are
+    /// ineligible for placement because UIPI can reject the native call.
+    pub elevated: bool,
     /// Current lifecycle state.
     pub lifecycle: WindowLifecycle,
 }

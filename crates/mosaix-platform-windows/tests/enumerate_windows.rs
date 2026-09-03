@@ -5,16 +5,21 @@
 
 #[cfg(windows)]
 mod tests {
-    use mosaix_domain::WindowLifecycle;
     use mosaix_platform_api::PlatformAdapter;
-    use mosaix_platform_windows::WindowsPlatformAdapter;
+    use mosaix_platform_windows::{enumerate_displays, WindowsPlatformAdapter};
 
     #[test]
+    #[ignore = "requires an interactive Windows desktop"]
     fn enumerate_returns_windows() {
         let adapter = WindowsPlatformAdapter::new();
         let windows = adapter
             .enumerate_windows()
             .expect("enumerate_windows should not fail");
+        let display_ids: Vec<_> = enumerate_displays()
+            .expect("enumerate_displays should not fail")
+            .into_iter()
+            .map(|display| display.id)
+            .collect();
 
         // On any interactive desktop session there should be at least one window
         // (the test runner itself, or a console host, etc.)
@@ -23,7 +28,10 @@ mod tests {
             "expected at least one manageable window on an interactive desktop"
         );
 
-        println!("\n=== Enumerated {} manageable windows ===\n", windows.len());
+        println!(
+            "\n=== Enumerated {} manageable windows ===\n",
+            windows.len()
+        );
         println!(
             "{:<8} {:<8} {:<30} {:<30} {:<12} {:<20} {:<10}",
             "HWND", "PID", "Title", "Class", "Role", "Bounds", "Lifecycle"
@@ -59,13 +67,12 @@ mod tests {
                 w.bounds
             );
 
-            // Lifecycle should not be Hidden (hidden windows are filtered out)
-            assert_ne!(
-                w.lifecycle,
-                WindowLifecycle::Hidden,
-                "window {:#x} '{}' should not have Hidden lifecycle",
+            assert!(
+                display_ids.contains(&w.display_id),
+                "window {:#x} '{}' was assigned to unknown display {:?}",
                 w.id.0,
                 w.title,
+                w.display_id,
             );
 
             // Should have either a title or a class name
@@ -76,11 +83,7 @@ mod tests {
             );
 
             // Process ID should be nonzero
-            assert_ne!(
-                w.process_id, 0,
-                "window {:#x} has zero process ID",
-                w.id.0,
-            );
+            assert_ne!(w.process_id, 0, "window {:#x} has zero process ID", w.id.0,);
         }
     }
 
