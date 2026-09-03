@@ -7,7 +7,7 @@
 //! connection's lifetime, so the agent recovers when the application dies
 //! and the operating system closes the pipe handle (ADR 0021).
 
-use mosaix_config::LayoutEdit;
+use mosaix_config::{BindingEdit, LayoutEdit};
 use mosaix_ipc::StateSnapshot;
 
 /// Why an agent request did not succeed. The three cases are kept apart
@@ -60,6 +60,18 @@ pub trait AgentTransport: Send + std::fmt::Debug {
     /// Asks the agent to register the hotkeys again. The editor closing
     /// cleanly is the ordinary way suspension ends.
     fn end_hotkey_capture(&mut self) -> Result<(), AgentError>;
+
+    /// Asks whether `combo` can be bound, before the user commits to it.
+    ///
+    /// The agent answers, not this application: only the agent can
+    /// attempt the registration, and only it knows Mosaix's own resolved
+    /// bindings well enough to say a conflict is one the user can resolve
+    /// themselves (ADR 0021).
+    fn probe_hotkey(&mut self, combo: &str) -> Result<serde_json::Value, AgentError>;
+
+    /// Asks the agent to change a binding, returning the configuration
+    /// file the write landed in and the combination now in effect.
+    fn edit_binding(&mut self, edit: BindingEdit) -> Result<(String, Option<String>), AgentError>;
 }
 
 /// The transport this build talks to a real agent through.
@@ -101,11 +113,19 @@ impl AgentTransport for UnsupportedPlatform {
     fn end_hotkey_capture(&mut self) -> Result<(), AgentError> {
         Err(AgentError::Unavailable)
     }
+
+    fn probe_hotkey(&mut self, _combo: &str) -> Result<serde_json::Value, AgentError> {
+        Err(AgentError::Unavailable)
+    }
+
+    fn edit_binding(&mut self, _edit: BindingEdit) -> Result<(String, Option<String>), AgentError> {
+        Err(AgentError::Unavailable)
+    }
 }
 
 #[cfg(windows)]
 mod windows_transport {
-    use mosaix_config::LayoutEdit;
+    use mosaix_config::{BindingEdit, LayoutEdit};
     use mosaix_ipc::{IpcConnection, IpcError, IpcRequest, IpcResponse, StateSnapshot};
 
     use super::{AgentError, AgentTransport};
@@ -233,6 +253,44 @@ mod windows_transport {
             // suspension the user has finished with.
             self.capturing = false;
             self.confirmed(IpcRequest::EndHotkeyCapture).map(|_| ())
+        }
+
+        fn probe_hotkey(&mut self, combo: &str) -> Result<serde_json::Value, AgentError> {
+            Ok(self
+                .confirmed(IpcRequest::ProbeHotkey {
+                    combo: combo.to_owned(),
+                })?
+                .unwrap_or(serde_json::Value::Null))
+        }
+
+        fn edit_binding(
+            &mut self,
+            edit: BindingEdit,
+        ) -> Result<(String, Option<String>), AgentError> {
+            let data = self.confirmed(match edit {
+                BindingEdit::Set {
+                    command,
+                    combo,
+                    to_base,
+                } => IpcRequest::SetBinding {
+                    command_path: command.to_string(),
+                    combo: combo.to_string(),
+                    to_base,
+                },
+                BindingEdit::Reset { command } => IpcRequest::ResetBinding {
+                    command_path: command.to_string(),
+                },
+            })?;
+            let field = |name: &str| {
+                data.as_ref()
+                    .and_then(|data| data.get(name))
+                    .and_then(|value| value.as_str())
+                    .map(str::to_owned)
+            };
+            Ok((
+                field("file").unwrap_or_else(|| "your configuration".to_owned()),
+                field("combo"),
+            ))
         }
 
         fn state(&mut self) -> Result<StateSnapshot, AgentError> {

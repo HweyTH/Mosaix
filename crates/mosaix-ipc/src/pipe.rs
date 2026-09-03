@@ -30,7 +30,7 @@ use windows::Win32::System::Pipes::{
 };
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
-use crate::handler::{handle_request, CaptureHold, ConfigStore};
+use crate::handler::{handle_request, CaptureHold, ConfigStore, HotkeyProbe};
 use crate::protocol::{decode_request, wrap_response, IpcResponse};
 
 pub const PIPE_NAME_PREFIX: &str = r"\\.\pipe\mosaix-";
@@ -60,17 +60,20 @@ pub struct IpcServer {
 
 impl IpcServer {
     /// `config` is what a request that changes configuration is performed
-    /// through: shared across client threads, so it is behind an `Arc`.
+    /// through, and `hotkeys` is what a combination-availability probe
+    /// asks. Both are shared across client threads, so both are behind an
+    /// `Arc`.
     pub fn start(
         events: EventSender,
         state_reader: StateReader,
         config: Arc<dyn ConfigStore>,
+        hotkeys: Arc<dyn HotkeyProbe>,
     ) -> std::io::Result<Self> {
         let stop_flag = Arc::new(AtomicBool::new(false));
         let thread_flag = Arc::clone(&stop_flag);
         let join_handle = thread::Builder::new()
             .name("mosaix-ipc".to_owned())
-            .spawn(move || server_loop(events, state_reader, config, thread_flag))?;
+            .spawn(move || server_loop(events, state_reader, config, hotkeys, thread_flag))?;
         Ok(Self {
             stop_flag,
             join_handle: Some(join_handle),
@@ -108,6 +111,7 @@ fn server_loop(
     events: EventSender,
     state_reader: StateReader,
     config: Arc<dyn ConfigStore>,
+    hotkeys: Arc<dyn HotkeyProbe>,
     stop_flag: Arc<AtomicBool>,
 ) {
     let name = wide(&pipe_name());
@@ -162,6 +166,7 @@ fn server_loop(
         let events = events.clone();
         let state_reader = state_reader.clone();
         let config = Arc::clone(&config);
+        let hotkeys = Arc::clone(&hotkeys);
         let client = ClientPipe(pipe);
         if let Err(error) = thread::Builder::new()
             .name("mosaix-ipc-client".to_owned())
@@ -171,7 +176,7 @@ fn server_loop(
                 // Reading the field directly would capture the bare
                 // `HANDLE` instead, which isn't.
                 let pipe = client.into_handle();
-                handle_client(pipe, &events, &state_reader, config.as_ref());
+                handle_client(pipe, &events, &state_reader, config.as_ref(), hotkeys.as_ref());
                 unsafe {
                     let _ = DisconnectNamedPipe(pipe);
                     let _ = CloseHandle(pipe);
@@ -206,6 +211,7 @@ fn handle_client(
     events: &EventSender,
     state_reader: &StateReader,
     config: &dyn ConfigStore,
+    hotkeys: &dyn HotkeyProbe,
 ) {
     let file = unsafe { File::from_raw_handle(pipe.0 as RawHandle) };
     let mut reader = BufReader::new(file);
@@ -247,7 +253,7 @@ fn handle_client(
         }
         let response = match decode_request(&bytes) {
             Ok(request) => {
-                let response = handle_request(&request, events, state_reader, config);
+                let response = handle_request(&request, events, state_reader, config, hotkeys);
                 capture.observe(&request, &response);
                 response
             }

@@ -2,10 +2,12 @@ import { invoke } from "@tauri-apps/api/core";
 
 import type {
   Appearance,
+  BindingWriteReceipt,
   CommandReceipt,
   DesktopBridge,
   EditorSnapshot,
   HotkeyList,
+  HotkeyProbeResult,
   LayoutDraft,
   LayoutWriteReceipt,
   SavedLayout,
@@ -75,6 +77,12 @@ export function createTauriDesktopBridge(
     startHotkeyCapture: () =>
       invokeCommand("start_hotkey_capture") as Promise<void>,
     endHotkeyCapture: () => invokeCommand("end_hotkey_capture") as Promise<void>,
+    probeHotkey: (combo: string) =>
+      invokeCommand("probe_hotkey", { combo }) as Promise<HotkeyProbeResult>,
+    setBinding: (command: string, combo: string, toBase: boolean) =>
+      invokeCommand("set_binding", { command, combo, toBase }) as Promise<BindingWriteReceipt>,
+    resetBinding: (command: string) =>
+      invokeCommand("reset_binding", { command }) as Promise<BindingWriteReceipt>,
     loadSavedLayouts: async () => {
       const list = await invokeCommand("load_saved_layouts") as SavedLayoutList;
       return { ...list, layouts: list.layouts.map(fromNormalizedLayout) };

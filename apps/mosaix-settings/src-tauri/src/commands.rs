@@ -3,8 +3,8 @@ use std::sync::Mutex;
 use tauri::State;
 
 use crate::editor::{
-    Appearance, CommandReceipt, EditorSession, EditorSnapshot, HotkeyList, LayoutDraft,
-    LayoutWriteReceipt, SavedLayoutList,
+    Appearance, BindingWriteReceipt, CommandReceipt, EditorSession, EditorSnapshot, HotkeyList,
+    HotkeyProbeResult, LayoutDraft, LayoutWriteReceipt, SavedLayoutList,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -214,6 +214,46 @@ pub fn delete_layout(
 ) -> Result<LayoutWriteReceipt, String> {
     let mut session = state.0.lock().map_err(|_| "editor state is unavailable")?;
     session.delete(&name).map_err(|error| error.to_string())
+}
+
+/// Asks the agent whether a captured combination can be bound, before
+/// the user commits to it.
+#[tauri::command]
+pub fn probe_hotkey(
+    combo: String,
+    state: State<'_, EditorState>,
+) -> Result<HotkeyProbeResult, String> {
+    let mut session = state.0.lock().map_err(|_| "editor state is unavailable")?;
+    session
+        .probe_hotkey(&combo)
+        .map_err(|error| error.to_string())
+}
+
+/// Binds a command to a combination. The agent does the writing; this
+/// reports only what it confirmed (ADR 0022).
+#[tauri::command]
+pub fn set_binding(
+    command: String,
+    combo: String,
+    to_base: bool,
+    state: State<'_, EditorState>,
+) -> Result<BindingWriteReceipt, String> {
+    let mut session = state.0.lock().map_err(|_| "editor state is unavailable")?;
+    session
+        .set_binding(&command, &combo, to_base)
+        .map_err(|error| error.to_string())
+}
+
+/// Steps a binding back toward its default.
+#[tauri::command]
+pub fn reset_binding(
+    command: String,
+    state: State<'_, EditorState>,
+) -> Result<BindingWriteReceipt, String> {
+    let mut session = state.0.lock().map_err(|_| "editor state is unavailable")?;
+    session
+        .reset_binding(&command)
+        .map_err(|error| error.to_string())
 }
 
 /// Opens hotkey capture: the agent unregisters every binding until the

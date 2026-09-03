@@ -278,6 +278,7 @@ fn main() {
         engine.events(),
         engine.state_reader(),
         config_store,
+        std::sync::Arc::new(PlatformHotkeyProbe),
     ) {
         Ok(server) => Some(server),
         Err(err) => {
@@ -1034,10 +1035,10 @@ fn main() {
 
 /// The agent's configuration directory, as the IPC handler sees it.
 ///
-/// The whole implementation is `mosaix_config::edit_layouts`; what this
-/// adds is the directory the agent resolved at startup and the translation
-/// of a config error into the sentence the person who asked for the change
-/// reads.
+/// The whole implementation is `mosaix_config`'s two edit functions; what
+/// this adds is the directory the agent resolved at startup and the
+/// translation of a config error into the sentence the person who asked
+/// for the change reads.
 #[derive(Debug)]
 struct DirectoryConfigStore {
     dir: std::path::PathBuf,
@@ -1051,5 +1052,41 @@ impl mosaix_ipc::ConfigStore for DirectoryConfigStore {
     ) -> Result<mosaix_config::LayoutWrite, mosaix_ipc::ConfigError> {
         mosaix_config::edit_layouts(&self.dir, fingerprint, edit)
             .map_err(|error| mosaix_ipc::ConfigError(error.to_string()))
+    }
+
+    fn edit_bindings(
+        &self,
+        fingerprint: &str,
+        edit: mosaix_config::BindingEdit,
+    ) -> Result<mosaix_config::BindingWrite, mosaix_ipc::ConfigError> {
+        mosaix_config::edit_bindings(&self.dir, fingerprint, edit)
+            .map_err(|error| mosaix_ipc::ConfigError(error.to_string()))
+    }
+}
+
+/// The real `RegisterHotKey` probe, behind the handler's platform-neutral
+/// trait.
+///
+/// Translating a `KeyCombo` into modifier flags and a virtual-key code is
+/// the same translation registration already goes through, so a
+/// combination that probes as available is one that can actually be
+/// registered -- and a key name with no virtual-key code behind it is
+/// reported as unsupported rather than as taken.
+#[derive(Debug)]
+struct PlatformHotkeyProbe;
+
+impl mosaix_ipc::HotkeyProbe for PlatformHotkeyProbe {
+    fn probe(&self, combo: &mosaix_config::KeyCombo) -> mosaix_ipc::ProbeOutcome {
+        let Some((modifiers, vk)) = hotkeys::binding_parts(combo) else {
+            return mosaix_ipc::ProbeOutcome::Unsupported {
+                reason: format!("Mosaix has no key named {:?}", combo.key),
+            };
+        };
+        match mosaix_platform_windows::probe_hotkey(modifiers, vk) {
+            mosaix_platform_windows::HotkeyAvailability::Available => {
+                mosaix_ipc::ProbeOutcome::Available
+            }
+            mosaix_platform_windows::HotkeyAvailability::Taken => mosaix_ipc::ProbeOutcome::Taken,
+        }
     }
 }

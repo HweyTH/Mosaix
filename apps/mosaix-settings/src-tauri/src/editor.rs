@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 
-use mosaix_config::LayoutEdit;
+use mosaix_config::{BindingEdit, Command, KeyCombo, LayoutEdit};
 use mosaix_domain::NormalizedRect;
 
 use crate::agent::{self, AgentError, AgentTransport};
@@ -136,6 +136,36 @@ pub struct HotkeyBindingView {
     pub file: Option<String>,
 }
 
+/// What the agent said about a combination the user just pressed.
+///
+/// `availability` is one of `available`, `mosaix_binding`,
+/// `system_or_other_application`, `reserved`, or `unsupported`. Kept as
+/// the agent's own string rather than re-modelled here: the interface
+/// renders one sentence per case, and a second enumeration to keep in
+/// step would buy nothing.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HotkeyProbeResult {
+    pub availability: String,
+    /// The Mosaix binding already using it, for `mosaix_binding`.
+    pub command: Option<String>,
+    /// An advisory that does not block the binding, such as `F12`.
+    pub warning: Option<String>,
+    /// Why Mosaix cannot express the combination, for `unsupported`.
+    pub reason: Option<String>,
+}
+
+/// What a confirmed binding write did.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BindingWriteReceipt {
+    /// The configuration file the agent wrote.
+    pub file: String,
+    /// The combination the binding now resolves to, absent when the edit
+    /// left the command unbound.
+    pub combo: Option<String>,
+}
+
 /// Every binding in effect, plus the topology they are in effect for.
 ///
 /// The fingerprint travels with the list because a topology change can
@@ -156,6 +186,10 @@ pub struct HotkeyList {
     /// registration pass, named so a shortcut another application took
     /// during capture is visible rather than merely dead.
     pub unregistered_commands: Vec<String>,
+    /// The file a binding neither layer carries yet would be created in,
+    /// which the interface needs to name a destination for a command
+    /// nothing is bound to.
+    pub base_file: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -196,6 +230,18 @@ pub enum EditorCommandError {
     },
     EmptyLayout,
     EmptyLayoutName,
+    /// The captured combination is not one Mosaix can express. Refused
+    /// here rather than sent, so the user hears why rather than watching
+    /// the agent turn it down.
+    UnusableCombination {
+        reason: String,
+    },
+    /// A command path this build has no verb for -- which means the
+    /// settings application and the agent disagree about what commands
+    /// exist, worth reporting rather than guessing at.
+    UnknownCommand {
+        command: String,
+    },
     DuplicateZoneId {
         zone_id: u32,
     },
@@ -224,6 +270,11 @@ impl std::fmt::Display for EditorCommandError {
             Self::AgentTransportFailed { detail } => {
                 write!(formatter, "could not reach the Mosaix agent: {detail}")
             }
+            Self::UnusableCombination { reason } => write!(formatter, "{reason}"),
+            Self::UnknownCommand { command } => write!(
+                formatter,
+                "{command} is not a command this build knows; update Mosaix so the agent and settings match"
+            ),
             Self::EmptyLayout => formatter.write_str("a layout must contain at least one zone"),
             Self::EmptyLayoutName => {
                 formatter.write_str("a layout needs a name before it can be saved")
@@ -363,6 +414,7 @@ impl EditorSession {
         let state = self.agent.state().map_err(EditorCommandError::from)?;
         Ok(HotkeyList {
             topology_fingerprint: state.topology_fingerprint,
+            base_file: mosaix_config::BASE_CONFIG_FILE_NAME.to_owned(),
             capture_suspended: state.hotkey_capture_suspended,
             unregistered_commands: state.unregistered_bindings,
             bindings: state
@@ -377,6 +429,67 @@ impl EditorSession {
                 })
                 .collect(),
         })
+    }
+
+    /// Asks the agent whether `combo` can be bound.
+    ///
+    /// Asked before the save, so a combination something else owns is
+    /// reported while the user is still choosing rather than after they
+    /// have committed to it (ADR 0021).
+    pub fn probe_hotkey(&mut self, combo: &str) -> Result<HotkeyProbeResult, EditorCommandError> {
+        let answer = self
+            .agent
+            .probe_hotkey(combo)
+            .map_err(EditorCommandError::from)?;
+        serde_json::from_value(answer).map_err(|error| EditorCommandError::AgentTransportFailed {
+            detail: format!("could not read the agent's verdict: {error}"),
+        })
+    }
+
+    /// Binds `command` to `combo`, reporting the file the agent wrote.
+    ///
+    /// `to_base` is the redirect beside the shown destination: it sends
+    /// the write to base config rather than to the layer supplying the
+    /// binding, so a combination set at one desk applies everywhere
+    /// (ADR 0022).
+    pub fn set_binding(
+        &mut self,
+        command: &str,
+        combo: &str,
+        to_base: bool,
+    ) -> Result<BindingWriteReceipt, EditorCommandError> {
+        let command = parse_command(command)?;
+        let combo =
+            KeyCombo::parse(combo).map_err(|reason| EditorCommandError::UnusableCombination {
+                reason,
+            })?;
+        self.edit_binding(BindingEdit::Set {
+            command,
+            combo,
+            to_base,
+        })
+    }
+
+    /// Steps `command`'s binding back toward its default, so an
+    /// experiment can be undone without remembering what the default was.
+    pub fn reset_binding(
+        &mut self,
+        command: &str,
+    ) -> Result<BindingWriteReceipt, EditorCommandError> {
+        let command = parse_command(command)?;
+        self.edit_binding(BindingEdit::Reset { command })
+    }
+
+    fn edit_binding(
+        &mut self,
+        edit: BindingEdit,
+    ) -> Result<BindingWriteReceipt, EditorCommandError> {
+        let (file, combo) = self
+            .agent
+            .edit_binding(edit)
+            .map_err(EditorCommandError::from)?;
+        self.revision += 1;
+        Ok(BindingWriteReceipt { file, combo })
     }
 
     /// Opens hotkey capture: the agent unregisters every binding until
@@ -529,6 +642,17 @@ impl EditorSession {
     }
 }
 
+/// The command a TOML path names, or a refusal naming what was asked for.
+///
+/// The interface only ever sends back a path the agent gave it, so a path
+/// that does not parse means the two builds disagree -- worth reporting
+/// rather than guessing at.
+fn parse_command(path: &str) -> Result<Command, EditorCommandError> {
+    Command::parse(path).ok_or_else(|| EditorCommandError::UnknownCommand {
+        command: path.to_owned(),
+    })
+}
+
 /// Rejects a layout name that is empty or whitespace-only.
 ///
 /// The one name rule the settings application can check on its own:
@@ -614,6 +738,9 @@ mod tests {
         edits: Arc<Mutex<Vec<LayoutEdit>>>,
         edit_outcome: Option<Result<String, AgentError>>,
         capture: Arc<Mutex<Vec<bool>>>,
+        binding_edits: Arc<Mutex<Vec<BindingEdit>>>,
+        binding_outcome: Option<Result<(String, Option<String>), AgentError>>,
+        probe_answer: Option<serde_json::Value>,
     }
 
     impl FakeAgent {
@@ -646,6 +773,16 @@ mod tests {
                 ..Self::default()
             }
         }
+
+        /// A fake answering a probe with `answer` and confirming any
+        /// binding write.
+        fn about_hotkeys(answer: serde_json::Value) -> Self {
+            Self {
+                probe_answer: Some(answer),
+                binding_outcome: Some(Ok(("config.toml".to_owned(), Some("ctrl+alt+j".to_owned())))),
+                ..Self::default()
+            }
+        }
     }
 
     impl AgentTransport for FakeAgent {
@@ -672,6 +809,22 @@ mod tests {
         fn start_hotkey_capture(&mut self) -> Result<(), AgentError> {
             self.capture.lock().unwrap().push(true);
             Ok(())
+        }
+
+        fn probe_hotkey(&mut self, _combo: &str) -> Result<serde_json::Value, AgentError> {
+            self.probe_answer
+                .clone()
+                .ok_or(AgentError::Unavailable)
+        }
+
+        fn edit_binding(
+            &mut self,
+            edit: BindingEdit,
+        ) -> Result<(String, Option<String>), AgentError> {
+            self.binding_edits.lock().unwrap().push(edit);
+            self.binding_outcome
+                .clone()
+                .expect("the test scripted no answer for this binding edit")
         }
 
         fn end_hotkey_capture(&mut self) -> Result<(), AgentError> {
@@ -1243,5 +1396,126 @@ mod tests {
             ),
             other => panic!("expected a save, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_probe_verdict_reaches_the_interface_with_its_owner_named() {
+        let mut session = session(FakeAgent::about_hotkeys(serde_json::json!({
+            "availability": "mosaix_binding",
+            "command": "snap-left",
+            "warning": null,
+        })));
+
+        let verdict = session.probe_hotkey("ctrl+alt+left").expect("the agent answered");
+
+        assert_eq!(verdict.availability, "mosaix_binding");
+        assert_eq!(
+            verdict.command.as_deref(),
+            Some("snap-left"),
+            "a conflict the user can resolve themselves has to name what to go and change"
+        );
+    }
+
+    #[test]
+    fn a_probe_advisory_travels_with_an_otherwise_available_verdict() {
+        let mut session = session(FakeAgent::about_hotkeys(serde_json::json!({
+            "availability": "available",
+            "warning": "Windows reserves F12 for the debugger, so this binding may not fire",
+        })));
+
+        let verdict = session.probe_hotkey("ctrl+alt+f12").expect("the agent answered");
+
+        assert_eq!(verdict.availability, "available");
+        assert!(verdict.warning.is_some());
+    }
+
+    #[test]
+    fn setting_a_binding_reaches_the_agent_and_reports_the_file_it_wrote() {
+        let agent = FakeAgent::about_hotkeys(serde_json::Value::Null);
+        let edits = Arc::clone(&agent.binding_edits);
+        let mut session = session(agent);
+
+        let receipt = session
+            .set_binding("focus-down", "ctrl+alt+j", false)
+            .expect("a confirmed write");
+
+        assert_eq!(receipt.file, "config.toml");
+        assert_eq!(receipt.combo.as_deref(), Some("ctrl+alt+j"));
+        assert_eq!(
+            edits.lock().unwrap().clone(),
+            vec![BindingEdit::Set {
+                command: Command::FocusDown,
+                combo: KeyCombo::parse("ctrl+alt+j").unwrap(),
+                to_base: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn a_redirected_binding_write_carries_the_redirect_to_the_agent() {
+        let agent = FakeAgent::about_hotkeys(serde_json::Value::Null);
+        let edits = Arc::clone(&agent.binding_edits);
+        let mut session = session(agent);
+
+        session
+            .set_binding("focus-down", "ctrl+alt+j", true)
+            .expect("a confirmed write");
+
+        assert!(matches!(
+            edits.lock().unwrap()[0],
+            BindingEdit::Set { to_base: true, .. }
+        ));
+    }
+
+    #[test]
+    fn resetting_a_binding_reaches_the_agent_as_a_reset() {
+        let agent = FakeAgent::about_hotkeys(serde_json::Value::Null);
+        let edits = Arc::clone(&agent.binding_edits);
+        let mut session = session(agent);
+
+        session.reset_binding("focus-down").expect("a confirmed write");
+
+        assert_eq!(
+            edits.lock().unwrap().clone(),
+            vec![BindingEdit::Reset {
+                command: Command::FocusDown
+            }]
+        );
+    }
+
+    #[test]
+    fn a_combination_mosaix_cannot_express_is_refused_before_the_agent_is_asked() {
+        // The fake has no scripted binding answer, so reaching it panics.
+        let mut session = session(FakeAgent::never_asked());
+
+        let error = session.set_binding("focus-down", "ctrl++", false).unwrap_err();
+
+        assert!(matches!(
+            error,
+            EditorCommandError::UnusableCombination { .. }
+        ));
+    }
+
+    #[test]
+    fn a_command_this_build_does_not_know_is_refused_by_name() {
+        let mut session = session(FakeAgent::never_asked());
+
+        let error = session.reset_binding("snap-diagonal").unwrap_err();
+
+        assert_eq!(
+            error,
+            EditorCommandError::UnknownCommand {
+                command: "snap-diagonal".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn the_hotkey_list_names_the_file_a_new_binding_would_be_created_in() {
+        let mut session = session(FakeAgent::reporting(Ok(state_reporting("MON-A", Vec::new()))));
+
+        let list = session.hotkeys().expect("the agent answered");
+
+        assert_eq!(list.base_file, "config.toml");
     }
 }

@@ -27,9 +27,9 @@ mod validate;
 pub use defaults::{default_base_config, default_config_content, fallback_config};
 pub use diff::diff_bindings;
 pub use io::{
-    edit_layouts, ensure_default_config, load, save_profile_settings, watch, ConfigEvent,
-    ConfigIoError, ConfigWatcher, LayoutEdit, LayoutEditError, LayoutWrite, ProfileSettingsUpdate,
-    DEBOUNCE_WINDOW,
+    edit_bindings, edit_layouts, ensure_default_config, load, save_profile_settings, watch,
+    BindingEdit, BindingEditError, BindingWrite, ConfigEvent, ConfigIoError, ConfigWatcher,
+    LayoutEdit, LayoutEditError, LayoutWrite, ProfileSettingsUpdate, DEBOUNCE_WINDOW,
 };
 pub use schema::{
     layout_names_collide, AutomaticTilingSection, BaseConfig, BehaviorSection, Command,

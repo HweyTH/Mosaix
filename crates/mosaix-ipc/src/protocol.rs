@@ -5,12 +5,13 @@ use serde::{Deserialize, Serialize};
 ///
 /// Bumped to 2 when [`IpcRequest`] gained its first data-carrying variant
 /// ([`IpcRequest::ApplyLayout`]), to 3 for the saved-layout editing
-/// requests, to 4 for the hotkey-capture pair, and to 5 when
-/// [`IpcRequest::SaveLayout`] gained its write-destination redirect. An
+/// requests, to 4 for the hotkey-capture pair, to 5 when
+/// [`IpcRequest::SaveLayout`] gained its write-destination redirect, and
+/// to 6 for the binding-editing requests. An
 /// older agent has no tag for a request this build added -- and no field
 /// for one an existing request grew -- so the version is what makes the
 /// mismatch reportable instead of surfacing as a deserialization failure.
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 6;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct IpcEnvelope {
@@ -95,6 +96,32 @@ pub enum IpcRequest {
     /// The hotkey editor closed cleanly. Registration resumes, exactly as
     /// it would have when this connection ended.
     EndHotkeyCapture,
+    /// Ask whether `combo` is free, before the user commits to it.
+    ///
+    /// Answered by attempting registration and releasing it again, then
+    /// naming who owns a refusal: another Mosaix binding, or the system
+    /// or another application (ADR 0021). The combination is not bound by
+    /// asking.
+    ProbeHotkey {
+        combo: String,
+    },
+    /// Bind `command` to `combo`.
+    ///
+    /// `command_path` is the TOML path the state snapshot reports --
+    /// `snap-left`, or `apply-layout.writing` -- so what the interface
+    /// shows and what it sends back are one string. It is spelled out
+    /// rather than called `command` because that name is this
+    /// enumeration's own serde tag. `to_base` is ADR 0022's redirect.
+    SetBinding {
+        command_path: String,
+        combo: String,
+        to_base: bool,
+    },
+    /// Step a binding back toward its default: a profile override is
+    /// dropped, and a base binding returns to what a fresh install gives.
+    ResetBinding {
+        command_path: String,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -257,6 +284,17 @@ mod tests {
             },
             IpcRequest::StartHotkeyCapture,
             IpcRequest::EndHotkeyCapture,
+            IpcRequest::ProbeHotkey {
+                combo: "ctrl+alt+left".to_owned(),
+            },
+            IpcRequest::SetBinding {
+                command_path: "snap-left".to_owned(),
+                combo: "ctrl+alt+left".to_owned(),
+                to_base: true,
+            },
+            IpcRequest::ResetBinding {
+                command_path: "apply-layout.writing".to_owned(),
+            },
         ];
         for request in requests {
             let decoded: IpcEnvelope = serde_json::from_str(

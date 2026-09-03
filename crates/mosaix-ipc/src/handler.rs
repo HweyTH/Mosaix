@@ -1,6 +1,9 @@
 use std::collections::BTreeMap;
 
-use mosaix_config::{Command, ConfigLayer, LayoutEdit, LayoutWrite, ResolvedConfig, SavedLayout};
+use mosaix_config::{
+    BindingEdit, BindingWrite, Command, ConfigLayer, KeyCombo, LayoutEdit, LayoutWrite,
+    ResolvedConfig, SavedLayout,
+};
 use mosaix_engine::{
     EligibilityReason, EngineState, Event, EventSender, StateReader, ZoneSnapDirection,
 };
@@ -285,6 +288,128 @@ impl From<EngineState> for StateSnapshot {
     }
 }
 
+/// What the operating system said about one combination.
+///
+/// A trait rather than a direct call, so the classification below --
+/// which refusal is another Mosaix binding, which is the system, and
+/// which combinations are refused without asking at all -- is testable
+/// without touching `RegisterHotKey`. The agent's implementation is the
+/// real `mosaix_platform_windows::probe_hotkey`.
+pub trait HotkeyProbe: Send + Sync {
+    fn probe(&self, combo: &KeyCombo) -> ProbeOutcome;
+}
+
+/// The platform's raw answer, before Mosaix's own bindings are consulted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProbeOutcome {
+    /// Registration succeeded and was released again.
+    Available,
+    /// Registration was refused. Something owns it; who is not knowable
+    /// from here.
+    Taken,
+    /// Mosaix cannot express this combination at all -- a key name with
+    /// no virtual-key code behind it. Distinct from `Taken`, because
+    /// "nothing owns it, Mosaix just cannot send it" is a different thing
+    /// to tell the user.
+    Unsupported { reason: String },
+}
+
+/// A probe for a build with no platform to ask. Reports every
+/// combination unsupported rather than claiming one is free.
+#[derive(Debug, Clone)]
+pub struct UnavailableHotkeyProbe {
+    pub reason: String,
+}
+
+impl HotkeyProbe for UnavailableHotkeyProbe {
+    fn probe(&self, _combo: &KeyCombo) -> ProbeOutcome {
+        ProbeOutcome::Unsupported {
+            reason: self.reason.clone(),
+        }
+    }
+}
+
+/// Whether `combo` is one of the two combinations the probe cannot see.
+///
+/// `Win+L` and `Ctrl+Alt+Del` are handled by Windows itself and are never
+/// registered hotkeys, so `RegisterHotKey` accepts them and the binding
+/// then never fires. Hardcoding exactly these two is deliberate: every
+/// other refusal is left to the probe, including Windows-key chords
+/// (ADR 0021).
+fn is_reserved(combo: &KeyCombo) -> bool {
+    let key = combo.key.to_ascii_uppercase();
+    let win_lock = combo.win && !combo.ctrl && !combo.alt && !combo.shift && key == "L";
+    let secure_attention = combo.ctrl && combo.alt && !combo.win && key == "DELETE";
+    win_lock || secure_attention
+}
+
+/// The advisory Microsoft's `RegisterHotKey` documentation earns for
+/// `F12`, which it reserves for the debugger.
+///
+/// A warning rather than a block: the reservation is real but not
+/// absolute, and refusing a combination the user may well be able to use
+/// is a worse answer than saying so (ADR 0021).
+fn advisory(combo: &KeyCombo) -> Option<String> {
+    combo.key.eq_ignore_ascii_case("F12").then(|| {
+        "Windows reserves F12 for the debugger, so this binding may not fire".to_owned()
+    })
+}
+
+/// The Mosaix binding already using `combo`, if any.
+///
+/// Asked before the probe's answer is interpreted, because during hotkey
+/// capture the agent holds no registrations at all -- so a combination
+/// Mosaix itself owns probes as free, and only the resolved config knows
+/// otherwise.
+fn mosaix_owner(config: &ResolvedConfig, combo: &KeyCombo) -> Option<Command> {
+    config
+        .hotkeys
+        .iter()
+        .find(|(_, bound)| *bound == combo)
+        .map(|(command, _)| command.clone())
+}
+
+/// The answer to "can I use this combination", as the interface reports
+/// it.
+fn availability(
+    config: &ResolvedConfig,
+    probe: &dyn HotkeyProbe,
+    combo: &KeyCombo,
+) -> serde_json::Value {
+    let warning = advisory(combo);
+    if is_reserved(combo) {
+        return serde_json::json!({
+            "availability": "reserved",
+            "warning": warning,
+        });
+    }
+    if let Some(command) = mosaix_owner(config, combo) {
+        return serde_json::json!({
+            "availability": "mosaix_binding",
+            "command": command.to_string(),
+            "warning": warning,
+        });
+    }
+    match probe.probe(combo) {
+        ProbeOutcome::Available => serde_json::json!({
+            "availability": "available",
+            "warning": warning,
+        }),
+        // An unexplained refusal is attributed to the system (ADR 0021):
+        // no Mosaix binding claimed it above, so whatever owns it is not
+        // something the user can resolve inside Mosaix.
+        ProbeOutcome::Taken => serde_json::json!({
+            "availability": "system_or_other_application",
+            "warning": warning,
+        }),
+        ProbeOutcome::Unsupported { reason } => serde_json::json!({
+            "availability": "unsupported",
+            "reason": reason,
+            "warning": warning,
+        }),
+    }
+}
+
 /// The agent's configuration directory, as the request handler needs it.
 ///
 /// A trait rather than a path, so what the handler does with a layout edit
@@ -298,6 +423,17 @@ pub trait ConfigStore: Send + Sync {
     /// reason the caller can act on.
     fn edit_layouts(&self, fingerprint: &str, edit: LayoutEdit)
         -> Result<LayoutWrite, ConfigError>;
+
+    /// Applies `edit` against the topology `fingerprint` is for, returning
+    /// the file it landed in and the configuration as it now stands.
+    ///
+    /// The binding twin of [`ConfigStore::edit_layouts`], for the same
+    /// reason: the settings application asks, the agent writes (ADR 0022).
+    fn edit_bindings(
+        &self,
+        fingerprint: &str,
+        edit: BindingEdit,
+    ) -> Result<BindingWrite, ConfigError>;
 }
 
 /// A configuration change that could not be made, in words meant for the
@@ -324,6 +460,14 @@ impl ConfigStore for UnavailableConfigStore {
     ) -> Result<LayoutWrite, ConfigError> {
         Err(ConfigError(self.reason.clone()))
     }
+
+    fn edit_bindings(
+        &self,
+        _fingerprint: &str,
+        _edit: BindingEdit,
+    ) -> Result<BindingWrite, ConfigError> {
+        Err(ConfigError(self.reason.clone()))
+    }
 }
 
 pub fn handle_request(
@@ -331,6 +475,7 @@ pub fn handle_request(
     events: &EventSender,
     state_reader: &StateReader,
     config: &dyn ConfigStore,
+    hotkeys: &dyn HotkeyProbe,
 ) -> IpcResponse {
     match request {
         IpcRequest::Ping => IpcResponse::Ok { data: None },
@@ -505,6 +650,85 @@ pub fn handle_request(
         ),
         IpcRequest::StartHotkeyCapture => send_event(events, Event::HotkeyCaptureStarted),
         IpcRequest::EndHotkeyCapture => send_event(events, Event::HotkeyCaptureEnded),
+        IpcRequest::ProbeHotkey { combo } => match KeyCombo::parse(combo) {
+            Ok(combo) => IpcResponse::Ok {
+                data: Some(availability(
+                    &state_reader.snapshot().resolved_config,
+                    hotkeys,
+                    &combo,
+                )),
+            },
+            Err(reason) => IpcResponse::Error { message: reason },
+        },
+        IpcRequest::SetBinding {
+            command_path,
+            combo,
+            to_base,
+        } => {
+            let Some(command) = Command::parse(command_path) else {
+                return unknown_command(command_path);
+            };
+            match KeyCombo::parse(combo) {
+                Ok(combo) => edit_bindings(
+                    events,
+                    state_reader,
+                    config,
+                    BindingEdit::Set {
+                        command,
+                        combo,
+                        to_base: *to_base,
+                    },
+                ),
+                Err(reason) => IpcResponse::Error { message: reason },
+            }
+        }
+        IpcRequest::ResetBinding { command_path } => match Command::parse(command_path) {
+            Some(command) => {
+                edit_bindings(events, state_reader, config, BindingEdit::Reset { command })
+            }
+            None => unknown_command(command_path),
+        },
+    }
+}
+
+/// A command path this build has no verb for. Refused by name rather than
+/// silently misread, the same posture load-time validation takes.
+fn unknown_command(path: &str) -> IpcResponse {
+    IpcResponse::Error {
+        message: format!("{path:?} is not a command this build knows"),
+    }
+}
+
+/// Performs one binding edit and makes the result live.
+///
+/// The same shape [`edit_layouts`] has, and for the same reason:
+/// delivering the resulting configuration straight into the reducer is
+/// what makes a rebind take effect without restarting the agent, rather
+/// than after the reload debounce (ADR 0008). The rebind poller sees the
+/// new resolved bindings and re-registers -- unless hotkey capture still
+/// holds registration suspended, in which case the change takes effect
+/// when the editor closes.
+fn edit_bindings(
+    events: &EventSender,
+    state_reader: &StateReader,
+    config: &dyn ConfigStore,
+    edit: BindingEdit,
+) -> IpcResponse {
+    let fingerprint = mosaix_domain::topology_fingerprint(&state_reader.snapshot().displays);
+    match config.edit_bindings(&fingerprint, edit) {
+        Ok(write) => {
+            let combo = write.combo.as_ref().map(|combo| combo.to_string());
+            match send_event(events, Event::ConfigChanged(Box::new(write.config))) {
+                IpcResponse::Ok { .. } => IpcResponse::Ok {
+                    data: Some(serde_json::json!({
+                        "file": write.file,
+                        "combo": combo,
+                    })),
+                },
+                other => other,
+            }
+        }
+        Err(ConfigError(reason)) => IpcResponse::Error { message: reason },
     }
 }
 
@@ -770,13 +994,28 @@ mod tests {
     struct RecordingStore {
         edits: std::sync::Mutex<Vec<(String, LayoutEdit)>>,
         answer: Option<Result<LayoutWrite, ConfigError>>,
+        binding_edits: std::sync::Mutex<Vec<(String, BindingEdit)>>,
+        binding_answer: Option<Result<BindingWrite, ConfigError>>,
     }
 
     impl RecordingStore {
         fn answering(answer: Result<LayoutWrite, ConfigError>) -> Self {
             Self {
-                edits: std::sync::Mutex::default(),
                 answer: Some(answer),
+                ..Self::default()
+            }
+        }
+
+        /// A store that confirms a binding write, reporting `file` and the
+        /// combination the binding now resolves to.
+        fn bound(file: &str, combo: Option<&str>) -> Self {
+            Self {
+                binding_answer: Some(Ok(BindingWrite {
+                    file: file.to_owned(),
+                    combo: combo.map(|combo| KeyCombo::parse(combo).unwrap()),
+                    config: mosaix_config::ResolvedConfigSet::default(),
+                })),
+                ..Self::default()
             }
         }
 
@@ -819,6 +1058,38 @@ mod tests {
                 .clone()
                 .expect("the test scripted no answer for this edit")
         }
+
+        fn edit_bindings(
+            &self,
+            fingerprint: &str,
+            edit: BindingEdit,
+        ) -> Result<BindingWrite, ConfigError> {
+            self.binding_edits
+                .lock()
+                .unwrap()
+                .push((fingerprint.to_owned(), edit));
+            self.binding_answer
+                .clone()
+                .expect("the test scripted no answer for this binding edit")
+        }
+    }
+
+    /// A probe answering whatever the test scripted, so classification is
+    /// exercised without touching `RegisterHotKey`.
+    #[derive(Debug)]
+    struct ScriptedProbe(ProbeOutcome);
+
+    impl HotkeyProbe for ScriptedProbe {
+        fn probe(&self, _combo: &KeyCombo) -> ProbeOutcome {
+            self.0.clone()
+        }
+    }
+
+    /// The probe for a test whose request never reaches one.
+    fn no_probe() -> ScriptedProbe {
+        ScriptedProbe(ProbeOutcome::Unsupported {
+            reason: "the test scripted no probe answer".to_owned(),
+        })
     }
 
     fn one_cell() -> Vec<mosaix_domain::NormalizedRect> {
@@ -844,6 +1115,7 @@ mod tests {
             &engine.events(),
             &engine.state_reader(),
             &store,
+            &no_probe(),
         );
 
         match response {
@@ -876,6 +1148,7 @@ mod tests {
             &engine.events(),
             &engine.state_reader(),
             &RecordingStore::wrote("config.toml", &[("writing", 0.5)]),
+            &no_probe(),
         );
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
@@ -916,6 +1189,7 @@ mod tests {
             &engine.events(),
             &engine.state_reader(),
             &store,
+            &no_probe(),
         );
 
         assert_eq!(
@@ -962,7 +1236,13 @@ mod tests {
         ] {
             let store = RecordingStore::wrote("config.toml", &[]);
 
-            handle_request(&request, &engine.events(), &engine.state_reader(), &store);
+        handle_request(
+            &request,
+            &engine.events(),
+            &engine.state_reader(),
+            &store,
+            &no_probe(),
+        );
 
             assert_eq!(store.edits.lock().unwrap()[0].1, expected);
         }
@@ -981,6 +1261,7 @@ mod tests {
             &UnavailableConfigStore {
                 reason: "no configuration directory".to_owned(),
             },
+            &no_probe(),
         );
 
         assert_eq!(
@@ -1086,6 +1367,7 @@ mod tests {
             &engine.events(),
             &engine.state_reader(),
             &RecordingStore::default(),
+            &no_probe(),
         );
 
         assert_eq!(
@@ -1141,6 +1423,7 @@ mod tests {
             &engine.events(),
             &engine.state_reader(),
             &RecordingStore::default(),
+            &no_probe(),
         );
 
         let IpcResponse::Ok { data: Some(data) } = response else {
@@ -1161,6 +1444,7 @@ mod tests {
             &engine.events(),
             &engine.state_reader(),
             &RecordingStore::default(),
+            &no_probe(),
         );
 
         let IpcResponse::Error { message } = response else {
@@ -1192,6 +1476,7 @@ mod tests {
             &engine.events(),
             &engine.state_reader(),
             &RecordingStore::default(),
+            &no_probe(),
         );
 
         let IpcResponse::Error { message } = response else {
@@ -1215,6 +1500,7 @@ mod tests {
             &engine.events(),
             &engine.state_reader(),
             &store,
+            &no_probe(),
         );
         wait_for_revision(&engine, 1);
         assert!(engine.state_reader().snapshot().hotkey_capture_suspended);
@@ -1224,6 +1510,7 @@ mod tests {
             &engine.events(),
             &engine.state_reader(),
             &store,
+            &no_probe(),
         );
         wait_for_revision(&engine, 2);
         assert!(!engine.state_reader().snapshot().hotkey_capture_suspended);
@@ -1347,6 +1634,7 @@ mod tests {
             &engine.events(),
             &engine.state_reader(),
             &store,
+            &no_probe(),
         );
 
         assert_eq!(
@@ -1357,5 +1645,289 @@ mod tests {
                 to_base: true,
             }
         );
+    }
+
+    /// An engine holding `bindings` as its resolved hotkeys, so the
+    /// classification below has Mosaix's own combinations to compare
+    /// against.
+    fn engine_bound(bindings: &[(Command, &str)]) -> mosaix_engine::EngineHandle {
+        let mut base = ResolvedConfig::default();
+        for (command, combo) in bindings {
+            base.hotkeys
+                .insert(command.clone(), KeyCombo::parse(combo).unwrap());
+        }
+        mosaix_engine::spawn_engine(
+            Vec::new(),
+            mosaix_config::ResolvedConfigSet {
+                base,
+                profiles: Vec::new(),
+            },
+        )
+    }
+
+    fn probe_response(
+        engine: &mosaix_engine::EngineHandle,
+        probe: ProbeOutcome,
+        combo: &str,
+    ) -> serde_json::Value {
+        let response = handle_request(
+            &IpcRequest::ProbeHotkey {
+                combo: combo.to_owned(),
+            },
+            &engine.events(),
+            &engine.state_reader(),
+            &UnavailableConfigStore {
+                reason: "not asked".to_owned(),
+            },
+            &ScriptedProbe(probe),
+        );
+        match response {
+            IpcResponse::Ok { data } => data.expect("a probe always answers with a verdict"),
+            other => panic!("expected a verdict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_free_combination_no_mosaix_binding_holds_is_reported_available() {
+        let engine = engine_bound(&[(Command::SnapLeft, "ctrl+alt+left")]);
+
+        let verdict = probe_response(&engine, ProbeOutcome::Available, "ctrl+alt+right");
+
+        assert_eq!(verdict["availability"], "available");
+    }
+
+    #[test]
+    fn a_combination_another_mosaix_binding_owns_names_that_binding() {
+        // The probe says free on purpose: during capture the agent holds
+        // no registrations, so a combination Mosaix owns really does read
+        // as available and only the resolved config knows otherwise.
+        let engine = engine_bound(&[(Command::SnapLeft, "ctrl+alt+left")]);
+
+        let verdict = probe_response(&engine, ProbeOutcome::Available, "ctrl+alt+left");
+
+        assert_eq!(verdict["availability"], "mosaix_binding");
+        assert_eq!(
+            verdict["command"], "snap-left",
+            "a conflict the user can resolve inside Mosaix has to name what to go and change"
+        );
+    }
+
+    #[test]
+    fn an_unexplained_refusal_is_attributed_to_the_system() {
+        let engine = engine_bound(&[]);
+
+        let verdict = probe_response(&engine, ProbeOutcome::Taken, "ctrl+alt+right");
+
+        assert_eq!(verdict["availability"], "system_or_other_application");
+    }
+
+    #[test]
+    fn the_two_combinations_the_probe_cannot_see_are_refused_without_asking() {
+        // The probe would accept both -- neither is a registered hotkey --
+        // and the binding would then never fire (ADR 0021).
+        let engine = engine_bound(&[]);
+
+        for combo in ["win+l", "ctrl+alt+delete"] {
+            assert_eq!(
+                probe_response(&engine, ProbeOutcome::Available, combo)["availability"],
+                "reserved",
+                "{combo} is handled by Windows itself and can never be bound"
+            );
+        }
+    }
+
+    #[test]
+    fn a_windows_key_chord_that_is_not_win_l_is_left_to_the_probe() {
+        let engine = engine_bound(&[]);
+
+        assert_eq!(
+            probe_response(&engine, ProbeOutcome::Available, "win+j")["availability"],
+            "available",
+            "the reserved list is exactly two combinations; everything else is probed"
+        );
+    }
+
+    #[test]
+    fn the_debugger_reserved_function_key_warns_without_blocking() {
+        let engine = engine_bound(&[]);
+
+        let verdict = probe_response(&engine, ProbeOutcome::Available, "ctrl+alt+f12");
+
+        assert_eq!(
+            verdict["availability"], "available",
+            "F12 is warned about, not blocked"
+        );
+        assert!(
+            verdict["warning"]
+                .as_str()
+                .is_some_and(|warning| warning.contains("F12")),
+            "the reservation is real enough to mention, got {verdict:?}"
+        );
+    }
+
+    #[test]
+    fn a_key_mosaix_cannot_express_is_reported_apart_from_a_taken_one() {
+        let engine = engine_bound(&[]);
+
+        let verdict = probe_response(
+            &engine,
+            ProbeOutcome::Unsupported {
+                reason: "Mosaix has no key named \"BREAK\"".to_owned(),
+            },
+            "ctrl+alt+break",
+        );
+
+        assert_eq!(verdict["availability"], "unsupported");
+        assert!(verdict["reason"].as_str().unwrap().contains("BREAK"));
+    }
+
+    #[test]
+    fn a_combination_that_does_not_parse_is_refused_rather_than_probed() {
+        let engine = engine_bound(&[]);
+
+        let response = handle_request(
+            &IpcRequest::ProbeHotkey {
+                combo: "ctrl++".to_owned(),
+            },
+            &engine.events(),
+            &engine.state_reader(),
+            &UnavailableConfigStore {
+                reason: "not asked".to_owned(),
+            },
+            &no_probe(),
+        );
+
+        assert!(matches!(response, IpcResponse::Error { .. }));
+    }
+
+    #[test]
+    fn setting_a_binding_answers_with_the_file_and_the_combination_in_effect() {
+        let engine = mosaix_engine::spawn_engine(Vec::new(), Default::default());
+        let store = RecordingStore::bound("desk.toml", Some("ctrl+shift+left"));
+
+        let response = handle_request(
+            &IpcRequest::SetBinding {
+                command_path: "snap-left".to_owned(),
+                combo: "ctrl+shift+left".to_owned(),
+                to_base: false,
+            },
+            &engine.events(),
+            &engine.state_reader(),
+            &store,
+            &no_probe(),
+        );
+
+        match response {
+            IpcResponse::Ok { data } => {
+                let data = data.unwrap();
+                assert_eq!(data["file"], "desk.toml");
+                assert_eq!(data["combo"], "ctrl+shift+left");
+            }
+            other => panic!("expected a confirmed write, got {other:?}"),
+        }
+        assert_eq!(
+            store.binding_edits.lock().unwrap()[0].1,
+            BindingEdit::Set {
+                command: Command::SnapLeft,
+                combo: KeyCombo::parse("ctrl+shift+left").unwrap(),
+                to_base: false,
+            }
+        );
+    }
+
+    #[test]
+    fn a_redirected_binding_write_reaches_the_config_store_as_a_redirect() {
+        let engine = mosaix_engine::spawn_engine(Vec::new(), Default::default());
+        let store = RecordingStore::bound("config.toml", Some("ctrl+shift+left"));
+
+        handle_request(
+            &IpcRequest::SetBinding {
+                command_path: "snap-left".to_owned(),
+                combo: "ctrl+shift+left".to_owned(),
+                to_base: true,
+            },
+            &engine.events(),
+            &engine.state_reader(),
+            &store,
+            &no_probe(),
+        );
+
+        assert!(matches!(
+            store.binding_edits.lock().unwrap()[0].1,
+            BindingEdit::Set { to_base: true, .. }
+        ));
+    }
+
+    #[test]
+    fn resetting_a_binding_reports_what_it_now_resolves_to() {
+        let engine = mosaix_engine::spawn_engine(Vec::new(), Default::default());
+        let store = RecordingStore::bound("config.toml", Some("ctrl+alt+left"));
+
+        let response = handle_request(
+            &IpcRequest::ResetBinding {
+                command_path: "snap-left".to_owned(),
+            },
+            &engine.events(),
+            &engine.state_reader(),
+            &store,
+            &no_probe(),
+        );
+
+        match response {
+            IpcResponse::Ok { data } => assert_eq!(data.unwrap()["combo"], "ctrl+alt+left"),
+            other => panic!("expected a confirmed write, got {other:?}"),
+        }
+        assert_eq!(
+            store.binding_edits.lock().unwrap()[0].1,
+            BindingEdit::Reset {
+                command: Command::SnapLeft
+            }
+        );
+    }
+
+    #[test]
+    fn a_reset_that_left_the_command_unbound_says_so_rather_than_naming_a_combination() {
+        let engine = mosaix_engine::spawn_engine(Vec::new(), Default::default());
+        let store = RecordingStore::bound("config.toml", None);
+
+        let response = handle_request(
+            &IpcRequest::ResetBinding {
+                command_path: "apply-layout.writing".to_owned(),
+            },
+            &engine.events(),
+            &engine.state_reader(),
+            &store,
+            &no_probe(),
+        );
+
+        match response {
+            IpcResponse::Ok { data } => assert!(data.unwrap()["combo"].is_null()),
+            other => panic!("expected a confirmed write, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_command_this_build_does_not_know_is_refused_by_name() {
+        let engine = mosaix_engine::spawn_engine(Vec::new(), Default::default());
+
+        let response = handle_request(
+            &IpcRequest::ResetBinding {
+                command_path: "snap-diagonal".to_owned(),
+            },
+            &engine.events(),
+            &engine.state_reader(),
+            &UnavailableConfigStore {
+                reason: "not asked".to_owned(),
+            },
+            &no_probe(),
+        );
+
+        match response {
+            IpcResponse::Error { message } => assert!(
+                message.contains("snap-diagonal"),
+                "the refusal names what was asked for, got {message}"
+            ),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
     }
 }

@@ -56,6 +56,7 @@ const hotkeys: HotkeyList = {
   topologyFingerprint: "DISPLAY-A@0,0 2560x1440 scale=1",
   captureSuspended: false,
   unregisteredCommands: [],
+  baseFile: "config.toml",
   bindings: [
     {
       command: "snap-left",
@@ -95,6 +96,14 @@ function bridge(): DesktopBridge {
     loadHotkeyBindings: vi.fn().mockResolvedValue(structuredClone(hotkeys)),
     startHotkeyCapture: vi.fn().mockResolvedValue(undefined),
     endHotkeyCapture: vi.fn().mockResolvedValue(undefined),
+    probeHotkey: vi.fn().mockResolvedValue({
+      availability: "available",
+      command: null,
+      warning: null,
+      reason: null,
+    }),
+    setBinding: vi.fn().mockResolvedValue({ file: "config.toml", combo: "ctrl+alt+j" }),
+    resetBinding: vi.fn().mockResolvedValue({ file: "config.toml", combo: "ctrl+alt+left" }),
     loadSavedLayouts: vi.fn().mockResolvedValue(structuredClone(savedLayouts)),
     saveLayout: vi.fn().mockResolvedValue({ file: "config.toml" }),
     renameLayout: vi.fn().mockResolvedValue({ file: "config.toml" }),
@@ -534,6 +543,7 @@ describe("hotkey binding watch", () => {
       topologyFingerprint: "DISPLAY-A|DISPLAY-B",
       captureSuspended: false,
       unregisteredCommands: [],
+      baseFile: "config.toml",
       bindings: [
         {
           command: "snap-left",
@@ -739,5 +749,255 @@ describe("layout write destination", () => {
       "base",
     );
     stop();
+  });
+});
+
+describe("hotkey capture dialog", () => {
+  /**
+   * Mounts the editor with the hotkey list loaded, then opens the rebind
+   * dialog for `command`.
+   */
+  async function openDialog(
+    desktop: DesktopBridge,
+    command = "snap-left",
+  ): Promise<{ root: HTMLElement; stop: () => void }> {
+    const root = document.createElement("div");
+    document.body.append(root);
+    const stop = await mountLayoutEditor(root, desktop);
+    await vi.waitFor(() =>
+      expect(root.querySelector(`[data-rebind="${command}"]`)).not.toBeNull(),
+    );
+    root.querySelector<HTMLElement>(`[data-rebind="${command}"]`)!.click();
+    return { root, stop };
+  }
+
+  function pressCombination(
+    root: HTMLElement,
+    code: string,
+    modifiers: Partial<KeyboardEventInit> = {},
+  ): void {
+    window.dispatchEvent(
+      new KeyboardEvent("keydown", { code, bubbles: true, ...modifiers }),
+    );
+    void root;
+  }
+
+  it("opens a capture dialog that says it is listening", async () => {
+    const { root, stop } = await openDialog(bridge());
+
+    expect(root.querySelector("[data-capture-dialog]")).not.toBeNull();
+    expect(root.querySelector("[data-captured-combo]")?.textContent).toContain(
+      "Press a combination",
+    );
+    stop();
+  });
+
+  it("keeps save disabled until the combination is complete", async () => {
+    const { root, stop } = await openDialog(bridge());
+    const save = (): HTMLButtonElement =>
+      root.querySelector<HTMLButtonElement>("[data-capture-save]")!;
+
+    expect(save().disabled).toBe(true);
+
+    // A bare key is not a combination worth binding globally.
+    pressCombination(root, "KeyJ");
+    expect(save().disabled).toBe(true);
+
+    pressCombination(root, "KeyJ", { ctrlKey: true, altKey: true });
+    expect(save().disabled).toBe(false);
+    expect(root.querySelector("[data-captured-combo]")?.textContent).toContain("ctrl+alt+j");
+    stop();
+  });
+
+  it("asks the agent about the combination and shows the verdict", async () => {
+    const desktop = bridge();
+    desktop.probeHotkey = vi.fn().mockResolvedValue({
+      availability: "mosaix_binding",
+      command: "focus-down",
+      warning: null,
+      reason: null,
+    });
+    const { root, stop } = await openDialog(desktop);
+
+    pressCombination(root, "KeyJ", { ctrlKey: true, altKey: true });
+
+    await vi.waitFor(() =>
+      expect(root.querySelector("[data-capture-verdict]")).not.toBeNull(),
+    );
+    expect(desktop.probeHotkey).toHaveBeenCalledWith("ctrl+alt+j");
+    expect(root.querySelector("[data-capture-verdict]")?.textContent).toContain("Focus down");
+    // Mosaix does not overrule the user about their own machine.
+    expect(root.querySelector<HTMLButtonElement>("[data-capture-save]")!.disabled).toBe(false);
+    stop();
+  });
+
+  it("blocks a combination Windows handles itself", async () => {
+    const desktop = bridge();
+    desktop.probeHotkey = vi.fn().mockResolvedValue({
+      availability: "reserved",
+      command: null,
+      warning: null,
+      reason: null,
+    });
+    const { root, stop } = await openDialog(desktop);
+
+    pressCombination(root, "KeyL", { metaKey: true });
+
+    await vi.waitFor(() =>
+      expect(root.querySelector("[data-capture-verdict]")).not.toBeNull(),
+    );
+    expect(root.querySelector<HTMLButtonElement>("[data-capture-save]")!.disabled).toBe(true);
+    stop();
+  });
+
+  it("warns about the debugger-reserved function key without blocking it", async () => {
+    const desktop = bridge();
+    desktop.probeHotkey = vi.fn().mockResolvedValue({
+      availability: "available",
+      command: null,
+      warning: "Windows reserves F12 for the debugger, so this binding may not fire",
+      reason: null,
+    });
+    const { root, stop } = await openDialog(desktop);
+
+    pressCombination(root, "F12", { ctrlKey: true, altKey: true });
+
+    await vi.waitFor(() =>
+      expect(root.querySelector("[data-capture-warning]")).not.toBeNull(),
+    );
+    expect(root.querySelector<HTMLButtonElement>("[data-capture-save]")!.disabled).toBe(false);
+    stop();
+  });
+
+  it("clears the buffer when the window loses foreground", async () => {
+    const { root, stop } = await openDialog(bridge());
+    pressCombination(root, "KeyJ", { ctrlKey: true, altKey: true });
+    expect(root.querySelector<HTMLButtonElement>("[data-capture-save]")!.disabled).toBe(false);
+
+    window.dispatchEvent(new Event("blur"));
+
+    expect(root.querySelector<HTMLButtonElement>("[data-capture-save]")!.disabled).toBe(true);
+    expect(root.querySelector("[data-capture-dialog]")?.textContent).toContain(
+      "lost focus",
+    );
+    stop();
+  });
+
+  it("captures nothing while the window is not frontmost", async () => {
+    const { root, stop } = await openDialog(bridge());
+    window.dispatchEvent(new Event("blur"));
+
+    pressCombination(root, "KeyJ", { ctrlKey: true, altKey: true });
+
+    expect(root.querySelector<HTMLButtonElement>("[data-capture-save]")!.disabled).toBe(true);
+    stop();
+  });
+
+  it("keeps the previous binding when the dialog is cancelled", async () => {
+    const desktop = bridge();
+    const { root, stop } = await openDialog(desktop);
+    pressCombination(root, "KeyJ", { ctrlKey: true, altKey: true });
+
+    root.querySelector<HTMLElement>("[data-capture-cancel]")!.click();
+
+    expect(root.querySelector("[data-capture-dialog]")).toBeNull();
+    expect(desktop.setBinding).not.toHaveBeenCalled();
+    stop();
+  });
+
+  it("saves the captured combination and reports the file the agent wrote", async () => {
+    const desktop = bridge();
+    const { root, stop } = await openDialog(desktop);
+    pressCombination(root, "KeyJ", { ctrlKey: true, altKey: true });
+
+    root.querySelector<HTMLElement>("[data-capture-save]")!.click();
+
+    await vi.waitFor(() => expect(desktop.setBinding).toHaveBeenCalled());
+    expect(desktop.setBinding).toHaveBeenCalledWith("snap-left", "ctrl+alt+j", false);
+    await vi.waitFor(() =>
+      expect(root.querySelector(".command-status")?.textContent).toContain("config.toml"),
+    );
+    stop();
+  });
+
+  it("reports the agent's own reason when it refuses the write", async () => {
+    const desktop = bridge();
+    desktop.setBinding = vi
+      .fn()
+      .mockRejectedValue(new Error("config.toml: ctrl+alt+j is already bound to focus-down"));
+    const { root, stop } = await openDialog(desktop);
+    pressCombination(root, "KeyJ", { ctrlKey: true, altKey: true });
+
+    root.querySelector<HTMLElement>("[data-capture-save]")!.click();
+
+    await vi.waitFor(() =>
+      expect(root.querySelector(".command-status")?.textContent).toContain("already bound"),
+    );
+    stop();
+  });
+
+  it("shows the destination before saving and offers a redirect for a profile binding", async () => {
+    const desktop = bridge();
+    const { root, stop } = await openDialog(desktop, "apply-layout.writing");
+
+    expect(root.querySelector("[data-binding-destination]")?.textContent).toContain("desk.toml");
+    const redirect = root.querySelector<HTMLInputElement>("[data-binding-redirect]")!;
+    redirect.checked = true;
+    redirect.dispatchEvent(new Event("change", { bubbles: true }));
+    expect(root.querySelector("[data-binding-destination]")?.textContent).toContain("config.toml");
+
+    pressCombination(root, "KeyJ", { ctrlKey: true, altKey: true });
+    root.querySelector<HTMLElement>("[data-capture-save]")!.click();
+
+    await vi.waitFor(() => expect(desktop.setBinding).toHaveBeenCalled());
+    expect(desktop.setBinding).toHaveBeenCalledWith(
+      "apply-layout.writing",
+      "ctrl+alt+j",
+      true,
+    );
+    stop();
+  });
+
+  it("offers no redirect for a binding base config already supplies", async () => {
+    const { root, stop } = await openDialog(bridge(), "snap-left");
+
+    expect(root.querySelector("[data-binding-destination]")?.textContent).toContain(
+      "config.toml",
+    );
+    expect(root.querySelector("[data-binding-redirect]")).toBeNull();
+    stop();
+  });
+
+  it("resets a binding to its default", async () => {
+    const desktop = bridge();
+    const root = document.createElement("div");
+    document.body.append(root);
+    const stop = await mountLayoutEditor(root, desktop);
+    await vi.waitFor(() =>
+      expect(root.querySelector('[data-reset-binding="snap-left"]')).not.toBeNull(),
+    );
+
+    root.querySelector<HTMLElement>('[data-reset-binding="snap-left"]')!.click();
+
+    await vi.waitFor(() => expect(desktop.resetBinding).toHaveBeenCalledWith("snap-left"));
+    await vi.waitFor(() =>
+      expect(root.querySelector(".command-status")?.textContent).toContain("ctrl+alt+left"),
+    );
+    stop();
+  });
+});
+
+describe("capture suspension lifetime", () => {
+  it("holds suspension for the window's lifetime rather than for one dialog", async () => {
+    const desktop = bridge();
+    const root = document.createElement("div");
+
+    const stop = await mountLayoutEditor(root, desktop);
+
+    await vi.waitFor(() => expect(desktop.startHotkeyCapture).toHaveBeenCalledTimes(1));
+    expect(desktop.endHotkeyCapture).not.toHaveBeenCalled();
+
+    stop();
+    expect(desktop.endHotkeyCapture).toHaveBeenCalledTimes(1);
   });
 });

@@ -140,6 +140,24 @@ impl Command {
             .into_iter()
             .find(|command| command.verb() == verb)
     }
+
+    /// The command a TOML path names -- the inverse of the [`fmt::Display`]
+    /// spelling, so a client that has only the string a validation error
+    /// or the state snapshot gave it can name the same command back.
+    ///
+    /// `None` for a path no verb matches, which keeps an unknown command
+    /// a refusal rather than something silently misread. A layout name may
+    /// itself contain dots (`apply-layout.deep.work`), so only the first
+    /// separator divides verb from payload.
+    pub fn parse(path: &str) -> Option<Self> {
+        match path.split_once('.') {
+            Some((APPLY_LAYOUT_VERB, name)) if !name.is_empty() => Some(Self::ApplyLayout {
+                name: name.to_owned(),
+            }),
+            Some(_) => None,
+            None => Self::unit_from_verb(path),
+        }
+    }
 }
 
 impl fmt::Display for Command {
@@ -899,5 +917,36 @@ mod tests {
             toml::from_str::<BaseConfig>("version = 1\n[automatic_tiling]\nenabled = true\n")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn a_commands_toml_path_parses_back_into_the_command_it_names() {
+        for command in Command::unit_verbs() {
+            assert_eq!(Command::parse(&command.to_string()), Some(command.clone()));
+        }
+        assert_eq!(
+            Command::parse("apply-layout.writing"),
+            Some(Command::ApplyLayout {
+                name: "writing".to_owned()
+            })
+        );
+        assert_eq!(
+            Command::parse("apply-layout.deep.work"),
+            Some(Command::ApplyLayout {
+                name: "deep.work".to_owned()
+            }),
+            "a layout name may carry dots, so only the first separator divides the path"
+        );
+    }
+
+    #[test]
+    fn a_path_no_verb_names_does_not_parse() {
+        assert_eq!(Command::parse("snap-diagonal"), None);
+        assert_eq!(
+            Command::parse("apply-layout"),
+            None,
+            "the verb alone is a table, and a command cannot be built without the layout name"
+        );
+        assert_eq!(Command::parse("apply-layout."), None);
     }
 }

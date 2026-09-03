@@ -14,9 +14,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use mosaix_config::{
-    edit_layouts, ensure_default_config, fallback_config, load, save_profile_settings, watch,
-    Command, ConfigEvent, ConfigIoError, ConfigLayer, FocusBorderOverride, GapsOverride, KeyCombo,
-    LayoutEdit, LayoutEditError, ProfileSettingsUpdate, RgbaColor,
+    edit_bindings, edit_layouts, ensure_default_config, fallback_config, load, save_profile_settings, watch,
+    BindingEdit, Command, ConfigEvent, ConfigIoError, ConfigLayer, FocusBorderOverride,
+    GapsOverride, KeyCombo, LayoutEdit, LayoutEditError, ProfileSettingsUpdate, RgbaColor,
 };
 use mosaix_domain::NormalizedRect;
 
@@ -320,6 +320,289 @@ fn a_layout_edit_without_the_redirect_still_lands_in_the_profile() {
     );
 
     cleanup(&dir);
+}
+
+/// A config directory whose `DESK` profile overrides `snap-left`,
+/// leaving every other binding base-supplied.
+fn dir_with_a_profile_override(label: &str) -> PathBuf {
+    let dir = temp_dir(label);
+    ensure_default_config(&dir).unwrap();
+    fs::write(
+        dir.join("profiles").join("desk.toml"),
+        format!(
+            "fingerprint = \"{DESK}\"\n\
+             [hotkeys]\n\
+             snap-left = \"ctrl+shift+left\"\n"
+        ),
+    )
+    .unwrap();
+    dir
+}
+
+fn combo(raw: &str) -> KeyCombo {
+    KeyCombo::parse(raw).expect("fixture combo should parse")
+}
+
+#[test]
+fn rebinding_a_base_supplied_command_writes_base_config() {
+    let dir = dir_with_a_profile_override("binding-base");
+
+    let write = edit_bindings(
+        &dir,
+        DESK,
+        BindingEdit::Set {
+            command: Command::SnapRight,
+            combo: combo("ctrl+alt+pagedown"),
+            to_base: false,
+        },
+    )
+    .expect("rebinding a base-supplied command should succeed");
+
+    assert_eq!(write.file, "config.toml");
+    assert_eq!(write.combo, Some(combo("ctrl+alt+pagedown")));
+    let reloaded = load(&dir).unwrap().unwrap();
+    assert_eq!(
+        reloaded.base.hotkeys[&Command::SnapRight],
+        combo("ctrl+alt+pagedown")
+    );
+}
+
+#[test]
+fn rebinding_a_command_the_profile_overrides_writes_the_profile() {
+    let dir = dir_with_a_profile_override("binding-profile");
+
+    let write = edit_bindings(
+        &dir,
+        DESK,
+        BindingEdit::Set {
+            command: Command::SnapLeft,
+            combo: combo("ctrl+shift+home"),
+            to_base: false,
+        },
+    )
+    .expect("rebinding a profile-supplied command should succeed");
+
+    assert_eq!(
+        write.file, "desk.toml",
+        "the write lands in the layer that supplies the value (ADR 0022)"
+    );
+    let reloaded = load(&dir).unwrap().unwrap();
+    assert_eq!(
+        reloaded.profiles[0].config.hotkeys[&Command::SnapLeft],
+        combo("ctrl+shift+home")
+    );
+    assert_eq!(
+        reloaded.base.hotkeys[&Command::SnapLeft],
+        combo("ctrl+alt+left"),
+        "base config keeps whatever it said; only the override moved"
+    );
+}
+
+#[test]
+fn redirecting_a_rebind_moves_it_out_of_the_profile() {
+    let dir = dir_with_a_profile_override("binding-redirect");
+
+    let write = edit_bindings(
+        &dir,
+        DESK,
+        BindingEdit::Set {
+            command: Command::SnapLeft,
+            combo: combo("ctrl+shift+home"),
+            to_base: true,
+        },
+    )
+    .expect("redirecting a rebind should succeed");
+
+    assert_eq!(write.file, "config.toml");
+    let reloaded = load(&dir).unwrap().unwrap();
+    assert_eq!(
+        reloaded.base.hotkeys[&Command::SnapLeft],
+        combo("ctrl+shift+home")
+    );
+    assert_eq!(
+        reloaded.profiles[0].config.hotkeys[&Command::SnapLeft],
+        combo("ctrl+shift+home"),
+        "with the override dropped, the profile resolves to base config's new value -- \
+         which is what \"apply everywhere\" has to mean"
+    );
+    assert_eq!(
+        reloaded.profiles[0]
+            .config
+            .binding_sources
+            .get(&Command::SnapLeft),
+        Some(&ConfigLayer::Base),
+        "provenance follows the move, so the destination shown next is the real one"
+    );
+}
+
+#[test]
+fn resetting_a_profile_override_falls_back_to_base_config() {
+    let dir = dir_with_a_profile_override("binding-reset-profile");
+
+    let write = edit_bindings(
+        &dir,
+        DESK,
+        BindingEdit::Reset {
+            command: Command::SnapLeft,
+        },
+    )
+    .expect("resetting a profile override should succeed");
+
+    assert_eq!(write.file, "desk.toml");
+    assert_eq!(
+        write.combo,
+        Some(combo("ctrl+alt+left")),
+        "one step back toward the default is base config's value, not nothing"
+    );
+    let profile_file = fs::read_to_string(dir.join("profiles").join("desk.toml")).unwrap();
+    assert!(
+        !profile_file.contains("snap-left"),
+        "the override is gone from the file: {profile_file}"
+    );
+}
+
+#[test]
+fn resetting_a_base_binding_restores_the_shipped_default() {
+    let dir = temp_dir("binding-reset-base");
+    ensure_default_config(&dir).unwrap();
+    edit_bindings(
+        &dir,
+        DESK,
+        BindingEdit::Set {
+            command: Command::SnapLeft,
+            combo: combo("ctrl+shift+f9"),
+            to_base: false,
+        },
+    )
+    .unwrap();
+
+    let write = edit_bindings(
+        &dir,
+        DESK,
+        BindingEdit::Reset {
+            command: Command::SnapLeft,
+        },
+    )
+    .expect("resetting a base binding should succeed");
+
+    assert_eq!(
+        write.combo,
+        Some(combo("ctrl+alt+left")),
+        "a user undoing an experiment should not have to remember the default"
+    );
+}
+
+#[test]
+fn resetting_a_layout_binding_unbinds_it_because_it_has_no_default() {
+    let dir = temp_dir("binding-reset-layout");
+    ensure_default_config(&dir).unwrap();
+    edit_layouts(
+        &dir,
+        DESK,
+        LayoutEdit::Save {
+            name: "writing".to_owned(),
+            cells: cells(1.0),
+            to_base: false,
+        },
+    )
+    .unwrap();
+    let layout_binding = Command::ApplyLayout {
+        name: "writing".to_owned(),
+    };
+    edit_bindings(
+        &dir,
+        DESK,
+        BindingEdit::Set {
+            command: layout_binding.clone(),
+            combo: combo("ctrl+alt+1"),
+            to_base: false,
+        },
+    )
+    .unwrap();
+
+    let write = edit_bindings(
+        &dir,
+        DESK,
+        BindingEdit::Reset {
+            command: layout_binding.clone(),
+        },
+    )
+    .expect("resetting a layout binding should succeed");
+
+    assert_eq!(write.combo, None);
+    let reloaded = load(&dir).unwrap().unwrap();
+    assert!(!reloaded.base.hotkeys.contains_key(&layout_binding));
+}
+
+#[test]
+fn resetting_a_command_nothing_binds_is_refused_naming_it() {
+    let dir = temp_dir("binding-reset-unbound");
+    ensure_default_config(&dir).unwrap();
+
+    let error = edit_bindings(
+        &dir,
+        DESK,
+        BindingEdit::Reset {
+            command: Command::ApplyLayout {
+                name: "writing".to_owned(),
+            },
+        },
+    )
+    .unwrap_err();
+
+    assert!(
+        error.to_string().contains("apply-layout.writing"),
+        "the refusal names what was asked for, got {error}"
+    );
+}
+
+#[test]
+fn a_rebind_onto_a_combination_another_binding_holds_persists_nothing() {
+    let dir = temp_dir("binding-duplicate");
+    ensure_default_config(&dir).unwrap();
+
+    let error = edit_bindings(
+        &dir,
+        DESK,
+        BindingEdit::Set {
+            command: Command::SnapRight,
+            // Already snap-left's, and duplicate detection runs over the
+            // whole directory (ADR 0007).
+            combo: combo("ctrl+alt+left"),
+            to_base: false,
+        },
+    )
+    .unwrap_err();
+
+    assert!(matches!(error, ConfigIoError::Validation(_)), "got {error}");
+    let reloaded = load(&dir).unwrap().unwrap();
+    assert_eq!(
+        reloaded.base.hotkeys[&Command::SnapRight],
+        combo("ctrl+alt+right"),
+        "a refused candidate leaves the previous configuration untouched"
+    );
+}
+
+#[test]
+fn a_binding_edit_leaves_hand_written_layouts_intact() {
+    let dir = dir_with_layered_layouts("binding-keeps-layouts");
+
+    edit_bindings(
+        &dir,
+        DESK,
+        BindingEdit::Set {
+            command: Command::SnapRight,
+            combo: combo("ctrl+alt+pagedown"),
+            to_base: false,
+        },
+    )
+    .expect("rebinding should succeed");
+
+    let reloaded = load(&dir).unwrap().unwrap();
+    assert!(
+        reloaded.base.layouts.contains_key("writing"),
+        "rewriting base config must preserve everything else it declares"
+    );
 }
 
 #[test]

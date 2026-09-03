@@ -1,3 +1,14 @@
+import {
+  blurCapture,
+  capturedCombo,
+  capturedLabel,
+  focusCapture,
+  openCapture,
+  pressKey,
+  releaseKey,
+  type CaptureSession,
+} from "./hotkey-capture";
+
 export type Appearance = "dark" | "light";
 
 export interface ZoneDraft {
@@ -94,9 +105,35 @@ export interface HotkeyBinding {
   file: string | null;
 }
 
+/** The agent's verdict on a combination the user just pressed. */
+export interface HotkeyProbeResult {
+  availability:
+    | "available"
+    | "mosaix_binding"
+    | "system_or_other_application"
+    | "reserved"
+    | "unsupported";
+  /** The Mosaix binding already using it, for `mosaix_binding`. */
+  command: string | null;
+  /** An advisory that does not block the binding, such as F12. */
+  warning: string | null;
+  /** Why Mosaix cannot express the combination, for `unsupported`. */
+  reason: string | null;
+}
+
+export interface BindingWriteReceipt {
+  file: string;
+  /** Absent when the edit left the command unbound. */
+  combo: string | null;
+}
+
 export interface HotkeyList {
   topologyFingerprint: string;
   bindings: HotkeyBinding[];
+  /**
+   * The file a binding neither layer carries yet would be created in.
+   */
+  baseFile: string;
   /**
    * Whether the agent currently has every binding unregistered for a
    * hotkey editor. While it is true no Mosaix hotkey works anywhere on
@@ -117,6 +154,9 @@ export interface DesktopBridge {
   loadHotkeyBindings(): Promise<HotkeyList>;
   startHotkeyCapture(): Promise<void>;
   endHotkeyCapture(): Promise<void>;
+  probeHotkey(combo: string): Promise<HotkeyProbeResult>;
+  setBinding(command: string, combo: string, toBase: boolean): Promise<BindingWriteReceipt>;
+  resetBinding(command: string): Promise<BindingWriteReceipt>;
   loadSavedLayouts(): Promise<SavedLayoutList>;
   saveLayout(draft: LayoutDraft, toBase: boolean): Promise<LayoutWriteReceipt>;
   renameLayout(from: string, to: string): Promise<LayoutWriteReceipt>;
@@ -210,6 +250,26 @@ export function watchSavedLayouts(
   intervalMs = 2000,
 ): () => void {
   return watchChanges(() => bridge.loadSavedLayouts(), handlers, intervalMs);
+}
+
+/**
+ * The configuration file a rebind of `binding` would land in, and whether
+ * the redirect control can change it.
+ *
+ * The same rule saved layouts follow: the write goes to the layer that
+ * currently supplies the value, and only a profile-supplied one has
+ * anywhere to be redirected from (ADR 0022).
+ */
+export function bindingDestination(
+  binding: HotkeyBinding | undefined,
+  list: HotkeyList | undefined,
+  toBase: boolean,
+): { file: string; redirectable: boolean } {
+  const baseFile = list?.baseFile ?? "your base configuration";
+  if (binding === undefined || binding.source !== "profile") {
+    return { file: binding?.file ?? baseFile, redirectable: false };
+  }
+  return { file: toBase ? baseFile : (binding.file ?? baseFile), redirectable: true };
 }
 
 /**
@@ -352,9 +412,96 @@ function renderBindings(hotkeys: HotkeyList | undefined, hotkeyError: string | u
           <span class="binding-command">${escapeHtml(bindingLabel(binding.command))}</span>
           <kbd>${escapeHtml(binding.combo)}</kbd>
           <small class="binding-file">${binding.source === "profile" ? "profile · " : ""}${escapeHtml(binding.file ?? "source unknown")}</small>
+          <span class="binding-actions">
+            <button data-rebind="${escapeHtml(binding.command)}" title="Rebind">⌨</button>
+            <button data-reset-binding="${escapeHtml(binding.command)}" title="Reset to default">↺</button>
+          </span>
         </li>`,
     )
     .join("")}</ul>`;
+}
+
+/**
+ * The "press your combination" dialog: what was captured, what the agent
+ * said about it, where a save would land, and whether saving is allowed
+ * yet.
+ *
+ * Rendered as part of the page rather than as a second window, because
+ * suspension is already held for the editor's whole lifetime -- the
+ * dialog's own job is only the fine scope, arming the buffer while it is
+ * frontmost (ADR 0021).
+ */
+function renderCaptureDialog(
+  capture: CaptureDialog | undefined,
+  hotkeys: HotkeyList | undefined,
+): string {
+  if (capture === undefined) return "";
+  const combo = capturedCombo(capture.session);
+  const binding = hotkeys?.bindings.find(
+    (candidate) => candidate.command === capture.command,
+  );
+  const destination = bindingDestination(binding, hotkeys, capture.toBase);
+  // Blocked, not merely warned: the two combinations Windows handles
+  // itself are never registered hotkeys, so a binding to one would be
+  // accepted and then never fire (ADR 0021).
+  const blocked = capture.verdict?.availability === "reserved";
+  const unusable = capture.verdict?.availability === "unsupported";
+  const savable = combo !== null && !blocked && !unusable;
+  return `
+    <div class="capture-backdrop" data-capture-dialog role="dialog" aria-modal="true" aria-label="Rebind ${escapeHtml(bindingLabel(capture.command))}">
+      <div class="capture-dialog">
+        <div class="panel-title">REBIND ${escapeHtml(bindingLabel(capture.command)).toUpperCase()}</div>
+        <p class="capture-hint">${capture.session.armed ? "Mosaix is listening. Press the combination you want." : "This window lost focus, so nothing is being captured. Click here and press again."}</p>
+        <div class="capture-combo${combo === null ? " incomplete" : ""}" data-captured-combo>${escapeHtml(capturedLabel(capture.session))}</div>
+        ${renderVerdict(capture.verdict)}
+        <p class="save-destination" data-binding-destination>Saves to <code>${escapeHtml(destination.file)}</code></p>
+        ${destination.redirectable ? `<label class="toggle-line redirect"><span>Save to base config instead<small>Applies at every desk, not just this one</small></span><input data-binding-redirect type="checkbox" ${capture.toBase ? "checked" : ""} /></label>` : ""}
+        <div class="library-actions">
+          <button class="primary-button" data-capture-save ${savable ? "" : "disabled"}>Save binding</button>
+          <button class="soft-button" data-capture-cancel>Cancel</button>
+        </div>
+      </div>
+    </div>`;
+}
+
+/**
+ * The agent's verdict in a sentence, kept apart from the dialog's own
+ * markup so each case reads as the thing the user has to decide about.
+ *
+ * A conflict names its owner and is still savable: Mosaix does not
+ * overrule the user about their own machine (ADR 0021).
+ */
+function renderVerdict(verdict: HotkeyProbeResult | undefined): string {
+  if (verdict === undefined) return "";
+  const notice = (kind: string, text: string): string =>
+    `<p class="capture-verdict ${kind}" data-capture-verdict>${text}</p>`;
+  const warning =
+    verdict.warning === null
+      ? ""
+      : `<p class="capture-verdict warning" data-capture-warning>${escapeHtml(verdict.warning)}</p>`;
+  switch (verdict.availability) {
+    case "available":
+      return `${notice("ok", "Available")}${warning}`;
+    case "mosaix_binding":
+      return `${notice("warning", `Already bound to ${escapeHtml(bindingLabel(verdict.command ?? ""))} · save anyway to take it over`)}${warning}`;
+    case "system_or_other_application":
+      return `${notice("warning", "The system or another application owns this · save anyway if you know it is free")}${warning}`;
+    case "reserved":
+      return `${notice("blocked", "Windows handles this itself, so a binding to it would never fire")}${warning}`;
+    case "unsupported":
+      return `${notice("blocked", escapeHtml(verdict.reason ?? "Mosaix cannot express this combination"))}${warning}`;
+  }
+}
+
+/** The open capture dialog's own state. */
+interface CaptureDialog {
+  /** The command being rebound, as its TOML path. */
+  command: string;
+  session: CaptureSession;
+  /** The agent's answer about what is captured, once it has arrived. */
+  verdict: HotkeyProbeResult | undefined;
+  /** Whether the save is redirected to base config (ADR 0022). */
+  toBase: boolean;
 }
 
 /**
@@ -378,6 +525,8 @@ export async function mountLayoutEditor(
   let selectedLayout: string | undefined;
   /** Whether the next save is redirected to base config (ADR 0022). */
   let redirectToBase = false;
+  /** The open capture dialog, if any. */
+  let capture: CaptureDialog | undefined;
   let selectedDisplayIndex = 0;
   let selectedZoneId = snapshot.draft.zones[0]?.id ?? 0;
   let commandStatus = "Ready";
@@ -497,6 +646,7 @@ export async function mountLayoutEditor(
           <button data-appearance="light" aria-pressed="${snapshot.appearance === "light"}"><i>☀</i><span>Light<small>Warm Paper</small></span></button>
         </nav>
         <div class="command-status" role="status">${commandStatus}</div>
+        ${renderCaptureDialog(capture, hotkeys)}
       </main>`;
 
     root.querySelector<HTMLSelectElement>("[data-display]")?.addEventListener("change", (event) => {
@@ -766,8 +916,156 @@ export async function mountLayoutEditor(
       });
     });
 
+    root.querySelectorAll<HTMLElement>("[data-rebind]").forEach((button) => {
+      button.addEventListener("click", (event) => {
+        // The click's own modifier flags are the snapshot: a user who
+        // opened this while holding Ctrl must not have Ctrl baked into
+        // every combination they then press (ADR 0021).
+        capture = {
+          command: button.dataset.rebind!,
+          session: openCapture(event as MouseEvent),
+          verdict: undefined,
+          toBase: false,
+        };
+        render();
+      });
+    });
+    root.querySelectorAll<HTMLElement>("[data-reset-binding]").forEach((button) => {
+      button.addEventListener("click", () => {
+        const command = button.dataset.resetBinding!;
+        commandStatus = "Resetting binding…";
+        render();
+        void bridge
+          .resetBinding(command)
+          .then(async (receipt) => {
+            commandStatus =
+              receipt.combo === null
+                ? `${bindingLabel(command)} is now unbound · ${receipt.file}`
+                : `${bindingLabel(command)} reset to ${receipt.combo} · ${receipt.file}`;
+            hotkeys = await bridge.loadHotkeyBindings();
+            hotkeyError = undefined;
+            render();
+          })
+          .catch((error: unknown) => {
+            commandStatus = `Reset failed · ${String(error)}`;
+            render();
+          });
+      });
+    });
+    root.querySelector<HTMLInputElement>("[data-binding-redirect]")?.addEventListener("change", (event) => {
+      if (capture === undefined) return;
+      capture.toBase = (event.currentTarget as HTMLInputElement).checked;
+      render();
+    });
+    root.querySelector<HTMLElement>("[data-capture-cancel]")?.addEventListener("click", () => {
+      // Opening the dialog is not a commitment: cancelling leaves the
+      // binding exactly as it was.
+      capture = undefined;
+      render();
+    });
+    root.querySelector<HTMLElement>("[data-capture-save]")?.addEventListener("click", () => {
+      if (capture === undefined) return;
+      const combo = capturedCombo(capture.session);
+      if (combo === null) return;
+      const command = capture.command;
+      const toBase = capture.toBase;
+      commandStatus = "Saving binding…";
+      capture = undefined;
+      render();
+      void bridge
+        .setBinding(command, combo, toBase)
+        .then(async (receipt) => {
+          commandStatus = `${bindingLabel(command)} bound to ${receipt.combo ?? combo} · ${receipt.file}`;
+          hotkeys = await bridge.loadHotkeyBindings();
+          hotkeyError = undefined;
+          render();
+        })
+        .catch((error: unknown) => {
+          commandStatus = `Rebind failed · ${String(error)}`;
+          render();
+        });
+    });
+
     restoreFocus(focused);
   };
+
+  /**
+   * Asks the agent about whatever the buffer now holds.
+   *
+   * Only a complete combination is worth asking about, and the answer is
+   * discarded if the dialog moved on while it was in flight -- the user
+   * presses faster than a round trip completes.
+   */
+  const probeCaptured = (): void => {
+    if (capture === undefined) return;
+    const combo = capturedCombo(capture.session);
+    if (combo === null) return;
+    const asked = capture.command;
+    void bridge
+      .probeHotkey(combo)
+      .then((verdict) => {
+        if (capture === undefined || capture.command !== asked) return;
+        if (capturedCombo(capture.session) !== combo) return;
+        capture.verdict = verdict;
+        render();
+      })
+      .catch((error: unknown) => {
+        commandStatus = `Could not check that combination · ${String(error)}`;
+        render();
+      });
+  };
+
+  /**
+   * The window-level key listeners the capture buffer needs.
+   *
+   * On `window` rather than on the dialog, because the dialog is markup
+   * that is rebuilt on every render and a listener bound to it would not
+   * survive the first keypress. The buffer's own `armed` flag is what
+   * decides whether a key counts, not where the listener sits.
+   */
+  const onKeyDown = (event: KeyboardEvent): void => {
+    if (capture === undefined) return;
+    // Swallowed so a capture never also drives the page underneath -- an
+    // arrow key would otherwise scroll the panel it was pressed over.
+    event.preventDefault();
+    capture.session = pressKey(capture.session, event);
+    capture.verdict = undefined;
+    render();
+    probeCaptured();
+  };
+  const onKeyUp = (event: KeyboardEvent): void => {
+    if (capture === undefined) return;
+    capture.session = releaseKey(capture.session, event);
+  };
+  // A dialog that is not frontmost captures nothing, and throws away what
+  // it held: a buffer left armed behind another window would record a
+  // combination the user meant for something else (ADR 0021).
+  const onBlur = (): void => {
+    if (capture === undefined) return;
+    capture.session = blurCapture(capture.session);
+    capture.verdict = undefined;
+    render();
+  };
+  const onFocus = (): void => {
+    if (capture === undefined) return;
+    capture.session = focusCapture(capture.session);
+    render();
+  };
+  window.addEventListener("keydown", onKeyDown);
+  window.addEventListener("keyup", onKeyUp);
+  window.addEventListener("blur", onBlur);
+  window.addEventListener("focus", onFocus);
+
+  // Suspension is held for this window's whole lifetime, not for one
+  // dialog and not while it happens to have focus (ADR 0021). Anything
+  // narrower churns RegisterHotKey and risks losing a combination to
+  // another application on each cycle. The cost -- no Mosaix hotkey works
+  // anywhere while this window is open -- is what the hotkeys panel
+  // states rather than leaving the user to infer.
+  void bridge.startHotkeyCapture().catch((error: unknown) => {
+    hotkeyError = `Could not suspend hotkeys for editing · ${String(error)}`;
+    render();
+  });
 
   render();
 
@@ -799,7 +1097,14 @@ export async function mountLayoutEditor(
   });
 
   return () => {
+    // The agent would release suspension anyway when this connection
+    // ends, so this is the clean-close path rather than the safety net.
+    void bridge.endHotkeyCapture().catch(() => {});
     stopLayoutWatch();
     stopHotkeyWatch();
+    window.removeEventListener("keydown", onKeyDown);
+    window.removeEventListener("keyup", onKeyUp);
+    window.removeEventListener("blur", onBlur);
+    window.removeEventListener("focus", onFocus);
   };
 }

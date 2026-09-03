@@ -196,6 +196,17 @@ fn vk_from_key_name(key: &str) -> Option<u32> {
     None
 }
 
+/// The modifier flags and virtual-key code `combo` registers as, or
+/// `None` when Mosaix has no virtual-key code for its key name.
+///
+/// The one translation from a platform-neutral `KeyCombo` to what
+/// `RegisterHotKey` takes. Registration and the availability probe both
+/// go through it, so a combination the probe reports free is one
+/// registration can actually take.
+pub fn binding_parts(combo: &KeyCombo) -> Option<(HOT_KEY_MODIFIERS, u32)> {
+    vk_from_key_name(&combo.key).map(|vk| (modifiers_from_combo(combo), vk))
+}
+
 /// Translates a resolved config's hotkey bindings into the platform
 /// bindings [`mosaix_platform_windows::start_hotkeys`] should register,
 /// paired with the [`HotkeyRegistry`] resolving the ids it allocated. A
@@ -209,7 +220,7 @@ pub fn bindings_from_resolved(
     let mut bindings = Vec::new();
     let mut registry = HotkeyRegistry::default();
     for (command, combo) in hotkeys {
-        let Some(vk) = vk_from_key_name(&combo.key) else {
+        let Some((modifiers, vk)) = binding_parts(combo) else {
             tracing::error!(
                 ?command,
                 key = %combo.key,
@@ -221,11 +232,7 @@ pub fn bindings_from_resolved(
         // unremarkable id, and a zero default is exactly the value a bug
         // elsewhere would produce.
         let id = bindings.len() as i32 + 1;
-        bindings.push(HotkeyBinding {
-            id,
-            modifiers: modifiers_from_combo(combo),
-            vk,
-        });
+        bindings.push(HotkeyBinding { id, modifiers, vk });
         registry.commands.insert(id, command.clone());
     }
     (bindings, registry)

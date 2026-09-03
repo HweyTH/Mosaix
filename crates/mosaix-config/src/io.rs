@@ -18,11 +18,12 @@ use thiserror::Error;
 
 use mosaix_domain::NormalizedRect;
 
-use crate::defaults::default_config_content;
+use crate::defaults::{default_base_config, default_config_content};
 use crate::schema::layout_names_collide;
 use crate::schema::{
-    AutomaticTilingSection, BaseConfig, ConfigLayer, FocusBorderOverride, GapsOverride,
-    ProfileConfig, ResolvedConfigSet, SavedLayout, BASE_CONFIG_FILE_NAME as BASE_FILE_NAME,
+    AutomaticTilingSection, BaseConfig, Command, ConfigLayer, FocusBorderOverride, GapsOverride,
+    KeyCombo, ProfileConfig, ResolvedConfigSet, SavedLayout,
+    BASE_CONFIG_FILE_NAME as BASE_FILE_NAME,
 };
 use crate::validate::{validate, CandidateConfig, CandidateProfile, ValidationError};
 
@@ -56,6 +57,9 @@ pub enum ConfigIoError {
 
     #[error(transparent)]
     LayoutEdit(#[from] LayoutEditError),
+
+    #[error(transparent)]
+    BindingEdit(#[from] BindingEditError),
 }
 
 /// Why a saved-layout edit was never attempted.
@@ -119,6 +123,57 @@ pub enum LayoutEdit {
     Delete {
         name: String,
     },
+}
+
+/// One change to a hotkey binding, performed by the agent on the user's
+/// behalf. The settings application never writes a configuration file
+/// itself (ADR 0022).
+#[derive(Debug, Clone, PartialEq)]
+pub enum BindingEdit {
+    /// Bind `command` to `combo`.
+    ///
+    /// `to_base` is ADR 0022's redirect: the write normally lands in the
+    /// layer that supplies the binding, and this sends it to base config
+    /// instead. Redirecting a binding the matched profile overrides
+    /// *moves* it -- base config takes the new combination and the profile
+    /// drops its override -- because leaving the override in place would
+    /// let the profile keep winning the merge, so a binding the user asked
+    /// to apply everywhere would still be desk-specific here.
+    Set {
+        command: Command,
+        combo: KeyCombo,
+        to_base: bool,
+    },
+    /// Step `command` back toward its default.
+    ///
+    /// Reset removes the binding from the layer that supplies it, and,
+    /// when that layer is base config and Mosaix ships a default for the
+    /// command, writes the default back. So resetting a profile override
+    /// returns the binding to whatever base config says, resetting a base
+    /// binding returns it to what a fresh install gives, and a layout
+    /// binding -- which has no shipped default -- is simply unbound.
+    Reset { command: Command },
+}
+
+/// Why a binding edit was never attempted.
+///
+/// Like [`LayoutEditError`], these are refusals reached before any file is
+/// written, so the caller can tell "that is not a change I can make" from
+/// whole-directory validation's verdict on the candidate.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum BindingEditError {
+    #[error("nothing is bound to {command}")]
+    UnboundCommand { command: String },
+}
+
+/// What a binding edit did: which file received it, the combination the
+/// binding now resolves to (`None` when the edit left it unbound), and
+/// the whole config directory as it now stands.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BindingWrite {
+    pub file: String,
+    pub combo: Option<KeyCombo>,
+    pub config: ResolvedConfigSet,
 }
 
 /// What a layout edit did: which file received it, and the whole config
@@ -489,6 +544,231 @@ fn plan_edit(layers: &LayoutLayers, edit: &LayoutEdit) -> Result<EditPlan, Layou
         LayoutEdit::Delete { name } => {
             let layer = layers.supplier(name)?.ok_or_else(|| unknown(name))?;
             Ok(EditPlan::in_place(layer, Some(name.clone()), None))
+        }
+    }
+}
+
+/// The two layers a binding edit can land in, paired with the file each
+/// was read from -- the same shape [`LayoutLayers`] has, for the same
+/// reason (ADR 0022).
+struct BindingLayers {
+    base: BaseConfig,
+    profile: Option<(String, ProfileConfig)>,
+}
+
+impl BindingLayers {
+    /// Which layer supplies `command`, `None` if neither binds it.
+    ///
+    /// Unlike a saved layout, a binding both layers declare is the
+    /// ordinary case rather than an ambiguity: that is what a profile
+    /// override *is*, and the profile wins the merge, so it is also the
+    /// layer that supplies the value on screen.
+    fn supplier(&self, command: &Command) -> Option<ConfigLayer> {
+        if self
+            .profile
+            .as_ref()
+            .is_some_and(|(_, profile)| profile.hotkeys.contains_key(command))
+        {
+            return Some(ConfigLayer::Profile);
+        }
+        self.base
+            .hotkeys
+            .contains_key(command)
+            .then_some(ConfigLayer::Base)
+    }
+}
+
+fn parse_binding_layers(
+    candidate: &CandidateConfig,
+    fingerprint: &str,
+) -> Result<BindingLayers, ConfigIoError> {
+    let layers = parse_layers(candidate, fingerprint)?;
+    Ok(BindingLayers {
+        base: layers.base,
+        profile: layers.profile,
+    })
+}
+
+/// Which file a binding edit writes, and what the binding says there
+/// afterwards.
+///
+/// `vacate_profile` is the override a redirect drops -- the second file
+/// such an edit touches, and the binding equivalent of a layout move.
+struct BindingPlan {
+    destination: ConfigLayer,
+    /// What the binding says in `destination` afterwards, `None` when the
+    /// edit takes it out.
+    bound: Option<KeyCombo>,
+    vacate_profile: bool,
+}
+
+fn plan_binding_edit(
+    layers: &BindingLayers,
+    edit: &BindingEdit,
+) -> Result<BindingPlan, BindingEditError> {
+    match edit {
+        BindingEdit::Set {
+            command,
+            combo,
+            to_base,
+        } => {
+            let supplier = layers.supplier(command);
+            // A redirect only has an override to drop when the profile is
+            // what supplies the binding. Otherwise it asks for where the
+            // write was already going.
+            if *to_base && supplier == Some(ConfigLayer::Profile) {
+                return Ok(BindingPlan {
+                    destination: ConfigLayer::Base,
+                    bound: Some(combo.clone()),
+                    vacate_profile: true,
+                });
+            }
+            Ok(BindingPlan {
+                destination: supplier.unwrap_or(ConfigLayer::Base),
+                bound: Some(combo.clone()),
+                vacate_profile: false,
+            })
+        }
+        BindingEdit::Reset { command } => {
+            let supplier =
+                layers
+                    .supplier(command)
+                    .ok_or_else(|| BindingEditError::UnboundCommand {
+                        command: command.to_string(),
+                    })?;
+            // Resetting a profile override is one step back toward the
+            // default: the override goes and base config's value shows
+            // through, whatever that is.
+            if supplier == ConfigLayer::Profile {
+                return Ok(BindingPlan {
+                    destination: ConfigLayer::Profile,
+                    bound: None,
+                    vacate_profile: false,
+                });
+            }
+            Ok(BindingPlan {
+                destination: ConfigLayer::Base,
+                // A command Mosaix ships a default for goes back to it; a
+                // layout binding, which has none, is simply unbound.
+                bound: default_base_config().hotkeys.get(command).cloned(),
+                vacate_profile: false,
+            })
+        }
+    }
+}
+
+/// Applies `edit` to the configuration directory `dir`, writing the layer
+/// that currently supplies the binding being edited: the profile matching
+/// `fingerprint` if it overrides that command, otherwise base config
+/// (ADR 0022). A command neither layer binds yet goes to base config.
+///
+/// The whole directory is validated as one candidate before anything is
+/// written (ADR 0007), so an edit that would leave an invalid
+/// configuration -- a duplicate binding, say -- is refused and nothing is
+/// persisted. The write itself is a temp file and an atomic replace,
+/// matching [`edit_layouts`].
+pub fn edit_bindings(
+    dir: &Path,
+    fingerprint: &str,
+    edit: BindingEdit,
+) -> Result<BindingWrite, ConfigIoError> {
+    ensure_default_config(dir)?;
+    let mut candidate = read_candidate(dir)?;
+    let layers = parse_binding_layers(&candidate, fingerprint)?;
+    let plan = plan_binding_edit(&layers, &edit)?;
+    let command = match &edit {
+        BindingEdit::Set { command, .. } | BindingEdit::Reset { command } => command.clone(),
+    };
+    let into_profile = plan.destination == ConfigLayer::Profile;
+
+    let (file_name, contents) = if into_profile {
+        let (file_name, mut profile) = layers
+            .profile
+            .clone()
+            .expect("a profile-supplied binding implies a matched profile");
+        apply_binding(&mut profile.hotkeys, &command, &plan.bound);
+        (file_name, to_toml(&profile)?)
+    } else {
+        let mut base = layers.base.clone();
+        apply_binding(&mut base.hotkeys, &command, &plan.bound);
+        (BASE_FILE_NAME.to_owned(), to_toml(&base)?)
+    };
+
+    // The second half of a redirect: the profile drops its override, so
+    // base config's new combination is what the merge resolves to.
+    let vacated = if plan.vacate_profile {
+        let (file_name, mut profile) = layers
+            .profile
+            .clone()
+            .expect("a redirect implies the profile whose override it drops");
+        profile.hotkeys.remove(&command);
+        Some((file_name, to_toml(&profile)?))
+    } else {
+        None
+    };
+
+    if into_profile {
+        candidate
+            .profiles
+            .iter_mut()
+            .find(|profile| profile.file_name == file_name)
+            .expect("the matched profile was read from this candidate")
+            .contents = contents.clone();
+    } else {
+        candidate.base = contents.clone();
+    }
+    if let Some((profile_file, profile_contents)) = &vacated {
+        candidate
+            .profiles
+            .iter_mut()
+            .find(|profile| &profile.file_name == profile_file)
+            .expect("the matched profile was read from this candidate")
+            .contents = profile_contents.clone();
+    }
+    let config = validate(&candidate).map_err(validation_message)?;
+
+    let destination = if into_profile {
+        dir.join(PROFILES_DIR_NAME).join(&file_name)
+    } else {
+        dir.join(&file_name)
+    };
+    write_atomically(&destination, &contents)?;
+    if let Some((profile_file, profile_contents)) = &vacated {
+        write_atomically(
+            &dir.join(PROFILES_DIR_NAME).join(profile_file),
+            profile_contents,
+        )?;
+    }
+
+    // Read the answer off the resolved set rather than off the plan: what
+    // the user now has is the merge result, which a dropped profile
+    // override makes base config's value rather than nothing at all.
+    let resolved = config
+        .profiles
+        .iter()
+        .find(|profile| profile.fingerprint == fingerprint)
+        .map(|profile| &profile.config)
+        .unwrap_or(&config.base);
+    let combo = resolved.hotkeys.get(&command).cloned();
+
+    Ok(BindingWrite {
+        file: file_name,
+        combo,
+        config,
+    })
+}
+
+fn apply_binding(
+    bindings: &mut std::collections::BTreeMap<Command, KeyCombo>,
+    command: &Command,
+    bound: &Option<KeyCombo>,
+) {
+    match bound {
+        Some(combo) => {
+            bindings.insert(command.clone(), combo.clone());
+        }
+        None => {
+            bindings.remove(command);
         }
     }
 }
