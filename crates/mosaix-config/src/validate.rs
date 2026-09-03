@@ -236,6 +236,11 @@ pub fn merge(base: &BaseConfig, profile: Option<&ProfileConfig>) -> ResolvedConf
         .keys()
         .map(|command| (command.clone(), ConfigLayer::Base))
         .collect();
+    let mut layout_sources: BTreeMap<String, ConfigLayer> = base
+        .layouts
+        .keys()
+        .map(|name| (name.clone(), ConfigLayer::Base))
+        .collect();
 
     if let Some(profile) = profile {
         for (command, combo) in &profile.hotkeys {
@@ -264,6 +269,7 @@ pub fn merge(base: &BaseConfig, profile: Option<&ProfileConfig>) -> ResolvedConf
         // leaves the rest of base config's set intact (ADR 0004).
         for (name, layout) in &profile.layouts {
             layouts.insert(name.clone(), layout.clone());
+            layout_sources.insert(name.clone(), ConfigLayer::Profile);
         }
     }
 
@@ -275,6 +281,7 @@ pub fn merge(base: &BaseConfig, profile: Option<&ProfileConfig>) -> ResolvedConf
         automatic_tiling_enabled,
         focus_border,
         layouts,
+        layout_sources,
         // Attached by `validate`, which is the only place a profile's
         // filename is known.
         profile_file: None,
@@ -704,6 +711,11 @@ snap-right = "ctrl+alt+left"
                 automatic_tiling_enabled: false,
                 focus_border: base.focus_border,
                 layouts: base.layouts.clone(),
+                layout_sources: base
+                    .layouts
+                    .keys()
+                    .map(|name| (name.clone(), ConfigLayer::Base))
+                    .collect(),
                 profile_file: None,
             }
         );
@@ -1452,6 +1464,78 @@ snap-right = "ctrl+alt+right"
         assert_eq!(
             resolved.binding_sources.get(&Command::TogglePause),
             Some(&ConfigLayer::Profile)
+        );
+    }
+
+    #[test]
+    fn a_layout_no_profile_touches_is_recorded_as_base_supplied() {
+        let resolved = validate(&base_only(BASE_WITH_TWO_LAYOUTS)).unwrap().base;
+
+        assert_eq!(
+            resolved.layout_sources.get("writing"),
+            Some(&ConfigLayer::Base)
+        );
+    }
+
+    #[test]
+    fn a_layout_the_matched_profile_overrides_is_recorded_as_profile_supplied() {
+        let resolved = only_profile(&with_profile(
+            BASE_WITH_TWO_LAYOUTS,
+            "fingerprint = \"DESK\"
+             [layouts.writing]
+             cells = [{ x = 0.25, y = 0.0, width = 0.5, height = 1.0 }]
+",
+        ));
+
+        assert_eq!(
+            resolved.layout_sources.get("writing"),
+            Some(&ConfigLayer::Profile),
+            "the profile supplies the cells on screen, so it receives the write"
+        );
+        assert_eq!(
+            resolved.layout_sources.get("coding"),
+            Some(&ConfigLayer::Base),
+            "a layout the profile does not mention still comes from base config"
+        );
+        assert_eq!(
+            resolved.profile_file,
+            Some("desk.toml".to_owned()),
+            "the file a profile-supplied write would land in has to be nameable"
+        );
+    }
+
+    #[test]
+    fn a_layout_only_the_profile_declares_is_recorded_as_profile_supplied() {
+        let resolved = only_profile(&with_profile(
+            BASE_WITH_TWO_LAYOUTS,
+            "fingerprint = \"DESK\"
+             [layouts.docked]
+             cells = [{ x = 0.0, y = 0.0, width = 1.0, height = 1.0 }]
+",
+        ));
+
+        assert_eq!(
+            resolved.layout_sources.get("docked"),
+            Some(&ConfigLayer::Profile)
+        );
+    }
+
+    #[test]
+    fn every_resolved_layout_has_a_source_and_no_source_lacks_a_layout() {
+        let resolved = only_profile(&with_profile(
+            BASE_WITH_TWO_LAYOUTS,
+            "fingerprint = \"DESK\"
+             [layouts.writing]
+             cells = [{ x = 0.25, y = 0.0, width = 0.5, height = 1.0 }]
+             [layouts.docked]
+             cells = [{ x = 0.0, y = 0.0, width = 1.0, height = 1.0 }]
+",
+        ));
+
+        assert_eq!(
+            resolved.layouts.keys().collect::<Vec<_>>(),
+            resolved.layout_sources.keys().collect::<Vec<_>>(),
+            "the parallel field must stay keyed identically to the map it describes"
         );
     }
 

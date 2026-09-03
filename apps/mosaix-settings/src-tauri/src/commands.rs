@@ -4,7 +4,7 @@ use tauri::State;
 
 use crate::editor::{
     Appearance, CommandReceipt, EditorSession, EditorSnapshot, HotkeyList, LayoutDraft,
-    LayoutWriteReceipt, SavedLayoutView,
+    LayoutWriteReceipt, SavedLayoutList,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -155,22 +155,29 @@ pub fn load_hotkey_bindings(state: State<'_, EditorState>) -> Result<HotkeyList,
     session.hotkeys().map_err(|error| error.to_string())
 }
 
-/// The saved layouts the agent currently offers.
+/// The saved layouts the agent currently offers, each naming the file
+/// that supplies it.
 #[tauri::command]
-pub fn load_saved_layouts(state: State<'_, EditorState>) -> Result<Vec<SavedLayoutView>, String> {
+pub fn load_saved_layouts(state: State<'_, EditorState>) -> Result<SavedLayoutList, String> {
     let mut session = state.0.lock().map_err(|_| "editor state is unavailable")?;
     session.layouts().map_err(|error| error.to_string())
 }
 
 /// Persists the drawn layout under the name it carries. The agent does
 /// the writing; this reports only what it confirmed (ADR 0022).
+///
+/// `to_base` is the interface's redirect control: it sends the write to
+/// base config rather than to the layer that supplies the layout.
 #[tauri::command]
 pub fn save_layout(
     draft: LayoutDraft,
+    to_base: bool,
     state: State<'_, EditorState>,
 ) -> Result<LayoutWriteReceipt, String> {
     let mut session = state.0.lock().map_err(|_| "editor state is unavailable")?;
-    session.save(draft).map_err(|error| error.to_string())
+    session
+        .save(draft, to_base)
+        .map_err(|error| error.to_string())
 }
 
 /// Renames a saved layout, in whichever file declares it.

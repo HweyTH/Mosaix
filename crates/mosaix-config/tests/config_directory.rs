@@ -15,8 +15,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use mosaix_config::{
     edit_layouts, ensure_default_config, fallback_config, load, save_profile_settings, watch,
-    Command, ConfigEvent, ConfigIoError, FocusBorderOverride, GapsOverride, KeyCombo, LayoutEdit,
-    LayoutEditError, ProfileSettingsUpdate, RgbaColor,
+    Command, ConfigEvent, ConfigIoError, ConfigLayer, FocusBorderOverride, GapsOverride, KeyCombo,
+    LayoutEdit, LayoutEditError, ProfileSettingsUpdate, RgbaColor,
 };
 use mosaix_domain::NormalizedRect;
 
@@ -147,6 +147,7 @@ fn dir_with_layered_layouts(label: &str) -> PathBuf {
         LayoutEdit::Save {
             name: "writing".to_owned(),
             cells: cells(1.0),
+            to_base: false,
         },
     )
     .unwrap();
@@ -173,6 +174,7 @@ fn a_new_layout_is_written_to_base_config_and_is_immediately_resolvable() {
         LayoutEdit::Save {
             name: "writing".to_owned(),
             cells: cells(0.6),
+            to_base: false,
         },
     )
     .expect("saving a new layout should succeed");
@@ -202,6 +204,7 @@ fn saving_over_a_layout_the_matched_profile_declares_writes_the_profile() {
         LayoutEdit::Save {
             name: "docked".to_owned(),
             cells: cells(0.75),
+            to_base: false,
         },
     )
     .expect("rewriting a profile-supplied layout should succeed");
@@ -224,6 +227,102 @@ fn saving_over_a_layout_the_matched_profile_declares_writes_the_profile() {
 }
 
 #[test]
+fn redirecting_a_profile_supplied_layout_moves_it_into_base_config() {
+    let dir = dir_with_layered_layouts("layout-redirect");
+
+    let write = edit_layouts(
+        &dir,
+        DESK,
+        LayoutEdit::Save {
+            name: "docked".to_owned(),
+            cells: cells(0.75),
+            to_base: true,
+        },
+    )
+    .expect("redirecting a profile-supplied layout should succeed");
+
+    assert_eq!(
+        write.file, "config.toml",
+        "the redirect is what the receipt names, not the layer the layout came from"
+    );
+    let reloaded = load(&dir).unwrap().unwrap();
+    assert_eq!(
+        reloaded.base.layouts["docked"].cells,
+        cells(0.75),
+        "base config now supplies it, so it applies at every desk"
+    );
+    let profile_file = fs::read_to_string(dir.join("profiles").join("desk.toml")).unwrap();
+    assert!(
+        !profile_file.contains("docked"),
+        "the profile gives the layout up, or it would still win the merge          and the redirect would appear to succeed and change nothing: {profile_file}"
+    );
+    assert_eq!(
+        reloaded.profiles[0].config.layout_sources.get("docked"),
+        Some(&ConfigLayer::Base),
+        "provenance follows the move, so the destination shown next is the real one"
+    );
+
+    cleanup(&dir);
+}
+
+#[test]
+fn redirecting_a_layout_base_config_already_supplies_changes_nothing_about_where_it_goes() {
+    let dir = dir_with_layered_layouts("layout-redirect-base");
+
+    let write = edit_layouts(
+        &dir,
+        DESK,
+        LayoutEdit::Save {
+            name: "writing".to_owned(),
+            cells: cells(0.4),
+            to_base: true,
+        },
+    )
+    .expect("redirecting a base-supplied layout should succeed");
+
+    assert_eq!(write.file, "config.toml");
+    let reloaded = load(&dir).unwrap().unwrap();
+    assert_eq!(reloaded.base.layouts["writing"].cells, cells(0.4));
+    assert!(
+        fs::read_to_string(dir.join("profiles").join("desk.toml"))
+            .unwrap()
+            .contains("docked"),
+        "a redirect must not disturb a layout it was not asked about"
+    );
+
+    cleanup(&dir);
+}
+
+#[test]
+fn a_layout_edit_without_the_redirect_still_lands_in_the_profile() {
+    let dir = dir_with_layered_layouts("layout-no-redirect");
+
+    let write = edit_layouts(
+        &dir,
+        DESK,
+        LayoutEdit::Save {
+            name: "docked".to_owned(),
+            cells: cells(0.75),
+            to_base: false,
+        },
+    )
+    .expect("rewriting a profile-supplied layout should succeed");
+
+    assert_eq!(write.file, "desk.toml");
+    let reloaded = load(&dir).unwrap().unwrap();
+    assert!(
+        !reloaded.base.layouts.contains_key("docked"),
+        "the default destination is unchanged by the redirect existing"
+    );
+    assert_eq!(
+        reloaded.profiles[0].config.layout_sources.get("docked"),
+        Some(&ConfigLayer::Profile)
+    );
+
+    cleanup(&dir);
+}
+
+#[test]
 fn a_layout_can_be_renamed_duplicated_and_deleted() {
     let dir = temp_dir("layout-manage");
     ensure_default_config(&dir).unwrap();
@@ -233,6 +332,7 @@ fn a_layout_can_be_renamed_duplicated_and_deleted() {
         LayoutEdit::Save {
             name: "draft".to_owned(),
             cells: cells(0.4),
+            to_base: false,
         },
     )
     .unwrap();
@@ -291,6 +391,7 @@ fn a_duplicate_name_is_refused_before_anything_is_written() {
         LayoutEdit::Save {
             name: "writing".to_owned(),
             cells: cells(0.6),
+            to_base: false,
         },
     )
     .unwrap();
@@ -334,6 +435,7 @@ fn an_empty_layout_name_is_refused() {
         LayoutEdit::Save {
             name: "   ".to_owned(),
             cells: cells(1.0),
+            to_base: false,
         },
     )
     .unwrap_err();
@@ -414,6 +516,7 @@ fn an_edit_that_would_invalidate_the_directory_persists_nothing() {
                 width: 0.9,
                 height: 1.0,
             }],
+            to_base: false,
         },
     )
     .unwrap_err();
@@ -443,6 +546,7 @@ fn a_layout_edit_leaves_hand_written_hotkeys_intact() {
         LayoutEdit::Save {
             name: "writing".to_owned(),
             cells: cells(1.0),
+            to_base: false,
         },
     )
     .unwrap();

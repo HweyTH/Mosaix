@@ -9,6 +9,7 @@ import type {
   LayoutDraft,
   LayoutWriteReceipt,
   SavedLayout,
+  SavedLayoutList,
 } from "./layout-editor";
 
 export type InvokeCommand = (
@@ -75,11 +76,14 @@ export function createTauriDesktopBridge(
       invokeCommand("start_hotkey_capture") as Promise<void>,
     endHotkeyCapture: () => invokeCommand("end_hotkey_capture") as Promise<void>,
     loadSavedLayouts: async () => {
-      const layouts = await invokeCommand("load_saved_layouts") as SavedLayout[];
-      return layouts.map(fromNormalizedLayout);
+      const list = await invokeCommand("load_saved_layouts") as SavedLayoutList;
+      return { ...list, layouts: list.layouts.map(fromNormalizedLayout) };
     },
-    saveLayout: (draft: LayoutDraft) =>
-      invokeCommand("save_layout", { draft: toNormalizedDraft(draft) }) as Promise<LayoutWriteReceipt>,
+    saveLayout: (draft: LayoutDraft, toBase: boolean) =>
+      invokeCommand("save_layout", {
+        draft: toNormalizedDraft(draft),
+        toBase,
+      }) as Promise<LayoutWriteReceipt>,
     renameLayout: (from: string, to: string) =>
       invokeCommand("rename_layout", { from, to }) as Promise<LayoutWriteReceipt>,
     duplicateLayout: (from: string, to: string) =>

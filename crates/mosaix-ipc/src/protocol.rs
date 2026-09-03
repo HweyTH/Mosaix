@@ -5,10 +5,12 @@ use serde::{Deserialize, Serialize};
 ///
 /// Bumped to 2 when [`IpcRequest`] gained its first data-carrying variant
 /// ([`IpcRequest::ApplyLayout`]), to 3 for the saved-layout editing
-/// requests, and to 4 for the hotkey-capture pair. An older agent has no
-/// tag for a request this build added, so the version is what makes the
+/// requests, to 4 for the hotkey-capture pair, and to 5 when
+/// [`IpcRequest::SaveLayout`] gained its write-destination redirect. An
+/// older agent has no tag for a request this build added -- and no field
+/// for one an existing request grew -- so the version is what makes the
 /// mismatch reportable instead of surfacing as a deserialization failure.
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct IpcEnvelope {
@@ -63,6 +65,12 @@ pub enum IpcRequest {
     SaveLayout {
         name: String,
         cells: Vec<NormalizedRect>,
+        /// Redirect this write to base config instead of the layer that
+        /// currently supplies the layout (ADR 0022). A layout the matched
+        /// profile declares is *moved*: base config gains it and the
+        /// profile gives it up, so the merge resolves to the copy the
+        /// user asked for.
+        to_base: bool,
     },
     RenameLayout {
         from: String,
@@ -234,6 +242,7 @@ mod tests {
                     width: 0.5,
                     height: 1.0,
                 }],
+                to_base: false,
             },
             IpcRequest::RenameLayout {
                 from: "writing".to_owned(),

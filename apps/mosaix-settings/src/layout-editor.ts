@@ -40,6 +40,24 @@ export interface EditorSnapshot {
 export interface SavedLayout {
   name: string;
   cells: ZoneDraft[];
+  /** Which layer supplies it: `base`, `profile`, or `unknown`. */
+  source: "base" | "profile" | "unknown";
+  /**
+   * The configuration file supplying it, and so the file a save of it
+   * would be written to (ADR 0022). Absent when the agent could not name
+   * it.
+   */
+  file: string | null;
+}
+
+/**
+ * The saved layouts on offer, plus the file a layout that does not exist
+ * yet would be created in -- which the interface needs to name a
+ * destination for a new drawing too.
+ */
+export interface SavedLayoutList {
+  baseFile: string;
+  layouts: SavedLayout[];
 }
 
 export interface LayoutWriteReceipt {
@@ -99,8 +117,8 @@ export interface DesktopBridge {
   loadHotkeyBindings(): Promise<HotkeyList>;
   startHotkeyCapture(): Promise<void>;
   endHotkeyCapture(): Promise<void>;
-  loadSavedLayouts(): Promise<SavedLayout[]>;
-  saveLayout(draft: LayoutDraft): Promise<LayoutWriteReceipt>;
+  loadSavedLayouts(): Promise<SavedLayoutList>;
+  saveLayout(draft: LayoutDraft, toBase: boolean): Promise<LayoutWriteReceipt>;
   renameLayout(from: string, to: string): Promise<LayoutWriteReceipt>;
   duplicateLayout(from: string, to: string): Promise<LayoutWriteReceipt>;
   deleteLayout(name: string): Promise<LayoutWriteReceipt>;
@@ -188,10 +206,38 @@ export function watchHotkeyBindings(
  */
 export function watchSavedLayouts(
   bridge: Pick<DesktopBridge, "loadSavedLayouts">,
-  handlers: WatchHandlers<SavedLayout[]>,
+  handlers: WatchHandlers<SavedLayoutList>,
   intervalMs = 2000,
 ): () => void {
   return watchChanges(() => bridge.loadSavedLayouts(), handlers, intervalMs);
+}
+
+/**
+ * The configuration file a save of `name` would land in, and whether the
+ * redirect control can change it.
+ *
+ * The destination is the layer that currently supplies the layout
+ * (ADR 0022). Two cases leave nothing for a redirect to do: a layout base
+ * config already supplies, and a name no layer declares yet -- a new
+ * layout goes to base config regardless, so it is available at every desk.
+ *
+ * Names are matched the way configuration matches them, ignoring case, so
+ * what the interface promises and where the agent writes cannot disagree
+ * over `Writing` and `writing`.
+ */
+export function saveDestination(
+  name: string,
+  list: SavedLayoutList | undefined,
+  toBase: boolean,
+): { file: string; redirectable: boolean } {
+  const baseFile = list?.baseFile ?? "your base configuration";
+  const existing = list?.layouts.find(
+    (layout) => layout.name.trim().toLowerCase() === name.trim().toLowerCase(),
+  );
+  if (existing === undefined || existing.source !== "profile") {
+    return { file: existing?.file ?? baseFile, redirectable: false };
+  }
+  return { file: toBase ? baseFile : (existing.file ?? baseFile), redirectable: true };
 }
 
 /**
@@ -226,19 +272,22 @@ function renderZones(snapshot: EditorSnapshot, selectedZoneId: number): string {
 }
 
 function renderLayouts(
-  layouts: SavedLayout[] | undefined,
+  list: SavedLayoutList | undefined,
   selected: string | undefined,
   error: string | undefined,
 ): string {
   if (error !== undefined) return `<p data-layout-error>${escapeHtml(error)}</p>`;
-  if (layouts === undefined) return `<p>Reading saved layouts…</p>`;
-  if (layouts.length === 0) return `<p>No saved layouts yet.</p>`;
-  return `<ul class="library-list">${layouts
+  if (list === undefined) return `<p>Reading saved layouts…</p>`;
+  if (list.layouts.length === 0) return `<p>No saved layouts yet.</p>`;
+  // `data-source` carries the same distinction the binding list draws, so
+  // a desk-specific layout looks desk-specific at a glance rather than
+  // only once its destination is read.
+  return `<ul class="library-list">${list.layouts
     .map(
       (layout) => `
-        <li class="library-item${layout.name === selected ? " active" : ""}" data-layout="${escapeHtml(layout.name)}">
+        <li class="library-item${layout.name === selected ? " active" : ""}" data-layout="${escapeHtml(layout.name)}" data-source="${escapeHtml(layout.source)}">
           <button class="layout-open" data-open-layout="${escapeHtml(layout.name)}">${escapeHtml(layout.name)}</button>
-          <small class="library-detail">${layout.cells.length} zone${layout.cells.length === 1 ? "" : "s"}</small>
+          <small class="library-detail">${layout.cells.length} zone${layout.cells.length === 1 ? "" : "s"} · ${layout.source === "profile" ? "profile · " : ""}${escapeHtml(layout.file ?? "source unknown")}</small>
           <span class="layout-actions">
             <button data-duplicate-layout="${escapeHtml(layout.name)}" title="Duplicate">⧉</button>
             <button data-delete-layout="${escapeHtml(layout.name)}" title="Delete">⌫</button>
@@ -246,6 +295,26 @@ function renderLayouts(
         </li>`,
     )
     .join("")}</ul>`;
+}
+
+/**
+ * Where the next save will go, said before it happens rather than in the
+ * receipt afterwards.
+ *
+ * Whenever a profile is matched, the layout on screen and the file that
+ * would receive the write are different objects, so naming the
+ * destination is load-bearing rather than decorative (ADR 0022) -- and
+ * the redirect beside it is the only way to move a desk-specific layout
+ * out of its profile without editing TOML.
+ */
+function renderSaveDestination(
+  destination: { file: string; redirectable: boolean },
+  toBase: boolean,
+): string {
+  const redirect = destination.redirectable
+    ? `<label class="toggle-line redirect"><span>Save to base config instead<small>Moves it out of this desk's profile</small></span><input data-redirect-to-base type="checkbox" ${toBase ? "checked" : ""} /></label>`
+    : "";
+  return `<p class="save-destination" data-save-destination>Saves to <code>${escapeHtml(destination.file)}</code></p>${redirect}`;
 }
 
 /**
@@ -304,9 +373,11 @@ export async function mountLayoutEditor(
   let tilingSettings = initialTilingSettings;
   let hotkeys: HotkeyList | undefined;
   let hotkeyError: string | undefined;
-  let layouts: SavedLayout[] | undefined;
+  let layouts: SavedLayoutList | undefined;
   let layoutError: string | undefined;
   let selectedLayout: string | undefined;
+  /** Whether the next save is redirected to base config (ADR 0022). */
+  let redirectToBase = false;
   let selectedDisplayIndex = 0;
   let selectedZoneId = snapshot.draft.zones[0]?.id ?? 0;
   let commandStatus = "Ready";
@@ -343,6 +414,7 @@ export async function mountLayoutEditor(
     // Never undefined: the session always offers at least a nominal
     // display, so the canvas has proportions to draw at.
     const display = snapshot.displays[selectedDisplayIndex] ?? snapshot.displays[0]!;
+    const destination = saveDestination(snapshot.draft.name, layouts, redirectToBase);
     document.body.className = snapshot.appearance === "dark" ? "night-tide" : "warm-paper";
     root.innerHTML = `
       <main class="spatial-editor">
@@ -392,6 +464,7 @@ export async function mountLayoutEditor(
         <aside class="panel layout-library" aria-label="Saved layouts">
           <div class="panel-title">SAVED LAYOUTS</div>
           <label class="field"><span>Name</span><input data-layout-name value="${escapeHtml(snapshot.draft.name)}" /></label>
+          ${renderSaveDestination(destination, redirectToBase)}
           <div class="library-actions">
             <button class="primary-button" data-save-layout>Save layout</button>
             <button class="soft-button" data-rename-layout ${selectedLayout === undefined ? "disabled" : ""}>Rename</button>
@@ -435,6 +508,14 @@ export async function mountLayoutEditor(
     // thrown away with the old markup.
     root.querySelector<HTMLInputElement>("[data-layout-name]")?.addEventListener("input", (event) => {
       snapshot.draft.name = (event.currentTarget as HTMLInputElement).value;
+      // Re-rendered so the destination follows the name being typed: a
+      // name that starts matching a profile's layout changes where the
+      // save would land, and saying so late is saying it too late.
+      render();
+    });
+    root.querySelector<HTMLInputElement>("[data-redirect-to-base]")?.addEventListener("change", (event) => {
+      redirectToBase = (event.currentTarget as HTMLInputElement).checked;
+      render();
     });
     /**
      * Runs one configuration write and reports what the agent said. The
@@ -467,7 +548,7 @@ export async function mountLayoutEditor(
       // opposite of what a user naming a new drawing means -- so the
       // second case is reported here rather than silently overwriting a
       // layout they never opened.
-      const clash = layouts?.find(
+      const clash = layouts?.layouts.find(
         (layout) =>
           layout.name !== selectedLayout &&
           layout.name.toLowerCase() === draft.name.trim().toLowerCase(),
@@ -480,8 +561,12 @@ export async function mountLayoutEditor(
       write(
         "Saving layout…",
         (receipt) => `Saved to ${receipt.file}`,
-        () => bridge.saveLayout(draft).then((receipt) => {
+        () => bridge.saveLayout(draft, redirectToBase).then((receipt) => {
           selectedLayout = draft.name;
+          // The layout now comes from wherever it was just written, so
+          // the redirect has done its job and stops applying to the next
+          // save of a layout that is no longer profile-supplied.
+          redirectToBase = false;
           return receipt;
         }),
       );
@@ -525,7 +610,7 @@ export async function mountLayoutEditor(
     root.querySelectorAll<HTMLElement>("[data-open-layout]").forEach((button) => {
       button.addEventListener("click", () => {
         const name = button.dataset.openLayout!;
-        const layout = layouts?.find((candidate) => candidate.name === name);
+        const layout = layouts?.layouts.find((candidate) => candidate.name === name);
         if (layout === undefined) return;
         // Opening a saved layout replaces the draft deliberately -- it is
         // the one action that is meant to discard what is on the canvas.

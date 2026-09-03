@@ -593,6 +593,16 @@ pub struct ResolvedConfig {
     pub automatic_tiling_enabled: bool,
     pub focus_border: FocusBorderSection,
     pub layouts: BTreeMap<String, SavedLayout>,
+    /// Which layer supplied each saved layout in `layouts`, keyed
+    /// identically.
+    ///
+    /// The same parallel-field shape `binding_sources` uses, and for the
+    /// same reason: a layout's consumers care about its cells, and pairing
+    /// every one with its origin would fan a UI concern out into all of
+    /// them. Bindings got this first (#38) because that was all the hotkey
+    /// list needed; showing a layout write's destination before the save
+    /// is what needs it here (ADR 0022).
+    pub layout_sources: BTreeMap<String, ConfigLayer>,
     /// The profile file this config was merged from, or `None` when base
     /// config alone supplies it. Set by [`crate::validate`], which is
     /// where a filename is known; [`crate::merge`] leaves it `None`

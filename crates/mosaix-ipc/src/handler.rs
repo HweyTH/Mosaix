@@ -36,6 +36,11 @@ pub struct StateSnapshot {
     /// (CONTEXT.md "Saved layout"). Shape only -- a layout never names a
     /// window, so there is nothing here to sanitize (ADR 0018).
     pub saved_layouts: BTreeMap<String, SavedLayout>,
+    /// Which layer supplies each entry of `saved_layouts`, keyed
+    /// identically. This is what lets the settings application show a
+    /// layout write's destination *before* the save rather than only in
+    /// the receipt afterwards (ADR 0022).
+    pub layout_sources: BTreeMap<String, LayoutSourceSnapshot>,
     /// Every hotkey binding in effect for the current topology, each
     /// naming the configuration file that supplies it. This is what lets
     /// the settings application list bindings without reading a TOML file,
@@ -55,6 +60,17 @@ pub struct StateSnapshot {
     /// closes, which is how the user finds out a shortcut is dead rather
     /// than by pressing it.
     pub unregistered_bindings: Vec<String>,
+}
+
+/// Which layer supplies one saved layout, and so which file a save of it
+/// would be written to (ADR 0022).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct LayoutSourceSnapshot {
+    /// `base`, `profile`, or `unknown` for a resolved config that recorded
+    /// no source.
+    pub source: String,
+    /// The file that supplies it. `None` when this build cannot name it.
+    pub file: Option<String>,
 }
 
 /// One resolved hotkey binding, flattened for a client that has no
@@ -91,8 +107,38 @@ pub struct HotkeyBindingSnapshot {
 /// reach that is a `ResolvedConfig` built by hand, and dropping a real
 /// binding from the list a user reads instead of the TOML file would be
 /// worse than admitting where it came from is unknown.
-fn binding_snapshots(config: &ResolvedConfig) -> Vec<HotkeyBindingSnapshot> {
+/// The layer a resolved value came from, as the interface labels it.
+fn layer_name(layer: Option<ConfigLayer>) -> String {
+    match layer {
+        Some(ConfigLayer::Base) => "base",
+        Some(ConfigLayer::Profile) => "profile",
+        None => "unknown",
+    }
+    .to_owned()
+}
+
+/// The file `layer` means, given the profile (if any) this config was
+/// merged from -- and so the file an edit of that value would be written
+/// to (ADR 0022).
+///
+/// `None` when this build cannot name it. A destination shown to a user
+/// before a write has to be the real one or absent: a plausible-looking
+/// guess is the worst of the three.
+fn supplying_file(layer: Option<ConfigLayer>, profile_file: &Option<String>) -> Option<String> {
     let base_file = || Some(mosaix_config::BASE_CONFIG_FILE_NAME.to_owned());
+    match (layer, profile_file) {
+        (Some(ConfigLayer::Base), _) => base_file(),
+        // `validate` attaches the filename to every resolved profile, so
+        // this is `Some` for any config that came through it.
+        (Some(ConfigLayer::Profile), file) => file.clone(),
+        // No recorded source. With no profile in play there is only one
+        // file it could be; with one, naming either would be a guess.
+        (None, None) => base_file(),
+        (None, Some(_)) => None,
+    }
+}
+
+fn binding_snapshots(config: &ResolvedConfig) -> Vec<HotkeyBindingSnapshot> {
     config
         .hotkeys
         .iter()
@@ -105,25 +151,33 @@ fn binding_snapshots(config: &ResolvedConfig) -> Vec<HotkeyBindingSnapshot> {
                     _ => None,
                 },
                 combo: combo.to_string(),
-                source: match layer {
-                    Some(ConfigLayer::Base) => "base",
-                    Some(ConfigLayer::Profile) => "profile",
-                    None => "unknown",
-                }
-                .to_owned(),
-                file: match (layer, &config.profile_file) {
-                    (Some(ConfigLayer::Base), _) => base_file(),
-                    // `validate` attaches the filename to every resolved
-                    // profile, so this is `Some` for any config that came
-                    // through it.
-                    (Some(ConfigLayer::Profile), file) => file.clone(),
-                    // No recorded source. With no profile in play there is
-                    // only one file it could be; with one, naming either
-                    // would be a guess.
-                    (None, None) => base_file(),
-                    (None, Some(_)) => None,
-                },
+                source: layer_name(layer),
+                file: supplying_file(layer, &config.profile_file),
             }
+        })
+        .collect()
+}
+
+/// Where each saved layout comes from, keyed the way
+/// [`StateSnapshot::saved_layouts`] is.
+///
+/// A parallel map rather than a field on the layout itself, matching how
+/// `mosaix-config` records it: the layout's cells and the file supplying
+/// them answer two different questions, and only the interface asks the
+/// second.
+fn layout_source_snapshots(config: &ResolvedConfig) -> BTreeMap<String, LayoutSourceSnapshot> {
+    config
+        .layouts
+        .keys()
+        .map(|name| {
+            let layer = config.layout_sources.get(name).copied();
+            (
+                name.clone(),
+                LayoutSourceSnapshot {
+                    source: layer_name(layer),
+                    file: supplying_file(layer, &config.profile_file),
+                },
+            )
         })
         .collect()
 }
@@ -202,6 +256,7 @@ impl From<EngineState> for StateSnapshot {
             .collect();
         managed_windows.sort_by_key(|window| window.window_id);
         let saved_layouts = state.resolved_config.layouts.clone();
+        let layout_sources = layout_source_snapshots(&state.resolved_config);
         let hotkeys = binding_snapshots(&state.resolved_config);
         let unregistered_bindings = state
             .unregistered_bindings
@@ -222,6 +277,7 @@ impl From<EngineState> for StateSnapshot {
             degraded_windows,
             managed_windows,
             saved_layouts,
+            layout_sources,
             hotkeys,
             hotkey_capture_suspended: state.hotkey_capture_suspended,
             unregistered_bindings,
@@ -409,13 +465,18 @@ pub fn handle_request(
                 },
             }
         }
-        IpcRequest::SaveLayout { name, cells } => edit_layouts(
+        IpcRequest::SaveLayout {
+            name,
+            cells,
+            to_base,
+        } => edit_layouts(
             events,
             state_reader,
             config,
             LayoutEdit::Save {
                 name: name.clone(),
                 cells: cells.clone(),
+                to_base: *to_base,
             },
         ),
         IpcRequest::RenameLayout { from, to } => edit_layouts(
@@ -778,6 +839,7 @@ mod tests {
             &IpcRequest::SaveLayout {
                 name: "writing".to_owned(),
                 cells: one_cell(),
+                to_base: false,
             },
             &engine.events(),
             &engine.state_reader(),
@@ -793,6 +855,7 @@ mod tests {
             LayoutEdit::Save {
                 name: "writing".to_owned(),
                 cells: one_cell(),
+                to_base: false,
             }
         );
     }
@@ -808,6 +871,7 @@ mod tests {
             &IpcRequest::SaveLayout {
                 name: "writing".to_owned(),
                 cells: one_cell(),
+                to_base: false,
             },
             &engine.events(),
             &engine.state_reader(),
@@ -1217,5 +1281,81 @@ mod tests {
 
         assert_eq!(json["hotkey_capture_suspended"], true);
         assert_eq!(json["unregistered_bindings"][0], "snap-left");
+    }
+
+    #[test]
+    fn the_state_snapshot_names_the_file_supplying_each_saved_layout() {
+        let mut state = EngineState::default();
+        state.resolved_config.profile_file = Some("desk.toml".to_owned());
+        state.resolved_config.layouts.insert(
+            "writing".to_owned(),
+            mosaix_config::SavedLayout { cells: Vec::new() },
+        );
+        state.resolved_config.layouts.insert(
+            "docked".to_owned(),
+            mosaix_config::SavedLayout { cells: Vec::new() },
+        );
+        state
+            .resolved_config
+            .layout_sources
+            .insert("writing".to_owned(), mosaix_config::ConfigLayer::Base);
+        state
+            .resolved_config
+            .layout_sources
+            .insert("docked".to_owned(), mosaix_config::ConfigLayer::Profile);
+
+        let json = serde_json::to_value(StateSnapshot::from(state)).unwrap();
+
+        assert_eq!(json["layout_sources"]["writing"]["source"], "base");
+        assert_eq!(json["layout_sources"]["writing"]["file"], "config.toml");
+        assert_eq!(json["layout_sources"]["docked"]["source"], "profile");
+        assert_eq!(
+            json["layout_sources"]["docked"]["file"], "desk.toml",
+            "the profile is where a save of it would land, so it has to be nameable"
+        );
+    }
+
+    #[test]
+    fn a_layout_with_no_recorded_source_names_no_file_while_a_profile_is_matched() {
+        let mut state = EngineState::default();
+        state.resolved_config.profile_file = Some("desk.toml".to_owned());
+        state.resolved_config.layouts.insert(
+            "writing".to_owned(),
+            mosaix_config::SavedLayout { cells: Vec::new() },
+        );
+
+        let json = serde_json::to_value(StateSnapshot::from(state)).unwrap();
+
+        assert_eq!(json["layout_sources"]["writing"]["source"], "unknown");
+        assert!(
+            json["layout_sources"]["writing"]["file"].is_null(),
+            "naming either layer would be a guess, and a guessed destination is the worst answer"
+        );
+    }
+
+    #[test]
+    fn a_redirected_save_reaches_the_config_store_as_a_redirect() {
+        let engine = mosaix_engine::spawn_engine(Vec::new(), Default::default());
+        let store = RecordingStore::wrote("config.toml", &[("docked", 0.5)]);
+
+        handle_request(
+            &IpcRequest::SaveLayout {
+                name: "docked".to_owned(),
+                cells: one_cell(),
+                to_base: true,
+            },
+            &engine.events(),
+            &engine.state_reader(),
+            &store,
+        );
+
+        assert_eq!(
+            store.edits.lock().unwrap()[0].1,
+            LayoutEdit::Save {
+                name: "docked".to_owned(),
+                cells: one_cell(),
+                to_base: true,
+            }
+        );
     }
 }

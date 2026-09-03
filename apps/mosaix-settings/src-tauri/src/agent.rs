@@ -200,7 +200,15 @@ mod windows_transport {
 
         fn edit_layouts(&mut self, edit: LayoutEdit) -> Result<String, AgentError> {
             let data = self.confirmed(match edit {
-                LayoutEdit::Save { name, cells } => IpcRequest::SaveLayout { name, cells },
+                LayoutEdit::Save {
+                    name,
+                    cells,
+                    to_base,
+                } => IpcRequest::SaveLayout {
+                    name,
+                    cells,
+                    to_base,
+                },
                 LayoutEdit::Rename { from, to } => IpcRequest::RenameLayout { from, to },
                 LayoutEdit::Duplicate { from, to } => IpcRequest::DuplicateLayout { from, to },
                 LayoutEdit::Delete { name } => IpcRequest::DeleteLayout { name },

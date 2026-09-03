@@ -62,12 +62,32 @@ pub fn nominal_display() -> DisplaySummary {
     }
 }
 
-/// One saved layout as the interface lists it.
+/// One saved layout as the interface lists it, with the file that
+/// supplies it -- and so the file a save of it would be written to
+/// (ADR 0022).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SavedLayoutView {
     pub name: String,
     pub cells: Vec<ZoneDraft>,
+    /// `base`, `profile`, or `unknown`.
+    pub source: String,
+    /// The configuration file currently supplying this layout, absent
+    /// when the agent could not name it.
+    pub file: Option<String>,
+}
+
+/// The saved layouts on offer, plus the file a layout that does not exist
+/// yet would be created in.
+///
+/// The base filename travels with the list because the interface has to
+/// name a destination for a *new* drawing too, and a new layout goes to
+/// base config so it is available at every desk.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SavedLayoutList {
+    pub base_file: String,
+    pub layouts: Vec<SavedLayoutView>,
 }
 
 /// What a confirmed configuration write did.
@@ -319,7 +339,9 @@ impl EditorSession {
     /// to have been.
     pub fn apply(&mut self, draft: LayoutDraft) -> Result<CommandReceipt, EditorCommandError> {
         let name = draft.name.clone();
-        self.save(draft)?;
+        // Applying is not the moment to change where a layout lives, so
+        // the write goes wherever the layout already comes from.
+        self.save(draft, false)?;
         self.agent
             .apply_saved_layout(&name)
             .map_err(EditorCommandError::from)?;
@@ -377,29 +399,46 @@ impl EditorSession {
             .map_err(EditorCommandError::from)
     }
 
-    /// The saved layouts the agent currently has, by name.
-    pub fn layouts(&mut self) -> Result<Vec<SavedLayoutView>, EditorCommandError> {
+    /// The saved layouts the agent currently has, each naming the file
+    /// that supplies it.
+    ///
+    /// The file is what makes a write destination showable before the
+    /// save rather than only in the receipt afterwards: with a profile
+    /// matched, the layout on screen and the file that would receive the
+    /// write are different objects (ADR 0022).
+    pub fn layouts(&mut self) -> Result<SavedLayoutList, EditorCommandError> {
         let state = self.agent.state().map_err(EditorCommandError::from)?;
-        Ok(state
-            .saved_layouts
-            .into_iter()
-            .map(|(name, layout)| SavedLayoutView {
-                name,
-                cells: layout
-                    .cells
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, cell)| ZoneDraft {
-                        id: index as u32 + 1,
-                        name: format!("Zone {}", index + 1),
-                        x: cell.x,
-                        y: cell.y,
-                        width: cell.width,
-                        height: cell.height,
-                    })
-                    .collect(),
-            })
-            .collect())
+        let mut sources = state.layout_sources;
+        Ok(SavedLayoutList {
+            base_file: mosaix_config::BASE_CONFIG_FILE_NAME.to_owned(),
+            layouts: state
+                .saved_layouts
+                .into_iter()
+                .map(|(name, layout)| {
+                    let source = sources.remove(&name);
+                    SavedLayoutView {
+                        cells: layout
+                            .cells
+                            .into_iter()
+                            .enumerate()
+                            .map(|(index, cell)| ZoneDraft {
+                                id: index as u32 + 1,
+                                name: format!("Zone {}", index + 1),
+                                x: cell.x,
+                                y: cell.y,
+                                width: cell.width,
+                                height: cell.height,
+                            })
+                            .collect(),
+                        file: source.as_ref().and_then(|source| source.file.clone()),
+                        source: source
+                            .map(|source| source.source)
+                            .unwrap_or_else(|| "unknown".to_owned()),
+                        name,
+                    }
+                })
+                .collect(),
+        })
     }
 
     /// Saves `draft` as the saved layout it names, and reports the file
@@ -412,7 +451,16 @@ impl EditorSession {
     /// rejected candidate afterwards. Everything else -- a name already
     /// taken, a layout declared in two layers -- is the agent's to
     /// answer, because only the agent can see the whole directory.
-    pub fn save(&mut self, draft: LayoutDraft) -> Result<LayoutWriteReceipt, EditorCommandError> {
+    ///
+    /// `to_base` is the redirect ADR 0022 asks for beside the shown
+    /// destination: it sends the write to base config rather than to the
+    /// layer that supplies the layout, moving a desk-specific layout out
+    /// of its profile so it applies everywhere.
+    pub fn save(
+        &mut self,
+        draft: LayoutDraft,
+        to_base: bool,
+    ) -> Result<LayoutWriteReceipt, EditorCommandError> {
         validate_draft(&draft)?;
         check_name(&draft.name)?;
         self.edit(LayoutEdit::Save {
@@ -427,6 +475,7 @@ impl EditorSession {
                     height: zone.height,
                 })
                 .collect(),
+            to_base,
         })
     }
 
@@ -688,7 +737,7 @@ mod tests {
         let mut draft = session.load().draft;
         draft.name = "Writing".to_owned();
 
-        let receipt = session.save(draft).expect("a confirmed save");
+        let receipt = session.save(draft, false).expect("a confirmed save");
 
         assert_eq!(
             receipt.file, "desk.toml",
@@ -696,8 +745,9 @@ mod tests {
         );
         let sent = edits.lock().unwrap().clone();
         match &sent[0] {
-            LayoutEdit::Save { name, cells } => {
+            LayoutEdit::Save { name, cells, to_base } => {
                 assert_eq!(name, "Writing");
+                assert!(!to_base, "an ordinary save goes where the layout lives");
                 assert_eq!(cells.len(), 3, "the drawn cells, not just the name");
                 assert_eq!(cells[0].width, 0.62);
             }
@@ -714,7 +764,7 @@ mod tests {
         })));
         let draft = session.load().draft;
 
-        let error = session.save(draft).unwrap_err();
+        let error = session.save(draft, false).unwrap_err();
 
         assert!(
             error.to_string().contains("falls outside"),
@@ -730,7 +780,7 @@ mod tests {
         draft.name = "   ".to_owned();
 
         assert_eq!(
-            session.save(draft),
+            session.save(draft, false),
             Err(EditorCommandError::EmptyLayoutName)
         );
     }
@@ -806,14 +856,15 @@ mod tests {
         );
         let mut session = session(FakeAgent::reporting(Ok(state)));
 
-        let layouts = session.layouts().expect("the agent answered");
+        let list = session.layouts().expect("the agent answered");
 
-        assert_eq!(layouts.len(), 1);
-        assert_eq!(layouts[0].name, "writing");
-        assert_eq!(layouts[0].cells.len(), 2);
-        assert_eq!(layouts[0].cells[1].x, 0.6);
+        assert_eq!(list.base_file, "config.toml");
+        assert_eq!(list.layouts.len(), 1);
+        assert_eq!(list.layouts[0].name, "writing");
+        assert_eq!(list.layouts[0].cells.len(), 2);
+        assert_eq!(list.layouts[0].cells[1].x, 0.6);
         assert_eq!(
-            layouts[0].cells[0].id, 1,
+            list.layouts[0].cells[0].id, 1,
             "cells get ids so the editor can select one after loading it"
         );
     }
@@ -1106,5 +1157,91 @@ mod tests {
             "a user whose hotkeys have stopped working is told why rather than left to infer it"
         );
         assert_eq!(list.unregistered_commands, vec!["snap-right".to_owned()]);
+    }
+
+    #[test]
+    fn the_saved_layout_list_names_the_file_supplying_each_layout() {
+        let mut state = state_reporting("MON-A", Vec::new());
+        state.saved_layouts.insert(
+            "writing".to_owned(),
+            mosaix_config::SavedLayout { cells: Vec::new() },
+        );
+        state.saved_layouts.insert(
+            "docked".to_owned(),
+            mosaix_config::SavedLayout { cells: Vec::new() },
+        );
+        state.layout_sources.insert(
+            "writing".to_owned(),
+            mosaix_ipc::LayoutSourceSnapshot {
+                source: "base".to_owned(),
+                file: Some("config.toml".to_owned()),
+            },
+        );
+        state.layout_sources.insert(
+            "docked".to_owned(),
+            mosaix_ipc::LayoutSourceSnapshot {
+                source: "profile".to_owned(),
+                file: Some("desk.toml".to_owned()),
+            },
+        );
+        let mut session = session(FakeAgent::reporting(Ok(state)));
+
+        let list = session.layouts().expect("the agent answered");
+
+        let docked = list
+            .layouts
+            .iter()
+            .find(|layout| layout.name == "docked")
+            .expect("the profile's layout is listed");
+        assert_eq!(docked.source, "profile");
+        assert_eq!(
+            docked.file.as_deref(),
+            Some("desk.toml"),
+            "a profile-supplied layout names the profile, which is where a save would land"
+        );
+        let writing = list
+            .layouts
+            .iter()
+            .find(|layout| layout.name == "writing")
+            .expect("base config's layout is listed");
+        assert_eq!(writing.source, "base");
+        assert_eq!(writing.file.as_deref(), Some("config.toml"));
+    }
+
+    #[test]
+    fn a_layout_the_agent_recorded_no_source_for_is_reported_as_unknown() {
+        let mut state = state_reporting("MON-A", Vec::new());
+        state.saved_layouts.insert(
+            "writing".to_owned(),
+            mosaix_config::SavedLayout { cells: Vec::new() },
+        );
+        let mut session = session(FakeAgent::reporting(Ok(state)));
+
+        let list = session.layouts().expect("the agent answered");
+
+        assert_eq!(list.layouts[0].source, "unknown");
+        assert_eq!(
+            list.layouts[0].file, None,
+            "a destination shown before a write is the real one or absent, never a guess"
+        );
+    }
+
+    #[test]
+    fn a_redirected_save_reaches_the_agent_as_a_redirect() {
+        let agent = FakeAgent::writing(Ok("config.toml".to_owned()));
+        let edits = Arc::clone(&agent.edits);
+        let mut session = session(agent);
+        let draft = session.load().draft;
+
+        session.save(draft, true).expect("a confirmed save");
+
+        let sent = edits.lock().unwrap().clone();
+        match &sent[0] {
+            LayoutEdit::Save { to_base, .. } => assert!(
+                to_base,
+                "the redirect the user set has to travel with the write, or the                  destination shown and the file written disagree"
+            ),
+            other => panic!("expected a save, got {other:?}"),
+        }
     }
 }

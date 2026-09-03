@@ -93,9 +93,19 @@ pub enum LayoutEditError {
 #[derive(Debug, Clone, PartialEq)]
 pub enum LayoutEdit {
     /// Create `name`, or replace the cells of the one that exists.
+    ///
+    /// `to_base` is ADR 0022's redirect: the write normally lands in the
+    /// layer that supplies the layout, and this sends it to base config
+    /// instead. Redirecting a layout the matched profile declares *moves*
+    /// it -- base config gains it and the profile loses it -- because a
+    /// copy would leave the profile still winning the merge, so the
+    /// redirect would appear to succeed and change nothing at this desk.
+    /// It is a no-op for a layout base config already supplies, and for a
+    /// layout that does not exist yet, which goes to base config anyway.
     Save {
         name: String,
         cells: Vec<NormalizedRect>,
+        to_base: bool,
     },
     Rename {
         from: String,
@@ -383,26 +393,70 @@ fn check_new_name(layers: &LayoutLayers, name: &str) -> Result<(), LayoutEditErr
     Ok(())
 }
 
-/// Which layer an edit writes, the layout it takes out of that layer, and
-/// the one it leaves there. A rename is a removal and an addition in one
-/// file, which is why this is not two separate decisions.
-type EditPlan = (
-    ConfigLayer,
-    Option<String>,
-    Option<(String, Vec<NormalizedRect>)>,
-);
+/// Which file an edit writes and what it ends up saying.
+///
+/// A rename is a removal and an addition in one file, which is why
+/// `removed` and `added` are not two separate decisions. `vacated` is the
+/// second file a redirect touches: moving a layout to base config means
+/// taking it out of the profile it lived in, and a plan that could only
+/// name one file would have to leave it in both.
+struct EditPlan {
+    /// The layer the layout ends up in, and the one the receipt names.
+    destination: ConfigLayer,
+    /// The layout to take out of `destination`.
+    removed: Option<String>,
+    /// The layout to write into `destination`.
+    added: Option<(String, Vec<NormalizedRect>)>,
+    /// The layout to take out of the matched profile, for a redirect that
+    /// moves it to base config (ADR 0022). Always `None` when
+    /// `destination` is the profile itself.
+    vacated: Option<String>,
+}
+
+impl EditPlan {
+    /// A plan touching one file, which is every edit but a redirect.
+    fn in_place(
+        destination: ConfigLayer,
+        removed: Option<String>,
+        added: Option<(String, Vec<NormalizedRect>)>,
+    ) -> Self {
+        Self {
+            destination,
+            removed,
+            added,
+            vacated: None,
+        }
+    }
+}
 
 fn plan_edit(layers: &LayoutLayers, edit: &LayoutEdit) -> Result<EditPlan, LayoutEditError> {
     let unknown = |name: &String| LayoutEditError::UnknownLayout { name: name.clone() };
     match edit {
-        LayoutEdit::Save { name, cells } => {
+        LayoutEdit::Save {
+            name,
+            cells,
+            to_base,
+        } => {
             let supplier = layers.supplier(name)?;
             if supplier.is_none() {
                 check_new_name(layers, name)?;
             }
+            // A redirect only has somewhere to move a layout *from* when
+            // the profile is what supplies it. For a base-supplied layout
+            // it asks for where the write was already going, and for a
+            // new one base config is already the destination.
+            let redirecting = *to_base && supplier == Some(ConfigLayer::Profile);
+            if redirecting {
+                return Ok(EditPlan {
+                    destination: ConfigLayer::Base,
+                    removed: None,
+                    added: Some((name.clone(), cells.clone())),
+                    vacated: Some(name.clone()),
+                });
+            }
             // A layout that exists is rewritten where it lives; a new one
             // goes to base config, so it is available at every desk.
-            Ok((
+            Ok(EditPlan::in_place(
                 supplier.unwrap_or(ConfigLayer::Base),
                 None,
                 Some((name.clone(), cells.clone())),
@@ -418,7 +472,11 @@ fn plan_edit(layers: &LayoutLayers, edit: &LayoutEdit) -> Result<EditPlan, Layou
                 return Err(LayoutEditError::EmptyName);
             }
             let cells = layers.cells(from, layer);
-            Ok((layer, Some(from.clone()), Some((to.clone(), cells))))
+            Ok(EditPlan::in_place(
+                layer,
+                Some(from.clone()),
+                Some((to.clone(), cells)),
+            ))
         }
         LayoutEdit::Duplicate { from, to } => {
             let layer = layers.supplier(from)?.ok_or_else(|| unknown(from))?;
@@ -426,11 +484,11 @@ fn plan_edit(layers: &LayoutLayers, edit: &LayoutEdit) -> Result<EditPlan, Layou
             // The copy lands beside its original, so a variant of a
             // desk-specific layout stays desk-specific.
             let cells = layers.cells(from, layer);
-            Ok((layer, None, Some((to.clone(), cells))))
+            Ok(EditPlan::in_place(layer, None, Some((to.clone(), cells))))
         }
         LayoutEdit::Delete { name } => {
             let layer = layers.supplier(name)?.ok_or_else(|| unknown(name))?;
-            Ok((layer, Some(name.clone()), None))
+            Ok(EditPlan::in_place(layer, Some(name.clone()), None))
         }
     }
 }
@@ -453,20 +511,36 @@ pub fn edit_layouts(
     ensure_default_config(dir)?;
     let mut candidate = read_candidate(dir)?;
     let layers = parse_layers(&candidate, fingerprint)?;
-    let (layer, removed, added) = plan_edit(&layers, &edit)?;
-    let into_profile = layer == ConfigLayer::Profile;
+    let plan = plan_edit(&layers, &edit)?;
+    let into_profile = plan.destination == ConfigLayer::Profile;
 
     let (file_name, contents) = if into_profile {
         let (file_name, mut profile) = layers
             .profile
             .clone()
             .expect("a profile-supplied layout implies a matched profile");
-        edit_layout_table(&mut profile.layouts, &removed, &added);
+        edit_layout_table(&mut profile.layouts, &plan.removed, &plan.added);
         (file_name, to_toml(&profile)?)
     } else {
         let mut base = layers.base.clone();
-        edit_layout_table(&mut base.layouts, &removed, &added);
+        edit_layout_table(&mut base.layouts, &plan.removed, &plan.added);
         (BASE_FILE_NAME.to_owned(), to_toml(&base)?)
+    };
+
+    // The second half of a redirect: the profile gives the layout up so
+    // base config's copy is the one the merge resolves to. Written after
+    // base config below, so a failure between the two leaves the layout
+    // declared twice -- recoverable by hand -- rather than nowhere.
+    let vacated = match &plan.vacated {
+        Some(name) => {
+            let (file_name, mut profile) = layers
+                .profile
+                .clone()
+                .expect("a redirect implies the profile it moves the layout out of");
+            profile.layouts.remove(name);
+            Some((file_name, to_toml(&profile)?))
+        }
+        None => None,
     };
 
     if into_profile {
@@ -479,6 +553,17 @@ pub fn edit_layouts(
     } else {
         candidate.base = contents.clone();
     }
+    if let Some((profile_file, profile_contents)) = &vacated {
+        candidate
+            .profiles
+            .iter_mut()
+            .find(|profile| &profile.file_name == profile_file)
+            .expect("the matched profile was read from this candidate")
+            .contents = profile_contents.clone();
+    }
+    // Both halves of a redirect are validated as one candidate, so a move
+    // that would leave the directory invalid is refused before either
+    // file is touched (ADR 0007).
     let config = validate(&candidate).map_err(validation_message)?;
 
     let destination = if into_profile {
@@ -487,6 +572,12 @@ pub fn edit_layouts(
         dir.join(&file_name)
     };
     write_atomically(&destination, &contents)?;
+    if let Some((profile_file, profile_contents)) = &vacated {
+        write_atomically(
+            &dir.join(PROFILES_DIR_NAME).join(profile_file),
+            profile_contents,
+        )?;
+    }
 
     Ok(LayoutWrite {
         file: file_name,

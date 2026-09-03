@@ -3,11 +3,12 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   bindingLabel,
   mountLayoutEditor,
+  saveDestination,
   watchHotkeyBindings,
   type DesktopBridge,
   type EditorSnapshot,
   type HotkeyList,
-  type SavedLayout,
+  type SavedLayoutList,
 } from "./layout-editor";
 
 const snapshot: EditorSnapshot = {
@@ -73,15 +74,20 @@ const hotkeys: HotkeyList = {
   ],
 };
 
-const savedLayouts: SavedLayout[] = [
-  {
-    name: "writing",
-    cells: [
-      { id: 1, name: "Zone 1", x: 0, y: 0, width: 60, height: 100 },
-      { id: 2, name: "Zone 2", x: 60, y: 0, width: 40, height: 100 },
-    ],
-  },
-];
+const savedLayouts: SavedLayoutList = {
+  baseFile: "config.toml",
+  layouts: [
+    {
+      name: "writing",
+      source: "base",
+      file: "config.toml",
+      cells: [
+        { id: 1, name: "Zone 1", x: 0, y: 0, width: 60, height: 100 },
+        { id: 2, name: "Zone 2", x: 60, y: 0, width: 40, height: 100 },
+      ],
+    },
+  ],
+};
 
 function bridge(): DesktopBridge {
   return {
@@ -305,6 +311,7 @@ describe("saved layouts", () => {
 
     expect(desktop.saveLayout).toHaveBeenCalledWith(
       expect.objectContaining({ name: "Drafting", zones: expect.any(Array) }),
+      false,
     );
   });
 
@@ -340,6 +347,7 @@ describe("saved layouts", () => {
     await vi.waitFor(() => expect(desktop.saveLayout).toHaveBeenCalled());
     expect(desktop.saveLayout).toHaveBeenCalledWith(
       expect.objectContaining({ name: "writing" }),
+      false,
     );
   });
 
@@ -351,10 +359,18 @@ describe("saved layouts", () => {
     desktop.loadSavedLayouts = vi
       .fn()
       .mockResolvedValueOnce(structuredClone(savedLayouts))
-      .mockResolvedValue([
+      .mockResolvedValue({
         ...structuredClone(savedLayouts),
-        { name: "hand written", cells: [{ id: 1, name: "Zone 1", x: 0, y: 0, width: 100, height: 100 }] },
-      ]);
+        layouts: [
+          ...structuredClone(savedLayouts.layouts),
+          {
+            name: "hand written",
+            source: "base",
+            file: "config.toml",
+            cells: [{ id: 1, name: "Zone 1", x: 0, y: 0, width: 100, height: 100 }],
+          },
+        ],
+      });
     await mountLayoutEditor(root, desktop);
 
     const name = root.querySelector<HTMLInputElement>("[data-layout-name]")!;
@@ -463,10 +479,18 @@ describe("saved layouts", () => {
     desktop.loadSavedLayouts = vi
       .fn()
       .mockResolvedValueOnce(structuredClone(savedLayouts))
-      .mockResolvedValue([
+      .mockResolvedValue({
         ...structuredClone(savedLayouts),
-        { name: "hand written", cells: [{ id: 1, name: "Zone 1", x: 0, y: 0, width: 100, height: 100 }] },
-      ]);
+        layouts: [
+          ...structuredClone(savedLayouts.layouts),
+          {
+            name: "hand written",
+            source: "base",
+            file: "config.toml",
+            cells: [{ id: 1, name: "Zone 1", x: 0, y: 0, width: 100, height: 100 }],
+          },
+        ],
+      });
     await mountLayoutEditor(root, desktop);
 
     await vi.advanceTimersByTimeAsync(2500);
@@ -608,6 +632,112 @@ describe("hotkey registration notices", () => {
 
     expect(root.querySelector("[data-capture-suspended]")).toBeNull();
     expect(root.querySelector("[data-unregistered-bindings]")).toBeNull();
+    stop();
+  });
+});
+
+describe("layout write destination", () => {
+  const layered: SavedLayoutList = {
+    baseFile: "config.toml",
+    layouts: [
+      {
+        name: "writing",
+        source: "base",
+        file: "config.toml",
+        cells: [{ id: 1, name: "Zone 1", x: 0, y: 0, width: 100, height: 100 }],
+      },
+      {
+        name: "docked",
+        source: "profile",
+        file: "desk.toml",
+        cells: [{ id: 1, name: "Zone 1", x: 0, y: 0, width: 50, height: 100 }],
+      },
+    ],
+  };
+
+  it("names base config for a layout that does not exist yet", () => {
+    expect(saveDestination("brand new", layered, false)).toEqual({
+      file: "config.toml",
+      redirectable: false,
+    });
+  });
+
+  it("names the profile for a layout the matched profile supplies", () => {
+    expect(saveDestination("docked", layered, false)).toEqual({
+      file: "desk.toml",
+      redirectable: true,
+    });
+  });
+
+  it("follows the redirect once it is set", () => {
+    expect(saveDestination("docked", layered, true)).toEqual({
+      file: "config.toml",
+      redirectable: true,
+    });
+  });
+
+  it("offers no redirect for a layout base config already supplies", () => {
+    expect(saveDestination("writing", layered, false)).toEqual({
+      file: "config.toml",
+      redirectable: false,
+    });
+  });
+
+  it("matches a name the way configuration does, ignoring case", () => {
+    expect(saveDestination("  DoCkEd ", layered, false).file).toBe("desk.toml");
+  });
+
+  it("shows the destination before the save and sends the redirect with it", async () => {
+    const desktop = bridge();
+    desktop.loadSavedLayouts = vi.fn().mockResolvedValue(structuredClone(layered));
+    const root = document.createElement("div");
+    document.body.append(root);
+
+    await mountLayoutEditor(root, desktop);
+    await vi.waitFor(() =>
+      expect(root.querySelector('[data-open-layout="docked"]')).not.toBeNull(),
+    );
+    expect(
+      root.querySelector("[data-redirect-to-base]"),
+      "the untouched draft is a new layout, which goes to base config anyway",
+    ).toBeNull();
+
+    // Opened rather than typed: saving replaces the cells of a layout the
+    // user has open, and a name typed over a layout they never opened is
+    // refused by the clash guard before any of this matters.
+    root.querySelector<HTMLElement>('[data-open-layout="docked"]')!.click();
+
+    expect(root.querySelector("[data-save-destination]")?.textContent).toContain("desk.toml");
+    const redirect = root.querySelector<HTMLInputElement>("[data-redirect-to-base]")!;
+    redirect.checked = true;
+    redirect.dispatchEvent(new Event("change", { bubbles: true }));
+    expect(root.querySelector("[data-save-destination]")?.textContent).toContain("config.toml");
+
+    root.querySelector<HTMLElement>("[data-save-layout]")!.click();
+    await vi.waitFor(() => expect(desktop.saveLayout).toHaveBeenCalled());
+    expect(desktop.saveLayout).toHaveBeenCalledWith(
+      expect.objectContaining({ name: "docked" }),
+      true,
+    );
+  });
+
+  it("distinguishes a profile-supplied layout from a base-supplied one in the list", async () => {
+    const desktop = bridge();
+    desktop.loadSavedLayouts = vi.fn().mockResolvedValue(structuredClone(layered));
+    const root = document.createElement("div");
+
+    const stop = await mountLayoutEditor(root, desktop);
+    await vi.waitFor(() =>
+      expect(root.querySelector('[data-layout="docked"]')).not.toBeNull(),
+    );
+
+    expect(root.querySelector('[data-layout="docked"]')?.getAttribute("data-source")).toBe(
+      "profile",
+    );
+    expect(root.querySelector('[data-layout="docked"]')?.textContent).toContain("desk.toml");
+    expect(root.querySelector('[data-layout="writing"]')?.getAttribute("data-source")).toBe(
+      "base",
+    );
     stop();
   });
 });
