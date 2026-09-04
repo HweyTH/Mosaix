@@ -84,7 +84,11 @@ fn window(id: isize, bounds: Rect) -> Window {
 
 /// Waits for `condition` to hold of a snapshot, since the reducer runs on
 /// its own thread. Fails the test rather than hanging.
-fn settle<T>(reader: &StateReader, what: &str, condition: impl Fn(&mosaix_engine::EngineState) -> Option<T>) -> T {
+fn settle<T>(
+    reader: &StateReader,
+    what: &str,
+    condition: impl Fn(&mosaix_engine::EngineState) -> Option<T>,
+) -> T {
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
         if let Some(value) = condition(&reader.snapshot()) {
@@ -114,10 +118,13 @@ fn record_a_snap(fingerprint: &str) -> mosaix_domain::UndoTransactionDraft {
     });
 
     let draft = settle(&reader, "the snap to be recorded", |state| {
-        state.persistence_intents.iter().find_map(|intent| match intent {
-            PersistenceIntent::RecordUndoTransaction(draft) => Some(draft.clone()),
-            _ => None,
-        })
+        state
+            .persistence_intents
+            .iter()
+            .find_map(|intent| match intent {
+                PersistenceIntent::RecordUndoTransaction(draft) => Some(draft.clone()),
+                _ => None,
+            })
     });
     engine.stop();
     draft

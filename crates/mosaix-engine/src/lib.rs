@@ -1671,7 +1671,10 @@ fn apply(state: &mut EngineState, event: Event) {
                 if switch.phase == WorkspaceSwitchPhase::Recording && switch.recording.is_empty() {
                     switch.phase = WorkspaceSwitchPhase::Parking;
                 }
-                if parks {
+                // Compensation puts the whole re-park set in flight up
+                // front, so that it cannot look settled before its drafts
+                // exist. Only the forward path adds a window here.
+                if parks && !switch.in_flight.contains(&pending.window_id) {
                     switch.in_flight.push(pending.window_id);
                 }
             }
@@ -4212,6 +4215,14 @@ pub fn plan_workspace_move(
     let name = state.workspaces.require(name)?;
     if state.paused {
         return Err(WorkspaceRefusal::Paused);
+    }
+    // A move exchanges what two monitors show. Doing that under a switch
+    // would leave the transaction compensating onto a display that no
+    // longer shows what it started from.
+    if let Some(switch) = &state.switch {
+        return Err(WorkspaceRefusal::SwitchInFlight {
+            display_id: switch.display_id,
+        });
     }
     let from_display_id = state
         .workspaces
@@ -13505,6 +13516,23 @@ mod tests {
             WorkspaceCommandResult::Refused(WorkspaceRefusal::SwitchInFlight {
                 display_id: DisplayId(1),
             })
+        );
+    }
+
+    #[test]
+    fn a_workspace_move_is_refused_while_a_switch_is_in_flight() {
+        let mut state = switch_fixture();
+        focus_workspace(&mut state, "chat");
+        assert!(state.switch.is_some());
+
+        let refused = plan_workspace_move(&state, "dev", DisplayId(1));
+
+        assert_eq!(
+            refused,
+            Err(WorkspaceRefusal::SwitchInFlight {
+                display_id: DisplayId(1)
+            }),
+            "exchanging what two monitors show under a switch would leave it              compensating onto a display that changed underneath it"
         );
     }
 
