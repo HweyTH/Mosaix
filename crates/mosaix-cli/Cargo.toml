@@ -10,6 +10,8 @@ name = "mosaix"
 path = "src/main.rs"
 
 [dependencies]
+mosaix-domain = { path = "../mosaix-domain" }
 mosaix-ipc = { path = "../mosaix-ipc" }
+mosaix-persistence = { path = "../mosaix-persistence" }
 clap = { workspace = true }
 serde_json = { workspace = true }

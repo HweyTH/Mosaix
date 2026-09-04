@@ -34,7 +34,7 @@ pub use io::{
 pub use schema::{
     layout_names_collide, AutomaticTilingSection, BaseConfig, BehaviorSection, Command,
     ConfigLayer, FocusBorderOverride, FocusBorderSection, GapsOverride, KeyCombo, ProfileConfig,
-    ResolvedConfig, ResolvedConfigSet, ResolvedProfile, RgbaColor, SavedLayout,
+    ResolvedConfig, ResolvedConfigSet, ResolvedProfile, RgbaColor, SavedLayout, TilingMode,
     BASE_CONFIG_FILE_NAME, CURRENT_VERSION,
 };
 pub use validate::{merge, validate, CandidateConfig, CandidateProfile, ValidationError};

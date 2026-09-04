@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 use crate::schema::layout_names_collide;
 use crate::schema::{
     BaseConfig, Command, ConfigLayer, KeyCombo, ProfileConfig, ResolvedConfig, ResolvedConfigSet,
-    ResolvedProfile, SavedLayout, BASE_CONFIG_FILE_NAME, CURRENT_VERSION,
+    ResolvedProfile, SavedLayout, TilingMode, BASE_CONFIG_FILE_NAME, CURRENT_VERSION,
 };
 
 /// One profile candidate: its filename (for error messages -- profiles are
@@ -229,6 +229,7 @@ pub fn merge(base: &BaseConfig, profile: Option<&ProfileConfig>) -> ResolvedConf
     let mut gaps = base.gaps;
     let behavior = base.behavior.clone();
     let mut automatic_tiling_enabled = false;
+    let mut tiling_mode = TilingMode::default();
     let mut focus_border = base.focus_border;
     let mut layouts = base.layouts.clone();
     let mut binding_sources: BTreeMap<Command, ConfigLayer> = base
@@ -256,6 +257,10 @@ pub fn merge(base: &BaseConfig, profile: Option<&ProfileConfig>) -> ResolvedConf
         automatic_tiling_enabled = profile
             .automatic_tiling
             .is_some_and(|tiling| tiling.enabled);
+        tiling_mode = profile
+            .automatic_tiling
+            .map(|tiling| tiling.mode)
+            .unwrap_or_default();
         if let Some(enabled) = profile.focus_border.enabled {
             focus_border.enabled = enabled;
         }
@@ -279,6 +284,7 @@ pub fn merge(base: &BaseConfig, profile: Option<&ProfileConfig>) -> ResolvedConf
         gaps,
         behavior,
         automatic_tiling_enabled,
+        tiling_mode,
         focus_border,
         layouts,
         layout_sources,
@@ -709,6 +715,7 @@ snap-right = "ctrl+alt+left"
                 gaps: base.gaps,
                 behavior: base.behavior.clone(),
                 automatic_tiling_enabled: false,
+                tiling_mode: TilingMode::Balanced,
                 focus_border: base.focus_border,
                 layouts: base.layouts.clone(),
                 layout_sources: base

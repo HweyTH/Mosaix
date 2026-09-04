@@ -415,6 +415,37 @@ pub struct BehaviorSection {}
 #[serde(deny_unknown_fields)]
 pub struct AutomaticTilingSection {
     pub enabled: bool,
+    /// Which arrangement automatic tiling produces. Omitted means
+    /// [`TilingMode::Balanced`], so an existing profile keeps the layout
+    /// it has always produced.
+    #[serde(default)]
+    pub mode: TilingMode,
+}
+
+/// How automatic tiling arranges a display's windows (ADR 0023).
+///
+/// The first tree release deliberately offers one tree policy. Stack,
+/// monocle, and the rest stay out of this enum until they exist, so a
+/// configuration file cannot name a mode that does nothing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TilingMode {
+    /// The stateless aspect-aware grid. Recomputed from scratch each time,
+    /// so it forgets any structure the user shaped.
+    #[default]
+    Balanced,
+    /// A persistent tree of weighted horizontal and vertical splits, with
+    /// deterministic BSP insertion.
+    Tree,
+}
+
+impl TilingMode {
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::Balanced => "balanced",
+            Self::Tree => "tree",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -609,6 +640,10 @@ pub struct ResolvedConfig {
     pub gaps: Gaps,
     pub behavior: BehaviorSection,
     pub automatic_tiling_enabled: bool,
+    /// Which arrangement automatic tiling produces when it is enabled.
+    /// Meaningless while `automatic_tiling_enabled` is false, and left at
+    /// its default there rather than being made an `Option`.
+    pub tiling_mode: TilingMode,
     pub focus_border: FocusBorderSection,
     pub layouts: BTreeMap<String, SavedLayout>,
     /// Which layer supplied each saved layout in `layouts`, keyed
@@ -904,6 +939,42 @@ mod tests {
         // And every unit verb sorts ahead of them, which is what lets the
         // nested table be emitted last.
         assert!(Command::TogglePause < writing);
+    }
+
+    #[test]
+    fn a_profile_omitting_a_tiling_mode_keeps_the_balanced_grid() {
+        let profile: ProfileConfig =
+            toml::from_str("fingerprint = \"display\"\n[automatic_tiling]\nenabled = true\n")
+                .expect("a profile without a mode is valid");
+
+        assert_eq!(
+            profile.automatic_tiling.unwrap().mode,
+            TilingMode::Balanced,
+            "an existing profile must keep the arrangement it has always produced"
+        );
+    }
+
+    #[test]
+    fn a_profile_can_select_the_container_tree() {
+        let profile: ProfileConfig = toml::from_str(
+            "fingerprint = \"display\"\n[automatic_tiling]\nenabled = true\nmode = \"tree\"\n",
+        )
+        .expect("a tree profile is valid");
+
+        assert_eq!(profile.automatic_tiling.unwrap().mode, TilingMode::Tree);
+    }
+
+    #[test]
+    fn an_unknown_tiling_mode_is_rejected_rather_than_silently_ignored() {
+        let error = toml::from_str::<ProfileConfig>(
+            "fingerprint = \"display\"\n[automatic_tiling]\nenabled = true\nmode = \"monocle\"\n",
+        )
+        .expect_err("a mode Mosaix cannot honour must not be accepted");
+
+        assert!(
+            error.to_string().contains("monocle"),
+            "the error should name the mode that was refused: {error}"
+        );
     }
 
     #[test]

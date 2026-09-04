@@ -7,11 +7,19 @@ use mosaix_config::{
 use mosaix_engine::{
     EligibilityReason, EngineState, Event, EventSender, StateReader, ZoneSnapDirection,
 };
+use mosaix_domain::undo::UndoResult;
 use mosaix_persistence::PersistenceHealth;
 use mosaix_rules::ManageAction;
 use serde::{Deserialize, Serialize};
 
 use crate::protocol::{IpcRequest, IpcResponse};
+
+/// One display's container tree, as its windows in visual order.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ContainerTreeSnapshot {
+    pub display_id: isize,
+    pub windows: Vec<isize>,
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct StateSnapshot {
@@ -24,6 +32,22 @@ pub struct StateSnapshot {
     pub persistence_status: String,
     pub last_durable_revision: u64,
     pub persistence_reason: Option<String>,
+    /// Whether undoing right now would actually move windows. Computed by
+    /// running the same preflight undo itself runs, so this never claims an
+    /// availability that a request would then refuse.
+    pub undo_available: bool,
+    /// What the next undo would reverse, whether or not it currently can.
+    pub undo_command: Option<String>,
+    pub undo_transaction_id: Option<i64>,
+    /// Why undo is unavailable, when a transaction exists but cannot run.
+    pub undo_blocked_reason: Option<String>,
+    /// Which arrangement automatic tiling is producing: `balanced` or
+    /// `tree`. Reported whether or not tiling is currently active, so a
+    /// caller can tell "tree mode, suspended" from "balanced mode".
+    pub tiling_mode: String,
+    /// Each display's container tree, as the windows it holds in visual
+    /// order. Empty under the balanced grid, which keeps no structure.
+    pub container_trees: Vec<ContainerTreeSnapshot>,
     pub paused: bool,
     pub automatic_tiling_active: bool,
     pub automatic_tiling_suspended: bool,
@@ -339,9 +363,39 @@ impl From<EngineState> for StateSnapshot {
                 } => (
                     "degraded".to_owned(),
                     last_durable_revision,
-                    Some(format!("{reason:?}").to_lowercase()),
+                    Some(reason.code().to_owned()),
                 ),
             };
+        // Asking the planner rather than merely reporting that history is
+        // non-empty: a stored transaction whose windows are gone, or whose
+        // database is degraded, is not an available undo.
+        let planned = mosaix_engine::plan_undo(&state);
+        let undo_available = planned.is_applied();
+        let undo_blocked_reason = match &planned {
+            UndoResult::Applied(_) => None,
+            UndoResult::Refused(refusal) => Some(refusal.code().to_owned()),
+        };
+        // Trees are published as their leaves in visual order rather than
+        // as the nested structure. That is what a client can act on -- the
+        // structure itself is the reducer's, and republishing it would
+        // invite a client to reason about a shape it cannot change.
+        let mut container_trees: Vec<ContainerTreeSnapshot> = state
+            .trees
+            .iter()
+            .map(|(display_id, tree)| ContainerTreeSnapshot {
+                display_id: display_id.0,
+                windows: tree.leaves().into_iter().map(|id| id.0).collect(),
+            })
+            .collect();
+        container_trees.sort_by_key(|snapshot| snapshot.display_id);
+
+        let (undo_command, undo_transaction_id) = match &state.newest_undo {
+            Some(transaction) => (
+                Some(transaction.command.clone()),
+                Some(transaction.id.0),
+            ),
+            None => (None, None),
+        };
         Self {
             revision: state.revision,
             display_count: state.displays.len(),
@@ -352,6 +406,12 @@ impl From<EngineState> for StateSnapshot {
             persistence_status,
             last_durable_revision,
             persistence_reason,
+            undo_available,
+            undo_command,
+            undo_transaction_id,
+            undo_blocked_reason,
+            tiling_mode: state.resolved_config.tiling_mode.code().to_owned(),
+            container_trees,
             paused: state.paused,
             automatic_tiling_active: state.automatic_tiling_active,
             automatic_tiling_suspended: state.automatic_tiling_suspended,
@@ -688,10 +748,31 @@ pub fn handle_request(
                 display_id: mosaix_domain::DisplayId(*display_id),
             },
         ),
+        IpcRequest::Undo => {
+            // Preflighting here is what lets a refusal carry its evidence.
+            // The reducer re-reaches the verdict against its own state, so
+            // this answer describes the plan, not a completed movement.
+            let planned = mosaix_engine::plan_undo(&state_reader.snapshot());
+            let payload = serde_json::to_value(&planned).expect("undo results serialize");
+            match planned {
+                UndoResult::Applied(_) => match send_event(events, Event::UndoRequested) {
+                    IpcResponse::Ok { .. } => IpcResponse::Ok {
+                        data: Some(payload),
+                    },
+                    other => other,
+                },
+                // A refusal is an answer, not a transport failure, so it
+                // comes back as data the caller can inspect rather than as
+                // a string it would have to parse.
+                UndoResult::Refused(_) => IpcResponse::Ok {
+                    data: Some(payload),
+                },
+            }
+        }
         IpcRequest::ApplyLayout { name } => {
             // The reducer would reach the same verdict, but only a log
             // would come of it. Asking first is what lets the caller be
-            // told *why* nothing happened (ADR 0020).
+            // told *why* nothing happened.
             match mosaix_engine::plan_saved_layout(&state_reader.snapshot(), name) {
                 Ok(plan) => match send_event(
                     events,
@@ -961,6 +1042,118 @@ mod tests {
 
         assert_eq!(json["degraded_windows"][0]["window_id"], 41);
         assert_eq!(json["degraded_windows"][0]["reason"], "circuit_open");
+    }
+
+    #[test]
+    fn an_undo_with_no_history_answers_with_a_typed_refusal_not_an_error() {
+        let engine = mosaix_engine::spawn_engine(Vec::new(), Default::default());
+
+        let response = handle_request(
+            &IpcRequest::Undo,
+            &engine.events(),
+            &engine.state_reader(),
+            &RecordingStore::wrote("config.toml", &[]),
+            &no_probe(),
+        );
+
+        // A refusal is an answer about windows, not a transport failure.
+        // Returning it as data is what lets a caller read the reason code
+        // and evidence instead of parsing a sentence.
+        let IpcResponse::Ok { data: Some(data) } = response else {
+            panic!("expected a typed answer, got {response:?}");
+        };
+        assert_eq!(data["refused"], "nothing_to_undo");
+        let parsed: UndoResult =
+            serde_json::from_value(data).expect("the CLI can read what the agent sent");
+        assert!(!parsed.is_applied());
+    }
+
+    #[test]
+    fn state_snapshot_reports_the_balanced_grid_and_no_trees_by_default() {
+        let json = serde_json::to_value(StateSnapshot::from(EngineState::default())).unwrap();
+
+        assert_eq!(json["tiling_mode"], "balanced");
+        assert_eq!(json["container_trees"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn state_snapshot_publishes_each_displays_tree_in_visual_order() {
+        use mosaix_domain::tree::{ContainerTree, SplitAxis};
+
+        let mut state = EngineState::default();
+        state.resolved_config.tiling_mode = mosaix_config::TilingMode::Tree;
+        let mut tree = ContainerTree::new();
+        tree.insert_first(mosaix_domain::WindowId(11));
+        tree.split_leaf(
+            &mosaix_domain::WindowId(11),
+            SplitAxis::Horizontal,
+            mosaix_domain::WindowId(12),
+        );
+        state.trees.insert(DisplayId(2), tree);
+
+        let json = serde_json::to_value(StateSnapshot::from(state)).unwrap();
+
+        assert_eq!(json["tiling_mode"], "tree");
+        assert_eq!(
+            json["container_trees"],
+            serde_json::json!([{ "display_id": 2, "windows": [11, 12] }])
+        );
+    }
+
+    #[test]
+    fn state_snapshot_reports_undo_as_unavailable_when_history_is_empty() {
+        let json = serde_json::to_value(StateSnapshot::from(EngineState::default())).unwrap();
+
+        assert_eq!(json["undo_available"], false);
+        assert_eq!(json["undo_command"], serde_json::Value::Null);
+        assert_eq!(json["undo_blocked_reason"], "nothing_to_undo");
+    }
+
+    #[test]
+    fn state_snapshot_does_not_advertise_undo_it_would_refuse() {
+        // The honest answer for a stored transaction whose database is
+        // degraded is "not available", with the reason -- not "available"
+        // followed by a refusal when the user acts on it.
+        let mut state = EngineState::default();
+        state.newest_undo = Some(mosaix_domain::UndoTransaction {
+            id: mosaix_domain::UndoTransactionId(9),
+            command: "snap-left".to_owned(),
+            recorded_at_unix: 1_756_000_000,
+            topology_fingerprint: String::new(),
+            durable_revision: 3,
+            members: Vec::new(),
+        });
+        state.persistence_health = PersistenceHealth::Degraded {
+            last_durable_revision: 3,
+            reason: mosaix_persistence::PersistenceFailure::WriteFailed,
+        };
+
+        let json = serde_json::to_value(StateSnapshot::from(state)).unwrap();
+
+        assert_eq!(json["undo_available"], false);
+        assert_eq!(json["undo_blocked_reason"], "persistence_degraded");
+        assert_eq!(
+            json["undo_command"], "snap-left",
+            "what undo would reverse is still worth reporting while it cannot"
+        );
+        assert_eq!(json["undo_transaction_id"], 9);
+    }
+
+    #[test]
+    fn state_snapshot_exposes_focused_display_and_persistence_health() {
+        let mut state = EngineState::default();
+        state.focused_display = Some(DisplayId(-7));
+        state.persistence_health = PersistenceHealth::Degraded {
+            last_durable_revision: 41,
+            reason: mosaix_persistence::PersistenceFailure::MigrationFailed,
+        };
+
+        let json = serde_json::to_value(StateSnapshot::from(state)).unwrap();
+
+        assert_eq!(json["focused_display"], -7);
+        assert_eq!(json["persistence_status"], "degraded");
+        assert_eq!(json["last_durable_revision"], 41);
+        assert_eq!(json["persistence_reason"], "migration_failed");
     }
 
     #[test]

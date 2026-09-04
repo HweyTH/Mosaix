@@ -202,13 +202,15 @@ fn main() {
     // The worker owns the per-user bundled-SQLite connection. A failure is
     // deliberately reflected into reducer state instead of aborting live
     // window management.
-    let persistence_path = config_dir
-        .as_ref()
-        .map(|dir| dir.parent().unwrap_or(dir).join("state.db"));
+    let persistence_path = mosaix_persistence::default_database_path();
+    let persistence_start_failure = std::sync::Arc::new(std::sync::Mutex::new(None));
     let persistence_worker = persistence_path.as_ref().and_then(|path| {
         mosaix_persistence::PersistenceWorker::start(path)
             .map_err(|error| {
                 tracing::error!(%error, "persistence worker could not start");
+                *persistence_start_failure
+                    .lock()
+                    .expect("persistence failure mutex poisoned") = Some(error.failure());
                 error
             })
             .ok()
@@ -219,7 +221,11 @@ fn main() {
             .send(mosaix_engine::Event::PersistenceHealthChanged(
                 mosaix_persistence::PersistenceHealth::Degraded {
                     last_durable_revision: 0,
-                    reason: mosaix_persistence::PersistenceFailure::OpenFailed,
+                    reason: persistence_start_failure
+                        .lock()
+                        .expect("persistence failure mutex poisoned")
+                        .take()
+                        .unwrap_or(mosaix_persistence::PersistenceFailure::OpenFailed),
                 },
             ));
     }
@@ -229,26 +235,97 @@ fn main() {
         let events = engine.events();
         let bridge = std::thread::spawn(move || {
             let mut submitted_revision = None;
+            // Intents accumulate in reducer state and are consumed by
+            // index, the same way the placement executor consumes effects.
+            let mut next_intent = 0usize;
+            // Recording prunes as it writes, so this only has to catch the
+            // agent that is left running without issuing any command.
+            const PRUNE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+            let mut last_prune = std::time::Instant::now();
             loop {
                 if stop_rx.try_recv().is_ok() {
                     break;
                 }
-                let revision = state_reader.revision();
-                if submitted_revision != Some(revision) {
-                    if worker.commit(revision).is_err() {
-                        let _ = events.send(mosaix_engine::Event::PersistenceHealthChanged(
-                            mosaix_persistence::PersistenceHealth::Degraded {
-                                last_durable_revision: submitted_revision.unwrap_or(0),
-                                reason: mosaix_persistence::PersistenceFailure::WriteFailed,
-                            },
-                        ));
+                let snapshot = state_reader.snapshot();
+
+                // Undo writes go first. A revision commit that overtook the
+                // transaction it describes would claim durability for a
+                // command whose record had not been stored yet.
+                let mut submission_failed = false;
+                for intent in snapshot.persistence_intents.iter().skip(next_intent) {
+                    let request = match intent {
+                        mosaix_engine::PersistenceIntent::RecordUndoTransaction(draft) => {
+                            mosaix_persistence::PersistenceRequest::RecordUndoTransaction(
+                                draft.clone(),
+                            )
+                        }
+                        mosaix_engine::PersistenceIntent::ConsumeUndoTransaction(id) => {
+                            mosaix_persistence::PersistenceRequest::ConsumeUndoTransaction(*id)
+                        }
+                        mosaix_engine::PersistenceIntent::SaveContainerTree {
+                            display_fingerprint,
+                            tree,
+                        } => mosaix_persistence::PersistenceRequest::SaveContainerTree {
+                            display_fingerprint: display_fingerprint.clone(),
+                            tree: tree.clone(),
+                        },
+                    };
+                    if worker.submit(request).is_err() {
+                        submission_failed = true;
                         break;
                     }
-                    if let Ok(health) = worker.next_update() {
-                        let _ = events.send(mosaix_engine::Event::PersistenceHealthChanged(health));
-                    }
-                    submitted_revision = Some(revision);
                 }
+                if !submission_failed {
+                    next_intent = snapshot.persistence_intents.len();
+                }
+
+                if !submission_failed && last_prune.elapsed() >= PRUNE_INTERVAL {
+                    if worker
+                        .submit(mosaix_persistence::PersistenceRequest::PruneHistory)
+                        .is_err()
+                    {
+                        submission_failed = true;
+                    } else {
+                        last_prune = std::time::Instant::now();
+                    }
+                }
+
+                let revision = snapshot.revision;
+                if !submission_failed && submitted_revision != Some(revision) {
+                    if worker.commit(revision).is_err() {
+                        submission_failed = true;
+                    } else {
+                        submitted_revision = Some(revision);
+                    }
+                }
+
+                if submission_failed {
+                    let _ = events.send(mosaix_engine::Event::PersistenceHealthChanged(
+                        mosaix_persistence::PersistenceHealth::Degraded {
+                            last_durable_revision: submitted_revision.unwrap_or(0),
+                            reason: mosaix_persistence::PersistenceFailure::WriteFailed,
+                        },
+                    ));
+                    break;
+                }
+
+                // Draining without blocking keeps this loop responsive to
+                // the stop signal even while the worker is busy.
+                while let Some(update) = worker.try_next_update() {
+                    let _ = events.send(mosaix_engine::Event::PersistenceHealthChanged(
+                        update.health,
+                    ));
+                    let _ = events.send(mosaix_engine::Event::UndoHistoryLoaded(
+                        update.newest_undo.map(Box::new),
+                    ));
+                    // Only the worker's first update carries these, so the
+                    // reducer's arrangements are never overwritten by the
+                    // database once the reducer owns them.
+                    if let Some(trees) = update.restored_trees {
+                        let _ = events.send(mosaix_engine::Event::ContainerTreesLoaded(trees));
+                    }
+                }
+
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
             worker.stop();

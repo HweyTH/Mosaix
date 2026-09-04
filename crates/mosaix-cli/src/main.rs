@@ -42,6 +42,30 @@ enum Command {
         #[command(subcommand)]
         action: LayoutAction,
     },
+    /// Reverse the newest placement command.
+    ///
+    /// Refuses, and keeps the command available to retry, whenever a target
+    /// window cannot be identified beyond doubt or your displays have
+    /// changed. There is no way to force it. There is no redo: it is
+    /// deferred to issue #44.
+    Undo {
+        /// Report what undo would do without doing it.
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Report the automatic-tiling arrangement and, in tree mode, each
+    /// display's container tree.
+    Arrangement {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Inspect or recover the durable state database.
+    Persistence {
+        #[command(subcommand)]
+        action: PersistenceAction,
+    },
     State {
         #[arg(long)]
         json: bool,
@@ -51,13 +75,27 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum LayoutAction {
-    /// Apply a saved layout to the focused window's display. Fails with
-    /// the agent's own reason if no managed window is focused or no layout
-    /// carries that name.
+    /// Apply a saved layout to the focused display. Fails with the agent's
+    /// own reason if no display is targeted or no layout carries that name.
     Apply {
         /// The layout's name, as declared under `[layouts]` in config.
         name: String,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum PersistenceAction {
+    /// Report whether committed state is durable, and why not if it is not.
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Move an unusable state database aside and start a fresh one.
+    ///
+    /// Nothing is deleted: the old file is preserved next to it. Refused
+    /// while a running agent still holds a healthy database, since that
+    /// database is not the one needing recovery.
+    Reset,
 }
 
 #[derive(Debug, Subcommand)]
@@ -83,6 +121,30 @@ fn main() {
     use mosaix_ipc::{send_request, IpcRequest, IpcResponse};
 
     let cli = Cli::parse();
+    // The two persistence actions do not map onto a single request: status
+    // renders fields the agent already publishes, and reset deliberately
+    // works on the file itself, because every failure that calls for it is
+    // one where the agent never got the database open.
+    if let Command::Persistence { action } = cli.command {
+        run_persistence(action);
+        return;
+    }
+    // Arrangement reads fields the agent already publishes and renders
+    // them, rather than asking for a report the agent does not have.
+    if let Command::Arrangement { json } = cli.command {
+        report_arrangement(json);
+        return;
+    }
+    // Undo answers with a typed result either way, so a refusal has to be
+    // rendered rather than printed as a bare error string.
+    if let Command::Undo { dry_run, json } = cli.command {
+        if dry_run {
+            report_undo_availability(json);
+        } else {
+            run_undo(json);
+        }
+        return;
+    }
     let state_json = matches!(&cli.command, Command::State { json: true });
     let request = match cli.command {
         Command::Snap {
@@ -123,6 +185,9 @@ fn main() {
         } => IpcRequest::ApplyLayout { name },
         Command::State { .. } => IpcRequest::GetState,
         Command::Ping => IpcRequest::Ping,
+        Command::Persistence { .. } | Command::Undo { .. } | Command::Arrangement { .. } => {
+            unreachable!("handled above")
+        }
     };
     match send_request(request) {
         Ok(IpcResponse::Ok { data: Some(data) }) if state_json => {
@@ -148,9 +213,419 @@ fn main() {
     }
 }
 
+/// Renders the arrangement section of published state.
+///
+/// A pure function of the snapshot so the wording can be tested without an
+/// agent to talk to, which is the only part of this command with any
+/// decisions in it.
+fn format_arrangement(state: &serde_json::Value) -> String {
+    let mode = state["tiling_mode"].as_str().unwrap_or("unknown");
+    let active = state["automatic_tiling_active"].as_bool().unwrap_or(false);
+    let suspended = state["automatic_tiling_suspended"]
+        .as_bool()
+        .unwrap_or(false);
+
+    // Suspension is reported ahead of activity because a suspended
+    // arrangement is still the configured one -- saying "off" would read as
+    // "you are not using tree mode".
+    let status = if suspended {
+        "suspended"
+    } else if active {
+        "active"
+    } else {
+        "off"
+    };
+    let mut rendered = format!("arrangement: {mode} ({status})");
+
+    let trees = state["container_trees"].as_array();
+    match trees {
+        Some(trees) if !trees.is_empty() => {
+            for tree in trees {
+                let display = tree["display_id"].as_i64().unwrap_or(0);
+                let windows: Vec<String> = tree["windows"]
+                    .as_array()
+                    .map(|windows| {
+                        windows
+                            .iter()
+                            .filter_map(|window| window.as_i64())
+                            .map(|window| window.to_string())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                rendered.push_str(&format!("\n  display {display}: {}", windows.join(" ")));
+            }
+        }
+        _ if mode == "tree" => {
+            rendered.push_str("\n  no display is arranging windows yet");
+        }
+        _ => {}
+    }
+    rendered
+}
+
+#[cfg(windows)]
+fn report_arrangement(json: bool) {
+    let Some(state) = published_persistence() else {
+        eprintln!("mosaix: no agent is running");
+        std::process::exit(1);
+    };
+
+    if json {
+        let value = serde_json::json!({
+            "tiling_mode": state["tiling_mode"],
+            "automatic_tiling_active": state["automatic_tiling_active"],
+            "automatic_tiling_suspended": state["automatic_tiling_suspended"],
+            "container_trees": state["container_trees"],
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&value).expect("JSON value serializes")
+        );
+        return;
+    }
+    println!("{}", format_arrangement(&state));
+}
+
+
+/// Reports whether undo would work right now, and why not if it would not.
+///
+/// Reads the agent's published state rather than asking undo to preflight,
+/// because the agent already computed the same verdict there -- and because
+/// a dry run must not be able to move a window by accident.
+#[cfg(windows)]
+fn report_undo_availability(json: bool) {
+    let Some(state) = published_persistence() else {
+        eprintln!("mosaix: no agent is running, so there is nothing to undo");
+        std::process::exit(1);
+    };
+    let available = state["undo_available"].as_bool().unwrap_or(false);
+    let command = state["undo_command"].as_str();
+    let blocked = state["undo_blocked_reason"].as_str();
+    let transaction = state["undo_transaction_id"].as_i64();
+
+    if json {
+        let value = serde_json::json!({
+            "undo_available": available,
+            "undo_command": command,
+            "undo_transaction_id": transaction,
+            "undo_blocked_reason": blocked,
+            "persistence_status": state["persistence_status"],
+            "persistence_reason": state["persistence_reason"],
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&value).expect("JSON value serializes")
+        );
+        if !available {
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    match (available, command) {
+        (true, Some(command)) => println!("undo would reverse {command}"),
+        (true, None) => println!("undo is available"),
+        (false, Some(command)) => {
+            println!("undo cannot run");
+            println!("  next in history: {command}");
+            if let Some(blocked) = blocked {
+                println!("  blocked by: {blocked}");
+            }
+            std::process::exit(1);
+        }
+        (false, None) => {
+            println!("there is nothing to undo");
+            std::process::exit(1);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn run_undo(json: bool) {
+    use mosaix_domain::undo::{UndoRefusal, UndoResult};
+    use mosaix_ipc::{send_request, IpcRequest, IpcResponse};
+
+    let data = match send_request(IpcRequest::Undo) {
+        Ok(IpcResponse::Ok { data: Some(data) }) => data,
+        Ok(IpcResponse::Ok { data: None }) => {
+            eprintln!("mosaix: the agent answered without an undo result");
+            std::process::exit(2);
+        }
+        Ok(IpcResponse::Error { message }) => {
+            eprintln!("mosaix: {message}");
+            std::process::exit(1);
+        }
+        Ok(IpcResponse::VersionMismatch { server_version }) => {
+            eprintln!("mosaix: protocol version mismatch (server: v{server_version})");
+            std::process::exit(1);
+        }
+        Err(error) => {
+            eprintln!("mosaix: {error}");
+            std::process::exit(2);
+        }
+    };
+
+    let result: UndoResult = match serde_json::from_value(data.clone()) {
+        Ok(result) => result,
+        Err(error) => {
+            eprintln!("mosaix: could not read the agent's undo result: {error}");
+            std::process::exit(2);
+        }
+    };
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&data).expect("JSON value serializes")
+        );
+        // A refusal is a normal answer to report, but it is still a
+        // failure to act on, so scripts see it in the exit status too.
+        if !result.is_applied() {
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    match result {
+        UndoResult::Applied(applied) => {
+            let count = applied.restored.len();
+            let plural = if count == 1 { "window" } else { "windows" };
+            println!("undid {} ({count} {plural})", applied.command);
+            for restored in applied.restored {
+                println!(
+                    "  window {} back to {}x{} at {},{} on display {}",
+                    restored.window_id.0,
+                    restored.placement.width,
+                    restored.placement.height,
+                    restored.placement.x,
+                    restored.placement.y,
+                    restored.display_id.0,
+                );
+            }
+        }
+        UndoResult::Refused(refusal) => {
+            eprintln!("mosaix: {refusal}");
+            match &refusal {
+                UndoRefusal::TopologyChanged {
+                    recorded_fingerprint,
+                    current_fingerprint,
+                    ..
+                } => {
+                    eprintln!("  recorded on: {recorded_fingerprint}");
+                    eprintln!("  now:         {current_fingerprint}");
+                    eprintln!("  reconnect that arrangement and try again");
+                }
+                UndoRefusal::TargetsUnresolved { targets, .. } => {
+                    for target in targets {
+                        eprintln!(
+                            "  target {} ({}): {}",
+                            target.ordinal,
+                            target.application,
+                            target.outcome.code()
+                        );
+                        for candidate in match_candidates(&target.outcome) {
+                            eprintln!(
+                                "      candidate window {} scored {}",
+                                candidate.window_id.0, candidate.score
+                            );
+                        }
+                    }
+                }
+                UndoRefusal::TargetsCollide {
+                    window_id,
+                    ordinals,
+                    ..
+                } => {
+                    eprintln!(
+                        "  targets {ordinals:?} all matched window {}",
+                        window_id.0
+                    );
+                }
+                UndoRefusal::PersistenceDegraded { reason, .. } => {
+                    eprintln!("  reason: {reason}");
+                    eprintln!("  see `mosaix persistence status`");
+                }
+                UndoRefusal::NothingToUndo => {}
+            }
+            std::process::exit(1);
+        }
+    }
+}
+
+/// The scored candidates a refusal has to show, whichever shape the
+/// outcome took.
+#[cfg(windows)]
+fn match_candidates(
+    outcome: &mosaix_domain::MatchOutcome,
+) -> &[mosaix_domain::ScoredCandidate] {
+    use mosaix_domain::MatchOutcome;
+
+    match outcome {
+        MatchOutcome::Confident(_) => &[],
+        MatchOutcome::Ambiguous { candidates } => candidates,
+        MatchOutcome::NoMatch { considered } => considered,
+    }
+}
+
+/// The agent's published view of durability, or `None` when no agent
+/// answered. "No agent" and "an agent that cannot reach its database" are
+/// different situations and only the first is safe to reset blindly.
+#[cfg(windows)]
+fn published_persistence() -> Option<serde_json::Value> {
+    use mosaix_ipc::{send_request, IpcRequest, IpcResponse};
+
+    match send_request(IpcRequest::GetState) {
+        Ok(IpcResponse::Ok { data: Some(data) }) => Some(data),
+        _ => None,
+    }
+}
+
+#[cfg(windows)]
+fn run_persistence(action: PersistenceAction) {
+    match action {
+        PersistenceAction::Status { json } => {
+            let Some(state) = published_persistence() else {
+                eprintln!("mosaix: no agent is running, so durability is not being tracked");
+                std::process::exit(1);
+            };
+            let status = state["persistence_status"].as_str().unwrap_or("unknown");
+            let revision = state["last_durable_revision"].as_u64().unwrap_or(0);
+            let reason = state["persistence_reason"].as_str();
+            if json {
+                let value = serde_json::json!({
+                    "persistence_status": status,
+                    "last_durable_revision": revision,
+                    "persistence_reason": reason,
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&value).expect("JSON value serializes")
+                );
+                return;
+            }
+            match reason {
+                None => println!("persistence: healthy (durable through revision {revision})"),
+                Some(reason) => {
+                    println!("persistence: degraded ({reason})");
+                    println!("last durable revision: {revision}");
+                    println!(
+                        "window management continues from memory, but nothing new is \
+                         being made durable and undo will refuse"
+                    );
+                    println!("run `mosaix persistence reset` to start a fresh database");
+                }
+            }
+        }
+        PersistenceAction::Reset => {
+            if let Some(state) = published_persistence() {
+                if state["persistence_status"].as_str() == Some("healthy") {
+                    eprintln!(
+                        "mosaix: the running agent's state database is healthy; \
+                         stop the agent before resetting it"
+                    );
+                    std::process::exit(1);
+                }
+            }
+            let Some(path) = mosaix_persistence::default_database_path() else {
+                eprintln!("mosaix: this platform has no state database location");
+                std::process::exit(2);
+            };
+            match mosaix_persistence::Persistence::reset(&path) {
+                Ok(outcome) => {
+                    match outcome.preserved {
+                        Some(preserved) => {
+                            println!("previous database preserved at {}", preserved.display());
+                        }
+                        None => println!("no previous database was present"),
+                    }
+                    println!("fresh state database created at {}", path.display());
+                    println!("restart the agent to resume durable state");
+                }
+                Err(error) => {
+                    eprintln!("mosaix: {error}");
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+}
+
 #[cfg(not(windows))]
 fn main() {
     let _ = Cli::parse();
     eprintln!("mosaix currently only supports Windows");
     std::process::exit(2);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_balanced_agent_reports_no_trees() {
+        let state = serde_json::json!({
+            "tiling_mode": "balanced",
+            "automatic_tiling_active": true,
+            "automatic_tiling_suspended": false,
+            "container_trees": [],
+        });
+
+        assert_eq!(format_arrangement(&state), "arrangement: balanced (active)");
+    }
+
+    #[test]
+    fn tree_mode_lists_each_displays_windows_in_visual_order() {
+        let state = serde_json::json!({
+            "tiling_mode": "tree",
+            "automatic_tiling_active": true,
+            "automatic_tiling_suspended": false,
+            "container_trees": [
+                { "display_id": 1, "windows": [11, 12, 13] },
+                { "display_id": 2, "windows": [21] },
+            ],
+        });
+
+        assert_eq!(
+            format_arrangement(&state),
+            "arrangement: tree (active)\n  display 1: 11 12 13\n  display 2: 21"
+        );
+    }
+
+    #[test]
+    fn tree_mode_with_nothing_arranged_says_so_rather_than_printing_nothing() {
+        let state = serde_json::json!({
+            "tiling_mode": "tree",
+            "automatic_tiling_active": true,
+            "automatic_tiling_suspended": false,
+            "container_trees": [],
+        });
+
+        assert_eq!(
+            format_arrangement(&state),
+            "arrangement: tree (active)\n  no display is arranging windows yet"
+        );
+    }
+
+    #[test]
+    fn a_suspended_arrangement_is_not_reported_as_off() {
+        let state = serde_json::json!({
+            "tiling_mode": "tree",
+            "automatic_tiling_active": false,
+            "automatic_tiling_suspended": true,
+            "container_trees": [],
+        });
+
+        assert!(
+            format_arrangement(&state).starts_with("arrangement: tree (suspended)"),
+            "a suspended arrangement is still the configured one"
+        );
+    }
+
+    #[test]
+    fn a_snapshot_missing_its_fields_renders_without_panicking() {
+        assert_eq!(
+            format_arrangement(&serde_json::json!({})),
+            "arrangement: unknown (off)"
+        );
+    }
 }

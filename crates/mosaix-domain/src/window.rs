@@ -28,6 +28,37 @@ pub enum WindowRole {
     Unknown,
 }
 
+impl WindowRole {
+    /// A stable text code. Durable records store this rather than a
+    /// serialization of the variant, so renaming a variant is a compile
+    /// error here instead of a silent read failure against an existing
+    /// database.
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Dialog => "dialog",
+            Self::ToolWindow => "tool_window",
+            Self::Popup => "popup",
+            Self::Splash => "splash",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// The inverse of [`WindowRole::code`]. An unrecognised code reads back
+    /// as [`WindowRole::Unknown`] rather than failing, so a record written
+    /// by a future build stays loadable.
+    pub fn from_code(code: &str) -> Self {
+        match code {
+            "normal" => Self::Normal,
+            "dialog" => Self::Dialog,
+            "tool_window" => Self::ToolWindow,
+            "popup" => Self::Popup,
+            "splash" => Self::Splash,
+            _ => Self::Unknown,
+        }
+    }
+}
+
 /// Capability flags describing what operations the platform allows on a window.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WindowCapabilities {
@@ -105,6 +136,33 @@ pub struct Window {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_role_code_round_trips_and_stays_distinct() {
+        let roles = [
+            WindowRole::Normal,
+            WindowRole::Dialog,
+            WindowRole::ToolWindow,
+            WindowRole::Popup,
+            WindowRole::Splash,
+            WindowRole::Unknown,
+        ];
+        for role in roles {
+            assert_eq!(WindowRole::from_code(role.code()), role);
+        }
+        let mut codes: Vec<&str> = roles.iter().map(WindowRole::code).collect();
+        codes.sort_unstable();
+        codes.dedup();
+        assert_eq!(codes.len(), roles.len());
+    }
+
+    #[test]
+    fn an_unrecognised_role_code_reads_back_as_unknown() {
+        assert_eq!(
+            WindowRole::from_code("a-role-a-later-build-invented"),
+            WindowRole::Unknown
+        );
+    }
 
     #[test]
     fn tileable_requires_move_and_resize() {
