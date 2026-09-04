@@ -143,8 +143,12 @@ One of four states published for the current topology: disabled (no matched prof
 _Avoid_: Enabled (which does not say whether parking is authorised), workspace mode
 
 **Workspace-switch degraded**:
-A health condition in which compensation for a failed workspace switch could not restore every moved window. Further switching remains blocked until the explicit restore action reconciles the affected windows, and it clears as soon as the last of them is back on screen, from whichever path put it there.
+A health condition in which compensation for a failed workspace switch could not restore every moved window. Further switching remains blocked until the explicit restore action reconciles every `Stranded window`, and it clears as each one reaches the place its workspace says it belongs, from whichever path put it there.
 _Avoid_: Persistence-degraded, degraded tiling
+
+**Stranded window**:
+A managed window a failed workspace switch left where neither the switch nor the user put it, because compensation could not move it back. It is named in published state until it reaches the place its workspace says it belongs: on screen when that workspace is displayed, at the parking site when it is hidden. Being stranded says nothing about where the window currently is -- a failed re-park leaves one visible and a failed restore leaves one parked -- so reconciling it means moving it in whichever direction its workspace requires, not restoring it.
+_Avoid_: Orphaned window, lost window, unaccounted window
 
 **Health condition precedence**:
 The one fixed order in which the three distinct health conditions are published, so every interface leads with the same one instead of each inventing a ranking: `workspace-switch degraded` first, because windows are off screen and switching is blocked until someone acts; `persistence-degraded` next, because nothing new becomes durable; `degraded tiling` last, because live management continues for everything else. The conditions stay separate facts with their own detail in published state; this only ranks them, and never hides the ones it does not lead with.

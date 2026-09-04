@@ -479,6 +479,48 @@ mod tests {
     }
 
     #[test]
+    fn a_site_validated_for_one_topology_is_stale_for_the_next() {
+        // Issue #61: a display connected beyond the chosen edge would put
+        // parked windows back in view. This is why the site is re-planned
+        // on every topology change rather than carried over, and why it
+        // is stamped with the topology it was validated for.
+        let before = [display(1, Rect::new(0, 0, 1920, 1080), true)];
+        let first = plan_parking_sites(&before).expect("one display leaves every edge free");
+        assert_eq!(first[0].edge, ParkingEdge::Right);
+
+        // A second display arrives inside the old right-edge probe block,
+        // which is exactly the case that would leave a parked window
+        // visible on it.
+        let after = [
+            display(1, Rect::new(0, 0, 1920, 1080), true),
+            display(
+                2,
+                Rect::new(1920 + PARKING_MARGIN + 100, 0, 1920, 1080),
+                false,
+            ),
+        ];
+
+        assert!(
+            !first[0].clear_of(&after),
+            "the site chosen for the old topology now has a display on it"
+        );
+
+        let second = plan_parking_sites(&after).expect("the wider box still leaves an edge free");
+        assert!(
+            second[0].clear_of(&after),
+            "re-planning yields a site clear of every display in the new topology"
+        );
+        assert_ne!(
+            second[0].virtual_screen, first[0].virtual_screen,
+            "the site moved with the virtual screen it was planned against"
+        );
+        assert_ne!(
+            second[0].topology_fingerprint, first[0].topology_fingerprint,
+            "the stamp is what makes a carried-over site recognisable as stale"
+        );
+    }
+
+    #[test]
     fn no_displays_refuses_a_site() {
         assert_eq!(plan_parking_sites(&[]), Err(ParkingSiteRefusal::NoDisplays));
     }

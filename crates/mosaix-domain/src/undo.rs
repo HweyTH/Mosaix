@@ -15,6 +15,7 @@ use crate::geometry::Rect;
 use crate::id::{DisplayId, WindowId};
 use crate::identity::{MatchOutcome, WindowEvidence};
 use crate::tree::PersistedTree;
+use crate::workspace::WorkspaceRefusal;
 
 /// Seconds since the Unix epoch, as retention bounds measure time.
 ///
@@ -180,11 +181,13 @@ pub enum UndoRefusal {
         reason: String,
     },
     /// Reversing this transaction means switching a display back to
-    /// another workspace, and that switch would itself be refused. The
-    /// reason is the switch's own, so the user is told what to fix.
+    /// another workspace, and that switch would itself be refused. It
+    /// carries the switch's own typed refusal, so a caller can tell a
+    /// blocked degraded condition from an unauthorised profile without
+    /// reading prose.
     WorkspaceSwitchRefused {
         transaction_id: UndoTransactionId,
-        reason: String,
+        reason: WorkspaceRefusal,
     },
 }
 
@@ -245,7 +248,7 @@ impl std::fmt::Display for UndoRefusal {
             ),
             Self::WorkspaceSwitchRefused { reason, .. } => write!(
                 formatter,
-                "undoing that command means switching a display back to another workspace,                  and that switch was refused: {reason}"
+                "undoing that command means switching a display back to another workspace, and that switch was refused: {reason}"
             ),
         }
     }

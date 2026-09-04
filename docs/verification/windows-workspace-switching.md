@@ -45,6 +45,10 @@ machine whose session can be disturbed.
 | A failed restore re-parks what it restored | `a_failed_restore_parks_again_what_it_restored_and_compensates` |
 | A failed compensation degrades and blocks | `a_failed_compensation_enters_workspace_switch_degraded_and_blocks_switching` |
 | The explicit restore path unblocks it | `restoring_the_stranded_windows_unblocks_switching` |
+| A window stranded on the visible side is parked, not declared fine | `a_window_stranded_in_plain_sight_is_parked_by_the_reconcile_not_declared_fine` |
+| A reconcile that cannot move a window leaves it stranded | `a_failed_reconcile_leaves_the_window_stranded_and_switching_blocked` |
+| Preflight refuses a window already awaiting an explicit park | `a_switch_refuses_a_window_already_waiting_on_an_explicit_park` |
+| A move cannot interleave with a switch | `a_workspace_move_is_refused_while_a_switch_is_in_flight` |
 | One undo transaction covers assignment and placements | `a_committed_switch_records_the_prior_assignment_and_placements_as_one_transaction` |
 | Undo switches back as a fresh guarded switch | `undoing_a_switch_switches_back_as_a_fresh_guarded_transaction` |
 | Undo refuses when the switch back would be | `undo_is_refused_when_the_switch_back_would_be` |
@@ -61,7 +65,7 @@ machine whose session can be disturbed.
 | Disconnect hides the workspace and parks its windows against the survivor | `disconnecting_a_monitor_parks_the_windows_of_the_workspace_it_took_with_it`, which also asserts the recovery entry records `DISPLAY1`, the survivor it migrated to |
 | Surviving assignments are untouched | The same test |
 | Reconnect reveals nothing on its own | `reconnecting_a_monitor_leaves_a_hidden_workspace_hidden_when_nothing_selects_it` |
-| A valid topology profile does select one | `reconnecting_a_monitor_does_not_reveal_a_hidden_workspace_that_has_windows` |
+| A valid topology profile does select one | `reconnecting_a_monitor_reveals_a_hidden_workspace_only_when_the_profile_maps_it` |
 | A rule target is recorded before parking, and steals no focus | `a_rule_sending_a_new_window_to_a_hidden_workspace_parks_it_without_switching_or_focus` |
 | It never triggers a switch | The same test asserts the displayed assignment is unchanged |
 | A minimized window stays minimized while hidden | `a_minimized_member_stays_unparked_while_hidden_and_parks_when_its_application_restores_it` |
@@ -71,8 +75,16 @@ machine whose session can be disturbed.
 | Stored assignments are reapplied through the ledger | `stored_assignments_are_reapplied_by_parking_through_the_ledger` |
 | No site means the window stays visible, with the reason published | `a_window_of_a_hidden_workspace_stays_visible_when_no_parking_site_is_verified` |
 | The reconciler never fights a switch | `the_reconciler_stands_aside_while_a_switch_is_in_flight` |
+| A half-applied stored assignment is never silent | `a_half_applied_stored_assignment_is_never_silent` |
+| A site validated for one topology is stale for the next | `a_site_validated_for_one_topology_is_stale_for_the_next` (`mosaix-platform-windows`) |
 | The three conditions stay distinct, in one order | `the_three_health_conditions_are_distinct_facts_in_one_fixed_order`, `a_healthy_agent_reports_no_conditions_at_all` |
 | Every client leads with the same one | `the_leading_health_condition_is_the_one_published_state_ordered_first`, `degraded_tiling_leads_only_when_nothing_more_serious_holds` |
+
+The profile gate the whole transaction rests on -- that base config can
+never request switching -- is covered where it is enforced, by
+`switching_in_base_config_is_rejected_with_where_it_belongs` in
+`crates/mosaix-config/src/validate.rs`. That crate is unchanged here, so
+this diff adds no config test rather than a redundant one.
 
 Startup recovery preceding identity reconciliation is a fact of ordering
 in `crates/mosaix-agent/src/main.rs`: the ledger pass runs after the

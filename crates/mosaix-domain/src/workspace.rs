@@ -18,6 +18,7 @@ use std::collections::{BTreeMap, HashMap};
 use serde::{Deserialize, Serialize};
 
 use crate::id::{DisplayId, WindowId};
+use crate::recovery::ParkingRefusal;
 use crate::tree::{ContainerTree, PersistedTree};
 
 /// The longest name a workspace may have, in characters. Long enough for
@@ -225,6 +226,18 @@ pub enum WorkspaceRefusal {
         name: WorkspaceName,
         window_id: WindowId,
     },
+    /// A window the switch would have to move cannot be parked, for a
+    /// reason the parking authorisation gives. Reached in preflight, so
+    /// nothing has moved.
+    MemberNotParkable {
+        name: WorkspaceName,
+        window_id: WindowId,
+        reason: ParkingRefusal,
+    },
+    /// The display should end up showing no workspace at all, and no
+    /// command does that: every switch names a workspace to show. Reached
+    /// when undo would have to restore an unfilled display.
+    CannotHideWithoutReplacement { display_fingerprint: String },
 }
 
 impl WorkspaceRefusal {
@@ -247,6 +260,8 @@ impl WorkspaceRefusal {
             Self::SwitchDegraded { .. } => "switch_degraded",
             Self::SwitchInFlight { .. } => "switch_in_flight",
             Self::FullscreenMember { .. } => "fullscreen_member",
+            Self::MemberNotParkable { .. } => "member_not_parkable",
+            Self::CannotHideWithoutReplacement { .. } => "cannot_hide_without_replacement",
         }
     }
 }
@@ -316,6 +331,22 @@ impl std::fmt::Display for WorkspaceRefusal {
                 formatter,
                 "window {} of workspace {name} is full-screen and is never forced out of it",
                 window_id.0
+            ),
+            Self::MemberNotParkable {
+                name,
+                window_id,
+                reason,
+            } => write!(
+                formatter,
+                "window {} of workspace {name} cannot be parked: {reason}",
+                window_id.0
+            ),
+            Self::CannotHideWithoutReplacement {
+                display_fingerprint,
+            } => write!(
+                formatter,
+                "display {display_fingerprint:?} showed no workspace, and no command hides one \
+                 without showing another"
             ),
         }
     }
@@ -885,7 +916,7 @@ mod tests {
     #[test]
     fn names_are_trimmed_and_refuse_empty_long_and_forbidden() {
         assert_eq!(name("  dev ").as_str(), "dev");
-        assert_eq!(WorkspaceName::new("   "), Err(WorkspaceNameError::Empty));
+        assert_eq!(WorkspaceName::new(" "), Err(WorkspaceNameError::Empty));
         assert_eq!(
             WorkspaceName::new(&"x".repeat(65)),
             Err(WorkspaceNameError::TooLong { chars: 65 })

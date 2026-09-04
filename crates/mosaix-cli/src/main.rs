@@ -452,14 +452,14 @@ fn format_arrangement(state: &serde_json::Value) -> String {
                     .unwrap_or_default();
                 if !overflow.is_empty() {
                     rendered.push_str(&format!(
-                        "\n    in constraint overflow (cannot fit at minimum size): {}",
+                        "\n in constraint overflow (cannot fit at minimum size): {}",
                         overflow.join(" ")
                     ));
                 }
                 if let Some(dormant) = tree["dormant_positions"].as_array() {
                     for slot in dormant {
                         rendered.push_str(&format!(
-                            "\n    dormant position {} kept for {} (expires {})",
+                            "\n dormant position {} kept for {} (expires {})",
                             slot["position"].as_u64().unwrap_or(0),
                             slot["application"].as_str().unwrap_or("?"),
                             slot["expires_unix"].as_i64().unwrap_or(0),
@@ -695,7 +695,7 @@ fn format_workspace_result(result: &mosaix_domain::WorkspaceCommandResult) -> St
             restoring,
         }) => match replaced {
             Some(replaced) => format!(
-                "switching display {} from {replaced} to {name}: parking {parking} window(s),                  restoring {restoring}",
+                "switching display {} from {replaced} to {name}: parking {parking} window(s), restoring {restoring}",
                 display_id.0
             ),
             None => format!(
@@ -708,7 +708,7 @@ fn format_workspace_result(result: &mosaix_domain::WorkspaceCommandResult) -> St
             failed.name, failed.reason
         ),
         WorkspaceCommandResult::SwitchFailed(failed) => format!(
-            "mosaix: the switch to {} failed and {} window(s) could not be put back ({});              workspace switching is blocked until `mosaix workspace restore-switch`",
+            "mosaix: the switch to {} failed and {} window(s) could not be put back ({}); workspace switching is blocked until `mosaix workspace restore-switch`",
             failed.name,
             failed.stranded_windows.len(),
             failed.reason
@@ -737,13 +737,13 @@ fn format_conditions(state: &serde_json::Value) -> Option<String> {
     let leading = *conditions.first()?;
     let described = match leading {
         "workspace_switch_degraded" => {
-            "workspace-switch degraded: a failed switch left windows unaccounted for;              switching is blocked until `mosaix workspace restore-switch`"
+            "workspace-switch degraded: a failed switch left windows unaccounted for; switching is blocked until `mosaix workspace restore-switch`"
         }
         "persistence_degraded" => {
-            "persistence degraded: live management continues, but nothing new is durable;              see `mosaix persistence status`"
+            "persistence degraded: live management continues, but nothing new is durable; see `mosaix persistence status`"
         }
         "degraded_tiling" => {
-            "degraded tiling: automatic tiling continues, with some windows excluded by a              placement failure"
+            "degraded tiling: automatic tiling continues, with some windows excluded by a placement failure"
         }
         other => return Some(format!("{other} (and {} more)", conditions.len() - 1)),
     };
@@ -807,7 +807,7 @@ fn format_switching(state: &serde_json::Value) -> String {
         lines.insert(
             0,
             format!(
-                "workspace switching: blocked; a failed switch left window(s) {stranded}                  unaccounted for ({}) -- run `mosaix workspace restore-switch`",
+                "workspace switching: blocked; a failed switch left window(s) {stranded} unaccounted for ({}) -- run `mosaix workspace restore-switch`",
                 degraded["reason"].as_str().unwrap_or("no reason")
             ),
         );
@@ -1052,18 +1052,17 @@ fn run_park_window(window: isize, json: bool) {
     }
 }
 
-#[cfg(windows)]
-/// Asks the agent to reconcile a degraded switch, and reports what it
-/// answered.
+/// Sends one request and returns the JSON the agent answered with.
 ///
-/// Exits non-zero when nothing was reconciled, so a script can tell "the
-/// condition is cleared" from "there was nothing to clear" without
-/// parsing prose.
+/// The absent agent, the protocol disagreement and the answer that
+/// carried no data all end the process the same way wherever they
+/// happen, so every command that wants a payload asks through here
+/// rather than restating twenty lines of matching.
 #[cfg(windows)]
-fn run_restore_switch(json: bool) {
-    use mosaix_ipc::{send_request, IpcRequest, IpcResponse};
+fn agent_answer(request: mosaix_ipc::IpcRequest) -> serde_json::Value {
+    use mosaix_ipc::{send_request, IpcResponse};
 
-    let data = match send_request(IpcRequest::RestoreWorkspaceSwitch) {
+    match send_request(request) {
         Ok(IpcResponse::Ok { data: Some(data) }) => data,
         Ok(IpcResponse::Ok { data: None }) => {
             eprintln!("mosaix: the agent answered without a result");
@@ -1081,7 +1080,18 @@ fn run_restore_switch(json: bool) {
             eprintln!("mosaix: {error}");
             std::process::exit(2);
         }
-    };
+    }
+}
+
+/// Asks the agent to reconcile a degraded switch, and reports what it
+/// answered.
+///
+/// Exits non-zero when nothing was reconciled, so a script can tell "the
+/// condition is cleared" from "there was nothing to clear" without
+/// parsing prose.
+#[cfg(windows)]
+fn run_restore_switch(json: bool) {
+    let data = agent_answer(mosaix_ipc::IpcRequest::RestoreWorkspaceSwitch);
     let result: mosaix_domain::WorkspaceSwitchRestoreResult =
         match serde_json::from_value(data.clone()) {
             Ok(result) => result,
@@ -1124,28 +1134,9 @@ fn run_restore_switch(json: bool) {
     }
 }
 
+#[cfg(windows)]
 fn run_restore_parked(json: bool) {
-    use mosaix_ipc::{send_request, IpcRequest, IpcResponse};
-
-    let data = match send_request(IpcRequest::RestoreParkedWindows) {
-        Ok(IpcResponse::Ok { data: Some(data) }) => data,
-        Ok(IpcResponse::Ok { data: None }) => {
-            eprintln!("mosaix: the agent answered without a result");
-            std::process::exit(2);
-        }
-        Ok(IpcResponse::Error { message }) => {
-            eprintln!("mosaix: {message}");
-            std::process::exit(1);
-        }
-        Ok(IpcResponse::VersionMismatch { server_version }) => {
-            eprintln!("mosaix: protocol version mismatch (server: v{server_version})");
-            std::process::exit(1);
-        }
-        Err(error) => {
-            eprintln!("mosaix: {error}");
-            std::process::exit(2);
-        }
-    };
+    let data = agent_answer(mosaix_ipc::IpcRequest::RestoreParkedWindows);
     if json {
         println!(
             "{}",
@@ -1361,7 +1352,7 @@ fn run_undo(json: bool) {
                     ..
                 } => {
                     eprintln!("  recorded on: {recorded_fingerprint}");
-                    eprintln!("  now:         {current_fingerprint}");
+                    eprintln!("  now: {current_fingerprint}");
                     eprintln!("  reconnect that arrangement and try again");
                 }
                 UndoRefusal::TargetsUnresolved { targets, .. } => {
@@ -1374,7 +1365,7 @@ fn run_undo(json: bool) {
                         );
                         for candidate in match_candidates(&target.outcome) {
                             eprintln!(
-                                "      candidate window {} scored {}",
+                                " candidate window {} scored {}",
                                 candidate.window_id.0, candidate.score
                             );
                         }
@@ -1648,7 +1639,7 @@ mod tests {
 
         assert_eq!(
             format_arrangement(&state),
-            "arrangement: tree (active)\n  display 1: 11 12 13\n    in constraint overflow (cannot fit at minimum size): 13"
+            "arrangement: tree (active)\n  display 1: 11 12 13\n in constraint overflow (cannot fit at minimum size): 13"
         );
     }
 
@@ -1672,7 +1663,7 @@ mod tests {
 
         assert_eq!(
             format_arrangement(&state),
-            "arrangement: tree (active)\n  display 1: 11\n    dormant position 1 kept for Code.exe (expires 1756604800)"
+            "arrangement: tree (active)\n  display 1: 11\n dormant position 1 kept for Code.exe (expires 1756604800)"
         );
     }
 

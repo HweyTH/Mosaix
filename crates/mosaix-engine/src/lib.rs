@@ -1626,19 +1626,7 @@ fn apply(state: &mut EngineState, event: Event) {
         Event::ParkingAuthorizationRequested { window_id } => {
             match plan_parking_authorization(state, window_id) {
                 Ok(draft) => {
-                    state.next_parking_token += 1;
-                    let token = state.next_parking_token;
-                    state.pending_parking.push(PendingParking {
-                        token,
-                        window_id,
-                        transaction: None,
-                    });
-                    state
-                        .persistence_intents
-                        .push(PersistenceIntent::RecordRecovery {
-                            token,
-                            draft: Box::new(draft),
-                        });
+                    request_recovery_entry(state, window_id, draft, None);
                     state.last_parking_refusal = None;
                 }
                 Err(refusal) => {
@@ -1731,6 +1719,7 @@ fn apply(state: &mut EngineState, event: Event) {
             state
                 .persistence_intents
                 .push(PersistenceIntent::MarkParked(entry_id));
+            settle_stranded_window(state, window_id);
             switch_window_settled(state, window_id, None);
             state.revision += 1;
         }
@@ -1747,7 +1736,17 @@ fn apply(state: &mut EngineState, event: Event) {
                 stage: ParkingStage::Park,
                 reason: reason.clone(),
             });
+            let in_switch = state
+                .switch
+                .as_ref()
+                .is_some_and(|switch| switch.in_flight.contains(&window_id));
             switch_window_settled(state, window_id, Some(&reason));
+            if !in_switch {
+                // Nothing was compensating this one: it was parked to
+                // keep a hidden workspace off the screen, and it is still
+                // on it.
+                strand_window(state, window_id, reason);
+            }
             state.revision += 1;
         }
 
@@ -1759,7 +1758,7 @@ fn apply(state: &mut EngineState, event: Event) {
                     .push(PersistenceIntent::MarkRestored(entry_id));
                 state.revision += 1;
             }
-            clear_switch_degraded_for(state, window_id);
+            settle_stranded_window(state, window_id);
             switch_window_settled(state, window_id, None);
         }
 
@@ -1785,22 +1784,47 @@ fn apply(state: &mut EngineState, event: Event) {
                     tracing::info!("no degraded workspace switch to reconcile");
                 }
                 WorkspaceSwitchRestoreResult::Reconciled { .. } => {
-                    // Nothing is parked any more, so the accounting is
-                    // all that was left to clear.
+                    // Every stranded window is already where its
+                    // workspace says it belongs, so there is nothing left
+                    // but the accounting.
                     tracing::info!(
-                        "no stranded window is still parked; workspace switching is unblocked"
+                        "every stranded window is already in place; workspace switching is unblocked"
                     );
                     state.switch_degraded = None;
                 }
                 WorkspaceSwitchRestoreResult::Requested { windows } => {
                     for window_id in windows {
-                        let Some(entry_id) = state.parked_windows.get(&window_id).copied() else {
-                            continue;
-                        };
-                        state.effects.push(EngineEffect::RestoreWindow {
-                            window_id,
-                            entry_id,
-                        });
+                        match stranded_move_for(state, window_id) {
+                            Some(StrandedMove::Restore) => {
+                                let Some(entry_id) = state.parked_windows.get(&window_id).copied()
+                                else {
+                                    continue;
+                                };
+                                state.effects.push(EngineEffect::RestoreWindow {
+                                    window_id,
+                                    entry_id,
+                                });
+                            }
+                            Some(StrandedMove::Park) => {
+                                // Visible, but its workspace is hidden.
+                                // It leaves the screen the only way any
+                                // window does: recovery data first.
+                                match plan_parking_authorization(state, window_id) {
+                                    Ok(draft) => {
+                                        request_recovery_entry(state, window_id, draft, None);
+                                    }
+                                    Err(refusal) => {
+                                        tracing::error!(
+                                            ?window_id,
+                                            %refusal,
+                                            "a stranded window cannot be parked; it stays stranded"
+                                        );
+                                        state.last_parking_refusal = Some(refusal);
+                                    }
+                                }
+                            }
+                            None => {}
+                        }
                     }
                 }
             }
@@ -3100,19 +3124,7 @@ fn reconcile_hidden_workspace_windows(state: &mut EngineState) {
     for window_id in to_park {
         match plan_parking_authorization(state, window_id) {
             Ok(draft) => {
-                state.next_parking_token += 1;
-                let token = state.next_parking_token;
-                state.pending_parking.push(PendingParking {
-                    token,
-                    window_id,
-                    transaction: None,
-                });
-                state
-                    .persistence_intents
-                    .push(PersistenceIntent::RecordRecovery {
-                        token,
-                        draft: Box::new(draft),
-                    });
+                request_recovery_entry(state, window_id, draft, None);
             }
             Err(refusal) => {
                 // Nothing is forced. The window stays visible where it
@@ -3512,29 +3524,35 @@ fn request_switch_parks(state: &mut EngineState, windows: Vec<WindowId>) {
         return;
     };
     for window_id in windows {
-        let Some(draft) = parking_draft_for(state, window_id) else {
+        if !state.inventory.contains_key(&window_id) {
+            // The window closed between preflight and here. There is
+            // nothing of it on screen to hide and nothing to put back,
+            // so the switch carries on without it.
             tracing::info!(
                 ?window_id,
-                "window has nothing to park; the switch carries on without it"
+                "window left management before it could park; the switch carries on without it"
             );
             continue;
+        }
+        // Preflight authorised every one of these; a refusal now means
+        // the window changed underneath the switch, and carrying on
+        // would commit with it still on screen under another workspace.
+        let draft = match plan_parking_authorization(state, window_id) {
+            Ok(draft) => draft,
+            Err(refusal) => {
+                tracing::warn!(
+                    ?window_id,
+                    %refusal,
+                    "a window stopped being parkable mid-switch; cancelling"
+                );
+                begin_switch_compensation(state, refusal.to_string());
+                return;
+            }
         };
-        state.next_parking_token += 1;
-        let token = state.next_parking_token;
-        state.pending_parking.push(PendingParking {
-            token,
-            window_id,
-            transaction: Some(transaction_id),
-        });
+        let token = request_recovery_entry(state, window_id, draft, Some(transaction_id));
         if let Some(switch) = state.switch.as_mut() {
             switch.recording.push(token);
         }
-        state
-            .persistence_intents
-            .push(PersistenceIntent::RecordRecovery {
-                token,
-                draft: Box::new(draft),
-            });
     }
 }
 
@@ -3545,26 +3563,28 @@ fn request_switch_parks(state: &mut EngineState, windows: Vec<WindowId>) {
 /// settled phase means and what follows it.
 fn advance_switch(state: &mut EngineState) {
     loop {
-        let Some(switch) = state.switch.as_ref() else {
+        // One mutable borrow per turn of the loop, taken once and
+        // released before anything is emitted. Nothing here re-reaches
+        // for `state.switch`, so no step can panic on a transaction
+        // another step has already taken.
+        let Some(switch) = state.switch.as_mut() else {
             return;
         };
         if !switch.phase_is_settled() {
             return;
         }
-        match switch.phase {
+        let windows = match switch.phase {
             WorkspaceSwitchPhase::Recording | WorkspaceSwitchPhase::Parking => {
                 // Everything that had to leave the screen has. Bring the
                 // target workspace's parked windows back.
-                let restore = std::mem::take(&mut state.switch.as_mut().expect("switch").queued);
+                let restore = std::mem::take(&mut switch.queued);
                 if restore.is_empty() {
                     commit_switch(state);
                     return;
                 }
-                let switch = state.switch.as_mut().expect("switch");
                 switch.phase = WorkspaceSwitchPhase::Restoring;
-                switch.in_flight = restore.clone();
-                emit_switch_restores(state, restore);
-                return;
+                switch.in_flight.clone_from(&restore);
+                restore
             }
             WorkspaceSwitchPhase::Restoring => {
                 commit_switch(state);
@@ -3573,22 +3593,22 @@ fn advance_switch(state: &mut EngineState) {
             WorkspaceSwitchPhase::CompensatingPark => {
                 // Everything this transaction had restored is back at the
                 // parking site. Now put back everything it parked.
-                let parked = state.switch.as_ref().expect("switch").parked.clone();
-                let switch = state.switch.as_mut().expect("switch");
+                let parked = switch.parked.clone();
                 switch.phase = WorkspaceSwitchPhase::CompensatingRestore;
                 if parked.is_empty() {
                     // Nothing to undo on this side; loop round and finish.
                     continue;
                 }
-                switch.in_flight = parked.clone();
-                emit_switch_restores(state, parked);
-                return;
+                switch.in_flight.clone_from(&parked);
+                parked
             }
             WorkspaceSwitchPhase::CompensatingRestore => {
                 finish_compensation(state);
                 return;
             }
-        }
+        };
+        emit_switch_restores(state, windows);
+        return;
     }
 }
 
@@ -3729,22 +3749,10 @@ fn request_switch_reparks(state: &mut EngineState, windows: Vec<WindowId>) {
             );
             continue;
         };
-        state.next_parking_token += 1;
-        let token = state.next_parking_token;
-        state.pending_parking.push(PendingParking {
-            token,
-            window_id,
-            transaction: Some(transaction_id),
-        });
+        let token = request_recovery_entry(state, window_id, draft, Some(transaction_id));
         if let Some(switch) = state.switch.as_mut() {
             switch.recording.push(token);
         }
-        state
-            .persistence_intents
-            .push(PersistenceIntent::RecordRecovery {
-                token,
-                draft: Box::new(draft),
-            });
     }
 }
 
@@ -3781,7 +3789,13 @@ fn commit_switch(state: &mut EngineState) {
     if switch.reverses_undo.is_none() {
         close_undo_scope(state);
     }
-    // The point of attention comes back with the workspace.
+    // The point of attention comes back with the workspace. When the
+    // window it last had is gone, focus falls back to a member, which is
+    // the same choice `plan_workspace_focus` already makes for a
+    // workspace that is displayed elsewhere -- see
+    // `last_focused_is_forgotten_when_the_window_closes_and_focus_falls_back_to_a_member`.
+    // Deliberately not narrowed here: a switch and a focus disagreeing
+    // about what to raise would be worse than either rule alone.
     let focused = state
         .workspaces
         .get(&target)
@@ -3864,13 +3878,48 @@ fn finish_compensation(state: &mut EngineState) {
     state.revision += 1;
 }
 
+/// Which way a stranded window has to move to reach the place its
+/// workspace says it belongs (CONTEXT.md "Stranded window").
+///
+/// Being stranded says nothing about where the window currently is: a
+/// failed re-park leaves one visible and a failed restore leaves one
+/// parked. Reconciling therefore means moving it in whichever direction
+/// its workspace requires, which is why this is a direction and not a
+/// yes-or-no.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StrandedMove {
+    Park,
+    Restore,
+}
+
+/// The move `window_id` still owes, or `None` when it is already where
+/// its workspace says it belongs.
+fn stranded_move_for(state: &EngineState, window_id: WindowId) -> Option<StrandedMove> {
+    if !state.inventory.contains_key(&window_id) {
+        // The window is gone. Nothing to move, and nothing to report:
+        // a closed window is accounted for by having closed.
+        return None;
+    }
+    let hidden = state
+        .workspaces
+        .workspace_of(window_id)
+        .is_some_and(|name| !state.workspaces.is_displayed(name));
+    let parked = state.parked_windows.contains_key(&window_id);
+    match (hidden, parked) {
+        (true, false) => Some(StrandedMove::Park),
+        (false, true) => Some(StrandedMove::Restore),
+        _ => None,
+    }
+}
+
 /// Decides what an explicit `restore-switch` would do about a degraded
 /// switch, without doing it (CONTEXT.md "Workspace-switch degraded").
 ///
-/// The answer names the stranded windows it would ask the adapter to put
-/// back: those still parked have a ledger entry to restore from, and
-/// those the ledger no longer holds are already wherever they ended up,
-/// so reconciling them is a matter of accounting rather than movement.
+/// The answer names every stranded window that is not where its workspace
+/// says it belongs -- in either direction. A window whose re-park failed
+/// is sitting on a monitor showing another workspace, and putting that
+/// right means parking it, not restoring it; answering "reconciled" and
+/// unblocking would leave two workspaces mixed on one screen.
 pub fn plan_workspace_switch_restore(state: &EngineState) -> WorkspaceSwitchRestoreResult {
     let Some(degraded) = &state.switch_degraded else {
         return WorkspaceSwitchRestoreResult::NotDegraded;
@@ -3879,34 +3928,93 @@ pub fn plan_workspace_switch_restore(state: &EngineState) -> WorkspaceSwitchRest
         .stranded_windows
         .iter()
         .copied()
-        .filter(|window_id| state.parked_windows.contains_key(window_id))
+        .filter(|window_id| stranded_move_for(state, *window_id).is_some())
         .collect();
     if windows.is_empty() {
         return WorkspaceSwitchRestoreResult::Reconciled {
-            restored_windows: Vec::new(),
+            restored_windows: degraded.stranded_windows.clone(),
         };
     }
     WorkspaceSwitchRestoreResult::Requested { windows }
 }
 
-/// Drops `window_id` from the degraded condition, and clears the
-/// condition entirely once nothing is left stranded.
+/// Records that `window_id` could not be moved to the side of the
+/// boundary its workspace requires, outside any switch transaction.
 ///
-/// Called whenever a window comes back on screen, from any path: the
-/// explicit restore, `restore-windows`, or the window's own application
-/// putting it back. Switching unblocks the moment the last stranded
-/// window is accounted for, because that is exactly when the condition
-/// stops being true.
-fn clear_switch_degraded_for(state: &mut EngineState, window_id: WindowId) {
+/// Reapplying a stored assignment, or parking a window a rule sent to a
+/// hidden workspace, moves one window at a time: putting the others back
+/// on a monitor showing a different workspace would mix two workspaces
+/// rather than un-mix them, so there is nothing to compensate. What the
+/// same safety rules do demand is that a half-applied assignment is never
+/// silent -- so the window is recorded as stranded, switching is blocked,
+/// and `restore-switch` is the way out, exactly as after a failed switch.
+///
+/// This is a deliberate reading of issue #61's "reapplied only as fresh
+/// guarded switches" (spec story 90). An all-or-nothing batch would have
+/// to restore the windows it had already parked, and spec story 83 says
+/// two workspaces are never intentionally left mixed; stranding one
+/// window mixes less than un-parking the rest.
+fn strand_window(state: &mut EngineState, window_id: WindowId, reason: String) {
+    let Some(name) = state.workspaces.workspace_of(window_id).cloned() else {
+        return;
+    };
+    if state.workspaces.is_displayed(&name) {
+        return;
+    }
+    let Some(display_id) = state
+        .inventory
+        .get(&window_id)
+        .map(|managed| managed.window.display_id)
+    else {
+        return;
+    };
+    match state.switch_degraded.as_mut() {
+        Some(degraded) => {
+            if !degraded.stranded_windows.contains(&window_id) {
+                degraded.stranded_windows.push(window_id);
+            }
+        }
+        None => {
+            tracing::error!(
+                ?window_id,
+                workspace = %name,
+                %reason,
+                "a window of a hidden workspace could not leave the screen; switching is blocked"
+            );
+            state.switch_degraded = Some(WorkspaceSwitchDegraded {
+                display_id,
+                target: name,
+                outgoing: state.workspaces.displayed_on(display_id).cloned(),
+                stranded_windows: vec![window_id],
+                reason,
+            });
+        }
+    }
+}
+
+/// Drops `window_id` from the degraded condition once it has reached the
+/// place its workspace says it belongs, and clears the condition entirely
+/// when nothing is left stranded.
+///
+/// Called whenever a window lands, in either direction and from any path:
+/// the explicit reconcile, `restore-windows`, a later switch, or the
+/// window's own application moving it. A landing that is still the wrong
+/// side of the boundary settles nothing, so switching unblocks exactly
+/// when the condition stops being true and not before.
+fn settle_stranded_window(state: &mut EngineState, window_id: WindowId) {
+    let still_owed = stranded_move_for(state, window_id).is_some();
     let Some(degraded) = state.switch_degraded.as_mut() else {
         return;
     };
-    if !degraded.stranded_windows.contains(&window_id) {
+    if !degraded.stranded_windows.contains(&window_id) || still_owed {
         return;
     }
     degraded.stranded_windows.retain(|id| *id != window_id);
     if degraded.stranded_windows.is_empty() {
-        tracing::info!("every stranded window is back; workspace switching is unblocked");
+        tracing::info!(
+            "every stranded window is where its workspace says it belongs; \
+             workspace switching is unblocked"
+        );
         state.switch_degraded = None;
     }
     state.revision += 1;
@@ -3969,6 +4077,34 @@ pub fn plan_parking_authorization(
         return Err(ParkingRefusal::AlreadyPending { window_id });
     }
     parking_draft_for(state, window_id).ok_or(ParkingRefusal::UnknownDisplay { window_id })
+}
+
+/// Registers a parking request for `window_id` and returns its token.
+///
+/// The single place a window starts waiting to be parked, so the ordering
+/// ADR 0023 rests on -- the ledger entry recorded first, the parking
+/// effect only once it is acknowledged durable -- is written once instead
+/// of being got right in three places and wrong in a fourth.
+fn request_recovery_entry(
+    state: &mut EngineState,
+    window_id: WindowId,
+    draft: RecoveryDraft,
+    transaction: Option<u64>,
+) -> u64 {
+    state.next_parking_token += 1;
+    let token = state.next_parking_token;
+    state.pending_parking.push(PendingParking {
+        token,
+        window_id,
+        transaction,
+    });
+    state
+        .persistence_intents
+        .push(PersistenceIntent::RecordRecovery {
+            token,
+            draft: Box::new(draft),
+        });
+    token
 }
 
 /// The recovery data for `window_id` as the inventory and the topology
@@ -4130,6 +4266,9 @@ pub fn plan_workspace_switch_on(
         restore,
     };
     if plan.moves_windows() {
+        // The whole-topology conditions first, so a refused parking site
+        // or a degraded database is reported as itself rather than as a
+        // property of whichever window happens to be checked first.
         let status = state.workspace_switching_status();
         if status != WorkspaceSwitchingStatus::Experimental {
             return Err(WorkspaceRefusal::SwitchingNotAuthorised {
@@ -4139,6 +4278,20 @@ pub fn plan_workspace_switch_on(
         }
         if matches!(state.persistence_health, PersistenceHealth::Degraded { .. }) {
             return Err(WorkspaceRefusal::PersistenceDegraded);
+        }
+        // Then every window the switch would move, through the same
+        // authorisation the move itself will ask for. Without this the
+        // switch discovers a window it cannot park only after other
+        // windows have already left the screen.
+        let outgoing = plan.outgoing.clone().unwrap_or_else(|| plan.target.clone());
+        for window_id in &plan.park {
+            if let Err(reason) = plan_parking_authorization(state, *window_id) {
+                return Err(WorkspaceRefusal::MemberNotParkable {
+                    name: outgoing,
+                    window_id: *window_id,
+                    reason,
+                });
+            }
         }
     }
     Ok(plan)
@@ -5087,7 +5240,7 @@ pub fn plan_undo(state: &EngineState) -> UndoResult {
 fn plan_undo_switch_back(
     state: &EngineState,
     transaction: &UndoTransaction,
-) -> Result<Option<WorkspaceSwitchPlan>, String> {
+) -> Result<Option<WorkspaceSwitchPlan>, WorkspaceRefusal> {
     for assignment in &transaction.prior_assignments {
         let Some(display_id) = display_id_of(state, &assignment.display_fingerprint) else {
             continue;
@@ -5097,11 +5250,9 @@ fn plan_undo_switch_back(
             // "nothing": every switch names a workspace to show, so this
             // is refused rather than approximated with a guess about
             // which workspace should take its place.
-            return Err(format!(
-                "display {:?} showed no workspace before that command, and there is no \
-                 command that hides one without showing another",
-                assignment.display_fingerprint
-            ));
+            return Err(WorkspaceRefusal::CannotHideWithoutReplacement {
+                display_fingerprint: assignment.display_fingerprint.clone(),
+            });
         };
         if state
             .workspaces
@@ -5110,9 +5261,7 @@ fn plan_undo_switch_back(
         {
             continue;
         }
-        return plan_workspace_switch_on(state, display_id, name)
-            .map(Some)
-            .map_err(|refusal| refusal.to_string());
+        return plan_workspace_switch_on(state, display_id, name).map(Some);
     }
     Ok(None)
 }
@@ -13505,6 +13654,49 @@ mod tests {
     }
 
     #[test]
+    fn a_switch_refuses_a_window_already_waiting_on_an_explicit_park() {
+        // Two recovery entries for one window would leave the ledger with
+        // an open row nobody restores, which the next session probes.
+        let mut state = switch_fixture();
+        apply(
+            &mut state,
+            Event::ParkingAuthorizationRequested {
+                window_id: WindowId(2),
+            },
+        );
+        assert_eq!(state.pending_parking.len(), 1);
+
+        let refused = plan_workspace_switch(&state, "chat");
+
+        assert_eq!(
+            refused,
+            Err(WorkspaceRefusal::MemberNotParkable {
+                name: ws("dev"),
+                window_id: WindowId(2),
+                reason: ParkingRefusal::AlreadyPending {
+                    window_id: WindowId(2)
+                },
+            })
+        );
+        assert_eq!(
+            focus_workspace(&mut state, "chat"),
+            WorkspaceCommandResult::Refused(WorkspaceRefusal::MemberNotParkable {
+                name: ws("dev"),
+                window_id: WindowId(2),
+                reason: ParkingRefusal::AlreadyPending {
+                    window_id: WindowId(2)
+                },
+            }),
+            "the refusal reaches the command, so nothing moves"
+        );
+        assert_eq!(
+            state.pending_parking.len(),
+            1,
+            "no second recovery entry was requested for the same window"
+        );
+    }
+
+    #[test]
     fn a_second_switch_is_refused_while_one_is_in_flight() {
         let mut state = switch_fixture();
         create(&mut state, "media");
@@ -13532,7 +13724,7 @@ mod tests {
             Err(WorkspaceRefusal::SwitchInFlight {
                 display_id: DisplayId(1)
             }),
-            "exchanging what two monitors show under a switch would leave it              compensating onto a display that changed underneath it"
+            "exchanging what two monitors show under a switch would leave it compensating onto a display that changed underneath it"
         );
     }
 
@@ -13692,6 +13884,130 @@ mod tests {
         );
     }
 
+    /// Strands a window on the *visible* side of the boundary: its
+    /// re-park failed during compensation, so it is sitting on a monitor
+    /// that shows another workspace.
+    ///
+    /// Returns the state with chat displayed, window 1 stranded and
+    /// visible while belonging to hidden dev, window 2 parked, and
+    /// window 3 back on screen as chat's member.
+    fn stranded_visible_window() -> EngineState {
+        let mut state = switch_fixture();
+        switch_to(&mut state, "chat");
+        observe(
+            &mut state,
+            vec![
+                app_window_at(1, "a.exe", 1, Rect::new(0, 0, 400, 300)),
+                app_window_at(2, "b.exe", 1, Rect::new(500, 0, 400, 300)),
+                app_window_at(3, "c.exe", 1, Rect::new(10, 10, 400, 300)),
+            ],
+        );
+        let cursor = state.effects.len();
+        focus_workspace(&mut state, "dev");
+        settle_switch_from(&mut state, cursor, &mut |window_id, stage| {
+            match (window_id, stage) {
+                // Dev's second window will not come back, which cancels
+                // the switch...
+                (WindowId(2), ParkingStage::Restore) => {
+                    Some("the window would not come back".to_owned())
+                }
+                // ...and the first one will not go back to the parking
+                // site, which is what strands it in plain sight.
+                (WindowId(1), ParkingStage::Park) => {
+                    Some("the window would not park again".to_owned())
+                }
+                _ => None,
+            }
+        });
+        state
+    }
+
+    #[test]
+    fn a_window_stranded_in_plain_sight_is_parked_by_the_reconcile_not_declared_fine() {
+        let mut state = stranded_visible_window();
+
+        let degraded = state
+            .switch_degraded
+            .clone()
+            .expect("compensation could not put window 1 back");
+        assert_eq!(degraded.stranded_windows, vec![WindowId(1)]);
+        assert_eq!(
+            state.workspaces.displayed(),
+            vec![(DisplayId(1), ws("chat"))],
+            "the switch was cancelled, so chat is still displayed"
+        );
+        assert!(
+            !state.parked_windows.contains_key(&WindowId(1)),
+            "the stranded window is visible on a monitor showing chat, \
+             while belonging to hidden dev"
+        );
+
+        // The bug this guards: filtering the stranded set down to what is
+        // still parked emptied it, so the reconcile answered "reconciled",
+        // unblocked switching, and left window 1 mixed in with chat.
+        assert_eq!(
+            plan_workspace_switch_restore(&state),
+            WorkspaceSwitchRestoreResult::Requested {
+                windows: vec![WindowId(1)]
+            },
+            "a stranded window owes a move in whichever direction its \
+             workspace requires, not only a restore"
+        );
+
+        let cursor = state.effects.len();
+        apply(&mut state, Event::WorkspaceSwitchRestoreRequested);
+
+        assert!(
+            state.switch_degraded.is_some(),
+            "the condition stands until the window has actually landed"
+        );
+        assert_eq!(
+            state.pending_parking.len(),
+            1,
+            "it leaves the screen the only way any window does: ledger first"
+        );
+
+        settle_switch_from(&mut state, cursor, &mut |_, _| None);
+
+        assert_eq!(state.switch_degraded, None);
+        assert_eq!(sorted_parked(&state), vec![WindowId(1), WindowId(2)]);
+        assert!(
+            plan_workspace_switch(&state, "dev").is_ok(),
+            "switching is available again only now"
+        );
+    }
+
+    #[test]
+    fn a_failed_reconcile_leaves_the_window_stranded_and_switching_blocked() {
+        let mut state = stranded_visible_window();
+        // The parking site is gone, so the reconcile cannot put window 1
+        // where it belongs and must not pretend otherwise.
+        apply(
+            &mut state,
+            Event::ParkingCapabilityReported(ParkingCapability::Refused {
+                reason: "every edge is covered by a display".to_owned(),
+            }),
+        );
+
+        apply(&mut state, Event::WorkspaceSwitchRestoreRequested);
+
+        assert_eq!(
+            state
+                .switch_degraded
+                .as_ref()
+                .map(|degraded| degraded.stranded_windows.clone()),
+            Some(vec![WindowId(1)]),
+            "an explicit failure, not a cleared condition"
+        );
+        assert!(state.pending_parking.is_empty());
+        assert_eq!(
+            state.last_parking_refusal,
+            Some(ParkingRefusal::ParkingRefused {
+                reason: "every edge is covered by a display".to_owned()
+            })
+        );
+    }
+
     #[test]
     fn a_committed_switch_records_the_prior_assignment_and_placements_as_one_transaction() {
         let mut state = switch_fixture();
@@ -13778,8 +14094,11 @@ mod tests {
             );
         };
         assert!(
-            reason.contains("experimental workspace switching is unavailable"),
-            "{reason}"
+            matches!(
+                reason,
+                WorkspaceRefusal::SwitchingNotAuthorised { status, .. } if status == "unavailable"
+            ),
+            "the switch's own typed refusal survives into undo: {reason:?}"
         );
         assert_eq!(
             state.workspaces.displayed(),
@@ -13870,7 +14189,7 @@ mod tests {
     }
 
     #[test]
-    fn reconnecting_a_monitor_does_not_reveal_a_hidden_workspace_that_has_windows() {
+    fn reconnecting_a_monitor_reveals_a_hidden_workspace_only_when_the_profile_maps_it() {
         let mut state = two_display_switching_state();
         observe(
             &mut state,
@@ -14144,6 +14463,71 @@ mod tests {
         );
         settle_switch_from(&mut state, cursor, &mut |_, _| None);
         assert_eq!(sorted_parked(&state), vec![WindowId(1)]);
+    }
+
+    #[test]
+    fn a_half_applied_stored_assignment_is_never_silent() {
+        // Reapplying a stored assignment moves one window at a time. If
+        // one will not move, the workspace is split across the boundary,
+        // and that has to be said rather than left to be discovered.
+        let mut state = switching_state(&["dev"], "dev");
+        create(&mut state, "chat");
+        observe(
+            &mut state,
+            vec![
+                app_window_at(1, "a.exe", 1, Rect::new(0, 0, 400, 300)),
+                app_window_at(2, "b.exe", 1, Rect::new(500, 0, 400, 300)),
+            ],
+        );
+        let chat = ws("chat");
+        state.workspaces.assign(WindowId(1), &chat);
+        state.workspaces.assign(WindowId(2), &chat);
+        let cursor = state.effects.len();
+
+        apply(
+            &mut state,
+            Event::WorkspacesLoaded(vec![
+                PersistedWorkspace {
+                    name: ws("chat"),
+                    origin: WorkspaceOrigin::Command,
+                    displayed_fingerprint: None,
+                    tree: None,
+                },
+                PersistedWorkspace {
+                    name: ws("dev"),
+                    origin: WorkspaceOrigin::Configuration,
+                    displayed_fingerprint: Some("DISPLAY1".to_owned()),
+                    tree: None,
+                },
+            ]),
+        );
+        settle_switch_from(&mut state, cursor, &mut |window_id, stage| {
+            (window_id == WindowId(2) && stage == ParkingStage::Park)
+                .then(|| "the window refused to move".to_owned())
+        });
+
+        assert_eq!(sorted_parked(&state), vec![WindowId(1)]);
+        let degraded = state
+            .switch_degraded
+            .clone()
+            .expect("a window of a hidden workspace is still on screen");
+        assert_eq!(degraded.stranded_windows, vec![WindowId(2)]);
+        assert_eq!(degraded.target, ws("chat"));
+        assert_eq!(
+            plan_workspace_switch(&state, "chat"),
+            Err(WorkspaceRefusal::SwitchDegraded {
+                stranded_windows: 1
+            }),
+            "switching is blocked while a workspace is split across the boundary"
+        );
+
+        // And the same explicit path clears it.
+        let cursor = state.effects.len();
+        apply(&mut state, Event::WorkspaceSwitchRestoreRequested);
+        settle_switch_from(&mut state, cursor, &mut |_, _| None);
+
+        assert_eq!(state.switch_degraded, None);
+        assert_eq!(sorted_parked(&state), vec![WindowId(1), WindowId(2)]);
     }
 
     #[test]
