@@ -415,6 +415,120 @@ fn stored_undo_records_contain_no_window_titles() {
     );
 }
 
+fn dated_draft(command: &str, recorded_at_unix: i64) -> mosaix_domain::UndoTransactionDraft {
+    mosaix_domain::UndoTransactionDraft {
+        recorded_at_unix,
+        ..draft(command, &["Code.exe"])
+    }
+}
+
+fn transaction_count(path: &Path) -> i64 {
+    rusqlite::Connection::open(path)
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM undo_transaction", [], |row| row.get(0))
+        .unwrap()
+}
+
+fn member_count(path: &Path) -> i64 {
+    rusqlite::Connection::open(path)
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM undo_member", [], |row| row.get(0))
+        .unwrap()
+}
+
+#[test]
+fn history_keeps_only_the_newest_hundred_transactions() {
+    let temporary = TempDatabase::new("retention-count");
+    let mut store = Persistence::open(&temporary.path()).expect("database opens");
+    let now = 1_756_000_000;
+
+    for index in 0..105 {
+        store
+            .record_transaction(&dated_draft(&format!("snap-{index}"), now))
+            .expect("records");
+    }
+
+    assert_eq!(
+        transaction_count(&temporary.path()),
+        mosaix_persistence::MAX_UNDO_TRANSACTIONS as i64
+    );
+    assert_eq!(
+        member_count(&temporary.path()),
+        mosaix_persistence::MAX_UNDO_TRANSACTIONS as i64,
+        "pruning a transaction takes its members with it"
+    );
+    assert_eq!(
+        store.newest_transaction().unwrap().unwrap().command,
+        "snap-104",
+        "the newest command is the one that survives, not the oldest"
+    );
+}
+
+#[test]
+fn history_drops_transactions_older_than_the_retention_window() {
+    let temporary = TempDatabase::new("retention-age");
+    let mut store = Persistence::open(&temporary.path()).expect("database opens");
+    let now = 1_756_000_000;
+    let window = mosaix_persistence::UNDO_RETENTION_SECONDS;
+
+    // Exactly at the boundary, one second inside it, and one second past.
+    store.record_transaction(&dated_draft("too-old", now - window - 1)).unwrap();
+    store.record_transaction(&dated_draft("exactly-at-the-edge", now - window)).unwrap();
+    store.record_transaction(&dated_draft("inside", now - window + 1)).unwrap();
+    assert_eq!(transaction_count(&temporary.path()), 3);
+
+    let pruned = store.prune_history(now).expect("pruning succeeds");
+
+    assert_eq!(pruned, 1, "only the entry past the window goes");
+    let surviving: Vec<String> = {
+        let connection = rusqlite::Connection::open(temporary.path()).unwrap();
+        let mut statement = connection
+            .prepare("SELECT command FROM undo_transaction ORDER BY id")
+            .unwrap();
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        rows
+    };
+    assert_eq!(surviving, vec!["exactly-at-the-edge", "inside"]);
+}
+
+#[test]
+fn pruning_is_durable_across_a_restart() {
+    let temporary = TempDatabase::new("retention-restart");
+    let now = 1_756_000_000;
+    {
+        let mut store = Persistence::open(&temporary.path()).expect("database opens");
+        store
+            .record_transaction(&dated_draft("ancient", now - 400_000_000))
+            .unwrap();
+        store.record_transaction(&dated_draft("recent", now)).unwrap();
+        store.prune_history(now).unwrap();
+    }
+
+    let restarted = Persistence::open(&temporary.path()).expect("database reopens");
+
+    assert_eq!(transaction_count(&temporary.path()), 1);
+    assert_eq!(
+        restarted.newest_transaction().unwrap().unwrap().command,
+        "recent"
+    );
+}
+
+#[test]
+fn pruning_an_already_bounded_history_changes_nothing() {
+    let temporary = TempDatabase::new("retention-idempotent");
+    let mut store = Persistence::open(&temporary.path()).expect("database opens");
+    let now = 1_756_000_000;
+    store.record_transaction(&dated_draft("recent", now)).unwrap();
+
+    assert_eq!(store.prune_history(now).unwrap(), 0);
+    assert_eq!(store.prune_history(now).unwrap(), 0);
+    assert_eq!(transaction_count(&temporary.path()), 1);
+}
+
 #[test]
 fn a_locked_database_degrades_the_write_and_recovers_when_the_lock_clears() {
     let temporary = TempDatabase::new("locked");

@@ -238,6 +238,10 @@ fn main() {
             // Intents accumulate in reducer state and are consumed by
             // index, the same way the placement executor consumes effects.
             let mut next_intent = 0usize;
+            // Recording prunes as it writes, so this only has to catch the
+            // agent that is left running without issuing any command.
+            const PRUNE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+            let mut last_prune = std::time::Instant::now();
             loop {
                 if stop_rx.try_recv().is_ok() {
                     break;
@@ -266,6 +270,17 @@ fn main() {
                 }
                 if !submission_failed {
                     next_intent = snapshot.persistence_intents.len();
+                }
+
+                if !submission_failed && last_prune.elapsed() >= PRUNE_INTERVAL {
+                    if worker
+                        .submit(mosaix_persistence::PersistenceRequest::PruneHistory)
+                        .is_err()
+                    {
+                        submission_failed = true;
+                    } else {
+                        last_prune = std::time::Instant::now();
+                    }
                 }
 
                 let revision = snapshot.revision;

@@ -25,6 +25,15 @@ pub struct StateSnapshot {
     pub persistence_status: String,
     pub last_durable_revision: u64,
     pub persistence_reason: Option<String>,
+    /// Whether undoing right now would actually move windows. Computed by
+    /// running the same preflight undo itself runs, so this never claims an
+    /// availability that a request would then refuse.
+    pub undo_available: bool,
+    /// What the next undo would reverse, whether or not it currently can.
+    pub undo_command: Option<String>,
+    pub undo_transaction_id: Option<i64>,
+    /// Why undo is unavailable, when a transaction exists but cannot run.
+    pub undo_blocked_reason: Option<String>,
     pub paused: bool,
     pub automatic_tiling_active: bool,
     pub automatic_tiling_suspended: bool,
@@ -343,6 +352,22 @@ impl From<EngineState> for StateSnapshot {
                     Some(reason.code().to_owned()),
                 ),
             };
+        // Asking the planner rather than merely reporting that history is
+        // non-empty: a stored transaction whose windows are gone, or whose
+        // database is degraded, is not an available undo.
+        let planned = mosaix_engine::plan_undo(&state);
+        let undo_available = planned.is_applied();
+        let undo_blocked_reason = match &planned {
+            UndoResult::Applied(_) => None,
+            UndoResult::Refused(refusal) => Some(refusal.code().to_owned()),
+        };
+        let (undo_command, undo_transaction_id) = match &state.newest_undo {
+            Some(transaction) => (
+                Some(transaction.command.clone()),
+                Some(transaction.id.0),
+            ),
+            None => (None, None),
+        };
         Self {
             revision: state.revision,
             display_count: state.displays.len(),
@@ -353,6 +378,10 @@ impl From<EngineState> for StateSnapshot {
             persistence_status,
             last_durable_revision,
             persistence_reason,
+            undo_available,
+            undo_command,
+            undo_transaction_id,
+            undo_blocked_reason,
             paused: state.paused,
             automatic_tiling_active: state.automatic_tiling_active,
             automatic_tiling_suspended: state.automatic_tiling_suspended,
@@ -1007,6 +1036,45 @@ mod tests {
         let parsed: UndoResult =
             serde_json::from_value(data).expect("the CLI can read what the agent sent");
         assert!(!parsed.is_applied());
+    }
+
+    #[test]
+    fn state_snapshot_reports_undo_as_unavailable_when_history_is_empty() {
+        let json = serde_json::to_value(StateSnapshot::from(EngineState::default())).unwrap();
+
+        assert_eq!(json["undo_available"], false);
+        assert_eq!(json["undo_command"], serde_json::Value::Null);
+        assert_eq!(json["undo_blocked_reason"], "nothing_to_undo");
+    }
+
+    #[test]
+    fn state_snapshot_does_not_advertise_undo_it_would_refuse() {
+        // The honest answer for a stored transaction whose database is
+        // degraded is "not available", with the reason -- not "available"
+        // followed by a refusal when the user acts on it.
+        let mut state = EngineState::default();
+        state.newest_undo = Some(mosaix_domain::UndoTransaction {
+            id: mosaix_domain::UndoTransactionId(9),
+            command: "snap-left".to_owned(),
+            recorded_at_unix: 1_756_000_000,
+            topology_fingerprint: String::new(),
+            durable_revision: 3,
+            members: Vec::new(),
+        });
+        state.persistence_health = PersistenceHealth::Degraded {
+            last_durable_revision: 3,
+            reason: mosaix_persistence::PersistenceFailure::WriteFailed,
+        };
+
+        let json = serde_json::to_value(StateSnapshot::from(state)).unwrap();
+
+        assert_eq!(json["undo_available"], false);
+        assert_eq!(json["undo_blocked_reason"], "persistence_degraded");
+        assert_eq!(
+            json["undo_command"], "snap-left",
+            "what undo would reverse is still worth reporting while it cannot"
+        );
+        assert_eq!(json["undo_transaction_id"], 9);
     }
 
     #[test]

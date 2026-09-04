@@ -46,8 +46,12 @@ enum Command {
     ///
     /// Refuses, and keeps the command available to retry, whenever a target
     /// window cannot be identified beyond doubt or your displays have
-    /// changed. There is no way to force it.
+    /// changed. There is no way to force it. There is no redo: it is
+    /// deferred to issue #44.
     Undo {
+        /// Report what undo would do without doing it.
+        #[arg(long)]
+        dry_run: bool,
         #[arg(long)]
         json: bool,
     },
@@ -121,8 +125,12 @@ fn main() {
     }
     // Undo answers with a typed result either way, so a refusal has to be
     // rendered rather than printed as a bare error string.
-    if let Command::Undo { json } = cli.command {
-        run_undo(json);
+    if let Command::Undo { dry_run, json } = cli.command {
+        if dry_run {
+            report_undo_availability(json);
+        } else {
+            run_undo(json);
+        }
         return;
     }
     let state_json = matches!(&cli.command, Command::State { json: true });
@@ -187,6 +195,59 @@ fn main() {
         Err(error) => {
             eprintln!("mosaix: {error}");
             std::process::exit(2);
+        }
+    }
+}
+
+/// Reports whether undo would work right now, and why not if it would not.
+///
+/// Reads the agent's published state rather than asking undo to preflight,
+/// because the agent already computed the same verdict there -- and because
+/// a dry run must not be able to move a window by accident.
+#[cfg(windows)]
+fn report_undo_availability(json: bool) {
+    let Some(state) = published_persistence() else {
+        eprintln!("mosaix: no agent is running, so there is nothing to undo");
+        std::process::exit(1);
+    };
+    let available = state["undo_available"].as_bool().unwrap_or(false);
+    let command = state["undo_command"].as_str();
+    let blocked = state["undo_blocked_reason"].as_str();
+    let transaction = state["undo_transaction_id"].as_i64();
+
+    if json {
+        let value = serde_json::json!({
+            "undo_available": available,
+            "undo_command": command,
+            "undo_transaction_id": transaction,
+            "undo_blocked_reason": blocked,
+            "persistence_status": state["persistence_status"],
+            "persistence_reason": state["persistence_reason"],
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&value).expect("JSON value serializes")
+        );
+        if !available {
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    match (available, command) {
+        (true, Some(command)) => println!("undo would reverse {command}"),
+        (true, None) => println!("undo is available"),
+        (false, Some(command)) => {
+            println!("undo cannot run");
+            println!("  next in history: {command}");
+            if let Some(blocked) = blocked {
+                println!("  blocked by: {blocked}");
+            }
+            std::process::exit(1);
+        }
+        (false, None) => {
+            println!("there is nothing to undo");
+            std::process::exit(1);
         }
     }
 }
@@ -360,9 +421,10 @@ fn run_persistence(action: PersistenceAction) {
                     println!("persistence: degraded ({reason})");
                     println!("last durable revision: {revision}");
                     println!(
-                        "window management continues from memory; \
-                         run `mosaix persistence reset` to start a fresh database"
+                        "window management continues from memory, but nothing new is \
+                         being made durable and undo will refuse"
                     );
+                    println!("run `mosaix persistence reset` to start a fresh database");
                 }
             }
         }

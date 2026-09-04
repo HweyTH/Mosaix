@@ -51,8 +51,8 @@ use mosaix_layout::{
 };
 use mosaix_domain::identity::{match_window_with_order, WindowEvidence};
 use mosaix_domain::undo::{
-    UndoApplied, UndoMember, UndoRefusal, UndoRestoredWindow, UndoResult, UndoTargetOutcome,
-    UndoTransaction, UndoTransactionDraft, UndoTransactionId,
+    now_unix, UndoApplied, UndoMember, UndoRefusal, UndoRestoredWindow, UndoResult,
+    UndoTargetOutcome, UndoTransaction, UndoTransactionDraft, UndoTransactionId,
 };
 use mosaix_persistence::PersistenceHealth;
 use mosaix_rules::{builtin_rules, ManageAction, Rule, RuleEvaluator};
@@ -380,6 +380,24 @@ const fn zone_snap_command(direction: ZoneSnapDirection) -> &'static str {
         ZoneSnapDirection::Right => "snap-right",
         ZoneSnapDirection::Top => "snap-top",
         ZoneSnapDirection::Bottom => "snap-bottom",
+    }
+}
+
+/// The stored command name for a directional swap.
+const fn swap_command(direction: CardinalDirection) -> &'static str {
+    match direction {
+        CardinalDirection::Left => "swap-left",
+        CardinalDirection::Right => "swap-right",
+        CardinalDirection::Up => "swap-up",
+        CardinalDirection::Down => "swap-down",
+    }
+}
+
+/// The stored command name for a throw to an adjacent display.
+const fn throw_command(direction: DisplayDirection) -> &'static str {
+    match direction {
+        DisplayDirection::Next => "throw-next-display",
+        DisplayDirection::Prev => "throw-previous-display",
     }
 }
 
@@ -862,6 +880,15 @@ fn display_window_order(state: &EngineState, display_id: DisplayId) -> Vec<Windo
 /// must not take down a reducer thread meant to run all day. Every `Event`
 /// variant is handled explicitly so this stays true as the enum grows.
 fn apply(state: &mut EngineState, event: Event) {
+    // An undo scope never outlives the event that opened it. Clearing it
+    // here means a future early return inside a command arm cannot leak
+    // that command's captures into the next command's transaction.
+    debug_assert!(
+        state.undo_scope.is_none(),
+        "an undo scope outlived the event that opened it"
+    );
+    state.undo_scope = None;
+
     match event {
         Event::PersistenceHealthChanged(health) => {
             if state.persistence_health != health {
@@ -979,14 +1006,27 @@ fn apply(state: &mut EngineState, event: Event) {
                 );
                 return;
             };
+            let restored_from = (placement.display_id, placement.bounds);
             placement.display_id = previous_display_id;
             placement.bounds = previous_bounds;
+            // The inventory is the source the identity matcher reads, so it
+            // has to follow the window here as it does in `place_window`.
+            if let Some(managed) = state.inventory.get_mut(&window_id) {
+                managed.window.display_id = previous_display_id;
+                managed.window.bounds = previous_bounds;
+            }
+            // Restore keeps its own meaning -- one remembered in-session
+            // placement, consumed when used -- and is also an explicit
+            // placement command, so it is durably reversible like any other.
+            open_undo_scope(state, "restore");
+            record_undo_member(state, window_id, Some(restored_from));
             state.effects.push(EngineEffect::PlaceWindow {
                 window_id,
                 display_id: previous_display_id,
                 bounds: previous_bounds,
             });
             state.revision += 1;
+            close_undo_scope(state);
         }
 
         Event::WindowThrowToDisplayRequested {
@@ -1032,6 +1072,9 @@ fn apply(state: &mut EngineState, event: Event) {
             };
 
             let new_bounds = throw_preserving_ratio(bounds, from_work_area, to_work_area);
+            // Opened only now that every guard has passed, so a throw that
+            // does nothing records nothing.
+            open_undo_scope(state, throw_command(direction));
             if state.automatic_tiling_active && state.inventory.contains_key(&window_id) {
                 if let Some(order) = state.visual_window_order.get_mut(&from_display_id) {
                     order.retain(|id| *id != window_id);
@@ -1048,11 +1091,15 @@ fn apply(state: &mut EngineState, event: Event) {
                     managed.window.display_id = to_display_id;
                     managed.window.bounds = new_bounds;
                 }
+                // This branch moves the thrown window itself without going
+                // through `place_window`, so it records its own member.
+                record_undo_member(state, window_id, Some((from_display_id, bounds)));
                 reconcile_balanced_grids(state);
                 state.revision += 1;
             } else {
                 place_window(state, window_id, to_display_id, new_bounds, None);
             }
+            close_undo_scope(state);
         }
 
         Event::WindowFocused {
@@ -1263,10 +1310,12 @@ fn apply(state: &mut EngineState, event: Event) {
             }
             state.automatic_tiling_suspended = !state.automatic_tiling_suspended;
             state.automatic_tiling_active = !state.automatic_tiling_suspended;
+            open_undo_scope(state, "toggle-automatic-tiling");
             if state.automatic_tiling_active {
                 reconcile_balanced_grids(state);
             }
             state.revision += 1;
+            close_undo_scope(state);
         }
 
         Event::ToggleFloatingRequested => {
@@ -1277,6 +1326,7 @@ fn apply(state: &mut EngineState, event: Event) {
                 return;
             }
             let action = state.inventory[&window_id].action;
+            open_undo_scope(state, "toggle-floating");
             if action == ManageAction::Float {
                 let force_tiled = !state.session_tiled.contains(&window_id);
                 if force_tiled {
@@ -1298,6 +1348,7 @@ fn apply(state: &mut EngineState, event: Event) {
             }
             reconcile_balanced_grids(state);
             state.revision += 1;
+            close_undo_scope(state);
         }
 
         Event::DirectionalFocusRequested { direction } => {
@@ -1332,8 +1383,10 @@ fn apply(state: &mut EngineState, event: Event) {
                 return;
             };
             order.swap(focused_index, neighbor_index);
+            open_undo_scope(state, swap_command(direction));
             reconcile_balanced_grids(state);
             state.revision += 1;
+            close_undo_scope(state);
         }
 
         Event::InteractivePlacementStarted { window_id } => {
@@ -1519,8 +1572,13 @@ fn apply(state: &mut EngineState, event: Event) {
                 }
             }
             tracing::info!(reset, "rearrange reset open placement circuits");
+            // This event only ever follows an explicit rearrange, so its
+            // placements belong to that command's transaction. The passive
+            // startup and wake reconciliations deliberately have no scope.
+            open_undo_scope(state, "rearrange");
             reconcile_balanced_grids(state);
             state.revision += 1;
+            close_undo_scope(state);
         }
 
         Event::WindowsObserved { windows } => {
@@ -2192,15 +2250,6 @@ fn record_undo_member(
         scope.claimed.insert(window_id);
         scope.members.push(member);
     }
-}
-
-/// Seconds since the Unix epoch, for retention bounds. A clock that has
-/// gone backwards yields zero rather than panicking; retention treats such
-/// an entry as ancient, which errs toward pruning rather than hoarding.
-fn now_unix() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_secs() as i64)
 }
 
 /// Records `bounds` as `window_id`'s current placement on `display_id`,
@@ -7212,6 +7261,235 @@ mod tests {
             recorded_drafts(&state).is_empty(),
             "undo must never claim it can reverse an application closing or a monitor \
              being unplugged"
+        );
+    }
+
+    // ---- Undo coverage and retention (issue #50) ----------------------
+
+    /// Automatic tiling running over two windows on one display, which is
+    /// the situation most explicit commands need in order to move anything.
+    fn tiling_state_with_two_windows() -> EngineState {
+        let mut state = tiling_state_with_saved_layout("halves", &[(0.0, 0.0, 0.5, 1.0)]);
+        state.displays = vec![display(1, "DISPLAY1", 0), display(2, "DISPLAY2", 1920)];
+        apply(
+            &mut state,
+            Event::WindowsObserved {
+                windows: vec![
+                    app_window_at(31, "alpha.exe", 1, Rect::new(10, 10, 400, 300)),
+                    app_window_at(32, "beta.exe", 1, Rect::new(500, 10, 400, 300)),
+                ],
+            },
+        );
+        apply(
+            &mut state,
+            Event::WindowFocused {
+                window_id: WindowId(31),
+                display_id: DisplayId(1),
+                bounds: Rect::new(10, 10, 400, 300),
+            },
+        );
+        state.effects.clear();
+        state.persistence_intents.clear();
+        state
+    }
+
+    /// One named command to drive against a prepared state.
+    type CommandCase = (&'static str, Box<dyn Fn(&mut EngineState)>);
+
+    #[test]
+    fn every_explicit_placement_command_records_exactly_one_transaction() {
+        // Each entry is a command that moves windows. The contract is one
+        // transaction per command -- not none, and not one per window.
+        let commands: Vec<CommandCase> = vec![
+            (
+                "zone snap",
+                Box::new(|state: &mut EngineState| {
+                    apply(
+                        state,
+                        Event::ZoneSnapRequested {
+                            direction: ZoneSnapDirection::Left,
+                        },
+                    )
+                }),
+            ),
+            (
+                "throw to display",
+                Box::new(|state: &mut EngineState| {
+                    apply(
+                        state,
+                        Event::WindowThrowToDisplayRequested {
+                            window_id: WindowId(31),
+                            direction: DisplayDirection::Next,
+                        },
+                    )
+                }),
+            ),
+            (
+                "directional swap",
+                Box::new(|state: &mut EngineState| {
+                    apply(
+                        state,
+                        Event::DirectionalSwapRequested {
+                            direction: CardinalDirection::Right,
+                        },
+                    )
+                }),
+            ),
+            (
+                "toggle floating",
+                Box::new(|state: &mut EngineState| apply(state, Event::ToggleFloatingRequested)),
+            ),
+            (
+                // Suspending moves nothing; resuming is the half that
+                // reflows, so the pair is what has a transaction to record.
+                "toggle automatic tiling back on",
+                Box::new(|state: &mut EngineState| {
+                    apply(state, Event::ToggleAutomaticTilingRequested);
+                    for window_id in [WindowId(31), WindowId(32)] {
+                        if let Some(placement) = state.windows.get_mut(&window_id) {
+                            placement.bounds = Rect::new(5, 5, 100, 100);
+                        }
+                    }
+                    apply(state, Event::ToggleAutomaticTilingRequested);
+                }),
+            ),
+        ];
+
+        for (name, run) in commands {
+            let mut state = tiling_state_with_two_windows();
+            run(&mut state);
+            let drafts = recorded_drafts(&state);
+            assert_eq!(
+                drafts.len(),
+                1,
+                "{name} moved windows but recorded {} transactions",
+                drafts.len()
+            );
+            assert!(
+                !drafts[0].members.is_empty(),
+                "{name} recorded a transaction with nothing in it"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rearrange_records_its_reflow_as_one_transaction() {
+        let mut state = tiling_state_with_two_windows();
+
+        apply(&mut state, Event::RearrangeRequested);
+        // A third window arrived while Mosaix was not looking, so the grid
+        // this rearrange recomputes is genuinely different from the one on
+        // screen -- otherwise there would be nothing to record.
+        apply(
+            &mut state,
+            Event::RearrangeReconciliationComplete {
+                windows: vec![
+                    app_window_at(31, "alpha.exe", 1, Rect::new(10, 10, 400, 300)),
+                    app_window_at(32, "beta.exe", 1, Rect::new(500, 10, 400, 300)),
+                    app_window_at(33, "gamma.exe", 1, Rect::new(900, 10, 400, 300)),
+                ],
+            },
+        );
+
+        let drafts = recorded_drafts(&state);
+        assert_eq!(drafts.len(), 1, "one rearrange, one transaction");
+        assert_eq!(drafts[0].command, "rearrange");
+    }
+
+    #[test]
+    fn restore_keeps_its_own_meaning_and_is_still_durably_reversible() {
+        let mut state = state_ready_to_snap();
+        apply(
+            &mut state,
+            Event::ZoneSnapRequested {
+                direction: ZoneSnapDirection::Left,
+            },
+        );
+        state.persistence_intents.clear();
+        state.effects.clear();
+
+        apply(
+            &mut state,
+            Event::WindowRestoreRequested {
+                window_id: WindowId(7),
+            },
+        );
+
+        assert_eq!(
+            placements(&state),
+            vec![(WindowId(7), DisplayId(1), Rect::new(10, 10, 500, 500))],
+            "restore still returns the window to its remembered placement"
+        );
+        let drafts = recorded_drafts(&state);
+        assert_eq!(drafts.len(), 1, "restore is an explicit placement command");
+        assert_eq!(drafts[0].command, "restore");
+        assert_eq!(
+            drafts[0].members[0].prior_placement,
+            Rect::new(0, 0, 960, 1080),
+            "undoing a restore returns the window to where the restore found it"
+        );
+
+        // The distinct meaning the ticket asks to preserve: one remembered
+        // in-session placement, consumed when it is used.
+        state.effects.clear();
+        state.persistence_intents.clear();
+        apply(
+            &mut state,
+            Event::WindowRestoreRequested {
+                window_id: WindowId(7),
+            },
+        );
+        assert!(
+            placements(&state).is_empty(),
+            "restore remembers one placement, not a history"
+        );
+        assert!(recorded_drafts(&state).is_empty());
+    }
+
+    #[test]
+    fn commands_that_change_no_placement_record_nothing() {
+        let mut state = tiling_state_with_two_windows();
+
+        apply(&mut state, Event::PauseRequested);
+        apply(&mut state, Event::ResumeRequested);
+        apply(
+            &mut state,
+            Event::DirectionalFocusRequested {
+                direction: CardinalDirection::Right,
+            },
+        );
+        apply(
+            &mut state,
+            Event::FocusDisplayRequested {
+                display_id: DisplayId(2),
+            },
+        );
+        apply(&mut state, Event::HotkeyCaptureStarted);
+        apply(&mut state, Event::HotkeyCaptureEnded);
+
+        assert!(
+            recorded_drafts(&state).is_empty(),
+            "pausing, focusing, and opening the hotkey editor move no window, \
+             so none of them belong in undo history"
+        );
+    }
+
+    #[test]
+    fn a_command_that_moves_nothing_records_nothing() {
+        // A throw with nowhere to throw to, on a single-display topology.
+        let mut state = state_ready_to_snap();
+
+        apply(
+            &mut state,
+            Event::WindowThrowToDisplayRequested {
+                window_id: WindowId(7),
+                direction: DisplayDirection::Next,
+            },
+        );
+
+        assert!(
+            recorded_drafts(&state).is_empty(),
+            "undo must not offer to reverse a command that did nothing"
         );
     }
 

@@ -16,7 +16,9 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use mosaix_domain::identity::WindowEvidence;
-use mosaix_domain::undo::{UndoMember, UndoTransaction, UndoTransactionDraft, UndoTransactionId};
+use mosaix_domain::undo::{
+    now_unix, UndoMember, UndoTransaction, UndoTransactionDraft, UndoTransactionId,
+};
 use mosaix_domain::{ApplicationId, Rect, WindowRole};
 use rusqlite::Connection;
 use thiserror::Error;
@@ -94,6 +96,15 @@ const MIGRATIONS: &[Migration] = &[
 
 /// The newest schema this build understands.
 pub const SUPPORTED_SCHEMA_VERSION: i32 = MIGRATIONS[MIGRATIONS.len() - 1].version;
+
+/// How many undo transactions history keeps at most (ADR 0024). Fixed in
+/// the first release: a configurable bound would be a promise about how
+/// much behavioural history Mosaix retains, and that is a decision worth
+/// making once rather than per user.
+pub const MAX_UNDO_TRANSACTIONS: u32 = 100;
+
+/// How long an undo transaction may live, in seconds. Seven days.
+pub const UNDO_RETENTION_SECONDS: i64 = 7 * 24 * 60 * 60;
 
 /// The schema steps this build ships, in ascending order.
 pub const fn migrations() -> &'static [Migration] {
@@ -472,10 +483,26 @@ impl Persistence {
                     ],
                 )?;
             }
+            // Pruning rides inside the insert's transaction, so history is
+            // never observably over its bounds and a failed prune cannot
+            // leave the new transaction stored without it.
+            prune_within(&transaction, draft.recorded_at_unix)?;
             transaction.commit()?;
             Ok(id)
         })?;
         Ok(outcome)
+    }
+
+    /// Applies both retention bounds and answers how many transactions
+    /// were removed. `now_unix` is a parameter rather than a clock read so
+    /// the boundary is testable and the caller decides what "now" means.
+    pub fn prune_history(&mut self, now_unix: i64) -> Result<usize, PersistenceError> {
+        self.write(|connection| {
+            let transaction = connection.unchecked_transaction()?;
+            let removed = prune_within(&transaction, now_unix)?;
+            transaction.commit()?;
+            Ok(removed)
+        })
     }
 
     /// The transaction undo would examine next, or `None` when history is
@@ -602,6 +629,21 @@ impl<T> OptionalRow<T> for Result<T, rusqlite::Error> {
     }
 }
 
+/// Enforces both retention bounds in one statement, so whichever binds
+/// first does. Members follow their transaction out through the foreign
+/// key's cascade rather than a second delete that could be skipped.
+fn prune_within(connection: &Connection, now_unix: i64) -> Result<usize, rusqlite::Error> {
+    let cutoff = now_unix.saturating_sub(UNDO_RETENTION_SECONDS);
+    connection.execute(
+        "DELETE FROM undo_transaction
+         WHERE recorded_at_unix < ?1
+            OR id NOT IN (
+                SELECT id FROM undo_transaction ORDER BY id DESC LIMIT ?2
+            )",
+        rusqlite::params![cutoff, MAX_UNDO_TRANSACTIONS],
+    )
+}
+
 fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
     let mut name = path.as_os_str().to_owned();
     name.push(suffix);
@@ -637,6 +679,13 @@ pub enum PersistenceRequest {
     RecordUndoTransaction(UndoTransactionDraft),
     /// Remove a transaction that has just been undone.
     ConsumeUndoTransaction(UndoTransactionId),
+    /// Apply the retention bounds against the current clock.
+    ///
+    /// Recording already prunes, so this exists for the case recording
+    /// cannot reach: an agent left running with no commands issued, whose
+    /// newest transaction would otherwise age past the window and still be
+    /// offered.
+    PruneHistory,
 }
 
 /// What the worker reports after each request: how durability now stands,
@@ -671,6 +720,14 @@ pub struct PersistenceWorker {
 impl PersistenceWorker {
     pub fn start(path: impl AsRef<Path>) -> Result<Self, PersistenceError> {
         let mut persistence = Persistence::open(path.as_ref())?;
+
+        // History that aged out while the agent was not running is dropped
+        // before anyone is told what undo would do, so a stale transaction
+        // is never offered even once.
+        if let Err(error) = persistence.prune_history(now_unix()) {
+            tracing::warn!(%error, "undo history could not be pruned at startup");
+        }
+
         let (sender, receiver) = mpsc::channel();
         let (update_sender, updates) = mpsc::channel();
 
@@ -696,6 +753,9 @@ impl PersistenceWorker {
                     }
                     PersistenceRequest::ConsumeUndoTransaction(id) => {
                         persistence.consume_transaction(*id).map(|_| ())
+                    }
+                    PersistenceRequest::PruneHistory => {
+                        persistence.prune_history(now_unix()).map(|_| ())
                     }
                 };
                 if let Err(error) = outcome {

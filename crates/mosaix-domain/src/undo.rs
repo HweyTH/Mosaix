@@ -15,6 +15,17 @@ use crate::geometry::Rect;
 use crate::id::{DisplayId, WindowId};
 use crate::identity::{MatchOutcome, WindowEvidence};
 
+/// Seconds since the Unix epoch, as retention bounds measure time.
+///
+/// A clock that has gone backwards past the epoch yields zero rather than
+/// panicking. Retention then treats such an entry as ancient, which errs
+/// toward pruning history rather than hoarding it.
+pub fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs() as i64)
+}
+
 /// A stored transaction's identity. Assigned by the state database, so a
 /// caller can name the transaction a refusal was about.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
