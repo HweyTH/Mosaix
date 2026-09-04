@@ -5,6 +5,7 @@ pub mod display;
 pub mod geometry;
 pub mod id;
 pub mod identity;
+pub mod tree;
 pub mod undo;
 pub mod window;
 
@@ -17,6 +18,7 @@ pub use identity::{
     match_window, match_window_with_order, EvidenceContribution, EvidenceSignal, MatchOutcome,
     ScoredCandidate, WindowEvidence,
 };
+pub use tree::{Child, ContainerTree, Node, PersistedTree, SplitAxis, Tree};
 pub use undo::{
     UndoApplied, UndoMember, UndoRefusal, UndoRestoredWindow, UndoResult, UndoTargetOutcome,
     UndoTransaction, UndoTransactionDraft, UndoTransactionId,

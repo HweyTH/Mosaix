@@ -14,6 +14,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::protocol::{IpcRequest, IpcResponse};
 
+/// One display's container tree, as its windows in visual order.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ContainerTreeSnapshot {
+    pub display_id: isize,
+    pub windows: Vec<isize>,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct StateSnapshot {
     pub revision: u64,
@@ -34,6 +41,13 @@ pub struct StateSnapshot {
     pub undo_transaction_id: Option<i64>,
     /// Why undo is unavailable, when a transaction exists but cannot run.
     pub undo_blocked_reason: Option<String>,
+    /// Which arrangement automatic tiling is producing: `balanced` or
+    /// `tree`. Reported whether or not tiling is currently active, so a
+    /// caller can tell "tree mode, suspended" from "balanced mode".
+    pub tiling_mode: String,
+    /// Each display's container tree, as the windows it holds in visual
+    /// order. Empty under the balanced grid, which keeps no structure.
+    pub container_trees: Vec<ContainerTreeSnapshot>,
     pub paused: bool,
     pub automatic_tiling_active: bool,
     pub automatic_tiling_suspended: bool,
@@ -361,6 +375,20 @@ impl From<EngineState> for StateSnapshot {
             UndoResult::Applied(_) => None,
             UndoResult::Refused(refusal) => Some(refusal.code().to_owned()),
         };
+        // Trees are published as their leaves in visual order rather than
+        // as the nested structure. That is what a client can act on -- the
+        // structure itself is the reducer's, and republishing it would
+        // invite a client to reason about a shape it cannot change.
+        let mut container_trees: Vec<ContainerTreeSnapshot> = state
+            .trees
+            .iter()
+            .map(|(display_id, tree)| ContainerTreeSnapshot {
+                display_id: display_id.0,
+                windows: tree.leaves().into_iter().map(|id| id.0).collect(),
+            })
+            .collect();
+        container_trees.sort_by_key(|snapshot| snapshot.display_id);
+
         let (undo_command, undo_transaction_id) = match &state.newest_undo {
             Some(transaction) => (
                 Some(transaction.command.clone()),
@@ -382,6 +410,8 @@ impl From<EngineState> for StateSnapshot {
             undo_command,
             undo_transaction_id,
             undo_blocked_reason,
+            tiling_mode: state.resolved_config.tiling_mode.code().to_owned(),
+            container_trees,
             paused: state.paused,
             automatic_tiling_active: state.automatic_tiling_active,
             automatic_tiling_suspended: state.automatic_tiling_suspended,
@@ -1036,6 +1066,38 @@ mod tests {
         let parsed: UndoResult =
             serde_json::from_value(data).expect("the CLI can read what the agent sent");
         assert!(!parsed.is_applied());
+    }
+
+    #[test]
+    fn state_snapshot_reports_the_balanced_grid_and_no_trees_by_default() {
+        let json = serde_json::to_value(StateSnapshot::from(EngineState::default())).unwrap();
+
+        assert_eq!(json["tiling_mode"], "balanced");
+        assert_eq!(json["container_trees"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn state_snapshot_publishes_each_displays_tree_in_visual_order() {
+        use mosaix_domain::tree::{ContainerTree, SplitAxis};
+
+        let mut state = EngineState::default();
+        state.resolved_config.tiling_mode = mosaix_config::TilingMode::Tree;
+        let mut tree = ContainerTree::new();
+        tree.insert_first(mosaix_domain::WindowId(11));
+        tree.split_leaf(
+            &mosaix_domain::WindowId(11),
+            SplitAxis::Horizontal,
+            mosaix_domain::WindowId(12),
+        );
+        state.trees.insert(DisplayId(2), tree);
+
+        let json = serde_json::to_value(StateSnapshot::from(state)).unwrap();
+
+        assert_eq!(json["tiling_mode"], "tree");
+        assert_eq!(
+            json["container_trees"],
+            serde_json::json!([{ "display_id": 2, "windows": [11, 12] }])
+        );
     }
 
     #[test]

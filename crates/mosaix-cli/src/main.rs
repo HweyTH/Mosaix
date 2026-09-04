@@ -55,6 +55,12 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Report the automatic-tiling arrangement and, in tree mode, each
+    /// display's container tree.
+    Arrangement {
+        #[arg(long)]
+        json: bool,
+    },
     /// Inspect or recover the durable state database.
     Persistence {
         #[command(subcommand)]
@@ -123,6 +129,12 @@ fn main() {
         run_persistence(action);
         return;
     }
+    // Arrangement reads fields the agent already publishes and renders
+    // them, rather than asking for a report the agent does not have.
+    if let Command::Arrangement { json } = cli.command {
+        report_arrangement(json);
+        return;
+    }
     // Undo answers with a typed result either way, so a refusal has to be
     // rendered rather than printed as a bare error string.
     if let Command::Undo { dry_run, json } = cli.command {
@@ -173,7 +185,9 @@ fn main() {
         } => IpcRequest::ApplyLayout { name },
         Command::State { .. } => IpcRequest::GetState,
         Command::Ping => IpcRequest::Ping,
-        Command::Persistence { .. } | Command::Undo { .. } => unreachable!("handled above"),
+        Command::Persistence { .. } | Command::Undo { .. } | Command::Arrangement { .. } => {
+            unreachable!("handled above")
+        }
     };
     match send_request(request) {
         Ok(IpcResponse::Ok { data: Some(data) }) if state_json => {
@@ -198,6 +212,80 @@ fn main() {
         }
     }
 }
+
+/// Renders the arrangement section of published state.
+///
+/// A pure function of the snapshot so the wording can be tested without an
+/// agent to talk to, which is the only part of this command with any
+/// decisions in it.
+fn format_arrangement(state: &serde_json::Value) -> String {
+    let mode = state["tiling_mode"].as_str().unwrap_or("unknown");
+    let active = state["automatic_tiling_active"].as_bool().unwrap_or(false);
+    let suspended = state["automatic_tiling_suspended"]
+        .as_bool()
+        .unwrap_or(false);
+
+    // Suspension is reported ahead of activity because a suspended
+    // arrangement is still the configured one -- saying "off" would read as
+    // "you are not using tree mode".
+    let status = if suspended {
+        "suspended"
+    } else if active {
+        "active"
+    } else {
+        "off"
+    };
+    let mut rendered = format!("arrangement: {mode} ({status})");
+
+    let trees = state["container_trees"].as_array();
+    match trees {
+        Some(trees) if !trees.is_empty() => {
+            for tree in trees {
+                let display = tree["display_id"].as_i64().unwrap_or(0);
+                let windows: Vec<String> = tree["windows"]
+                    .as_array()
+                    .map(|windows| {
+                        windows
+                            .iter()
+                            .filter_map(|window| window.as_i64())
+                            .map(|window| window.to_string())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                rendered.push_str(&format!("\n  display {display}: {}", windows.join(" ")));
+            }
+        }
+        _ if mode == "tree" => {
+            rendered.push_str("\n  no display is arranging windows yet");
+        }
+        _ => {}
+    }
+    rendered
+}
+
+#[cfg(windows)]
+fn report_arrangement(json: bool) {
+    let Some(state) = published_persistence() else {
+        eprintln!("mosaix: no agent is running");
+        std::process::exit(1);
+    };
+
+    if json {
+        let value = serde_json::json!({
+            "tiling_mode": state["tiling_mode"],
+            "automatic_tiling_active": state["automatic_tiling_active"],
+            "automatic_tiling_suspended": state["automatic_tiling_suspended"],
+            "container_trees": state["container_trees"],
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&value).expect("JSON value serializes")
+        );
+        return;
+    }
+    println!("{}", format_arrangement(&state));
+}
+
 
 /// Reports whether undo would work right now, and why not if it would not.
 ///
@@ -467,4 +555,77 @@ fn main() {
     let _ = Cli::parse();
     eprintln!("mosaix currently only supports Windows");
     std::process::exit(2);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_balanced_agent_reports_no_trees() {
+        let state = serde_json::json!({
+            "tiling_mode": "balanced",
+            "automatic_tiling_active": true,
+            "automatic_tiling_suspended": false,
+            "container_trees": [],
+        });
+
+        assert_eq!(format_arrangement(&state), "arrangement: balanced (active)");
+    }
+
+    #[test]
+    fn tree_mode_lists_each_displays_windows_in_visual_order() {
+        let state = serde_json::json!({
+            "tiling_mode": "tree",
+            "automatic_tiling_active": true,
+            "automatic_tiling_suspended": false,
+            "container_trees": [
+                { "display_id": 1, "windows": [11, 12, 13] },
+                { "display_id": 2, "windows": [21] },
+            ],
+        });
+
+        assert_eq!(
+            format_arrangement(&state),
+            "arrangement: tree (active)\n  display 1: 11 12 13\n  display 2: 21"
+        );
+    }
+
+    #[test]
+    fn tree_mode_with_nothing_arranged_says_so_rather_than_printing_nothing() {
+        let state = serde_json::json!({
+            "tiling_mode": "tree",
+            "automatic_tiling_active": true,
+            "automatic_tiling_suspended": false,
+            "container_trees": [],
+        });
+
+        assert_eq!(
+            format_arrangement(&state),
+            "arrangement: tree (active)\n  no display is arranging windows yet"
+        );
+    }
+
+    #[test]
+    fn a_suspended_arrangement_is_not_reported_as_off() {
+        let state = serde_json::json!({
+            "tiling_mode": "tree",
+            "automatic_tiling_active": false,
+            "automatic_tiling_suspended": true,
+            "container_trees": [],
+        });
+
+        assert!(
+            format_arrangement(&state).starts_with("arrangement: tree (suspended)"),
+            "a suspended arrangement is still the configured one"
+        );
+    }
+
+    #[test]
+    fn a_snapshot_missing_its_fields_renders_without_panicking() {
+        assert_eq!(
+            format_arrangement(&serde_json::json!({})),
+            "arrangement: unknown (off)"
+        );
+    }
 }

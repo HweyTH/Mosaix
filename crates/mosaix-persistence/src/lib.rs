@@ -10,12 +10,14 @@
 //! failed migration is preserved byte-for-byte until a user asks for
 //! [`Persistence::reset`].
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use mosaix_domain::identity::WindowEvidence;
+use mosaix_domain::tree::PersistedTree;
 use mosaix_domain::undo::{
     now_unix, UndoMember, UndoTransaction, UndoTransactionDraft, UndoTransactionId,
 };
@@ -91,6 +93,17 @@ const MIGRATIONS: &[Migration] = &[
                      );
                      CREATE INDEX undo_transaction_recorded_at
                          ON undo_transaction (recorded_at_unix);",
+    },
+    // Container trees (ADR 0023). One row per display, holding the whole
+    // arrangement as a document rather than a row per node: the tree is
+    // only ever read and written whole, and a document cannot be left
+    // half-updated the way a set of node rows could.
+    Migration {
+        version: 3,
+        statements: "CREATE TABLE container_tree (
+                         display_fingerprint TEXT PRIMARY KEY,
+                         tree TEXT NOT NULL
+                     );",
     },
 ];
 
@@ -193,6 +206,8 @@ pub enum PersistenceError {
     },
     #[error("database write failed: {0}")]
     Write(#[source] rusqlite::Error),
+    #[error("an arrangement could not be encoded for storage: {0}")]
+    TreeEncoding(#[source] serde_json::Error),
     #[error("database directory could not be created: {0}")]
     Directory(#[source] std::io::Error),
     #[error("database file could not be moved aside: {0}")]
@@ -206,7 +221,9 @@ impl PersistenceError {
             Self::Open(_) | Self::Directory(_) | Self::Quarantine(_) => {
                 PersistenceFailure::OpenFailed
             }
-            Self::Read(_) | Self::Corrupt { .. } => PersistenceFailure::CorruptOrUnreadable,
+            Self::Read(_) | Self::Corrupt { .. } | Self::TreeEncoding(_) => {
+                PersistenceFailure::CorruptOrUnreadable
+            }
             Self::Migration { .. } => PersistenceFailure::MigrationFailed,
             Self::Write(_) => PersistenceFailure::WriteFailed,
         }
@@ -591,6 +608,74 @@ impl Persistence {
         })
     }
 
+    /// Stores one display's arrangement, replacing whatever it held.
+    ///
+    /// An empty tree deletes the row instead of storing an empty document:
+    /// a display with no tiled windows has no arrangement, and keeping a
+    /// row for it would restore emptiness over a fresh arrangement.
+    pub fn save_tree(
+        &mut self,
+        display_fingerprint: &str,
+        tree: &PersistedTree,
+    ) -> Result<(), PersistenceError> {
+        if tree.is_empty() {
+            return self.delete_tree(display_fingerprint).map(|_| ());
+        }
+        let document = serde_json::to_string(tree).map_err(PersistenceError::TreeEncoding)?;
+        self.write(|connection| {
+            connection.execute(
+                "INSERT INTO container_tree (display_fingerprint, tree) VALUES (?1, ?2)
+                 ON CONFLICT (display_fingerprint) DO UPDATE SET tree = excluded.tree",
+                rusqlite::params![display_fingerprint, document],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn delete_tree(&mut self, display_fingerprint: &str) -> Result<bool, PersistenceError> {
+        self.write(|connection| {
+            let removed = connection.execute(
+                "DELETE FROM container_tree WHERE display_fingerprint = ?1",
+                [display_fingerprint],
+            )?;
+            Ok(removed > 0)
+        })
+    }
+
+    /// Every stored arrangement, keyed by the display it belongs to.
+    ///
+    /// A row that cannot be read as a tree is skipped with a warning rather
+    /// than failing the load: one unreadable display's arrangement is not a
+    /// reason to lose the others.
+    pub fn load_trees(&self) -> Result<HashMap<String, PersistedTree>, PersistenceError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT display_fingerprint, tree FROM container_tree")
+            .map_err(PersistenceError::Read)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(PersistenceError::Read)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(PersistenceError::Read)?;
+
+        let mut trees = HashMap::with_capacity(rows.len());
+        for (fingerprint, document) in rows {
+            match serde_json::from_str::<PersistedTree>(&document) {
+                Ok(tree) => {
+                    trees.insert(fingerprint, tree);
+                }
+                Err(error) => tracing::warn!(
+                    %error,
+                    %fingerprint,
+                    "stored arrangement could not be read; that display starts empty"
+                ),
+            }
+        }
+        Ok(trees)
+    }
+
     /// Runs a write, mapping any failure onto the same sticky degradation
     /// [`Persistence::commit_revision`] uses. Every durable write in this
     /// module goes through here so that one failed write cannot leave the
@@ -671,7 +756,9 @@ fn quarantine_path(path: &Path) -> PathBuf {
 }
 
 /// A durable write for the worker to perform, in the order submitted.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Not `Eq`: a container tree carries float weights.
+#[derive(Debug, Clone, PartialEq)]
 pub enum PersistenceRequest {
     /// Record committed state through `revision` as durable.
     Commit { revision: u64 },
@@ -686,15 +773,26 @@ pub enum PersistenceRequest {
     /// newest transaction would otherwise age past the window and still be
     /// offered.
     PruneHistory,
+    /// Store one display's container tree.
+    SaveContainerTree {
+        display_fingerprint: String,
+        tree: Box<PersistedTree>,
+    },
 }
 
 /// What the worker reports after each request: how durability now stands,
 /// and what undo would find. Both travel together so the agent never
 /// publishes a health state and an undo history from different moments.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PersistenceUpdate {
     pub health: PersistenceHealth,
     pub newest_undo: Option<UndoTransaction>,
+    /// The stored arrangements, sent only in the worker's first update.
+    ///
+    /// Once the reducer has adopted them it is the authority on what each
+    /// display's tree is, and the database follows it. Re-sending them
+    /// would let a stale arrangement overwrite a live one.
+    pub restored_trees: Option<HashMap<String, PersistedTree>>,
 }
 
 #[derive(Debug)]
@@ -732,9 +830,19 @@ impl PersistenceWorker {
         let (update_sender, updates) = mpsc::channel();
 
         // The first update is sent before any request arrives, so a caller
-        // learns what undo history the database already holds without
-        // having to write something first.
-        let _ = update_sender.send(snapshot_of(&persistence));
+        // learns what the database already holds -- history and stored
+        // arrangements alike -- without having to write something first.
+        let restored_trees = match persistence.load_trees() {
+            Ok(trees) => Some(trees),
+            Err(error) => {
+                tracing::warn!(%error, "stored arrangements could not be read");
+                None
+            }
+        };
+        let _ = update_sender.send(PersistenceUpdate {
+            restored_trees,
+            ..snapshot_of(&persistence)
+        });
 
         let join = thread::spawn(move || {
             while let Ok(message) = receiver.recv() {
@@ -757,6 +865,10 @@ impl PersistenceWorker {
                     PersistenceRequest::PruneHistory => {
                         persistence.prune_history(now_unix()).map(|_| ())
                     }
+                    PersistenceRequest::SaveContainerTree {
+                        display_fingerprint,
+                        tree,
+                    } => persistence.save_tree(display_fingerprint, tree),
                 };
                 if let Err(error) = outcome {
                     tracing::warn!(
@@ -821,6 +933,7 @@ fn snapshot_of(persistence: &Persistence) -> PersistenceUpdate {
     PersistenceUpdate {
         health: persistence.health(),
         newest_undo,
+        restored_trees: None,
     }
 }
 
@@ -879,6 +992,7 @@ mod tests {
                     last_durable_revision: 0
                 },
                 newest_undo: None,
+                restored_trees: Some(HashMap::new()),
             },
             "the worker states what the database already holds before any write"
         );

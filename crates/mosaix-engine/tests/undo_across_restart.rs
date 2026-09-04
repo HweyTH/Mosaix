@@ -115,7 +115,7 @@ fn record_a_snap(fingerprint: &str) -> mosaix_domain::UndoTransactionDraft {
     let draft = settle(&reader, "the snap to be recorded", |state| {
         state.persistence_intents.iter().find_map(|intent| match intent {
             PersistenceIntent::RecordUndoTransaction(draft) => Some(draft.clone()),
-            PersistenceIntent::ConsumeUndoTransaction(_) => None,
+            _ => None,
         })
     });
     engine.stop();

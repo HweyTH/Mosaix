@@ -262,6 +262,13 @@ fn main() {
                         mosaix_engine::PersistenceIntent::ConsumeUndoTransaction(id) => {
                             mosaix_persistence::PersistenceRequest::ConsumeUndoTransaction(*id)
                         }
+                        mosaix_engine::PersistenceIntent::SaveContainerTree {
+                            display_fingerprint,
+                            tree,
+                        } => mosaix_persistence::PersistenceRequest::SaveContainerTree {
+                            display_fingerprint: display_fingerprint.clone(),
+                            tree: tree.clone(),
+                        },
                     };
                     if worker.submit(request).is_err() {
                         submission_failed = true;
@@ -311,6 +318,12 @@ fn main() {
                     let _ = events.send(mosaix_engine::Event::UndoHistoryLoaded(
                         update.newest_undo.map(Box::new),
                     ));
+                    // Only the worker's first update carries these, so the
+                    // reducer's arrangements are never overwritten by the
+                    // database once the reducer owns them.
+                    if let Some(trees) = update.restored_trees {
+                        let _ = events.send(mosaix_engine::Event::ContainerTreesLoaded(trees));
+                    }
                 }
 
                 std::thread::sleep(std::time::Duration::from_millis(50));

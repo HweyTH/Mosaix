@@ -40,16 +40,17 @@ use std::sync::mpsc::{sync_channel, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
-use mosaix_config::{Command, ResolvedConfig, ResolvedConfigSet};
+use mosaix_config::{Command, ResolvedConfig, ResolvedConfigSet, TilingMode};
 use mosaix_domain::{
     topology_fingerprint, Display, DisplayId, Rect, Window, WindowId, WindowLifecycle,
 };
 use mosaix_layout::{
-    apply_gaps, cycle_display, plan_balanced_grid, resolve_saved_layout, resolve_zone_cycle,
-    snap_to_half, throw_preserving_ratio, CycleStep, DisplayDirection, HalfZone,
-    HorizontalDirection,
+    apply_gaps, choose_insertion, cycle_display, plan_balanced_grid, plan_tree, plan_tree_raw,
+    resolve_saved_layout, resolve_zone_cycle, snap_to_half, throw_preserving_ratio, CycleStep,
+    DisplayDirection, HalfZone, HorizontalDirection,
 };
 use mosaix_domain::identity::{match_window_with_order, WindowEvidence};
+use mosaix_domain::tree::{ContainerTree, PersistedTree};
 use mosaix_domain::undo::{
     now_unix, UndoApplied, UndoMember, UndoRefusal, UndoRestoredWindow, UndoResult,
     UndoTargetOutcome, UndoTransaction, UndoTransactionDraft, UndoTransactionId,
@@ -95,12 +96,21 @@ pub enum EngineEffect {
 /// from effects because an effect touches the desktop and an intent
 /// touches the disk -- and because a storage failure must never look like
 /// a placement failure.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Not `Eq`: a container tree carries float weights.
+#[derive(Debug, Clone, PartialEq)]
 pub enum PersistenceIntent {
     /// Store one explicit command's reversible placements.
     RecordUndoTransaction(UndoTransactionDraft),
     /// Remove a transaction that has just been undone successfully.
     ConsumeUndoTransaction(UndoTransactionId),
+    /// Store one display's container tree, so the arrangement survives a
+    /// restart. Keyed by the display's stable fingerprint rather than its
+    /// id, which is a native handle and means nothing next session.
+    SaveContainerTree {
+        display_fingerprint: String,
+        tree: Box<PersistedTree>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -187,6 +197,27 @@ pub struct EngineState {
     /// everything it moves. Lives only for the duration of one [`apply`]
     /// call, and is `None` between events.
     undo_scope: Option<UndoScope>,
+    /// Each display's container tree, when tree mode is the resolved
+    /// arrangement (ADR 0023). Empty under the balanced grid, which keeps
+    /// no structure between reflows. A display that leaves the topology
+    /// takes its tree with it, the way its arrangement name does.
+    pub trees: HashMap<DisplayId, ContainerTree>,
+    /// Stored arrangements the agent read at startup, waiting for their
+    /// display to have windows to match them against.
+    ///
+    /// Consumed the first time that display reflows, after which the
+    /// reducer is the authority on its tree and the database follows.
+    /// Holding them here rather than adopting them on arrival is what makes
+    /// the order of "the database answered" and "the windows were observed"
+    /// not matter.
+    pub pending_trees: HashMap<String, PersistedTree>,
+    /// Each display's tree as it was last written out.
+    ///
+    /// Compared against rather than a snapshot taken at the start of the
+    /// reflow, because commands reshape the tree before asking for a
+    /// reflow -- a directional swap does exactly that -- and such a change
+    /// would otherwise look like no change at all.
+    saved_trees: HashMap<DisplayId, ContainerTree>,
     pub displays: Vec<Display>,
     /// Where each tracked window currently sits, keyed by window. Entries
     /// are created (and their `previous_placement` remembered) by
@@ -435,6 +466,10 @@ pub enum Event {
 
     /// Reverse the newest transaction, or refuse and keep it (ADR 0024).
     UndoRequested,
+
+    /// The container trees the state database holds, keyed by display
+    /// fingerprint. Published once at startup.
+    ContainerTreesLoaded(HashMap<String, PersistedTree>),
 
     /// A window was snapped or otherwise placed at `bounds` on
     /// `display_id`. Producers (a zone-snap command that resolved bounds
@@ -904,6 +939,17 @@ fn apply(state: &mut EngineState, event: Event) {
             }
         }
 
+        Event::ContainerTreesLoaded(trees) => {
+            if trees.is_empty() {
+                return;
+            }
+            state.pending_trees = trees;
+            // A display that already has windows adopts its arrangement
+            // now; one that does not will adopt it when it first reflows.
+            reconcile_arrangements(state);
+            state.revision += 1;
+        }
+
         Event::UndoRequested => {
             if state.paused {
                 tracing::debug!("undo requested while paused; ignoring");
@@ -965,12 +1011,22 @@ fn apply(state: &mut EngineState, event: Event) {
             state
                 .last_applied_layouts
                 .retain(|display_id, _| state.displays.iter().any(|d| d.id == *display_id));
+            // A container tree for a display that is gone is structure with
+            // nowhere to go. Dropped here rather than during the reflow
+            // below, because the reflow does not run when the new topology
+            // resolves to a configuration without automatic tiling.
+            state
+                .trees
+                .retain(|display_id, _| state.displays.iter().any(|d| d.id == *display_id));
+            state
+                .saved_trees
+                .retain(|display_id, _| state.displays.iter().any(|d| d.id == *display_id));
             if topology_identity_changed {
                 state.resolved_config = select_resolved_config(&state.config_set, &state.displays);
                 state.automatic_tiling_suspended = false;
                 state.automatic_tiling_active = state.resolved_config.automatic_tiling_enabled;
             }
-            reconcile_balanced_grids(state);
+            reconcile_arrangements(state);
             state.revision += 1;
         }
 
@@ -987,7 +1043,7 @@ fn apply(state: &mut EngineState, event: Event) {
                 set_session_floating(state, window_id, true);
             }
             place_window(state, window_id, display_id, bounds, None);
-            reconcile_balanced_grids(state);
+            reconcile_arrangements(state);
         }
 
         Event::WindowRestoreRequested { window_id } => {
@@ -1094,7 +1150,7 @@ fn apply(state: &mut EngineState, event: Event) {
                 // This branch moves the thrown window itself without going
                 // through `place_window`, so it records its own member.
                 record_undo_member(state, window_id, Some((from_display_id, bounds)));
-                reconcile_balanced_grids(state);
+                reconcile_arrangements(state);
                 state.revision += 1;
             } else {
                 place_window(state, window_id, to_display_id, new_bounds, None);
@@ -1220,7 +1276,7 @@ fn apply(state: &mut EngineState, event: Event) {
             }
             if state.automatic_tiling_active {
                 set_session_floating(state, window_id, true);
-                reconcile_balanced_grids(state);
+                reconcile_arrangements(state);
             }
             close_undo_scope(state);
         }
@@ -1276,7 +1332,7 @@ fn apply(state: &mut EngineState, event: Event) {
             state.automatic_tiling_active =
                 state.resolved_config.automatic_tiling_enabled && !state.automatic_tiling_suspended;
             state.config_set = *config_set;
-            reconcile_balanced_grids(state);
+            reconcile_arrangements(state);
             state.revision += 1;
         }
 
@@ -1297,7 +1353,7 @@ fn apply(state: &mut EngineState, event: Event) {
             }
             tracing::info!("window management resumed");
             state.paused = false;
-            reconcile_balanced_grids(state);
+            reconcile_arrangements(state);
             state.revision += 1;
         }
 
@@ -1312,7 +1368,7 @@ fn apply(state: &mut EngineState, event: Event) {
             state.automatic_tiling_active = !state.automatic_tiling_suspended;
             open_undo_scope(state, "toggle-automatic-tiling");
             if state.automatic_tiling_active {
-                reconcile_balanced_grids(state);
+                reconcile_arrangements(state);
             }
             state.revision += 1;
             close_undo_scope(state);
@@ -1346,7 +1402,7 @@ fn apply(state: &mut EngineState, event: Event) {
                 let floating = !state.session_floating.contains(&window_id);
                 set_session_floating(state, window_id, floating);
             }
-            reconcile_balanced_grids(state);
+            reconcile_arrangements(state);
             state.revision += 1;
             close_undo_scope(state);
         }
@@ -1383,8 +1439,19 @@ fn apply(state: &mut EngineState, event: Event) {
                 return;
             };
             order.swap(focused_index, neighbor_index);
+            // In tree mode the arrangement comes from the tree, not from
+            // visual order, so the exchange has to happen there too. It is
+            // an exchange of the two leaves' occupants and nothing else:
+            // containers, axes, weights, and parentage all stay as they
+            // were (ADR 0026). Focus is deliberately not moved, so the user
+            // keeps controlling the window they just moved.
+            if state.resolved_config.tiling_mode == TilingMode::Tree {
+                if let Some(tree) = state.trees.get_mut(&display_id) {
+                    tree.swap_leaves(&focused, &neighbor);
+                }
+            }
             open_undo_scope(state, swap_command(direction));
-            reconcile_balanced_grids(state);
+            reconcile_arrangements(state);
             state.revision += 1;
             close_undo_scope(state);
         }
@@ -1423,7 +1490,7 @@ fn apply(state: &mut EngineState, event: Event) {
             state.interactive_placement = None;
             state.deferred_reflow_displays.clear();
             let effect_start = state.effects.len();
-            reconcile_balanced_grids(state);
+            reconcile_arrangements(state);
             if !committed_manual_placement
                 && !state.effects[effect_start..].iter().any(|effect| {
                     matches!(effect, EngineEffect::PlaceWindow { window_id: id, .. } if *id == window_id)
@@ -1495,7 +1562,7 @@ fn apply(state: &mut EngineState, event: Event) {
                 replace_inventory_from_observations(state, windows);
             }
             tracing::info!("wake reconciliation complete");
-            reconcile_balanced_grids(state);
+            reconcile_arrangements(state);
             state.revision += 1;
         }
 
@@ -1521,7 +1588,7 @@ fn apply(state: &mut EngineState, event: Event) {
                 if let Some(managed) = state.inventory.get_mut(&window_id) {
                     managed.eligibility = EligibilityReason::CircuitOpen;
                 }
-                reconcile_balanced_grids(state);
+                reconcile_arrangements(state);
                 state.revision += 1;
             } else {
                 tracing::debug!(
@@ -1576,7 +1643,7 @@ fn apply(state: &mut EngineState, event: Event) {
             // placements belong to that command's transaction. The passive
             // startup and wake reconciliations deliberately have no scope.
             open_undo_scope(state, "rearrange");
-            reconcile_balanced_grids(state);
+            reconcile_arrangements(state);
             state.revision += 1;
             close_undo_scope(state);
         }
@@ -1600,7 +1667,7 @@ fn apply(state: &mut EngineState, event: Event) {
                 .map(|window| (window.id, window))
                 .collect();
             if replace_inventory_from_observations(state, windows) {
-                reconcile_balanced_grids(state);
+                reconcile_arrangements(state);
                 state.revision += 1;
             }
         }
@@ -1609,7 +1676,7 @@ fn apply(state: &mut EngineState, event: Event) {
             state.rules = rules;
             let observed: Vec<Window> = state.observed_windows.values().cloned().collect();
             replace_inventory_from_observations(state, observed);
-            reconcile_balanced_grids(state);
+            reconcile_arrangements(state);
             state.revision += 1;
         }
 
@@ -1653,7 +1720,7 @@ fn apply(state: &mut EngineState, event: Event) {
                         for window_id in placed {
                             set_session_floating(state, window_id, true);
                         }
-                        reconcile_balanced_grids(state);
+                        reconcile_arrangements(state);
                     }
                     close_undo_scope(state);
                 }
@@ -1878,11 +1945,25 @@ fn replace_inventory_from_observations(state: &mut EngineState, observed: Vec<Wi
 /// Updates visual order and emits one final Balanced-grid plan per affected
 /// display. It is intentionally a no-op in manual mode, leaving current
 /// bounds untouched on profile deactivation (ADR 0015).
-fn reconcile_balanced_grids(state: &mut EngineState) {
-    if !state.automatic_tiling_active || state.paused {
-        return;
+/// Reflows every display's tiled windows using whichever arrangement the
+/// resolved configuration selects.
+///
+/// The two arrangements agree on *which* windows are tiled and disagree
+/// only on where they go, so membership is computed once by
+/// [`refresh_tiling_sets`] and each planner is handed the same answer.
+fn reconcile_arrangements(state: &mut EngineState) {
+    match state.resolved_config.tiling_mode {
+        TilingMode::Balanced => reconcile_balanced_grids(state),
+        TilingMode::Tree => reconcile_container_trees(state),
     }
+}
 
+/// Brings each display's visual window order up to date and returns the
+/// windows each one should currently arrange, with its work area.
+///
+/// Shared by both planners so a window can never be tiled under one
+/// arrangement and forgotten under the other.
+fn refresh_tiling_sets(state: &mut EngineState) -> Vec<(DisplayId, Rect, Vec<WindowId>)> {
     for (display_id, order) in &mut state.visual_window_order {
         order.retain(|id| {
             state.inventory.get(id).is_some_and(|managed| {
@@ -1913,7 +1994,7 @@ fn reconcile_balanced_grids(state: &mut EngineState) {
         }
     }
 
-    let plans: Vec<_> = state
+    state
         .displays
         .iter()
         .map(|display| {
@@ -1935,13 +2016,28 @@ fn reconcile_balanced_grids(state: &mut EngineState) {
                 .collect();
             (display.id, display.work_area, active)
         })
-        .collect();
-    for (display_id, work_area, active) in plans {
-        if state
-            .interactive_placement
-            .is_some_and(|session| session.display_id == display_id)
-        {
-            state.deferred_reflow_displays.insert(display_id);
+        .collect()
+}
+
+/// Whether this display's reflow must wait for a drag to finish.
+fn defer_reflow(state: &mut EngineState, display_id: DisplayId) -> bool {
+    if state
+        .interactive_placement
+        .is_some_and(|session| session.display_id == display_id)
+    {
+        state.deferred_reflow_displays.insert(display_id);
+        return true;
+    }
+    false
+}
+
+fn reconcile_balanced_grids(state: &mut EngineState) {
+    if !state.automatic_tiling_active || state.paused {
+        return;
+    }
+
+    for (display_id, work_area, active) in refresh_tiling_sets(state) {
+        if defer_reflow(state, display_id) {
             continue;
         }
         let cells = plan_balanced_grid(work_area, active.len());
@@ -1955,6 +2051,154 @@ fn reconcile_balanced_grids(state: &mut EngineState) {
             }
         }
     }
+}
+
+/// Reflows every display's container tree, growing and shrinking each tree
+/// to match the windows currently tiled there.
+///
+/// The tree is reconciled against the active set rather than mutated by
+/// each event that could affect it. A structure that survives restarts has
+/// to be able to re-derive itself from observed reality; rebuilding the
+/// delta here is what makes "the window closed while the agent was not
+/// running" the same code path as "the window closed just now".
+fn reconcile_container_trees(state: &mut EngineState) {
+    if !state.automatic_tiling_active || state.paused {
+        return;
+    }
+
+    let live_displays: HashSet<DisplayId> = state.displays.iter().map(|display| display.id).collect();
+    state.trees.retain(|display_id, _| live_displays.contains(display_id));
+
+    for (display_id, work_area, active) in refresh_tiling_sets(state) {
+        if defer_reflow(state, display_id) {
+            continue;
+        }
+        let focused = state.focused_window;
+        let fingerprint = display_fingerprint_of(state, display_id);
+
+        // Taken out of the map for the duration, so the matcher below can
+        // read the rest of the state freely.
+        let mut tree = state.trees.remove(&display_id).unwrap_or_default();
+
+        // The stored arrangement replaces whatever insertion has built so
+        // far, keeping only the leaves whose windows are confidently
+        // identified. It is not conditional on the tree being empty: the
+        // database's answer normally arrives *after* the first windows are
+        // observed, so by then a default arrangement already exists, and
+        // the user's saved one is the arrangement they asked for. Windows
+        // the stored tree cannot account for are re-inserted below.
+        //
+        // `pending_trees` is a startup payload and is consumed here, so
+        // this happens once and the reducer is the authority afterwards.
+        if let Some(stored) = fingerprint
+            .as_ref()
+            .and_then(|fingerprint| state.pending_trees.remove(fingerprint))
+        {
+            tree = restore_tree(state, &stored, &active);
+        }
+
+        // Windows that are no longer tiled here give their space back.
+        // Dormant leaves, which would hold that space open for a later
+        // match, are deferred: see issue #9.
+        let departed: Vec<WindowId> = tree
+            .leaves()
+            .into_iter()
+            .filter(|window_id| !active.contains(window_id))
+            .copied()
+            .collect();
+        for window_id in departed {
+            tree.remove(&window_id);
+        }
+
+        // New windows arrive in visual order, so the arrangement a set of
+        // windows produces does not depend on which order they were
+        // observed in.
+        for window_id in &active {
+            if tree.contains(window_id) {
+                continue;
+            }
+            if tree.insert_first(*window_id) {
+                continue;
+            }
+            let placements = plan_tree_raw(&tree, work_area);
+            let Some(insertion) = choose_insertion(&placements, focused) else {
+                continue;
+            };
+            tree.split_leaf(&insertion.target, insertion.axis, *window_id);
+        }
+
+        // Only a structural change is worth a write. A reflow that moved
+        // windows without reshaping the tree -- a display resizing, say --
+        // has nothing new to store.
+        if state.saved_trees.get(&display_id) != Some(&tree) {
+            if let Some(fingerprint) = fingerprint {
+                let durable = durable_tree(state, &tree);
+                state
+                    .persistence_intents
+                    .push(PersistenceIntent::SaveContainerTree {
+                        display_fingerprint: fingerprint,
+                        tree: Box::new(durable),
+                    });
+                state.saved_trees.insert(display_id, tree.clone());
+            }
+        }
+
+        let planned = plan_tree(&tree, work_area, state.resolved_config.gaps);
+        state.trees.insert(display_id, tree);
+        for (window_id, bounds) in planned {
+            let unchanged = state.windows.get(&window_id).is_some_and(|placement| {
+                placement.display_id == display_id && placement.bounds == bounds
+            });
+            if !unchanged {
+                place_window(state, window_id, display_id, bounds, None);
+            }
+        }
+    }
+}
+
+/// Turns a stored arrangement back into a live one.
+///
+/// Each leaf's evidence is matched against the windows currently tiled on
+/// that display. A leaf that cannot be identified confidently is dropped
+/// rather than guessed at, and no live window is claimed by two leaves --
+/// the same refusal-first rule undo follows, applied to structure.
+fn restore_tree(
+    state: &EngineState,
+    stored: &PersistedTree,
+    active: &[WindowId],
+) -> ContainerTree {
+    let candidates: Vec<&Window> = active
+        .iter()
+        .filter_map(|window_id| state.inventory.get(window_id))
+        .map(|managed| &managed.window)
+        .collect();
+    let mut claimed: HashSet<WindowId> = HashSet::new();
+    stored.filter_map_leaves(&mut |evidence| {
+        match_window_with_order(
+            evidence,
+            candidates.iter().copied(),
+            |window| display_fingerprint_of(state, window.display_id),
+            |window| Some(launch_order_of(state, window.id)),
+        )
+        .confident_window()
+        .filter(|window_id| claimed.insert(*window_id))
+    })
+}
+
+/// The durable form of a live tree: the same structure with each window
+/// replaced by evidence that can find it again. A window the inventory
+/// cannot describe is dropped, because a leaf nothing could ever match
+/// would only hold space open forever.
+fn durable_tree(state: &EngineState, tree: &ContainerTree) -> PersistedTree {
+    tree.filter_map_leaves(&mut |window_id| {
+        let managed = state.inventory.get(window_id)?;
+        let fingerprint = display_fingerprint_of(state, managed.window.display_id)?;
+        Some(WindowEvidence::capture(
+            &managed.window,
+            launch_order_of(state, *window_id),
+            &fingerprint,
+        ))
+    })
 }
 
 /// The resolved config that should be active for `displays`' current
@@ -2610,6 +2854,9 @@ pub fn spawn_engine_with_capacity(
         newest_undo: None,
         last_undo_result: None,
         undo_scope: None,
+        trees: HashMap::new(),
+        pending_trees: HashMap::new(),
+        saved_trees: HashMap::new(),
         displays: initial_displays,
         windows: HashMap::new(),
         inventory: HashMap::new(),
@@ -6576,7 +6823,8 @@ mod tests {
             .iter()
             .filter_map(|intent| match intent {
                 PersistenceIntent::RecordUndoTransaction(draft) => Some(draft),
-                PersistenceIntent::ConsumeUndoTransaction(_) => None,
+                PersistenceIntent::ConsumeUndoTransaction(_)
+                | PersistenceIntent::SaveContainerTree { .. } => None,
             })
             .collect()
     }
@@ -7490,6 +7738,238 @@ mod tests {
         assert!(
             recorded_drafts(&state).is_empty(),
             "undo must not offer to reverse a command that did nothing"
+        );
+    }
+
+    // ---- Container tree (issue #51) -----------------------------------
+
+    /// Automatic tiling running in tree mode on one 1920x1080 display.
+    fn tree_state() -> EngineState {
+        EngineState {
+            displays: vec![display(1, "DISPLAY1", 0)],
+            automatic_tiling_active: true,
+            resolved_config: ResolvedConfig {
+                automatic_tiling_enabled: true,
+                tiling_mode: TilingMode::Tree,
+                ..ResolvedConfig::default()
+            },
+            ..EngineState::default()
+        }
+    }
+
+    fn observe(state: &mut EngineState, windows: Vec<Window>) {
+        apply(state, Event::WindowsObserved { windows });
+    }
+
+    /// Where each window currently sits, ordered by window id so the
+    /// assertion does not depend on effect ordering.
+    fn arrangement(state: &EngineState) -> Vec<(isize, Rect)> {
+        let mut placed: Vec<(isize, Rect)> = state
+            .windows
+            .iter()
+            .map(|(window_id, placement)| (window_id.0, placement.bounds))
+            .collect();
+        placed.sort_by_key(|(window_id, _)| *window_id);
+        placed
+    }
+
+    #[test]
+    fn tree_mode_gives_the_first_window_the_whole_work_area() {
+        let mut state = tree_state();
+
+        observe(&mut state, vec![window_at(1, 1, Rect::new(0, 0, 400, 300))]);
+
+        assert_eq!(arrangement(&state), vec![(1, Rect::new(0, 0, 1920, 1080))]);
+        assert_eq!(state.trees[&DisplayId(1)].len(), 1);
+    }
+
+    #[test]
+    fn a_new_window_splits_the_focused_leaf_in_half_on_its_longer_axis() {
+        let mut state = tree_state();
+        observe(&mut state, vec![window_at(1, 1, Rect::new(0, 0, 400, 300))]);
+
+        observe(
+            &mut state,
+            vec![
+                window_at(1, 1, Rect::new(0, 0, 1920, 1080)),
+                window_at(2, 1, Rect::new(0, 0, 400, 300)),
+            ],
+        );
+
+        assert_eq!(
+            arrangement(&state),
+            vec![
+                (1, Rect::new(0, 0, 960, 1080)),
+                (2, Rect::new(960, 0, 960, 1080)),
+            ],
+            "a 1920x1080 leaf is wider than tall, so it divides side by side"
+        );
+
+        // A third window, with the right-hand one focused, takes half of
+        // that half -- and the left-hand window does not move.
+        apply(
+            &mut state,
+            Event::WindowFocused {
+                window_id: WindowId(2),
+                display_id: DisplayId(1),
+                bounds: Rect::new(960, 0, 960, 1080),
+            },
+        );
+        observe(
+            &mut state,
+            vec![
+                window_at(1, 1, Rect::new(0, 0, 960, 1080)),
+                window_at(2, 1, Rect::new(960, 0, 960, 1080)),
+                window_at(3, 1, Rect::new(0, 0, 400, 300)),
+            ],
+        );
+
+        assert_eq!(
+            arrangement(&state),
+            vec![
+                (1, Rect::new(0, 0, 960, 1080)),
+                (2, Rect::new(960, 0, 960, 540)),
+                (3, Rect::new(960, 540, 960, 540)),
+            ],
+            "insertion follows focus and reshapes nothing else"
+        );
+    }
+
+    #[test]
+    fn a_closed_window_gives_its_space_back_to_its_sibling() {
+        let mut state = tree_state();
+        observe(&mut state, vec![window_at(1, 1, Rect::new(0, 0, 400, 300))]);
+        observe(
+            &mut state,
+            vec![
+                window_at(1, 1, Rect::new(0, 0, 1920, 1080)),
+                window_at(2, 1, Rect::new(0, 0, 400, 300)),
+            ],
+        );
+
+        observe(&mut state, vec![window_at(1, 1, Rect::new(0, 0, 960, 1080))]);
+
+        assert_eq!(arrangement(&state), vec![(1, Rect::new(0, 0, 1920, 1080))]);
+        assert_eq!(state.trees[&DisplayId(1)].len(), 1);
+    }
+
+    #[test]
+    fn the_arrangement_does_not_depend_on_the_order_windows_were_observed() {
+        // Three windows arriving one at a time, versus the same three
+        // arriving together, must settle into the same tree.
+        let mut incremental = tree_state();
+        observe(&mut incremental, vec![window_at(1, 1, Rect::new(0, 0, 400, 300))]);
+        observe(
+            &mut incremental,
+            vec![
+                window_at(1, 1, Rect::new(0, 0, 1920, 1080)),
+                window_at(2, 1, Rect::new(0, 0, 400, 300)),
+            ],
+        );
+        observe(
+            &mut incremental,
+            vec![
+                window_at(1, 1, Rect::new(0, 0, 960, 1080)),
+                window_at(2, 1, Rect::new(960, 0, 960, 1080)),
+                window_at(3, 1, Rect::new(0, 0, 400, 300)),
+            ],
+        );
+
+        let mut at_once = tree_state();
+        observe(
+            &mut at_once,
+            vec![
+                window_at(1, 1, Rect::new(0, 0, 400, 300)),
+                window_at(2, 1, Rect::new(500, 0, 400, 300)),
+                window_at(3, 1, Rect::new(1000, 0, 400, 300)),
+            ],
+        );
+
+        assert_eq!(arrangement(&incremental), arrangement(&at_once));
+    }
+
+    #[test]
+    fn a_tree_command_and_its_reflow_form_one_undo_transaction() {
+        let mut state = tree_state();
+        observe(
+            &mut state,
+            vec![
+                window_at(41, 1, Rect::new(0, 0, 400, 300)),
+                window_at(42, 1, Rect::new(500, 0, 400, 300)),
+            ],
+        );
+        apply(
+            &mut state,
+            Event::WindowFocused {
+                window_id: WindowId(41),
+                display_id: DisplayId(1),
+                bounds: Rect::new(0, 0, 960, 1080),
+            },
+        );
+        state.persistence_intents.clear();
+        state.effects.clear();
+
+        apply(
+            &mut state,
+            Event::DirectionalSwapRequested {
+                direction: CardinalDirection::Right,
+            },
+        );
+
+        let drafts = recorded_drafts(&state);
+        assert_eq!(
+            drafts.len(),
+            1,
+            "the command and the BSP reflow it caused are one transaction"
+        );
+        assert!(
+            drafts[0].members.len() >= 2,
+            "both swapped windows are reversible together, found {:?}",
+            drafts[0].members.len()
+        );
+    }
+
+    #[test]
+    fn balanced_mode_keeps_no_tree_at_all() {
+        let mut state = tiling_state_with_saved_layout("unused", &[]);
+        state.displays = vec![display(1, "DISPLAY1", 0)];
+
+        observe(
+            &mut state,
+            vec![
+                window_at(1, 1, Rect::new(0, 0, 400, 300)),
+                window_at(2, 1, Rect::new(500, 0, 400, 300)),
+            ],
+        );
+
+        assert!(
+            state.trees.is_empty(),
+            "the balanced grid is stateless; it must not accumulate structure"
+        );
+    }
+
+    #[test]
+    fn a_disconnected_display_takes_its_tree_with_it() {
+        let mut state = tree_state();
+        state.displays = vec![display(1, "DISPLAY1", 0), display(2, "DISPLAY2", 1920)];
+        observe(
+            &mut state,
+            vec![
+                window_at(1, 1, Rect::new(0, 0, 400, 300)),
+                window_at(2, 2, Rect::new(1920, 0, 400, 300)),
+            ],
+        );
+        assert_eq!(state.trees.len(), 2);
+
+        apply(
+            &mut state,
+            Event::DisplayTopologyChanged(vec![display(1, "DISPLAY1", 0)]),
+        );
+
+        assert_eq!(
+            state.trees.keys().copied().collect::<Vec<_>>(),
+            vec![DisplayId(1)],
+            "a tree for a display nobody can see is structure with nowhere to go"
         );
     }
 

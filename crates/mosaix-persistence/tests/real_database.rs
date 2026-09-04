@@ -529,6 +529,129 @@ fn pruning_an_already_bounded_history_changes_nothing() {
     assert_eq!(transaction_count(&temporary.path()), 1);
 }
 
+fn stored_tree(applications: &[&str]) -> mosaix_domain::PersistedTree {
+    use mosaix_domain::tree::{Child, Node, SplitAxis};
+
+    let mut children: Vec<Child<mosaix_domain::WindowEvidence>> = Vec::new();
+    for (index, application) in applications.iter().enumerate() {
+        children.push(Child {
+            weight: 1.0 + index as f64,
+            node: Node::Leaf(evidence(application, index as u32)),
+        });
+    }
+    mosaix_domain::PersistedTree::from_root(Node::Split {
+        axis: SplitAxis::Vertical,
+        children,
+    })
+}
+
+#[test]
+fn an_arrangement_survives_a_restart_with_its_axes_and_weights() {
+    let temporary = TempDatabase::new("tree-restart");
+    let tree = stored_tree(&["Code.exe", "firefox.exe", "wt.exe"]);
+
+    {
+        let mut store = Persistence::open(&temporary.path()).expect("database opens");
+        store.save_tree("DISPLAY1", &tree).expect("the tree stores");
+    }
+
+    let restarted = Persistence::open(&temporary.path()).expect("database reopens");
+    let loaded = restarted.load_trees().expect("arrangements are readable");
+
+    assert_eq!(loaded.len(), 1);
+    assert_eq!(
+        loaded.get("DISPLAY1"),
+        Some(&tree),
+        "topology, axes, weights, and leaf evidence all survive"
+    );
+}
+
+#[test]
+fn saving_an_arrangement_replaces_the_one_that_display_held() {
+    let temporary = TempDatabase::new("tree-replace");
+    let mut store = Persistence::open(&temporary.path()).expect("database opens");
+
+    store.save_tree("DISPLAY1", &stored_tree(&["Code.exe"])).unwrap();
+    let replacement = stored_tree(&["firefox.exe", "wt.exe"]);
+    store.save_tree("DISPLAY1", &replacement).unwrap();
+
+    let loaded = store.load_trees().unwrap();
+    assert_eq!(loaded.len(), 1, "a display holds one arrangement, not a history");
+    assert_eq!(loaded["DISPLAY1"], replacement);
+}
+
+#[test]
+fn saving_an_empty_arrangement_forgets_the_display_rather_than_storing_emptiness() {
+    let temporary = TempDatabase::new("tree-empty");
+    let mut store = Persistence::open(&temporary.path()).expect("database opens");
+    store.save_tree("DISPLAY1", &stored_tree(&["Code.exe"])).unwrap();
+
+    store
+        .save_tree("DISPLAY1", &mosaix_domain::PersistedTree::new())
+        .unwrap();
+
+    assert!(
+        store.load_trees().unwrap().is_empty(),
+        "an empty stored arrangement would restore emptiness over a fresh one"
+    );
+}
+
+#[test]
+fn each_display_keeps_its_own_arrangement() {
+    let temporary = TempDatabase::new("tree-per-display");
+    let mut store = Persistence::open(&temporary.path()).expect("database opens");
+
+    store.save_tree("DISPLAY1", &stored_tree(&["Code.exe"])).unwrap();
+    store.save_tree("DISPLAY2", &stored_tree(&["firefox.exe"])).unwrap();
+
+    let loaded = store.load_trees().unwrap();
+    assert_eq!(loaded.len(), 2);
+    assert_ne!(loaded["DISPLAY1"], loaded["DISPLAY2"]);
+}
+
+#[test]
+fn an_unreadable_arrangement_does_not_cost_the_others() {
+    let temporary = TempDatabase::new("tree-unreadable");
+    {
+        let mut store = Persistence::open(&temporary.path()).expect("database opens");
+        store.save_tree("DISPLAY1", &stored_tree(&["Code.exe"])).unwrap();
+        store.save_tree("DISPLAY2", &stored_tree(&["firefox.exe"])).unwrap();
+    }
+    rusqlite::Connection::open(temporary.path())
+        .unwrap()
+        .execute(
+            "UPDATE container_tree SET tree = 'not a tree' WHERE display_fingerprint = ?1",
+            ["DISPLAY1"],
+        )
+        .unwrap();
+
+    let store = Persistence::open(&temporary.path()).expect("database reopens");
+    let loaded = store.load_trees().expect("the load itself still succeeds");
+
+    assert_eq!(
+        loaded.keys().collect::<Vec<_>>(),
+        vec!["DISPLAY2"],
+        "one unreadable display must not cost the arrangement of the others"
+    );
+}
+
+#[test]
+fn stored_arrangements_contain_no_window_titles() {
+    let temporary = TempDatabase::new("tree-privacy");
+    let mut store = Persistence::open(&temporary.path()).expect("database opens");
+    store
+        .save_tree("DISPLAY1", &stored_tree(&["Code.exe"]))
+        .unwrap();
+    drop(store);
+
+    let bytes = fs::read(temporary.path()).expect("database is readable");
+
+    assert!(
+        !String::from_utf8_lossy(&bytes).contains("a document nobody should be storing"),
+        "leaf identity is evidence, and evidence has no title field"
+    );
+}
+
 #[test]
 fn a_locked_database_degrades_the_write_and_recovers_when_the_lock_clears() {
     let temporary = TempDatabase::new("locked");

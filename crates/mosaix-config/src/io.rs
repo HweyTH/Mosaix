@@ -322,8 +322,17 @@ pub fn save_profile_settings(
         focus_border: FocusBorderOverride::default(),
         layouts: Default::default(),
     });
+    // The settings surface toggles activation, not the arrangement, so the
+    // profile's existing mode is carried through. Defaulting it here would
+    // silently turn a tree profile back into a balanced one on any
+    // unrelated save.
+    let existing_mode = profile
+        .automatic_tiling
+        .map(|tiling| tiling.mode)
+        .unwrap_or_default();
     profile.automatic_tiling = Some(AutomaticTilingSection {
         enabled: update.automatic_tiling_enabled,
+        mode: existing_mode,
     });
     profile.gaps = update.gaps;
     profile.focus_border = update.focus_border;
