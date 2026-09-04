@@ -45,7 +45,7 @@ use mosaix_domain::commands::{
     DirectionalSwapApplied, DirectionalSwapRefusal, RemovePositionApplied, RemovePositionRefusal,
     TreeResizeApplied, TreeResizeRefusal, TREE_RESIZE_STEP_PERCENT,
 };
-use mosaix_domain::identity::{match_window_with_order, WindowEvidence};
+use mosaix_domain::identity::{match_window_with_order, MatchOutcome, WindowEvidence};
 use mosaix_domain::tree::{
     ContainerTree, DormantPosition, LeafFate, Occupant, PersistedTree, SplitAxis, Toward,
 };
@@ -2253,13 +2253,15 @@ fn reconcile_container_trees(state: &mut EngineState) {
             tree = restore_tree(state, &stored, &active, now);
         }
 
-        // A window that is no longer tiled here -- closed, minimized,
-        // floated, or moved away -- leaves its slot dormant rather than
+        // A window that has closed leaves its slot dormant rather than
         // giving it up, so a confident return can reclaim it (spec user
         // stories 38 and 39). The evidence was captured at the last
         // reflow, because a closed window is already gone from the
-        // inventory by now. A leaf nothing could ever recognise is
-        // removed instead of holding space open forever.
+        // inventory by now. A window that is still open but no longer
+        // tiled here -- floated, minimized, or moved to another display
+        // -- simply leaves the tree: it is not lost, and a slot kept for
+        // a window the user can see would be a ghost. A leaf nothing could
+        // ever recognise is removed instead of holding space open forever.
         let departed: Vec<WindowId> = tree
             .windows()
             .into_iter()
@@ -2267,8 +2269,9 @@ fn reconcile_container_trees(state: &mut EngineState) {
             .copied()
             .collect();
         for window_id in departed {
-            match state.leaf_evidence.remove(&window_id) {
-                Some(evidence) => {
+            let evidence = state.leaf_evidence.remove(&window_id);
+            match evidence {
+                Some(evidence) if !state.inventory.contains_key(&window_id) => {
                     tree.make_dormant(
                         &window_id,
                         DormantPosition {
@@ -2277,7 +2280,7 @@ fn reconcile_container_trees(state: &mut EngineState) {
                         },
                     );
                 }
-                None => {
+                _ => {
                     tree.remove(&window_id);
                 }
             }
@@ -2391,6 +2394,12 @@ fn reconcile_container_trees(state: &mut EngineState) {
             }
         }
     }
+    // Evidence is only ever needed for a window that could still close
+    // out of a tree; anything the inventory no longer holds has already
+    // gone dormant or been dropped above.
+    state
+        .leaf_evidence
+        .retain(|window_id, _| state.inventory.contains_key(window_id));
 }
 
 /// Turns a stored arrangement back into a live one.
@@ -2540,6 +2549,12 @@ pub fn diff_placements(
 /// some members have moved and a later one turns out to be unresolvable.
 /// The same function answers the IPC preflight and drives the reducer, so a
 /// caller is never told something different from what happens.
+/// Whether automatic tiling is currently producing container trees, which
+/// is what every tree command requires.
+fn tree_mode_active(state: &EngineState) -> bool {
+    state.resolved_config.tiling_mode == TilingMode::Tree && state.automatic_tiling_active
+}
+
 /// The windows currently eligible to occupy leaves of `display_id`'s tree:
 /// tiled, on that display, and not temporarily ineligible.
 fn active_tiled_windows_on(state: &EngineState, display_id: DisplayId) -> Vec<WindowId> {
@@ -2586,7 +2601,7 @@ pub fn plan_tree_resize(
     if state.paused {
         return Err(TreeResizeRefusal::Paused);
     }
-    if state.resolved_config.tiling_mode != TilingMode::Tree || !state.automatic_tiling_active {
+    if !tree_mode_active(state) {
         return Err(TreeResizeRefusal::NotTreeMode);
     }
     let window_id = state
@@ -2705,7 +2720,7 @@ pub fn plan_remove_position(
     if state.paused {
         return Err(RemovePositionRefusal::Paused);
     }
-    if state.resolved_config.tiling_mode != TilingMode::Tree || !state.automatic_tiling_active {
+    if !tree_mode_active(state) {
         return Err(RemovePositionRefusal::NotTreeMode);
     }
     if work_area_of(&state.displays, display_id).is_none() {
@@ -2779,6 +2794,47 @@ pub fn plan_undo(state: &EngineState) -> UndoResult {
         return UndoResult::Refused(UndoRefusal::TargetsUnresolved {
             transaction_id: transaction.id,
             targets,
+        });
+    }
+
+    // The structure the undo puts back is preflighted too. A leaf whose
+    // window is gone is fine -- it comes back dormant, which is exactly
+    // what its slot would be by now -- but a leaf that could be either of
+    // two windows is refused, because restoring it would guess (ADR
+    // 0024). The same matcher decides here and at apply time.
+    let mut structure: Vec<UndoTargetOutcome> = Vec::new();
+    for snapshot in &transaction.prior_trees {
+        let Some(display_id) = display_id_of(state, &snapshot.display_fingerprint) else {
+            continue;
+        };
+        let active = active_tiled_windows_on(state, display_id);
+        let on_display: Vec<&Window> = active
+            .iter()
+            .filter_map(|window_id| state.inventory.get(window_id))
+            .map(|managed| &managed.window)
+            .collect();
+        for evidence in snapshot.tree.windows() {
+            structure.push(UndoTargetOutcome {
+                ordinal: (targets.len() + structure.len()) as u32,
+                application: evidence.application_id.0.clone(),
+                outcome: match_window_with_order(
+                    evidence,
+                    on_display.iter().copied(),
+                    |window| display_fingerprint_of(state, window.display_id),
+                    |window| Some(launch_order_of(state, window.id)),
+                ),
+            });
+        }
+    }
+    if structure
+        .iter()
+        .any(|target| matches!(target.outcome, MatchOutcome::Ambiguous { .. }))
+    {
+        let mut all = targets;
+        all.extend(structure);
+        return UndoResult::Refused(UndoRefusal::TargetsUnresolved {
+            transaction_id: transaction.id,
+            targets: all,
         });
     }
 
@@ -9344,10 +9400,13 @@ mod tests {
         // resized repeatedly in every direction: every plan must keep
         // tiling exactly, and every resize must be reversible by the
         // opposite resize on the sibling.
+        // Two displays at different scales: an odd, negative-origin one at
+        // 125% on the left and the primary at 100%.
         let mut state = tree_state();
         state.displays[0].full_bounds = Rect::new(-1367, -13, 1367, 769);
         state.displays[0].work_area = Rect::new(-1367, -13, 1367, 741);
         state.displays[0].scale_factor = 1.25;
+        state.displays.push(display(2, "DISPLAY2", 0));
         let mut windows = Vec::new();
         for id in 1..=5 {
             windows.push(window_at(
@@ -9359,31 +9418,220 @@ mod tests {
             let bounds = state.windows[&WindowId(id)].bounds;
             focus(&mut state, id, bounds);
         }
-        let work_area = state.displays[0].work_area;
+        for id in 6..=8 {
+            windows.push(window_at(id, 2, Rect::new(id as i32 * 10, 0, 300, 200)));
+            observe(&mut state, windows.clone());
+            let bounds = state.windows[&WindowId(id)].bounds;
+            focus(&mut state, id, bounds);
+        }
+        let work_area_of_display =
+            |state: &EngineState, id: isize| state.displays[usize::from(id != 1)].work_area;
         for (id, direction) in [
             (5, CardinalDirection::Left),
             (5, CardinalDirection::Up),
             (3, CardinalDirection::Down),
             (2, CardinalDirection::Right),
             (4, CardinalDirection::Left),
+            (7, CardinalDirection::Left),
+            (8, CardinalDirection::Up),
+            (6, CardinalDirection::Right),
         ] {
             let bounds = state.windows[&WindowId(id)].bounds;
             focus(&mut state, id, bounds);
             resize(&mut state, direction);
-            let placed = arrangement(&state);
-            let covered: i64 = placed
-                .iter()
-                .map(|(_, rect)| (rect.width as i64) * (rect.height as i64))
-                .sum();
-            assert_eq!(
-                covered,
-                (work_area.width as i64) * (work_area.height as i64),
-                "after {direction:?} on {id}: the tiling must still cover the work area exactly"
-            );
-            for (_, rect) in &placed {
-                assert!(work_area.contains(rect), "{rect:?} escaped {work_area:?}");
+            for display_id in [1, 2] {
+                let work_area = work_area_of_display(&state, display_id);
+                let placed: Vec<Rect> = state
+                    .windows
+                    .values()
+                    .filter(|placement| placement.display_id == DisplayId(display_id))
+                    .map(|placement| placement.bounds)
+                    .collect();
+                let covered: i64 = placed
+                    .iter()
+                    .map(|rect| (rect.width as i64) * (rect.height as i64))
+                    .sum();
+                assert_eq!(
+                    covered,
+                    (work_area.width as i64) * (work_area.height as i64),
+                    "after {direction:?} on {id}: display {display_id} must still be tiled exactly"
+                );
+                for rect in &placed {
+                    assert!(work_area.contains(rect), "{rect:?} escaped {work_area:?}");
+                }
             }
         }
+    }
+
+    #[test]
+    fn an_overflowed_window_returns_when_the_display_grows() {
+        let mut state = narrow_tree_state(1000);
+        // The topology change re-selects config, so the set has to keep
+        // tree mode on for the new fingerprint too.
+        state.config_set = ResolvedConfigSet {
+            base: state.resolved_config.clone(),
+            profiles: Vec::new(),
+        };
+        observe(
+            &mut state,
+            vec![
+                window_needing(1, 1, Rect::new(0, 0, 400, 300), (600, 100)),
+                window_needing(2, 1, Rect::new(500, 0, 400, 300), (600, 100)),
+            ],
+        );
+        assert_eq!(
+            state.constraint_overflow.get(&DisplayId(1)),
+            Some(&vec![WindowId(2)])
+        );
+        let tree_before = state.trees[&DisplayId(1)].clone();
+
+        let mut wider = display(1, "DISPLAY1", 0);
+        wider.full_bounds = Rect::new(0, 0, 1400, 600);
+        wider.work_area = Rect::new(0, 0, 1400, 600);
+        apply(&mut state, Event::DisplayTopologyChanged(vec![wider]));
+
+        assert!(state.constraint_overflow.is_empty());
+        assert_eq!(state.trees[&DisplayId(1)], tree_before, "the leaf was kept");
+        assert_eq!(
+            state.windows[&WindowId(2)].bounds,
+            Rect::new(700, 0, 700, 600)
+        );
+    }
+
+    #[test]
+    fn a_floated_or_transferred_window_leaves_the_tree_without_a_dormant_slot() {
+        let mut state = two_apps_state();
+        state.displays.push(display(2, "DISPLAY2", 1920));
+
+        focus(&mut state, 2, Rect::new(960, 0, 960, 1080));
+        apply(&mut state, Event::ToggleFloatingRequested);
+        assert!(
+            dormant_positions(&state).is_empty(),
+            "a window the user floated is visible; a slot kept for it would be a ghost"
+        );
+        apply(&mut state, Event::ToggleFloatingRequested);
+
+        apply(
+            &mut state,
+            Event::WindowThrowToDisplayRequested {
+                window_id: WindowId(2),
+                direction: DisplayDirection::Next,
+            },
+        );
+        assert!(
+            dormant_positions(&state).is_empty(),
+            "display transfer is explicit; the source keeps no slot"
+        );
+    }
+
+    #[test]
+    fn a_stored_dormant_slot_past_retention_is_pruned_on_load() {
+        let mut first = two_apps_state();
+        let durable = durable_tree(&first, &first.trees[&DisplayId(1)]);
+        first.trees.clear();
+        let aged = durable.convert_leaves(&mut |leaf| match &leaf.occupant {
+            mosaix_domain::Occupant::Live(evidence) if evidence.application_id.0 == "beta.exe" => {
+                mosaix_domain::LeafFate::Dormant(mosaix_domain::DormantPosition {
+                    evidence: evidence.clone(),
+                    since_unix: now_unix() - mosaix_domain::DORMANT_RETENTION_SECONDS - 1,
+                })
+            }
+            mosaix_domain::Occupant::Live(evidence) => {
+                mosaix_domain::LeafFate::Live(evidence.clone())
+            }
+            mosaix_domain::Occupant::Dormant(position) => {
+                mosaix_domain::LeafFate::Dormant(position.clone())
+            }
+        });
+
+        let mut state = tree_state();
+        observe(
+            &mut state,
+            vec![known_window_at(
+                501,
+                "alpha.exe",
+                1,
+                Rect::new(0, 0, 400, 300),
+            )],
+        );
+        apply(
+            &mut state,
+            Event::ContainerTreesLoaded([("DISPLAY1".to_owned(), aged)].into_iter().collect()),
+        );
+        observe(
+            &mut state,
+            vec![known_window_at(
+                501,
+                "alpha.exe",
+                1,
+                Rect::new(0, 0, 1920, 1080),
+            )],
+        );
+
+        assert!(
+            dormant_positions(&state).is_empty(),
+            "retention counts from when it went dormant"
+        );
+        assert_eq!(state.trees[&DisplayId(1)].len(), 1);
+    }
+
+    #[test]
+    fn undo_refuses_when_a_leaf_of_the_prior_tree_is_ambiguous() {
+        // alpha | beta, swapped. Then gamma opens twice, identically. The
+        // transaction's members (alpha, beta) still resolve, but the prior
+        // tree is edited to carry a gamma leaf whose evidence fits either
+        // gamma window equally -- restoring it would guess.
+        let mut state = two_apps_state();
+        focus(&mut state, 1, Rect::new(0, 0, 960, 1080));
+        apply(
+            &mut state,
+            Event::DirectionalSwapRequested {
+                direction: CardinalDirection::Right,
+            },
+        );
+        let mut draft = recorded_drafts(&state)[0].clone();
+        observe(
+            &mut state,
+            vec![
+                known_window_at(1, "alpha.exe", 1, Rect::new(960, 0, 960, 1080)),
+                known_window_at(2, "beta.exe", 1, Rect::new(0, 0, 960, 1080)),
+                known_window_at(8, "gamma.exe", 1, Rect::new(10, 10, 300, 200)),
+                known_window_at(9, "gamma.exe", 1, Rect::new(10, 10, 300, 200)),
+            ],
+        );
+        let gamma = mosaix_domain::WindowEvidence {
+            application_id: mosaix_domain::ApplicationId("gamma.exe".to_owned()),
+            executable_path: Some("C:/apps/gamma.exe".to_owned()),
+            native_class: Some("gamma.exe-class".to_owned()),
+            role: mosaix_domain::WindowRole::Normal,
+            launch_order: 5,
+            last_placement: Rect::new(5000, 5000, 10, 10),
+            display_fingerprint: "DISPLAY1".to_owned(),
+        };
+        let mut with_gamma = draft.prior_trees[0].tree.clone();
+        let first_leaf = with_gamma.windows()[0].clone();
+        with_gamma.split_leaf(&first_leaf, SplitAxis::Vertical, gamma);
+        draft.prior_trees[0].tree = with_gamma;
+        let stored = stored(&draft, 1);
+        apply(&mut state, Event::UndoHistoryLoaded(Some(Box::new(stored))));
+        state.effects.clear();
+        let tree_before = state.trees[&DisplayId(1)].clone();
+
+        let planned = plan_undo(&state);
+        let UndoResult::Refused(UndoRefusal::TargetsUnresolved { targets, .. }) = &planned else {
+            panic!("an ambiguous leaf must refuse, got {planned:?}");
+        };
+        assert!(targets.iter().any(|target| {
+            target.application == "gamma.exe"
+                && matches!(target.outcome, MatchOutcome::Ambiguous { .. })
+        }));
+        apply(&mut state, Event::UndoRequested);
+        assert!(placements(&state).is_empty(), "nothing moved");
+        assert_eq!(state.trees[&DisplayId(1)], tree_before, "nothing reshaped");
+        assert!(
+            state.newest_undo.is_some(),
+            "the transaction is kept for retry"
+        );
     }
 
     // ---- Constraint overflow (issue #54) ------------------------------

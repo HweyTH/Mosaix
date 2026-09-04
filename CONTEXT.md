@@ -95,11 +95,11 @@ Adding a tiled window by dividing the focused tiled leaf into equal siblings alo
 _Avoid_: Append, preselection, insertion direction
 
 **Dormant tree leaf**:
-A persisted window position whose window is closed or not currently matched, retained without consuming screen space so a later confident match can reclaim its structural position. It expires after seven days unless a saved scene retains it, and an explicit remove-position command deletes it immediately.
+A persisted window position whose window is closed or not currently matched, retained without consuming screen space so a later confident match can reclaim its structural position. A window that is still open but leaves the tree -- floated, minimized, or transferred to another display -- leaves no dormant leaf behind. It expires after seven days unless a saved scene retains it (scene retention arrives with issue #28; until then expiry is unconditional), and an explicit remove-position command deletes it immediately.
 _Avoid_: Empty tile, placeholder window, missing window
 
 **Tree resize**:
-Moving the closest container-tree divider facing the requested direction by five percentage points per command while keeping every affected window at or above its minimum size. The resulting placements form one undo transaction.
+Moving the closest container-tree divider facing the requested direction by five percentage points per command while keeping every affected window at or above its minimum size. A resize never pays for itself by reducing gaps or overflowing a window: when the full step would, the largest smaller whole-point step that does not is taken, and none if none fits. The resulting placements, and the tree as it stood before, form one undo transaction.
 _Avoid_: Window resize (alone), free resize, pixel resize
 
 **Logical workspace**:

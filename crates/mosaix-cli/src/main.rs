@@ -33,10 +33,25 @@ enum Command {
     FocusRight,
     FocusUp,
     FocusDown,
-    SwapLeft,
-    SwapRight,
-    SwapUp,
-    SwapDown,
+    /// Exchange the focused window with its neighbor that way. Reports
+    /// the typed outcome; a swap with no neighbor that way is refused
+    /// rather than wrapping or crossing a display.
+    SwapLeft {
+        #[arg(long)]
+        json: bool,
+    },
+    SwapRight {
+        #[arg(long)]
+        json: bool,
+    },
+    SwapUp {
+        #[arg(long)]
+        json: bool,
+    },
+    SwapDown {
+        #[arg(long)]
+        json: bool,
+    },
     /// Move the nearest container-tree divider facing that way by five
     /// percentage points, growing the focused window's side.
     ///
@@ -184,14 +199,14 @@ fn main() {
         run_resize(direction, json);
         return;
     }
-    if let Some(request) = match cli.command {
-        Command::SwapLeft => Some(IpcRequest::SwapLeft),
-        Command::SwapRight => Some(IpcRequest::SwapRight),
-        Command::SwapUp => Some(IpcRequest::SwapUp),
-        Command::SwapDown => Some(IpcRequest::SwapDown),
+    if let Some((request, json)) = match cli.command {
+        Command::SwapLeft { json } => Some((IpcRequest::SwapLeft, json)),
+        Command::SwapRight { json } => Some((IpcRequest::SwapRight, json)),
+        Command::SwapUp { json } => Some((IpcRequest::SwapUp, json)),
+        Command::SwapDown { json } => Some((IpcRequest::SwapDown, json)),
         _ => None,
     } {
-        run_swap(request);
+        run_swap(request, json);
         return;
     }
     if let Command::RemovePosition {
@@ -234,10 +249,6 @@ fn main() {
         Command::FocusRight => IpcRequest::FocusRight,
         Command::FocusUp => IpcRequest::FocusUp,
         Command::FocusDown => IpcRequest::FocusDown,
-        Command::SwapLeft => IpcRequest::SwapLeft,
-        Command::SwapRight => IpcRequest::SwapRight,
-        Command::SwapUp => IpcRequest::SwapUp,
-        Command::SwapDown => IpcRequest::SwapDown,
         Command::Layout {
             action: LayoutAction::Apply { name },
         } => IpcRequest::ApplyLayout { name },
@@ -247,7 +258,11 @@ fn main() {
         | Command::Undo { .. }
         | Command::Arrangement { .. }
         | Command::Resize { .. }
-        | Command::RemovePosition { .. } => {
+        | Command::RemovePosition { .. }
+        | Command::SwapLeft { .. }
+        | Command::SwapRight { .. }
+        | Command::SwapUp { .. }
+        | Command::SwapDown { .. } => {
             unreachable!("handled above")
         }
     };
@@ -327,7 +342,7 @@ fn format_arrangement(state: &serde_json::Value) -> String {
                     .unwrap_or_default();
                 if !overflow.is_empty() {
                     rendered.push_str(&format!(
-                        "\n    cannot fit at minimum size, left floating: {}",
+                        "\n    in constraint overflow (cannot fit at minimum size): {}",
                         overflow.join(" ")
                     ));
                 }
@@ -475,14 +490,14 @@ fn format_swap(result: &mosaix_domain::DirectionalSwapResult) -> String {
 }
 
 #[cfg(windows)]
-fn run_swap(request: mosaix_ipc::IpcRequest) {
+fn run_swap(request: mosaix_ipc::IpcRequest, json: bool) {
     use mosaix_ipc::{send_request, IpcResponse};
 
     let data = match send_request(request) {
         Ok(IpcResponse::Ok { data: Some(data) }) => data,
         Ok(IpcResponse::Ok { data: None }) => {
-            println!("Ok");
-            return;
+            eprintln!("mosaix: the agent answered without a swap result");
+            std::process::exit(2);
         }
         Ok(IpcResponse::Error { message }) => {
             eprintln!("mosaix: {message}");
@@ -497,17 +512,24 @@ fn run_swap(request: mosaix_ipc::IpcRequest) {
             std::process::exit(2);
         }
     };
-    let result: mosaix_domain::DirectionalSwapResult = match serde_json::from_value(data) {
+    let result: mosaix_domain::DirectionalSwapResult = match serde_json::from_value(data.clone()) {
         Ok(result) => result,
         Err(error) => {
             eprintln!("mosaix: could not read the agent's swap result: {error}");
             std::process::exit(2);
         }
     };
-    if result.is_applied() {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&data).expect("JSON value serializes")
+        );
+    } else if result.is_applied() {
         println!("{}", format_swap(&result));
     } else {
         eprintln!("{}", format_swap(&result));
+    }
+    if !result.is_applied() {
         std::process::exit(1);
     }
 }
@@ -882,7 +904,7 @@ mod tests {
 
         assert_eq!(
             format_arrangement(&state),
-            "arrangement: tree (active)\n  display 1: 11 12 13\n    cannot fit at minimum size, left floating: 13"
+            "arrangement: tree (active)\n  display 1: 11 12 13\n    in constraint overflow (cannot fit at minimum size): 13"
         );
     }
 

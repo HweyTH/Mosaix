@@ -647,6 +647,41 @@ fn an_arrangement_survives_a_restart_with_its_axes_and_weights() {
 }
 
 #[test]
+fn a_dormant_leaf_survives_a_restart_with_its_evidence_and_age() {
+    use mosaix_domain::tree::{Child, DormantPosition, Node, SplitAxis};
+
+    let temporary = TempDatabase::new("tree-dormant");
+    let tree = mosaix_domain::PersistedTree::from_root(Node::Split {
+        axis: SplitAxis::Horizontal,
+        children: vec![
+            Child {
+                weight: 1.0,
+                node: Node::window(evidence("Code.exe", 0)),
+            },
+            Child {
+                weight: 1.0,
+                node: Node::dormant(DormantPosition {
+                    evidence: evidence("firefox.exe", 0),
+                    since_unix: 1_756_000_000,
+                }),
+            },
+        ],
+    });
+
+    {
+        let mut store = Persistence::open(&temporary.path()).expect("database opens");
+        store.save_tree("DISPLAY1", &tree).expect("the tree stores");
+    }
+    let restarted = Persistence::open(&temporary.path()).expect("database reopens");
+    let loaded = restarted.load_trees().expect("arrangements are readable");
+
+    assert_eq!(loaded.get("DISPLAY1"), Some(&tree));
+    let dormant = loaded["DISPLAY1"].dormant_positions();
+    assert_eq!(dormant.len(), 1);
+    assert_eq!(dormant[0].1.since_unix, 1_756_000_000);
+}
+
+#[test]
 fn saving_an_arrangement_replaces_the_one_that_display_held() {
     let temporary = TempDatabase::new("tree-replace");
     let mut store = Persistence::open(&temporary.path()).expect("database opens");

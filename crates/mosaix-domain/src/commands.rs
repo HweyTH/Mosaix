@@ -158,7 +158,8 @@ impl std::fmt::Display for DirectionalSwapRefusal {
             Self::NoFocusedWindow => formatter.write_str("no managed window is focused"),
             Self::NotArranged { window_id } => write!(
                 formatter,
-                "window {} is floating or cannot be fitted, so it has no place to swap from",
+                "window {} is not arranged by the tree (floating, or in constraint overflow), \
+                 so it has no place to swap from",
                 window_id.0
             ),
             Self::DisplayUnavailable { display_id } => write!(

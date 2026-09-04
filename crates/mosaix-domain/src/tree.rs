@@ -223,8 +223,6 @@ pub enum Toward {
 /// divider it moved, and the container's weights before and after.
 #[derive(Clone, Debug, PartialEq)]
 pub struct DividerChange<L> {
-    pub axis: SplitAxis,
-    pub toward: Toward,
     /// Every window in the child that gained space.
     pub grew: Vec<L>,
     /// Every window in the child that gave space up.
@@ -775,8 +773,6 @@ impl<L: PartialEq> Tree<L> {
                 child.weight /= renormalized;
             }
             return Some(DividerChange {
-                axis,
-                toward,
                 grew: children[index]
                     .node
                     .windows()

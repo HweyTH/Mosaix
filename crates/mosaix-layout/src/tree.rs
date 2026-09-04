@@ -822,6 +822,36 @@ mod tests {
     }
 
     #[test]
+    fn arranged_windows_never_overlap_while_others_overflow() {
+        for seed in 0..40u64 {
+            let tree = shaped_tree(seed, 1 + (seed as usize % 12));
+            let minimum = |window_id: WindowId| {
+                let n = (seed as i32 * 3 + window_id.0 as i32 * 5) % 4;
+                Some(Size::new(300 + 200 * n, 250 + 150 * n))
+            };
+            let plan = plan_tree_constrained(&tree, WORK_AREA, Gaps::new(6, 3), minimum);
+
+            for (index, (_, left)) in plan.placements.iter().enumerate() {
+                for (_, right) in plan.placements.iter().skip(index + 1) {
+                    assert!(
+                        !overlaps(*left, *right),
+                        "seed {seed}: {left:?} overlaps {right:?}"
+                    );
+                }
+            }
+            for (_, rect) in &plan.placements {
+                assert!(
+                    rect.x >= WORK_AREA.x
+                        && rect.y >= WORK_AREA.y
+                        && rect.right() <= WORK_AREA.right()
+                        && rect.bottom() <= WORK_AREA.bottom(),
+                    "seed {seed}: {rect:?} escapes the work area"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn overflow_order_is_stable_and_never_oscillates() {
         for seed in 0..40u64 {
             let tree = shaped_tree(seed, 1 + (seed as usize % 12));
