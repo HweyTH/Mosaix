@@ -25,6 +25,10 @@ enum Command {
     Rearrange,
     ToggleAutomaticTiling,
     ToggleFloating,
+    /// Select a display for commands such as saved-layout apply.
+    FocusDisplay {
+        display_id: isize,
+    },
     FocusLeft,
     FocusRight,
     FocusUp,
@@ -105,6 +109,7 @@ fn main() {
         Command::Rearrange => IpcRequest::Rearrange,
         Command::ToggleAutomaticTiling => IpcRequest::ToggleAutomaticTiling,
         Command::ToggleFloating => IpcRequest::ToggleFloating,
+        Command::FocusDisplay { display_id } => IpcRequest::FocusDisplay { display_id },
         Command::FocusLeft => IpcRequest::FocusLeft,
         Command::FocusRight => IpcRequest::FocusRight,
         Command::FocusUp => IpcRequest::FocusUp,

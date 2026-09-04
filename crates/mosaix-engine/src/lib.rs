@@ -49,6 +49,7 @@ use mosaix_layout::{
     snap_to_half, throw_preserving_ratio, CycleStep, DisplayDirection, HalfZone,
     HorizontalDirection,
 };
+use mosaix_persistence::PersistenceHealth;
 use mosaix_rules::{builtin_rules, ManageAction, Rule, RuleEvaluator};
 
 /// Default bound on the event queue before a sender blocks. Chosen
@@ -133,6 +134,9 @@ pub struct EngineState {
     /// Bumped on every committed mutation (architecture doc section 13:
     /// "Monotonic state revision on every committed mutation").
     pub revision: u64,
+    /// Whether committed state is currently durable independently of the
+    /// reducer's in-memory authority.
+    pub persistence_health: PersistenceHealth,
     pub displays: Vec<Display>,
     /// Where each tracked window currently sits, keyed by window. Entries
     /// are created (and their `previous_placement` remembered) by
@@ -158,6 +162,8 @@ pub struct EngineState {
     /// first [`Event::WindowFocused`] is observed. Sourced from the OS's
     /// foreground-change notification (architecture doc section 8.2).
     pub focused_window: Option<WindowId>,
+    /// Last display targeted by focus or an explicit display command.
+    pub focused_display: Option<DisplayId>,
     /// The currently active hotkeys/gaps/behavior settings (CONTEXT.md
     /// "Resolved config") -- whichever of `config_set`'s `base` or one of
     /// its `profiles` currently matches `displays`' topology. Updated by
@@ -340,6 +346,9 @@ pub enum Event {
     /// changed.
     DisplayTopologyChanged(Vec<Display>),
 
+    /// Ordered persistence acknowledgement or failure from the worker.
+    PersistenceHealthChanged(PersistenceHealth),
+
     /// A window was snapped or otherwise placed at `bounds` on
     /// `display_id`. Producers (a zone-snap command that resolved bounds
     /// via [`mosaix_layout`], drag-to-snap, etc.) send this after
@@ -387,6 +396,14 @@ pub enum Event {
         window_id: WindowId,
         display_id: DisplayId,
         bounds: Rect,
+    },
+
+    /// Focus is on the desktop or another unmanaged surface.
+    DesktopFocused,
+
+    /// Selects a display even when it has no managed focused window.
+    FocusDisplayRequested {
+        display_id: DisplayId,
     },
 
     /// A zone-snap hotkey fired for `direction` (architecture doc section
@@ -606,6 +623,8 @@ pub enum SavedLayoutRejection {
     /// Focus rests on the desktop, on an excluded window, or nowhere, so
     /// there is no display to target.
     NoFocusedManagedWindow,
+    /// There is no display target in the current usable topology.
+    NoFocusedDisplay,
     /// The focused window's display left the topology between the command
     /// being issued and being applied.
     DisplayUnavailable { display_id: DisplayId },
@@ -621,6 +640,8 @@ impl std::fmt::Display for SavedLayoutRejection {
             Self::NoFocusedManagedWindow => formatter.write_str(
                 "no managed window is focused, so there is no display to apply a layout to",
             ),
+            Self::NoFocusedDisplay => formatter
+                .write_str("no display is focused, so there is no display to apply a layout to"),
             Self::DisplayUnavailable { display_id } => write!(
                 formatter,
                 "the focused window's display {} is no longer connected",
@@ -677,10 +698,17 @@ pub fn plan_saved_layout(
             name: name.to_owned(),
         });
     };
+    // Existing callers that construct a state synchronously may not yet
+    // have observed a focus event. Derive the same target once for that
+    // compatibility path; live reducer state always carries it explicitly.
     let display_id = state
-        .focused_window
-        .and_then(|window_id| state.inventory.get(&window_id))
-        .map(|managed| managed.window.display_id)
+        .focused_display
+        .or_else(|| {
+            state
+                .focused_window
+                .and_then(|window_id| state.inventory.get(&window_id))
+                .map(|managed| managed.window.display_id)
+        })
         .ok_or(SavedLayoutRejection::NoFocusedManagedWindow)?;
     let Some(work_area) = work_area_of(&state.displays, display_id) else {
         return Err(SavedLayoutRejection::DisplayUnavailable { display_id });
@@ -766,6 +794,11 @@ fn display_window_order(state: &EngineState, display_id: DisplayId) -> Vec<Windo
 /// variant is handled explicitly so this stays true as the enum grows.
 fn apply(state: &mut EngineState, event: Event) {
     match event {
+        Event::PersistenceHealthChanged(health) => {
+            if state.persistence_health != health {
+                state.persistence_health = health;
+            }
+        }
         Event::DisplayTopologyChanged(displays) => {
             if displays.is_empty() {
                 tracing::warn!("empty display observation; retaining last usable topology");
@@ -785,6 +818,7 @@ fn apply(state: &mut EngineState, event: Event) {
             state.interactive_placement = None;
             state.deferred_reflow_displays.clear();
             migrate_orphaned_windows(state, &displays);
+            migrate_focused_display(state, &displays);
             state.displays = displays;
             // A display that is gone has no arrangement to report. Keeping
             // its entry would leave published state naming a layout as
@@ -923,7 +957,32 @@ fn apply(state: &mut EngineState, event: Event) {
                 rejection_count: 0,
             });
             state.focused_window = Some(window_id);
+            if state
+                .displays
+                .iter()
+                .any(|display| display.id == display_id)
+            {
+                state.focused_display = Some(display_id);
+            }
             state.revision += 1;
+        }
+
+        Event::DesktopFocused => {
+            if state.focused_window.take().is_some() {
+                state.revision += 1;
+            }
+        }
+
+        Event::FocusDisplayRequested { display_id } => {
+            if state
+                .displays
+                .iter()
+                .any(|display| display.id == display_id)
+                && state.focused_display != Some(display_id)
+            {
+                state.focused_display = Some(display_id);
+                state.revision += 1;
+            }
         }
 
         Event::ZoneSnapRequested { direction } => {
@@ -1945,6 +2004,35 @@ fn migrate_orphaned_windows(state: &mut EngineState, new_displays: &[Display]) {
     }
 }
 
+fn migrate_focused_display(state: &mut EngineState, new_displays: &[Display]) {
+    let Some(focused_id) = state.focused_display else {
+        return;
+    };
+    if new_displays.iter().any(|display| display.id == focused_id) {
+        return;
+    }
+    let Some(previous) = state
+        .displays
+        .iter()
+        .find(|display| display.id == focused_id)
+    else {
+        state.focused_display = None;
+        return;
+    };
+    let center_x = previous.full_bounds.x + previous.full_bounds.width / 2;
+    let center_y = previous.full_bounds.y + previous.full_bounds.height / 2;
+    state.focused_display = new_displays
+        .iter()
+        .min_by_key(|candidate| {
+            let candidate_x = candidate.full_bounds.x + candidate.full_bounds.width / 2;
+            let candidate_y = candidate.full_bounds.y + candidate.full_bounds.height / 2;
+            let dx = (candidate_x - center_x) as i64;
+            let dy = (candidate_y - center_y) as i64;
+            (dx * dx + dy * dy, !candidate.is_primary, candidate.id.0)
+        })
+        .map(|display| display.id);
+}
+
 /// The queue actually carries this, not `Event` directly, so [`stop`]
 /// can terminate the reducer with an explicit poison pill rather than by
 /// waiting for every sender to be dropped -- callers are expected to hand
@@ -2094,8 +2182,12 @@ pub fn spawn_engine_with_capacity(
     let (tx, rx) = sync_channel::<Message>(capacity);
     let initial_resolved_config = select_resolved_config(&initial_config_set, &initial_displays);
     let initial_automatic_tiling_active = initial_resolved_config.automatic_tiling_enabled;
+    let initial_focused_display = initial_displays.first().map(|display| display.id);
     let initial_state = EngineState {
         revision: 0,
+        persistence_health: PersistenceHealth::Healthy {
+            last_durable_revision: 0,
+        },
         displays: initial_displays,
         windows: HashMap::new(),
         inventory: HashMap::new(),
@@ -2105,6 +2197,7 @@ pub fn spawn_engine_with_capacity(
         session_floating: HashSet::new(),
         session_tiled: HashSet::new(),
         focused_window: None,
+        focused_display: initial_focused_display,
         resolved_config: initial_resolved_config,
         config_set: initial_config_set,
         paused: false,
@@ -5986,5 +6079,35 @@ mod tests {
             state.last_applied_layouts.is_empty(),
             "a display nobody can see has no current arrangement to report"
         );
+    }
+    #[test]
+    fn focused_display_survives_desktop_focus_and_moves_when_its_display_disconnects() {
+        let mut state = state_with_saved_layout("unused", &[]);
+        apply(
+            &mut state,
+            Event::DisplayTopologyChanged(vec![
+                display(1, "left", -1920),
+                display(2, "primary", 0),
+            ]),
+        );
+        apply(
+            &mut state,
+            Event::WindowFocused {
+                window_id: WindowId(10),
+                display_id: DisplayId(1),
+                bounds: Rect::new(-1800, 0, 800, 600),
+            },
+        );
+        assert_eq!(state.focused_display, Some(DisplayId(1)));
+
+        apply(&mut state, Event::DesktopFocused);
+        assert_eq!(state.focused_window, None);
+        assert_eq!(state.focused_display, Some(DisplayId(1)));
+
+        apply(
+            &mut state,
+            Event::DisplayTopologyChanged(vec![display(2, "primary", 0)]),
+        );
+        assert_eq!(state.focused_display, Some(DisplayId(2)));
     }
 }

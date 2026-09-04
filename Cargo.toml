@@ -8,6 +8,7 @@ members = [
     "crates/mosaix-rules",
     "crates/mosaix-engine",
     "crates/mosaix-config",
+    "crates/mosaix-persistence",
     "crates/mosaix-ipc",
     "crates/mosaix-platform-api",
     "crates/mosaix-platform-windows",
@@ -33,4 +34,5 @@ tracing = "0.1"
 tracing-subscriber = "0.3"
 tokio = { version = "1", features = ["full"] }
 regex = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
 clap = { version = "4", features = ["derive"] }

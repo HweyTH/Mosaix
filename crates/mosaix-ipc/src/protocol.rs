@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 /// older agent has no tag for a request this build added -- and no field
 /// for one an existing request grew -- so the version is what makes the
 /// mismatch reportable instead of surfacing as a deserialization failure.
-pub const PROTOCOL_VERSION: u32 = 7;
+pub const PROTOCOL_VERSION: u32 = 8;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct IpcEnvelope {
@@ -51,6 +51,10 @@ pub enum IpcRequest {
     SwapUp,
     SwapDown,
     GetPauseState,
+    /// Select a display for display-scoped commands, including an empty one.
+    FocusDisplay {
+        display_id: isize,
+    },
     /// Apply the saved layout called `name` to the focused window's
     /// display (ADR 0020). The first request carrying a payload, hence
     /// [`PROTOCOL_VERSION`] 2.
@@ -263,6 +267,7 @@ mod tests {
             IpcRequest::SwapUp,
             IpcRequest::SwapDown,
             IpcRequest::GetPauseState,
+            IpcRequest::FocusDisplay { display_id: 7 },
             IpcRequest::ApplyLayout {
                 name: "writing".to_owned(),
             },

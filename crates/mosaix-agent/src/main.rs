@@ -199,6 +199,65 @@ fn main() {
 
     let engine = mosaix_engine::spawn_engine(initial_displays, initial_config_set);
 
+    // The worker owns the per-user bundled-SQLite connection. A failure is
+    // deliberately reflected into reducer state instead of aborting live
+    // window management.
+    let persistence_path = config_dir
+        .as_ref()
+        .map(|dir| dir.parent().unwrap_or(dir).join("state.db"));
+    let persistence_worker = persistence_path.as_ref().and_then(|path| {
+        mosaix_persistence::PersistenceWorker::start(path)
+            .map_err(|error| {
+                tracing::error!(%error, "persistence worker could not start");
+                error
+            })
+            .ok()
+    });
+    if persistence_worker.is_none() {
+        let _ = engine
+            .events()
+            .send(mosaix_engine::Event::PersistenceHealthChanged(
+                mosaix_persistence::PersistenceHealth::Degraded {
+                    last_durable_revision: 0,
+                    reason: mosaix_persistence::PersistenceFailure::OpenFailed,
+                },
+            ));
+    }
+    let (persistence_stop_tx, persistence_bridge) = if let Some(worker) = persistence_worker {
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+        let state_reader = engine.state_reader();
+        let events = engine.events();
+        let bridge = std::thread::spawn(move || {
+            let mut submitted_revision = None;
+            loop {
+                if stop_rx.try_recv().is_ok() {
+                    break;
+                }
+                let revision = state_reader.revision();
+                if submitted_revision != Some(revision) {
+                    if worker.commit(revision).is_err() {
+                        let _ = events.send(mosaix_engine::Event::PersistenceHealthChanged(
+                            mosaix_persistence::PersistenceHealth::Degraded {
+                                last_durable_revision: submitted_revision.unwrap_or(0),
+                                reason: mosaix_persistence::PersistenceFailure::WriteFailed,
+                            },
+                        ));
+                        break;
+                    }
+                    if let Ok(health) = worker.next_update() {
+                        let _ = events.send(mosaix_engine::Event::PersistenceHealthChanged(health));
+                    }
+                    submitted_revision = Some(revision);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            worker.stop();
+        });
+        (Some(stop_tx), Some(bridge))
+    } else {
+        (None, None)
+    };
+
     // Feature 28 — startup reconciliation.
     //
     // Before the OS-event hooks are active, enumerate every existing window
@@ -1003,6 +1062,12 @@ fn main() {
     }
     let _ = hotkey_rebind_stop_tx.send(());
     let _ = hotkey_rebind_forwarder.join();
+    if let Some(stop_tx) = persistence_stop_tx {
+        let _ = stop_tx.send(());
+    }
+    if let Some(bridge) = persistence_bridge {
+        let _ = bridge.join();
+    }
 
     // The overlay controller stops only when every `OverlayRequest` sender is
     // gone, so this must come after the three forwarders that hold clones --

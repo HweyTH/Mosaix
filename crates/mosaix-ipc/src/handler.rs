@@ -7,6 +7,7 @@ use mosaix_config::{
 use mosaix_engine::{
     EligibilityReason, EngineState, Event, EventSender, StateReader, ZoneSnapDirection,
 };
+use mosaix_persistence::PersistenceHealth;
 use mosaix_rules::ManageAction;
 use serde::{Deserialize, Serialize};
 
@@ -19,6 +20,10 @@ pub struct StateSnapshot {
     pub topology_fingerprint: String,
     pub window_count: usize,
     pub focused_window: Option<isize>,
+    pub focused_display: Option<isize>,
+    pub persistence_status: String,
+    pub last_durable_revision: u64,
+    pub persistence_reason: Option<String>,
     pub paused: bool,
     pub automatic_tiling_active: bool,
     pub automatic_tiling_suspended: bool,
@@ -323,12 +328,30 @@ impl From<EngineState> for StateSnapshot {
             .iter()
             .map(|command| command.to_string())
             .collect();
+        let (persistence_status, last_durable_revision, persistence_reason) =
+            match state.persistence_health {
+                PersistenceHealth::Healthy {
+                    last_durable_revision,
+                } => ("healthy".to_owned(), last_durable_revision, None),
+                PersistenceHealth::Degraded {
+                    last_durable_revision,
+                    reason,
+                } => (
+                    "degraded".to_owned(),
+                    last_durable_revision,
+                    Some(format!("{reason:?}").to_lowercase()),
+                ),
+            };
         Self {
             revision: state.revision,
             display_count: state.displays.len(),
             topology_fingerprint: mosaix_domain::topology_fingerprint(&state.displays),
             window_count: state.windows.len(),
             focused_window: state.focused_window.map(|id| id.0),
+            focused_display: state.focused_display.map(|id| id.0),
+            persistence_status,
+            last_durable_revision,
+            persistence_reason,
             paused: state.paused,
             automatic_tiling_active: state.automatic_tiling_active,
             automatic_tiling_suspended: state.automatic_tiling_suspended,
@@ -659,6 +682,12 @@ pub fn handle_request(
             let value = serde_json::json!({ "paused": state.paused });
             IpcResponse::Ok { data: Some(value) }
         }
+        IpcRequest::FocusDisplay { display_id } => send_event(
+            events,
+            Event::FocusDisplayRequested {
+                display_id: mosaix_domain::DisplayId(*display_id),
+            },
+        ),
         IpcRequest::ApplyLayout { name } => {
             // The reducer would reach the same verdict, but only a log
             // would come of it. Asking first is what lets the caller be
