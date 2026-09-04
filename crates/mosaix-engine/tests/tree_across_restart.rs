@@ -94,6 +94,7 @@ fn window(id: isize, application: &str, class: &str) -> Window {
         },
         elevated: false,
         lifecycle: WindowLifecycle::Active,
+        minimum_size: None,
     }
 }
 
@@ -118,7 +119,7 @@ fn order_by_application(state: &EngineState) -> Vec<String> {
     let mut placed: Vec<(i32, String)> = state
         .trees
         .values()
-        .flat_map(|tree| tree.leaves())
+        .flat_map(|tree| tree.windows())
         .filter_map(|window_id| {
             let managed = state.inventory.get(window_id)?;
             let placement = state.windows.get(window_id)?;

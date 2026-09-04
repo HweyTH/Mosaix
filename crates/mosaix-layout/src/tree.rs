@@ -11,7 +11,7 @@
 //! tile the work area exactly.
 
 use mosaix_domain::tree::{ContainerTree, Node, SplitAxis};
-use mosaix_domain::{allocate_edges, Gaps, Rect, WindowId};
+use mosaix_domain::{allocate_edges, Gaps, Rect, Size, WindowId};
 
 use crate::zones::apply_gaps;
 
@@ -23,20 +23,91 @@ pub struct Insertion {
     pub axis: SplitAxis,
 }
 
-/// Places every window in `tree` inside `work_area`.
-///
-/// Gaps are applied last, and are reduced together toward zero rather than
-/// allowed to consume a window: a display too small for the configured
-/// decoration loses the decoration first (spec user story 43).
+/// What the planner produced for one display: where each arranged
+/// window goes, which windows it could not fit, and the gaps it ended up
+/// using.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TreePlan {
+    /// Every arranged window, in visual order, gaps already applied.
+    pub placements: Vec<(WindowId, Rect)>,
+    /// Windows whose leaves are kept but which the display cannot fit at
+    /// their minimum size, newest insertion first (CONTEXT.md
+    /// "Constraint-overflow window"). Empty whenever everything fits.
+    pub overflow: Vec<WindowId>,
+    /// The gaps actually applied: the configured ones when they fit, and
+    /// a reduced fraction of them when decoration had to give way.
+    pub gaps: Gaps,
+}
+
+/// Places every window in `tree` inside `work_area`, with no minimum-size
+/// constraints. The shape [`plan_tree_constrained`] takes when nothing is
+/// known about any window's minimum.
 pub fn plan_tree(tree: &ContainerTree, work_area: Rect, gaps: Gaps) -> Vec<(WindowId, Rect)> {
-    let raw = plan_tree_raw(tree, work_area);
-    if raw.is_empty() {
-        return raw;
+    plan_tree_constrained(tree, work_area, gaps, |_| None).placements
+}
+
+/// Places every window in `tree` inside `work_area` that the display can
+/// fit, honouring each window's minimum size.
+///
+/// The degradation order is fixed (spec user stories 43 and 44). Gaps are
+/// reduced together toward zero first, so a display too small for the
+/// configured decoration loses the decoration before it loses a window.
+/// Only if the windows still cannot fit at zero gaps does the newest
+/// inserted window leave the arrangement, and the rest are planned again
+/// without it; that repeats until the remainder fits. Established windows
+/// therefore keep their places, and the same tree on the same display
+/// always overflows the same windows in the same order.
+///
+/// `minimum_size` answers `None` for a window whose minimum is unknown,
+/// which is treated as needing positive area and nothing more -- an
+/// unknown minimum is never guessed at.
+pub fn plan_tree_constrained(
+    tree: &ContainerTree,
+    work_area: Rect,
+    gaps: Gaps,
+    minimum_size: impl Fn(WindowId) -> Option<Size>,
+) -> TreePlan {
+    let mut arranged = tree.clone();
+    let mut overflow = Vec::new();
+    loop {
+        let raw = plan_tree_raw(&arranged, work_area);
+        if raw.is_empty() {
+            return TreePlan {
+                placements: raw,
+                overflow,
+                gaps: Gaps::new(0, 0),
+            };
+        }
+        if let Some(usable) = usable_gaps(&raw, work_area, gaps, &minimum_size) {
+            return TreePlan {
+                placements: raw
+                    .into_iter()
+                    .map(|(window_id, rect)| (window_id, apply_gaps(rect, work_area, usable)))
+                    .collect(),
+                overflow,
+                gaps: usable,
+            };
+        }
+        // Nothing fits even undecorated: the newest window gives its
+        // space back. Visual order breaks a tie in insertion number, later
+        // counting as newer, so the choice never depends on iteration.
+        let Some(newest) = arranged
+            .leaves()
+            .into_iter()
+            .enumerate()
+            .max_by_key(|(index, leaf)| (leaf.inserted, *index))
+            .map(|(_, leaf)| leaf.window)
+        else {
+            return TreePlan {
+                placements: Vec::new(),
+                overflow,
+                gaps: Gaps::new(0, 0),
+            };
+        };
+        arranged =
+            arranged.filter_map_windows(&mut |window| (*window != newest).then_some(*window));
+        overflow.push(newest);
     }
-    let usable = usable_gaps(&raw, work_area, gaps);
-    raw.into_iter()
-        .map(|(window_id, rect)| (window_id, apply_gaps(rect, work_area, usable)))
-        .collect()
 }
 
 /// The tiling before gaps: contiguous rectangles that exactly cover
@@ -54,26 +125,33 @@ pub fn plan_tree_raw(tree: &ContainerTree, work_area: Rect) -> Vec<(WindowId, Re
     placements
 }
 
-/// The largest fraction of `gaps` that leaves every cell with positive
-/// area. Whole steps rather than a continuous search, so the result is
-/// stable against float drift and easy to reason about.
-fn usable_gaps(placements: &[(WindowId, Rect)], work_area: Rect, gaps: Gaps) -> Gaps {
+/// The largest fraction of `gaps` that leaves every cell at or above its
+/// window's minimum size, or `None` when not even zero gaps do. Whole
+/// steps rather than a continuous search, so the result is stable against
+/// float drift and easy to reason about.
+fn usable_gaps(
+    placements: &[(WindowId, Rect)],
+    work_area: Rect,
+    gaps: Gaps,
+    minimum_size: &impl Fn(WindowId) -> Option<Size>,
+) -> Option<Gaps> {
     const STEPS: i32 = 8;
-    for step in (0..=STEPS).rev() {
-        let candidate = Gaps::new(gaps.outer * step / STEPS, gaps.inner * step / STEPS);
-        let fits = placements.iter().all(|(_, rect)| {
-            apply_gaps(*rect, work_area, candidate).has_positive_area()
-        });
-        if fits {
-            return candidate;
-        }
-    }
-    Gaps::new(0, 0)
+    (0..=STEPS)
+        .rev()
+        .map(|step| Gaps::new(gaps.outer * step / STEPS, gaps.inner * step / STEPS))
+        .find(|candidate| {
+            placements.iter().all(|(window_id, rect)| {
+                let placed = apply_gaps(*rect, work_area, *candidate);
+                minimum_size(*window_id)
+                    .unwrap_or(Size::new(1, 1))
+                    .fits_within(placed)
+            })
+        })
 }
 
 fn tile(node: &Node<WindowId>, area: Rect, placements: &mut Vec<(WindowId, Rect)>) {
     match node {
-        Node::Leaf(window_id) => placements.push((*window_id, area)),
+        Node::Leaf(leaf) => placements.push((leaf.window, area)),
         Node::Split { axis, children } => {
             let weights: Vec<f64> = children.iter().map(|child| child.weight).collect();
             if weights.is_empty() {
@@ -199,7 +277,7 @@ mod tests {
         let mut tree = ContainerTree::new();
         tree.insert_first(WindowId(0));
         for id in 1..leaves as isize {
-            let existing: Vec<WindowId> = tree.leaves().into_iter().copied().collect();
+            let existing: Vec<WindowId> = tree.windows().into_iter().copied().collect();
             let target = existing[next() % existing.len()];
             let axis = if next() % 2 == 0 {
                 SplitAxis::Horizontal
@@ -343,10 +421,12 @@ mod tests {
             let tree = shaped_tree(seed, leaves);
             let placements = plan_tree(&tree, WORK_AREA, Gaps::new(6, 3));
 
-            let mut placed: Vec<isize> =
-                placements.iter().map(|(window_id, _)| window_id.0).collect();
+            let mut placed: Vec<isize> = placements
+                .iter()
+                .map(|(window_id, _)| window_id.0)
+                .collect();
             placed.sort_unstable();
-            let mut expected: Vec<isize> = tree.leaves().into_iter().map(|id| id.0).collect();
+            let mut expected: Vec<isize> = tree.windows().into_iter().map(|id| id.0).collect();
             expected.sort_unstable();
             assert_eq!(placed, expected, "seed {seed}");
         }
@@ -376,7 +456,11 @@ mod tests {
             let leaves = 1 + (seed as usize % 12);
             let tree = shaped_tree(seed, leaves);
 
-            for area in [WORK_AREA, Rect::new(-1920, -200, 1280, 1024), Rect::new(3, 7, 801, 603)] {
+            for area in [
+                WORK_AREA,
+                Rect::new(-1920, -200, 1280, 1024),
+                Rect::new(3, 7, 801, 603),
+            ] {
                 for (_, rect) in plan_tree(&tree, area, Gaps::new(6, 3)) {
                     assert!(
                         rect.x >= area.x
@@ -467,11 +551,11 @@ mod tests {
             children: vec![
                 Child {
                     weight: 3.0,
-                    node: Node::Leaf(WindowId(1)),
+                    node: Node::window(WindowId(1)),
                 },
                 Child {
                     weight: 1.0,
-                    node: Node::Leaf(WindowId(2)),
+                    node: Node::window(WindowId(2)),
                 },
             ],
         });
@@ -483,5 +567,249 @@ mod tests {
                 (WindowId(2), Rect::new(1440, 0, 480, 1080)),
             ]
         );
+    }
+
+    // ---- minimum sizes and constraint overflow (issue #54) ------------
+
+    /// A minimum-size oracle over a fixed table, unknown for the rest.
+    fn minimums(table: &[(isize, i32, i32)]) -> impl Fn(WindowId) -> Option<Size> + '_ {
+        move |window_id| {
+            table
+                .iter()
+                .find(|(id, _, _)| *id == window_id.0)
+                .map(|(_, width, height)| Size::new(*width, *height))
+        }
+    }
+
+    #[test]
+    fn a_plan_with_no_known_minimums_matches_the_unconstrained_plan() {
+        let tree = tree_of(&[1, 2, 3]);
+
+        let plan = plan_tree_constrained(&tree, WORK_AREA, Gaps::new(10, 4), |_| None);
+
+        assert_eq!(
+            plan.placements,
+            plan_tree(&tree, WORK_AREA, Gaps::new(10, 4))
+        );
+        assert!(plan.overflow.is_empty());
+        assert_eq!(plan.gaps, Gaps::new(10, 4));
+    }
+
+    #[test]
+    fn gaps_give_way_before_any_window_does() {
+        // Two windows side by side on a 1000px display, each needing 490px.
+        // With the configured gaps they would get 474px; with none, 500px.
+        let tree = tree_of(&[1, 2]);
+        let area = Rect::new(0, 0, 1000, 600);
+
+        let plan = plan_tree_constrained(
+            &tree,
+            area,
+            Gaps::new(20, 12),
+            minimums(&[(1, 490, 100), (2, 490, 100)]),
+        );
+
+        assert!(
+            plan.overflow.is_empty(),
+            "both windows fit once gaps shrink"
+        );
+        assert!(
+            plan.gaps.outer < 20 && plan.gaps.inner < 12,
+            "decoration was sacrificed: {:?}",
+            plan.gaps
+        );
+        for (window_id, rect) in &plan.placements {
+            assert!(rect.width >= 490, "window {window_id:?} got {rect:?}");
+        }
+    }
+
+    #[test]
+    fn the_newest_window_overflows_first_and_the_rest_keep_their_places() {
+        // Three windows in a row, each needing 400px of a 1000px display:
+        // only two can fit. Window 3 was inserted last, so it goes.
+        let tree = Tree::from_root(Node::Split {
+            axis: SplitAxis::Horizontal,
+            children: vec![
+                Child {
+                    weight: 1.0,
+                    node: Node::window(WindowId(1)),
+                },
+                Child {
+                    weight: 1.0,
+                    node: Node::window(WindowId(2)),
+                },
+                Child {
+                    weight: 1.0,
+                    node: Node::window(WindowId(3)),
+                },
+            ],
+        });
+        let area = Rect::new(0, 0, 1000, 600);
+        let table = [(1, 400, 100), (2, 400, 100), (3, 400, 100)];
+
+        let plan = plan_tree_constrained(&tree, area, Gaps::new(0, 0), minimums(&table));
+
+        assert_eq!(plan.overflow, vec![WindowId(3)]);
+        assert_eq!(
+            plan.placements,
+            vec![
+                (WindowId(1), Rect::new(0, 0, 500, 600)),
+                (WindowId(2), Rect::new(500, 0, 500, 600)),
+            ],
+            "the established windows share the space the newest gave back"
+        );
+    }
+
+    #[test]
+    fn overflow_follows_the_newest_slot_which_a_swap_does_not_move() {
+        // Window 9 arrived last and took half of window 1 space. Swapping
+        // them exchanges only the occupants (ADR 0026): the slot that was
+        // inserted last now holds window 1, and it is the slot that gives
+        // its space back, so window 1 overflows.
+        let mut tree = ContainerTree::new();
+        tree.insert_first(WindowId(1));
+        tree.split_leaf(&WindowId(1), SplitAxis::Horizontal, WindowId(2));
+        tree.split_leaf(&WindowId(1), SplitAxis::Horizontal, WindowId(9));
+        tree.swap_leaves(&WindowId(1), &WindowId(9));
+        assert_eq!(
+            tree.windows()
+                .into_iter()
+                .map(|id| id.0)
+                .collect::<Vec<_>>(),
+            vec![9, 1, 2]
+        );
+        let area = Rect::new(0, 0, 1000, 600);
+        let table = [(1, 300, 100), (2, 300, 100), (9, 300, 100)];
+
+        let plan = plan_tree_constrained(&tree, area, Gaps::new(0, 0), minimums(&table));
+
+        assert_eq!(plan.overflow, vec![WindowId(1)]);
+        assert_eq!(
+            plan.placements,
+            vec![
+                (WindowId(9), Rect::new(0, 0, 333, 600)),
+                (WindowId(2), Rect::new(333, 0, 667, 600)),
+            ],
+            "window 9 keeps the older slot and the space that slot regains"
+        );
+    }
+
+    #[test]
+    fn overflow_keeps_removing_the_newest_until_the_rest_fit() {
+        let tree = tree_of(&[1, 2, 3, 4]);
+        let area = Rect::new(0, 0, 1000, 600);
+        // Everything needs the whole display: only the first survives.
+        let table = [
+            (1, 1000, 600),
+            (2, 1000, 600),
+            (3, 1000, 600),
+            (4, 1000, 600),
+        ];
+
+        let plan = plan_tree_constrained(&tree, area, Gaps::new(0, 0), minimums(&table));
+
+        assert_eq!(
+            plan.overflow,
+            vec![WindowId(4), WindowId(3), WindowId(2)],
+            "newest first, one at a time"
+        );
+        assert_eq!(plan.placements, vec![(WindowId(1), area)]);
+    }
+
+    #[test]
+    fn a_window_that_cannot_fit_the_display_at_all_overflows_alone() {
+        let tree = tree_of(&[1]);
+
+        let plan = plan_tree_constrained(
+            &tree,
+            Rect::new(0, 0, 800, 600),
+            Gaps::new(0, 0),
+            minimums(&[(1, 1200, 100)]),
+        );
+
+        assert_eq!(plan.overflow, vec![WindowId(1)]);
+        assert!(plan.placements.is_empty());
+    }
+
+    #[test]
+    fn an_unknown_minimum_is_never_guessed_at() {
+        // A cramped strip of eight windows: with no minimums known, every
+        // one is still placed, at positive area.
+        let tree = tree_of(&[1, 2, 3, 4, 5, 6, 7, 8]);
+
+        let plan = plan_tree_constrained(&tree, Rect::new(0, 0, 80, 60), Gaps::new(0, 0), |_| None);
+
+        assert!(plan.overflow.is_empty());
+        assert_eq!(plan.placements.len(), 8);
+    }
+
+    #[test]
+    fn every_arranged_window_meets_its_minimum_size() {
+        for seed in 0..40u64 {
+            let leaves = 1 + (seed as usize % 12);
+            let tree = shaped_tree(seed, leaves);
+            // Minimums vary per window and per seed, some unknown.
+            let minimum = |window_id: WindowId| {
+                let n = (seed as i32 * 7 + window_id.0 as i32 * 13) % 5;
+                (n != 0).then(|| Size::new(120 * n, 90 * n))
+            };
+            let plan = plan_tree_constrained(&tree, WORK_AREA, Gaps::new(6, 3), minimum);
+
+            for (window_id, rect) in &plan.placements {
+                assert!(
+                    minimum(*window_id)
+                        .unwrap_or(Size::new(1, 1))
+                        .fits_within(*rect),
+                    "seed {seed}: {window_id:?} at {rect:?} is below its minimum"
+                );
+            }
+            let mut accounted: Vec<isize> = plan
+                .placements
+                .iter()
+                .map(|(id, _)| id.0)
+                .chain(plan.overflow.iter().map(|id| id.0))
+                .collect();
+            accounted.sort_unstable();
+            let mut expected: Vec<isize> = tree.windows().into_iter().map(|id| id.0).collect();
+            expected.sort_unstable();
+            assert_eq!(
+                accounted, expected,
+                "seed {seed}: every window is either arranged or overflowed, never both"
+            );
+        }
+    }
+
+    #[test]
+    fn overflow_order_is_stable_and_never_oscillates() {
+        for seed in 0..40u64 {
+            let tree = shaped_tree(seed, 1 + (seed as usize % 12));
+            let minimum = |_: WindowId| Some(Size::new(700, 500));
+            let first = plan_tree_constrained(&tree, WORK_AREA, Gaps::new(6, 3), minimum);
+            let second = plan_tree_constrained(&tree, WORK_AREA, Gaps::new(6, 3), minimum);
+            assert_eq!(first, second, "seed {seed}");
+
+            // Overflow is newest-first: insertion numbers descend.
+            let numbers: Vec<u64> = first
+                .overflow
+                .iter()
+                .map(|id| {
+                    tree.insertion_of(id)
+                        .expect("an overflowed window is in the tree")
+                })
+                .collect();
+            assert!(
+                numbers.windows(2).all(|pair| pair[0] > pair[1]),
+                "seed {seed}: overflow {numbers:?} is not newest-first"
+            );
+
+            // And re-planning the tree with the overflowed windows removed
+            // reproduces the arranged placements exactly: the arrangement
+            // the survivors got is the one they would have got alone.
+            let survivors =
+                tree.filter_map_windows(&mut |id| (!first.overflow.contains(id)).then_some(*id));
+            let alone = plan_tree_constrained(&survivors, WORK_AREA, Gaps::new(6, 3), minimum);
+            assert_eq!(alone.placements, first.placements, "seed {seed}");
+            assert!(alone.overflow.is_empty(), "seed {seed}");
+        }
     }
 }

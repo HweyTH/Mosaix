@@ -536,7 +536,7 @@ fn stored_tree(applications: &[&str]) -> mosaix_domain::PersistedTree {
     for (index, application) in applications.iter().enumerate() {
         children.push(Child {
             weight: 1.0 + index as f64,
-            node: Node::Leaf(evidence(application, index as u32)),
+            node: Node::window(evidence(application, index as u32)),
         });
     }
     mosaix_domain::PersistedTree::from_root(Node::Split {

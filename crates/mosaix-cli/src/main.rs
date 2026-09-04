@@ -253,6 +253,22 @@ fn format_arrangement(state: &serde_json::Value) -> String {
                     })
                     .unwrap_or_default();
                 rendered.push_str(&format!("\n  display {display}: {}", windows.join(" ")));
+                let overflow: Vec<String> = tree["constraint_overflow"]
+                    .as_array()
+                    .map(|windows| {
+                        windows
+                            .iter()
+                            .filter_map(|window| window.as_i64())
+                            .map(|window| window.to_string())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if !overflow.is_empty() {
+                    rendered.push_str(&format!(
+                        "\n    cannot fit at minimum size, left floating: {}",
+                        overflow.join(" ")
+                    ));
+                }
             }
         }
         _ if mode == "tree" => {
@@ -588,6 +604,23 @@ mod tests {
         assert_eq!(
             format_arrangement(&state),
             "arrangement: tree (active)\n  display 1: 11 12 13\n  display 2: 21"
+        );
+    }
+
+    #[test]
+    fn tree_mode_names_the_windows_it_could_not_fit() {
+        let state = serde_json::json!({
+            "tiling_mode": "tree",
+            "automatic_tiling_active": true,
+            "automatic_tiling_suspended": false,
+            "container_trees": [
+                { "display_id": 1, "windows": [11, 12, 13], "constraint_overflow": [13] },
+            ],
+        });
+
+        assert_eq!(
+            format_arrangement(&state),
+            "arrangement: tree (active)\n  display 1: 11 12 13\n    cannot fit at minimum size, left floating: 13"
         );
     }
 

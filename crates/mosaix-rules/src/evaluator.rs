@@ -95,6 +95,7 @@ mod tests {
             },
             elevated: false,
             lifecycle: WindowLifecycle::Active,
+            minimum_size: None,
         }
     }
 

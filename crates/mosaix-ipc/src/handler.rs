@@ -4,10 +4,10 @@ use mosaix_config::{
     BindingEdit, BindingWrite, Command, ConfigLayer, KeyCombo, LayoutEdit, LayoutWrite,
     ResolvedConfig, SavedLayout,
 };
+use mosaix_domain::undo::UndoResult;
 use mosaix_engine::{
     EligibilityReason, EngineState, Event, EventSender, StateReader, ZoneSnapDirection,
 };
-use mosaix_domain::undo::UndoResult;
 use mosaix_persistence::PersistenceHealth;
 use mosaix_rules::ManageAction;
 use serde::{Deserialize, Serialize};
@@ -18,7 +18,14 @@ use crate::protocol::{IpcRequest, IpcResponse};
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct ContainerTreeSnapshot {
     pub display_id: isize,
+    /// Every window holding a leaf, in visual order, whether or not it is
+    /// currently arranged.
     pub windows: Vec<isize>,
+    /// The windows the display cannot fit at their minimum size, newest
+    /// insertion first (CONTEXT.md "Constraint-overflow window"). They
+    /// appear in `windows` too, because they keep their leaves.
+    #[serde(default)]
+    pub constraint_overflow: Vec<isize>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -278,6 +285,12 @@ pub struct ManagedWindowSnapshot {
     pub display_id: isize,
     pub action: String,
     pub eligibility: String,
+    /// Whether the container tree is currently leaving this window where
+    /// it is because the display cannot fit it at its minimum size.
+    /// Separate from `eligibility`, which stays `eligible`: overflow is a
+    /// planner outcome, not a rule or a session-floating choice.
+    #[serde(default)]
+    pub constraint_overflow: bool,
 }
 
 fn action_name(action: ManageAction) -> &'static str {
@@ -336,6 +349,10 @@ impl From<EngineState> for StateSnapshot {
                 display_id: managed.window.display_id.0,
                 action: action_name(managed.action).to_owned(),
                 eligibility: eligibility_name(managed.eligibility).to_owned(),
+                constraint_overflow: state
+                    .constraint_overflow
+                    .get(&managed.window.display_id)
+                    .is_some_and(|overflow| overflow.contains(&managed.window.id)),
             })
             .collect();
         managed_windows.sort_by_key(|window| window.window_id);
@@ -384,16 +401,18 @@ impl From<EngineState> for StateSnapshot {
             .iter()
             .map(|(display_id, tree)| ContainerTreeSnapshot {
                 display_id: display_id.0,
-                windows: tree.leaves().into_iter().map(|id| id.0).collect(),
+                windows: tree.windows().into_iter().map(|id| id.0).collect(),
+                constraint_overflow: state
+                    .constraint_overflow
+                    .get(display_id)
+                    .map(|overflow| overflow.iter().map(|id| id.0).collect())
+                    .unwrap_or_default(),
             })
             .collect();
         container_trees.sort_by_key(|snapshot| snapshot.display_id);
 
         let (undo_command, undo_transaction_id) = match &state.newest_undo {
-            Some(transaction) => (
-                Some(transaction.command.clone()),
-                Some(transaction.id.0),
-            ),
+            Some(transaction) => (Some(transaction.command.clone()), Some(transaction.id.0)),
             None => (None, None),
         };
         Self {
@@ -1023,6 +1042,29 @@ mod tests {
     use mosaix_domain::{DisplayId, Rect, WindowId};
     use mosaix_engine::{ManagedWindow, WindowPlacement, CIRCUIT_BREAKER_THRESHOLD};
 
+    fn sample_window(id: isize) -> Window {
+        Window {
+            id: WindowId(id),
+            process_id: 1,
+            application_id: ApplicationId("test.exe".to_owned()),
+            executable_path: None,
+            title: "non-sensitive".to_owned(),
+            native_class: None,
+            role: WindowRole::Normal,
+            bounds: Rect::new(0, 0, 100, 100),
+            display_id: DisplayId(1),
+            capabilities: WindowCapabilities {
+                can_move: true,
+                can_resize: true,
+                can_minimize: true,
+                can_maximize: true,
+            },
+            elevated: false,
+            lifecycle: WindowLifecycle::Active,
+            minimum_size: None,
+        }
+    }
+
     #[test]
     fn state_snapshot_exposes_each_degraded_window_with_a_stable_reason() {
         let mut state = EngineState::default();
@@ -1096,8 +1138,56 @@ mod tests {
         assert_eq!(json["tiling_mode"], "tree");
         assert_eq!(
             json["container_trees"],
-            serde_json::json!([{ "display_id": 2, "windows": [11, 12] }])
+            serde_json::json!([{ "display_id": 2, "windows": [11, 12], "constraint_overflow": [] }])
         );
+    }
+
+    #[test]
+    fn state_snapshot_reports_constraint_overflow_apart_from_floating() {
+        use mosaix_domain::tree::{ContainerTree, SplitAxis};
+
+        let mut state = EngineState::default();
+        state.resolved_config.tiling_mode = mosaix_config::TilingMode::Tree;
+        let mut tree = ContainerTree::new();
+        tree.insert_first(mosaix_domain::WindowId(11));
+        tree.split_leaf(
+            &mosaix_domain::WindowId(11),
+            SplitAxis::Horizontal,
+            mosaix_domain::WindowId(12),
+        );
+        state.trees.insert(DisplayId(2), tree);
+        state
+            .constraint_overflow
+            .insert(DisplayId(2), vec![mosaix_domain::WindowId(12)]);
+        for id in [11, 12] {
+            let mut window = sample_window(id);
+            window.display_id = DisplayId(2);
+            state.inventory.insert(
+                WindowId(id),
+                ManagedWindow {
+                    window,
+                    action: ManageAction::Tile,
+                    eligibility: EligibilityReason::Eligible,
+                },
+            );
+        }
+
+        let json = serde_json::to_value(StateSnapshot::from(state)).unwrap();
+
+        assert_eq!(
+            json["container_trees"][0]["constraint_overflow"],
+            serde_json::json!([12]),
+            "the tree names what it could not fit"
+        );
+        let managed = json["managed_windows"].as_array().unwrap();
+        let overflowed = managed.iter().find(|w| w["window_id"] == 12).unwrap();
+        assert_eq!(overflowed["constraint_overflow"], true);
+        assert_eq!(
+            overflowed["eligibility"], "eligible",
+            "overflow is reported beside eligibility, not as a kind of floating"
+        );
+        let arranged = managed.iter().find(|w| w["window_id"] == 11).unwrap();
+        assert_eq!(arranged["constraint_overflow"], false);
     }
 
     #[test]
@@ -1180,6 +1270,7 @@ mod tests {
                     },
                     elevated: true,
                     lifecycle: WindowLifecycle::Active,
+                    minimum_size: None,
                 },
                 action: ManageAction::Tile,
                 eligibility: EligibilityReason::Elevated,
@@ -1656,6 +1747,7 @@ mod tests {
             },
             elevated: false,
             lifecycle: WindowLifecycle::Active,
+            minimum_size: None,
         }
     }
 

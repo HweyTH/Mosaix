@@ -41,19 +41,19 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 use mosaix_config::{Command, ResolvedConfig, ResolvedConfigSet, TilingMode};
-use mosaix_domain::{
-    topology_fingerprint, Display, DisplayId, Rect, Window, WindowId, WindowLifecycle,
-};
-use mosaix_layout::{
-    apply_gaps, choose_insertion, cycle_display, plan_balanced_grid, plan_tree, plan_tree_raw,
-    resolve_saved_layout, resolve_zone_cycle, snap_to_half, throw_preserving_ratio, CycleStep,
-    DisplayDirection, HalfZone, HorizontalDirection,
-};
 use mosaix_domain::identity::{match_window_with_order, WindowEvidence};
 use mosaix_domain::tree::{ContainerTree, PersistedTree};
 use mosaix_domain::undo::{
     now_unix, UndoApplied, UndoMember, UndoRefusal, UndoRestoredWindow, UndoResult,
     UndoTargetOutcome, UndoTransaction, UndoTransactionDraft, UndoTransactionId,
+};
+use mosaix_domain::{
+    topology_fingerprint, Display, DisplayId, Rect, Window, WindowId, WindowLifecycle,
+};
+use mosaix_layout::{
+    apply_gaps, choose_insertion, cycle_display, plan_balanced_grid, plan_tree_constrained,
+    plan_tree_raw, resolve_saved_layout, resolve_zone_cycle, snap_to_half, throw_preserving_ratio,
+    CycleStep, DisplayDirection, HalfZone, HorizontalDirection,
 };
 use mosaix_persistence::PersistenceHealth;
 use mosaix_rules::{builtin_rules, ManageAction, Rule, RuleEvaluator};
@@ -218,6 +218,12 @@ pub struct EngineState {
     /// reflow -- a directional swap does exactly that -- and such a change
     /// would otherwise look like no change at all.
     saved_trees: HashMap<DisplayId, ContainerTree>,
+    /// The windows each display's tree could not fit at their minimum
+    /// size, newest insertion first (CONTEXT.md "Constraint-overflow
+    /// window"). They keep their leaves and stay managed; they are simply
+    /// not placed until the tree can satisfy them again. Distinct from
+    /// session-floating, which is the user's choice and outlives a reflow.
+    pub constraint_overflow: HashMap<DisplayId, Vec<WindowId>>,
     pub displays: Vec<Display>,
     /// Where each tracked window currently sits, keyed by window. Entries
     /// are created (and their `previous_placement` remembered) by
@@ -1810,10 +1816,39 @@ fn eligibility_for(window: &Window, action: ManageAction, circuit_open: bool) ->
     }
 }
 
+/// Whether `window_id` currently occupies a live, actively arranged leaf
+/// of `display_id`'s container tree: in it, and not in constraint
+/// overflow. Under the balanced grid every eligible window is arranged,
+/// so this is only asked in tree mode.
+fn arranged_in_tree(state: &EngineState, display_id: DisplayId, window_id: WindowId) -> bool {
+    state
+        .trees
+        .get(&display_id)
+        .is_some_and(|tree| tree.contains(&window_id))
+        && !state
+            .constraint_overflow
+            .get(&display_id)
+            .is_some_and(|overflow| overflow.contains(&window_id))
+}
+
+/// Whether `window_id` can be an endpoint of a directional command on
+/// `display_id`: eligible for tiling and, in tree mode, actually arranged
+/// (CONTEXT.md "Directional focus", "Directional swap").
+fn directional_endpoint(state: &EngineState, display_id: DisplayId, window_id: WindowId) -> bool {
+    let eligible = state.inventory.get(&window_id).is_some_and(|managed| {
+        managed.eligibility == EligibilityReason::Eligible
+            && managed.window.display_id == display_id
+    });
+    eligible
+        && (state.resolved_config.tiling_mode != TilingMode::Tree
+            || !state.automatic_tiling_active
+            || arranged_in_tree(state, display_id, window_id))
+}
+
 fn directional_neighbor(state: &EngineState, direction: CardinalDirection) -> Option<WindowId> {
     let focused = state.focused_window?;
     let source = state.inventory.get(&focused)?;
-    if source.eligibility != EligibilityReason::Eligible {
+    if !directional_endpoint(state, source.window.display_id, focused) {
         return None;
     }
     let source_bounds = state.windows.get(&focused)?.bounds;
@@ -1831,10 +1866,7 @@ fn directional_neighbor(state: &EngineState, direction: CardinalDirection) -> Op
             if *candidate_id == focused {
                 return None;
             }
-            let managed = state.inventory.get(candidate_id)?;
-            if managed.eligibility != EligibilityReason::Eligible
-                || managed.window.display_id != source.window.display_id
-            {
+            if !directional_endpoint(state, source.window.display_id, *candidate_id) {
                 return None;
             }
             let bounds = state.windows.get(candidate_id)?.bounds;
@@ -2035,6 +2067,7 @@ fn reconcile_balanced_grids(state: &mut EngineState) {
     if !state.automatic_tiling_active || state.paused {
         return;
     }
+    state.constraint_overflow.clear();
 
     for (display_id, work_area, active) in refresh_tiling_sets(state) {
         if defer_reflow(state, display_id) {
@@ -2066,8 +2099,14 @@ fn reconcile_container_trees(state: &mut EngineState) {
         return;
     }
 
-    let live_displays: HashSet<DisplayId> = state.displays.iter().map(|display| display.id).collect();
-    state.trees.retain(|display_id, _| live_displays.contains(display_id));
+    let live_displays: HashSet<DisplayId> =
+        state.displays.iter().map(|display| display.id).collect();
+    state
+        .trees
+        .retain(|display_id, _| live_displays.contains(display_id));
+    state
+        .constraint_overflow
+        .retain(|display_id, _| live_displays.contains(display_id));
 
     for (display_id, work_area, active) in refresh_tiling_sets(state) {
         if defer_reflow(state, display_id) {
@@ -2101,7 +2140,7 @@ fn reconcile_container_trees(state: &mut EngineState) {
         // Dormant leaves, which would hold that space open for a later
         // match, are deferred: see issue #9.
         let departed: Vec<WindowId> = tree
-            .leaves()
+            .windows()
             .into_iter()
             .filter(|window_id| !active.contains(window_id))
             .copied()
@@ -2143,9 +2182,26 @@ fn reconcile_container_trees(state: &mut EngineState) {
             }
         }
 
-        let planned = plan_tree(&tree, work_area, state.resolved_config.gaps);
+        // A window the display cannot fit at its minimum size is left
+        // where it is rather than squeezed: it keeps its leaf and its
+        // management, and comes back the moment the tree can hold it
+        // (spec user stories 45 and 46). Nothing here floats it by choice,
+        // so the overflow set is recomputed from scratch every reflow.
+        let planned = plan_tree_constrained(&tree, work_area, state.resolved_config.gaps, |id| {
+            state
+                .inventory
+                .get(&id)
+                .and_then(|managed| managed.window.minimum_size)
+        });
         state.trees.insert(display_id, tree);
-        for (window_id, bounds) in planned {
+        if planned.overflow.is_empty() {
+            state.constraint_overflow.remove(&display_id);
+        } else {
+            state
+                .constraint_overflow
+                .insert(display_id, planned.overflow);
+        }
+        for (window_id, bounds) in planned.placements {
             let unchanged = state.windows.get(&window_id).is_some_and(|placement| {
                 placement.display_id == display_id && placement.bounds == bounds
             });
@@ -2162,18 +2218,14 @@ fn reconcile_container_trees(state: &mut EngineState) {
 /// that display. A leaf that cannot be identified confidently is dropped
 /// rather than guessed at, and no live window is claimed by two leaves --
 /// the same refusal-first rule undo follows, applied to structure.
-fn restore_tree(
-    state: &EngineState,
-    stored: &PersistedTree,
-    active: &[WindowId],
-) -> ContainerTree {
+fn restore_tree(state: &EngineState, stored: &PersistedTree, active: &[WindowId]) -> ContainerTree {
     let candidates: Vec<&Window> = active
         .iter()
         .filter_map(|window_id| state.inventory.get(window_id))
         .map(|managed| &managed.window)
         .collect();
     let mut claimed: HashSet<WindowId> = HashSet::new();
-    stored.filter_map_leaves(&mut |evidence| {
+    stored.filter_map_windows(&mut |evidence| {
         match_window_with_order(
             evidence,
             candidates.iter().copied(),
@@ -2190,7 +2242,7 @@ fn restore_tree(
 /// cannot describe is dropped, because a leaf nothing could ever match
 /// would only hold space open forever.
 fn durable_tree(state: &EngineState, tree: &ContainerTree) -> PersistedTree {
-    tree.filter_map_leaves(&mut |window_id| {
+    tree.filter_map_windows(&mut |window_id| {
         let managed = state.inventory.get(window_id)?;
         let fingerprint = display_fingerprint_of(state, managed.window.display_id)?;
         Some(WindowEvidence::capture(
@@ -2403,10 +2455,7 @@ fn launch_order_of(state: &EngineState, window_id: WindowId) -> u32 {
         .map(|other| other.window.id)
         .collect();
     siblings.sort_unstable_by_key(|id| id.0);
-    siblings
-        .iter()
-        .position(|id| *id == window_id)
-        .unwrap_or(0) as u32
+    siblings.iter().position(|id| *id == window_id).unwrap_or(0) as u32
 }
 
 /// Opens an undo scope for `command`.
@@ -2857,6 +2906,7 @@ pub fn spawn_engine_with_capacity(
         trees: HashMap::new(),
         pending_trees: HashMap::new(),
         saved_trees: HashMap::new(),
+        constraint_overflow: HashMap::new(),
         displays: initial_displays,
         windows: HashMap::new(),
         inventory: HashMap::new(),
@@ -4305,6 +4355,7 @@ mod tests {
             },
             elevated: false,
             lifecycle,
+            minimum_size: None,
         }
     }
 
@@ -6954,7 +7005,10 @@ mod tests {
             "a successful undo consumes its transaction"
         );
         assert!(state.newest_undo.is_none());
-        assert!(matches!(state.last_undo_result, Some(UndoResult::Applied(_))));
+        assert!(matches!(
+            state.last_undo_result,
+            Some(UndoResult::Applied(_))
+        ));
     }
 
     #[test]
@@ -7091,7 +7145,10 @@ mod tests {
         let Some(UndoResult::Refused(UndoRefusal::TargetsUnresolved { targets, .. })) =
             &state.last_undo_result
         else {
-            panic!("expected an unresolved refusal, got {:?}", state.last_undo_result);
+            panic!(
+                "expected an unresolved refusal, got {:?}",
+                state.last_undo_result
+            );
         };
         assert_eq!(targets.len(), 1);
         assert_eq!(
@@ -7325,9 +7382,16 @@ mod tests {
         let Some(UndoResult::Refused(UndoRefusal::TargetsUnresolved { targets, .. })) =
             &state.last_undo_result
         else {
-            panic!("expected an unresolved refusal, got {:?}", state.last_undo_result);
+            panic!(
+                "expected an unresolved refusal, got {:?}",
+                state.last_undo_result
+            );
         };
-        assert_eq!(targets.len(), 2, "both members are reported, not only the failing one");
+        assert_eq!(
+            targets.len(),
+            2,
+            "both members are reported, not only the failing one"
+        );
         assert_eq!(
             targets.iter().filter(|target| target.is_resolved()).count(),
             1,
@@ -7393,7 +7457,12 @@ mod tests {
         apply(
             &mut state,
             Event::WindowsObserved {
-                windows: vec![app_window_at(12, "beta.exe", 1, Rect::new(960, 0, 960, 1080))],
+                windows: vec![app_window_at(
+                    12,
+                    "beta.exe",
+                    1,
+                    Rect::new(960, 0, 960, 1080),
+                )],
             },
         );
         state.effects.clear();
@@ -7411,7 +7480,10 @@ mod tests {
             "the newest transaction stays newest; it is not discarded to reach the older one"
         );
         assert_eq!(
-            state.last_undo_result.as_ref().map(|result| result.is_applied()),
+            state
+                .last_undo_result
+                .as_ref()
+                .map(|result| result.is_applied()),
             Some(false)
         );
         assert_ne!(
@@ -7451,7 +7523,11 @@ mod tests {
         );
 
         let drafts = recorded_drafts(&state);
-        assert_eq!(drafts.len(), 1, "the reflow is part of the command, not a second one");
+        assert_eq!(
+            drafts.len(),
+            1,
+            "the reflow is part of the command, not a second one"
+        );
         let moved: HashSet<WindowId> = placements(&state)
             .into_iter()
             .map(|(window_id, _, _)| window_id)
@@ -7847,7 +7923,10 @@ mod tests {
             ],
         );
 
-        observe(&mut state, vec![window_at(1, 1, Rect::new(0, 0, 960, 1080))]);
+        observe(
+            &mut state,
+            vec![window_at(1, 1, Rect::new(0, 0, 960, 1080))],
+        );
 
         assert_eq!(arrangement(&state), vec![(1, Rect::new(0, 0, 1920, 1080))]);
         assert_eq!(state.trees[&DisplayId(1)].len(), 1);
@@ -7858,7 +7937,10 @@ mod tests {
         // Three windows arriving one at a time, versus the same three
         // arriving together, must settle into the same tree.
         let mut incremental = tree_state();
-        observe(&mut incremental, vec![window_at(1, 1, Rect::new(0, 0, 400, 300))]);
+        observe(
+            &mut incremental,
+            vec![window_at(1, 1, Rect::new(0, 0, 400, 300))],
+        );
         observe(
             &mut incremental,
             vec![
@@ -7927,6 +8009,203 @@ mod tests {
             "both swapped windows are reversible together, found {:?}",
             drafts[0].members.len()
         );
+    }
+
+    // ---- Constraint overflow (issue #54) ------------------------------
+
+    /// [`window_at`] with a known minimum size.
+    fn window_needing(id: isize, display_id: isize, bounds: Rect, minimum: (i32, i32)) -> Window {
+        let mut window = window_at(id, display_id, bounds);
+        window.minimum_size = Some(mosaix_domain::Size::new(minimum.0, minimum.1));
+        window
+    }
+
+    /// A tree-mode display too narrow for three windows of the given
+    /// minimum width side by side.
+    fn narrow_tree_state(width: i32) -> EngineState {
+        let mut state = tree_state();
+        state.displays[0].full_bounds = Rect::new(0, 0, width, 600);
+        state.displays[0].work_area = Rect::new(0, 0, width, 600);
+        state
+    }
+
+    #[test]
+    fn a_window_the_tree_cannot_fit_overflows_and_keeps_its_leaf() {
+        // 1000x600; each window needs 400x400. Two fit side by side at
+        // 500x600; a third would stack under the first at 500x300, which
+        // is too short. The newest inserted gives way; the others stay.
+        let mut state = narrow_tree_state(1000);
+        observe(
+            &mut state,
+            vec![
+                window_needing(1, 1, Rect::new(0, 0, 400, 300), (400, 400)),
+                window_needing(2, 1, Rect::new(500, 0, 400, 300), (400, 400)),
+            ],
+        );
+        observe(
+            &mut state,
+            vec![
+                window_needing(1, 1, Rect::new(0, 0, 500, 600), (400, 400)),
+                window_needing(2, 1, Rect::new(500, 0, 500, 600), (400, 400)),
+                window_needing(3, 1, Rect::new(10, 10, 400, 300), (400, 400)),
+            ],
+        );
+
+        assert_eq!(
+            state.constraint_overflow.get(&DisplayId(1)),
+            Some(&vec![WindowId(3)]),
+            "the newest window is the one that overflowed"
+        );
+        assert!(
+            state.trees[&DisplayId(1)].contains(&WindowId(3)),
+            "an overflowed window keeps its tree leaf"
+        );
+        assert_eq!(
+            state.windows[&WindowId(3)].bounds,
+            Rect::new(10, 10, 400, 300),
+            "an overflowed window is left where it is, not squeezed"
+        );
+        assert_eq!(
+            state.inventory[&WindowId(3)].eligibility,
+            EligibilityReason::Eligible,
+            "overflow is a planner outcome, not an eligibility change"
+        );
+        assert!(
+            !state.session_floating.contains(&WindowId(3)),
+            "overflow is distinct from a session-floating choice"
+        );
+        // The two established windows share the display between them.
+        assert_eq!(
+            state.windows[&WindowId(1)].bounds,
+            Rect::new(0, 0, 500, 600)
+        );
+        assert_eq!(
+            state.windows[&WindowId(2)].bounds,
+            Rect::new(500, 0, 500, 600)
+        );
+    }
+
+    #[test]
+    fn an_overflowed_window_returns_to_its_leaf_when_the_tree_can_hold_it() {
+        // 1000px wide; each window needs 600px, so only one fits at a
+        // time and the newer overflows.
+        let mut state = narrow_tree_state(1000);
+        observe(
+            &mut state,
+            vec![
+                window_needing(1, 1, Rect::new(0, 0, 400, 300), (600, 100)),
+                window_needing(2, 1, Rect::new(500, 0, 400, 300), (600, 100)),
+            ],
+        );
+        assert_eq!(
+            state.constraint_overflow.get(&DisplayId(1)),
+            Some(&vec![WindowId(2)]),
+            "the fixture must overflow the newer window to mean anything"
+        );
+        state.effects.clear();
+        state.persistence_intents.clear();
+
+        // The first window closes: the tree can now hold the second.
+        observe(
+            &mut state,
+            vec![window_needing(
+                2,
+                1,
+                Rect::new(500, 0, 400, 300),
+                (600, 100),
+            )],
+        );
+
+        assert!(
+            state.constraint_overflow.is_empty(),
+            "nothing overflows once the constraints can be met"
+        );
+        assert_eq!(
+            placements(&state),
+            vec![(WindowId(2), DisplayId(1), Rect::new(0, 0, 1000, 600))],
+            "the returning window is placed by the reflow, in the leaf it kept"
+        );
+        assert!(
+            recorded_drafts(&state).is_empty(),
+            "overflow and re-entry are passive; neither is an undo transaction"
+        );
+    }
+
+    #[test]
+    fn overflow_windows_are_not_directional_endpoints_in_tree_mode() {
+        let mut state = narrow_tree_state(1000);
+        observe(
+            &mut state,
+            vec![
+                window_needing(1, 1, Rect::new(0, 0, 400, 300), (400, 400)),
+                window_needing(2, 1, Rect::new(500, 0, 400, 300), (400, 400)),
+                window_needing(3, 1, Rect::new(600, 10, 400, 300), (400, 400)),
+            ],
+        );
+        assert_eq!(
+            state.constraint_overflow.get(&DisplayId(1)),
+            Some(&vec![WindowId(3)])
+        );
+
+        // Focus the overflowed window: it can neither be moved nor be
+        // found from a neighbour.
+        apply(
+            &mut state,
+            Event::WindowFocused {
+                window_id: WindowId(3),
+                display_id: DisplayId(1),
+                bounds: Rect::new(600, 10, 400, 300),
+            },
+        );
+        let tree_before = state.trees[&DisplayId(1)].clone();
+        state.effects.clear();
+        apply(
+            &mut state,
+            Event::DirectionalSwapRequested {
+                direction: CardinalDirection::Left,
+            },
+        );
+        assert_eq!(state.trees[&DisplayId(1)], tree_before);
+        assert!(placements(&state).is_empty());
+
+        apply(
+            &mut state,
+            Event::WindowFocused {
+                window_id: WindowId(2),
+                display_id: DisplayId(1),
+                bounds: Rect::new(500, 0, 500, 600),
+            },
+        );
+        state.effects.clear();
+        apply(
+            &mut state,
+            Event::DirectionalFocusRequested {
+                direction: CardinalDirection::Right,
+            },
+        );
+        assert!(
+            state.effects.is_empty(),
+            "the overflowed window to the right is not a focus target"
+        );
+    }
+
+    #[test]
+    fn overflow_reduces_gaps_before_it_removes_a_window() {
+        // Two 490px-minimum windows on a 1000px display with 20px gaps:
+        // undecorated they fit exactly.
+        let mut state = narrow_tree_state(1000);
+        state.resolved_config.gaps = mosaix_domain::Gaps::new(20, 12);
+        observe(
+            &mut state,
+            vec![
+                window_needing(1, 1, Rect::new(0, 0, 400, 300), (490, 100)),
+                window_needing(2, 1, Rect::new(500, 0, 400, 300), (490, 100)),
+            ],
+        );
+
+        assert!(state.constraint_overflow.is_empty());
+        assert!(state.windows[&WindowId(1)].bounds.width >= 490);
+        assert!(state.windows[&WindowId(2)].bounds.width >= 490);
     }
 
     #[test]
