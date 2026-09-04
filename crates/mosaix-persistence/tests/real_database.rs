@@ -304,6 +304,30 @@ fn a_recorded_transaction_survives_a_restart_intact() {
 }
 
 #[test]
+fn a_multi_window_transaction_survives_a_restart_with_every_member() {
+    let temporary = TempDatabase::new("undo-multi-restart");
+    let recorded = draft("apply-layout halves", &["Code.exe", "firefox.exe", "wt.exe"]);
+
+    {
+        let mut store = Persistence::open(&temporary.path()).expect("database opens");
+        store.record_transaction(&recorded).expect("records");
+    }
+
+    let restarted = Persistence::open(&temporary.path()).expect("database reopens");
+    let loaded = restarted.newest_transaction().unwrap().unwrap();
+
+    assert_eq!(
+        loaded.members, recorded.members,
+        "a transaction that loses a member on reload would undo only part of a command"
+    );
+    assert_eq!(
+        loaded.members.iter().map(|member| member.ordinal).collect::<Vec<_>>(),
+        vec![0, 1, 2],
+        "members come back in their recorded order"
+    );
+}
+
+#[test]
 fn undo_history_reads_newest_first() {
     let temporary = TempDatabase::new("undo-newest");
     let mut store = Persistence::open(&temporary.path()).expect("database opens");

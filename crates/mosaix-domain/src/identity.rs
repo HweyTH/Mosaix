@@ -303,14 +303,14 @@ fn score_contributions(
             0
         },
     );
+    // A signal absent from both sides scores nothing. Knowing nothing about
+    // either window is not evidence that they are the same window -- and
+    // crediting it would let every window of one application clear the
+    // threshold on application identity alone.
     award(
         EvidenceSignal::NativeClass,
         match (&evidence.native_class, &window.native_class) {
             (Some(stored), Some(live)) if stored == live => EvidenceSignal::NativeClass.weight(),
-            // Absent on both sides is agreement of a weaker kind: it rules
-            // nothing out, so it earns part of the weight rather than all
-            // or none of it.
-            (None, None) => EvidenceSignal::NativeClass.weight() / 2,
             _ => 0,
         },
     );
@@ -326,7 +326,6 @@ fn score_contributions(
             (Some(stored), Some(live)) if *stored == live => {
                 EvidenceSignal::ExecutablePath.weight()
             }
-            (None, None) => EvidenceSignal::ExecutablePath.weight() / 2,
             _ => 0,
         },
     );
@@ -582,6 +581,30 @@ mod tests {
             .contributions
             .iter()
             .all(|entry| entry.awarded <= entry.available));
+    }
+
+    #[test]
+    fn a_sibling_window_of_the_same_application_is_not_a_confident_match() {
+        // The failure this guards against: two windows of one application
+        // that carry no class and no executable path agree on application
+        // and role alone. That must not be enough, or undo would move
+        // whichever sibling happened to be enumerated.
+        let mut subject = window(1, "Code.exe", "", Rect::new(0, 0, 800, 600));
+        subject.native_class = None;
+        subject.executable_path = None;
+        let evidence = evidence_for(&subject, 0);
+
+        let mut sibling = window(2, "Code.exe", "", Rect::new(900, 0, 800, 600));
+        sibling.native_class = None;
+        sibling.executable_path = None;
+
+        let outcome = match_window_with_order(&evidence, [&sibling], on_display_one, |_| Some(1));
+
+        assert_eq!(
+            outcome.confident_window(),
+            None,
+            "sharing an application and a role is not proof of being the same window"
+        );
     }
 
     #[test]

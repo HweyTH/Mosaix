@@ -1561,6 +1561,9 @@ fn apply(state: &mut EngineState, event: Event) {
             // two, and a hotkey has no synchronous caller to ask at all.
             match plan_saved_layout(state, &name) {
                 Ok(plan) => {
+                    // One command, one transaction, however many windows it
+                    // moves -- including the reflow below (ADR 0024).
+                    open_undo_scope(state, &format!("apply-layout {name}"));
                     if plan.unplaced > 0 {
                         tracing::info!(
                             layout = %name,
@@ -1594,6 +1597,7 @@ fn apply(state: &mut EngineState, event: Event) {
                         }
                         reconcile_balanced_grids(state);
                     }
+                    close_undo_scope(state);
                 }
                 Err(rejection) => {
                     tracing::warn!(
@@ -5579,6 +5583,14 @@ mod tests {
         window
     }
 
+    /// [`window_at`] belonging to a named application, for the cases where
+    /// two windows have to be genuinely distinguishable.
+    fn app_window_at(id: isize, application: &str, display_id: isize, bounds: Rect) -> Window {
+        let mut window = window_at(id, display_id, bounds);
+        window.application_id = mosaix_domain::ApplicationId(application.to_owned());
+        window
+    }
+
     fn placements(state: &EngineState) -> Vec<(WindowId, DisplayId, Rect)> {
         state
             .effects
@@ -6870,6 +6882,337 @@ mod tests {
             );
             assert_eq!(state.newest_undo, Some(transaction.clone()));
         }
+    }
+
+    // ---- Command-level atomic undo (issue #49) ------------------------
+
+    /// Two managed windows on one display with a two-cell layout, so an
+    /// explicit command has more than one window to move.
+    fn state_ready_for_a_two_window_command() -> EngineState {
+        let mut state =
+            state_with_saved_layout("halves", &[(0.0, 0.0, 0.5, 1.0), (0.5, 0.0, 0.5, 1.0)]);
+        state.displays = vec![display(1, "DISPLAY1", 0)];
+        apply(
+            &mut state,
+            Event::WindowsObserved {
+                windows: vec![
+                    window_at(11, 1, Rect::new(10, 10, 400, 300)),
+                    window_at(12, 1, Rect::new(500, 400, 400, 300)),
+                ],
+            },
+        );
+        apply(
+            &mut state,
+            Event::FocusDisplayRequested {
+                display_id: DisplayId(1),
+            },
+        );
+        state.effects.clear();
+        state.persistence_intents.clear();
+        state
+    }
+
+    #[test]
+    fn one_multi_window_command_records_one_transaction_covering_every_window() {
+        let mut state = state_ready_for_a_two_window_command();
+
+        apply(
+            &mut state,
+            Event::SavedLayoutApplyRequested {
+                name: "halves".to_owned(),
+            },
+        );
+
+        let drafts = recorded_drafts(&state);
+        assert_eq!(
+            drafts.len(),
+            1,
+            "two windows moved by one command is still one transaction"
+        );
+        let mut priors: Vec<Rect> = drafts[0]
+            .members
+            .iter()
+            .map(|member| member.prior_placement)
+            .collect();
+        priors.sort_by_key(|rect| (rect.x, rect.y));
+        assert_eq!(
+            priors,
+            vec![Rect::new(10, 10, 400, 300), Rect::new(500, 400, 400, 300)],
+            "every window's own prior placement is recorded, not just the first"
+        );
+        let ordinals: Vec<u32> = drafts[0]
+            .members
+            .iter()
+            .map(|member| member.ordinal)
+            .collect();
+        assert_eq!(ordinals, vec![0, 1], "members are ordinal-addressable");
+    }
+
+    #[test]
+    fn undoing_a_multi_window_command_restores_every_window_at_once() {
+        let mut state = state_ready_for_a_two_window_command();
+        apply(
+            &mut state,
+            Event::SavedLayoutApplyRequested {
+                name: "halves".to_owned(),
+            },
+        );
+        let transaction = stored(recorded_drafts(&state)[0], 5);
+        state.persistence_intents.clear();
+        state.effects.clear();
+        apply(
+            &mut state,
+            Event::UndoHistoryLoaded(Some(Box::new(transaction))),
+        );
+
+        apply(&mut state, Event::UndoRequested);
+
+        let mut restored: Vec<(WindowId, Rect)> = placements(&state)
+            .into_iter()
+            .map(|(window_id, _, bounds)| (window_id, bounds))
+            .collect();
+        restored.sort_by_key(|(window_id, _)| window_id.0);
+        assert_eq!(
+            restored,
+            vec![
+                (WindowId(11), Rect::new(10, 10, 400, 300)),
+                (WindowId(12), Rect::new(500, 400, 400, 300)),
+            ],
+            "one undo reverses the whole command, not one window of it"
+        );
+        assert_eq!(
+            state.persistence_intents,
+            vec![PersistenceIntent::ConsumeUndoTransaction(
+                UndoTransactionId(5)
+            )],
+            "consumption is committed in the same transition as the placements"
+        );
+    }
+
+    #[test]
+    fn one_unresolvable_member_stops_the_whole_multi_window_undo() {
+        let mut state = state_ready_for_a_two_window_command();
+        apply(
+            &mut state,
+            Event::SavedLayoutApplyRequested {
+                name: "halves".to_owned(),
+            },
+        );
+        let transaction = stored(recorded_drafts(&state)[0], 5);
+        apply(
+            &mut state,
+            Event::UndoHistoryLoaded(Some(Box::new(transaction.clone()))),
+        );
+        // One of the two windows has closed. The other is still perfectly
+        // identifiable -- and must still not move.
+        apply(
+            &mut state,
+            Event::WindowsObserved {
+                windows: vec![window_at(11, 1, Rect::new(0, 0, 960, 1080))],
+            },
+        );
+        state.effects.clear();
+        state.persistence_intents.clear();
+
+        apply(&mut state, Event::UndoRequested);
+
+        assert!(
+            placements(&state).is_empty(),
+            "a partial undo would leave a half-restored layout, so none of it runs"
+        );
+        assert!(
+            state.persistence_intents.is_empty(),
+            "a refused transaction is not consumed"
+        );
+        assert_eq!(state.newest_undo, Some(transaction));
+        let Some(UndoResult::Refused(UndoRefusal::TargetsUnresolved { targets, .. })) =
+            &state.last_undo_result
+        else {
+            panic!("expected an unresolved refusal, got {:?}", state.last_undo_result);
+        };
+        assert_eq!(targets.len(), 2, "both members are reported, not only the failing one");
+        assert_eq!(
+            targets.iter().filter(|target| target.is_resolved()).count(),
+            1,
+            "the report distinguishes the member that was found from the one that was not"
+        );
+    }
+
+    #[test]
+    fn a_refused_newest_transaction_is_never_skipped_for_an_older_one() {
+        // Two different applications, so "the window is gone" is a fact the
+        // matcher can actually establish rather than a tie it has to break.
+        let mut state =
+            state_with_saved_layout("halves", &[(0.0, 0.0, 0.5, 1.0), (0.5, 0.0, 0.5, 1.0)]);
+        state.displays = vec![display(1, "DISPLAY1", 0)];
+        apply(
+            &mut state,
+            Event::WindowsObserved {
+                windows: vec![
+                    app_window_at(11, "alpha.exe", 1, Rect::new(10, 10, 400, 300)),
+                    app_window_at(12, "beta.exe", 1, Rect::new(500, 400, 400, 300)),
+                ],
+            },
+        );
+        apply(
+            &mut state,
+            Event::FocusDisplayRequested {
+                display_id: DisplayId(1),
+            },
+        );
+        state.persistence_intents.clear();
+
+        apply(
+            &mut state,
+            Event::SavedLayoutApplyRequested {
+                name: "halves".to_owned(),
+            },
+        );
+        let older = stored(recorded_drafts(&state)[0], 1);
+        state.persistence_intents.clear();
+        apply(
+            &mut state,
+            Event::WindowFocused {
+                window_id: WindowId(11),
+                display_id: DisplayId(1),
+                bounds: Rect::new(0, 0, 960, 1080),
+            },
+        );
+        apply(
+            &mut state,
+            Event::ZoneSnapRequested {
+                direction: ZoneSnapDirection::Right,
+            },
+        );
+        let newest = stored(recorded_drafts(&state)[0], 2);
+        assert_ne!(older.id, newest.id);
+
+        // The newest transaction's target has closed; the older one's
+        // targets are both still present and identifiable.
+        apply(
+            &mut state,
+            Event::UndoHistoryLoaded(Some(Box::new(newest.clone()))),
+        );
+        apply(
+            &mut state,
+            Event::WindowsObserved {
+                windows: vec![app_window_at(12, "beta.exe", 1, Rect::new(960, 0, 960, 1080))],
+            },
+        );
+        state.effects.clear();
+        state.persistence_intents.clear();
+
+        apply(&mut state, Event::UndoRequested);
+
+        assert!(
+            placements(&state).is_empty(),
+            "undo must not reach past an unavailable newest transaction"
+        );
+        assert_eq!(
+            state.newest_undo,
+            Some(newest),
+            "the newest transaction stays newest; it is not discarded to reach the older one"
+        );
+        assert_eq!(
+            state.last_undo_result.as_ref().map(|result| result.is_applied()),
+            Some(false)
+        );
+        assert_ne!(
+            state.newest_undo.as_ref().map(|held| held.id),
+            Some(older.id)
+        );
+    }
+
+    #[test]
+    fn an_explicit_command_and_the_reflow_it_causes_share_one_transaction() {
+        let mut state = tiling_state_with_saved_layout("halves", &[(0.0, 0.0, 0.5, 1.0)]);
+        state.displays = vec![display(1, "DISPLAY1", 0)];
+        apply(
+            &mut state,
+            Event::WindowsObserved {
+                windows: vec![
+                    window_at(21, 1, Rect::new(10, 10, 400, 300)),
+                    window_at(22, 1, Rect::new(500, 10, 400, 300)),
+                ],
+            },
+        );
+        apply(
+            &mut state,
+            Event::WindowFocused {
+                window_id: WindowId(21),
+                display_id: DisplayId(1),
+                bounds: Rect::new(10, 10, 400, 300),
+            },
+        );
+        state.persistence_intents.clear();
+
+        apply(
+            &mut state,
+            Event::ZoneSnapRequested {
+                direction: ZoneSnapDirection::Left,
+            },
+        );
+
+        let drafts = recorded_drafts(&state);
+        assert_eq!(drafts.len(), 1, "the reflow is part of the command, not a second one");
+        let moved: HashSet<WindowId> = placements(&state)
+            .into_iter()
+            .map(|(window_id, _, _)| window_id)
+            .collect();
+        assert!(
+            moved.len() > 1,
+            "this test only means something if the snap provoked a reflow"
+        );
+        assert_eq!(
+            drafts[0].members.len(),
+            moved.len(),
+            "every window the command moved is reversible with it"
+        );
+    }
+
+    #[test]
+    fn no_passive_event_class_creates_an_undo_transaction() {
+        let mut state = state_ready_for_a_two_window_command();
+
+        // An application moving its own window.
+        apply(
+            &mut state,
+            Event::WindowBoundsObserved {
+                window_id: WindowId(11),
+                display_id: DisplayId(1),
+                bounds: Rect::new(77, 77, 400, 300),
+            },
+        );
+        // A window closing.
+        apply(
+            &mut state,
+            Event::WindowsObserved {
+                windows: vec![window_at(11, 1, Rect::new(77, 77, 400, 300))],
+            },
+        );
+        // A monitor being unplugged, then replugged.
+        apply(
+            &mut state,
+            Event::DisplayTopologyChanged(vec![display(2, "DISPLAY2", 0)]),
+        );
+        apply(
+            &mut state,
+            Event::DisplayTopologyChanged(vec![display(1, "DISPLAY1", 0)]),
+        );
+        // Waking up.
+        apply(
+            &mut state,
+            Event::WakeReconciliation {
+                displays: vec![display(1, "DISPLAY1", 0)],
+                windows: Some(vec![window_at(11, 1, Rect::new(77, 77, 400, 300))]),
+            },
+        );
+
+        assert!(
+            recorded_drafts(&state).is_empty(),
+            "undo must never claim it can reverse an application closing or a monitor \
+             being unplugged"
+        );
     }
 
     #[test]
