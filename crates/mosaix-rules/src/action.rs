@@ -18,12 +18,18 @@ pub enum ManageAction {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuleActions {
     pub manage: ManageAction,
+    /// The logical workspace a matching managed window belongs to, by
+    /// name. `None` leaves the window in the workspace displayed where it
+    /// appeared. The engine resolves the name against its pool and
+    /// refuses an unknown one rather than creating it (ADR 0028).
+    pub workspace: Option<String>,
 }
 
 impl Default for RuleActions {
     fn default() -> Self {
         Self {
             manage: ManageAction::Tile,
+            workspace: None,
         }
     }
 }

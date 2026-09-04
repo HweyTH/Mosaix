@@ -9,6 +9,7 @@ pub mod identity;
 pub mod tree;
 pub mod undo;
 pub mod window;
+pub mod workspace;
 
 // Re-export commonly used types at the crate root for convenience.
 pub use commands::{
@@ -33,3 +34,8 @@ pub use undo::{
     UndoTransaction, UndoTransactionDraft, UndoTransactionId, UndoTreeSnapshot,
 };
 pub use window::{Window, WindowCapabilities, WindowLifecycle, WindowRole};
+pub use workspace::{
+    PersistedWorkspace, Workspace, WorkspaceCommandResult, WorkspaceCreateApplied,
+    WorkspaceDeleteApplied, WorkspaceFocusApplied, WorkspaceMoveApplied, WorkspaceName,
+    WorkspaceNameError, WorkspaceOrigin, WorkspacePool, WorkspaceRefusal, MAX_WORKSPACE_NAME_CHARS,
+};

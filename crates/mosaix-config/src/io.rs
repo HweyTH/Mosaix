@@ -315,6 +315,7 @@ pub fn save_profile_settings(
 
     let mut profile = updated_profile.unwrap_or(ProfileConfig {
         fingerprint: update.fingerprint.clone(),
+        workspaces: Vec::new(),
         hotkeys: Default::default(),
         gaps: GapsOverride::default(),
         behavior: Default::default(),

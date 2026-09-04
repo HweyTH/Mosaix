@@ -6,6 +6,8 @@ use mosaix_config::{
 };
 use mosaix_domain::commands::{DirectionalSwapResult, RemovePositionResult, TreeResizeResult};
 use mosaix_domain::undo::UndoResult;
+use mosaix_domain::workspace::WorkspaceCommandResult;
+use mosaix_domain::DisplayId;
 use mosaix_engine::{
     EligibilityReason, EngineState, Event, EventSender, StateReader, ZoneSnapDirection,
 };
@@ -47,6 +49,37 @@ pub struct DormantPositionSnapshot {
     pub expires_unix: i64,
 }
 
+/// One logical workspace as published state describes it (CONTEXT.md
+/// "Logical workspace"). Membership is by window id, which is what every
+/// other part of the snapshot uses; names carry no window titles.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceSnapshot {
+    pub name: String,
+    /// `configuration` or `command`: which of the two ways a workspace
+    /// comes to exist made this one, and so whether a command may delete
+    /// it.
+    pub origin: String,
+    /// The display it is shown on, or `None` while hidden.
+    pub displayed_on: Option<isize>,
+    /// Every managed window that belongs to it, in window-id order.
+    pub members: Vec<isize>,
+    /// The member that last had focus, if it is still open.
+    pub last_focused_window: Option<isize>,
+    /// Positions the hidden workspace keeps for closed windows. A
+    /// displayed workspace's dormant positions are listed under its
+    /// display's container tree instead.
+    pub dormant_positions: usize,
+}
+
+/// A rule that named a workspace the pool does not hold, so the window
+/// stayed in the workspace of the display it appeared on (ADR 0028).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct RuleWorkspaceRefusalSnapshot {
+    pub window_id: isize,
+    pub rule_id: Option<String>,
+    pub workspace: String,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct StateSnapshot {
     pub revision: u64,
@@ -74,6 +107,12 @@ pub struct StateSnapshot {
     /// Each display's container tree, as the windows it holds in visual
     /// order. Empty under the balanced grid, which keeps no structure.
     pub container_trees: Vec<ContainerTreeSnapshot>,
+    /// The global workspace pool, in name order (ADR 0028).
+    #[serde(default)]
+    pub workspaces: Vec<WorkspaceSnapshot>,
+    /// Rules whose workspace target named nothing in the pool.
+    #[serde(default)]
+    pub rule_workspace_refusals: Vec<RuleWorkspaceRefusalSnapshot>,
     pub paused: bool,
     pub automatic_tiling_active: bool,
     pub automatic_tiling_suspended: bool,
@@ -226,6 +265,14 @@ fn bindable_commands(config: &ResolvedConfig) -> Vec<Command> {
                 .keys()
                 .map(|name| Command::ApplyLayout { name: name.clone() }),
         )
+        .chain(
+            config
+                .workspaces
+                .iter()
+                .map(|name| Command::FocusWorkspace {
+                    name: name.as_str().to_owned(),
+                }),
+        )
         .collect();
     // Whatever is actually bound is listed too, even a layout binding
     // whose layout is not declared -- which validation rejects, so it
@@ -310,6 +357,10 @@ pub struct ManagedWindowSnapshot {
     /// planner outcome, not a rule or a session-floating choice.
     #[serde(default)]
     pub constraint_overflow: bool,
+    /// The logical workspace this window belongs to. `None` only on a
+    /// display the pool had no workspace left to fill.
+    #[serde(default)]
+    pub workspace: Option<String>,
 }
 
 fn action_name(action: ManageAction) -> &'static str {
@@ -372,9 +423,45 @@ impl From<EngineState> for StateSnapshot {
                     .constraint_overflow
                     .get(&managed.window.display_id)
                     .is_some_and(|overflow| overflow.contains(&managed.window.id)),
+                workspace: state
+                    .workspaces
+                    .workspace_of(managed.window.id)
+                    .map(|name| name.as_str().to_owned()),
             })
             .collect();
         managed_windows.sort_by_key(|window| window.window_id);
+        let workspaces = state
+            .workspaces
+            .iter()
+            .map(|(name, workspace)| WorkspaceSnapshot {
+                name: name.as_str().to_owned(),
+                origin: workspace.origin.code().to_owned(),
+                displayed_on: state.workspaces.display_of(name).map(|id| id.0),
+                members: state
+                    .workspaces
+                    .members_of(name)
+                    .into_iter()
+                    .map(|id| id.0)
+                    .collect(),
+                last_focused_window: workspace
+                    .last_focused
+                    .filter(|id| state.inventory.contains_key(id))
+                    .map(|id| id.0),
+                dormant_positions: workspace
+                    .stashed_tree
+                    .as_ref()
+                    .map_or(0, |tree| tree.dormant_positions().len()),
+            })
+            .collect();
+        let rule_workspace_refusals = state
+            .rule_workspace_refusals
+            .iter()
+            .map(|refusal| RuleWorkspaceRefusalSnapshot {
+                window_id: refusal.window_id.0,
+                rule_id: refusal.rule_id.clone(),
+                workspace: refusal.workspace.clone(),
+            })
+            .collect();
         let last_applied_layouts = state
             .last_applied_layouts
             .iter()
@@ -462,6 +549,8 @@ impl From<EngineState> for StateSnapshot {
             undo_blocked_reason,
             tiling_mode: state.resolved_config.tiling_mode.code().to_owned(),
             container_trees,
+            workspaces,
+            rule_workspace_refusals,
             paused: state.paused,
             automatic_tiling_active: state.automatic_tiling_active,
             automatic_tiling_suspended: state.automatic_tiling_suspended,
@@ -818,6 +907,75 @@ pub fn handle_request(
             let value = serde_json::json!({ "paused": state.paused });
             IpcResponse::Ok { data: Some(value) }
         }
+        IpcRequest::CreateWorkspace { name } => {
+            let result = match mosaix_engine::plan_workspace_create(&state_reader.snapshot(), name)
+            {
+                Ok(applied) => {
+                    if let other @ IpcResponse::Error { .. } = send_event(
+                        events,
+                        Event::WorkspaceCreateRequested { name: name.clone() },
+                    ) {
+                        return other;
+                    }
+                    WorkspaceCommandResult::Created(applied)
+                }
+                Err(refusal) => WorkspaceCommandResult::Refused(refusal),
+            };
+            workspace_answer(result)
+        }
+        IpcRequest::DeleteWorkspace { name } => {
+            let result = match mosaix_engine::plan_workspace_delete(&state_reader.snapshot(), name)
+            {
+                Ok(applied) => {
+                    if let other @ IpcResponse::Error { .. } = send_event(
+                        events,
+                        Event::WorkspaceDeleteRequested { name: name.clone() },
+                    ) {
+                        return other;
+                    }
+                    WorkspaceCommandResult::Deleted(applied)
+                }
+                Err(refusal) => WorkspaceCommandResult::Refused(refusal),
+            };
+            workspace_answer(result)
+        }
+        IpcRequest::FocusWorkspace { name } => {
+            let result = match mosaix_engine::plan_workspace_focus(&state_reader.snapshot(), name) {
+                Ok(applied) => {
+                    if let other @ IpcResponse::Error { .. } = send_event(
+                        events,
+                        Event::WorkspaceFocusRequested { name: name.clone() },
+                    ) {
+                        return other;
+                    }
+                    WorkspaceCommandResult::Focused(applied)
+                }
+                Err(refusal) => WorkspaceCommandResult::Refused(refusal),
+            };
+            workspace_answer(result)
+        }
+        IpcRequest::MoveWorkspace { name, display_id } => {
+            let result = match mosaix_engine::plan_workspace_move(
+                &state_reader.snapshot(),
+                name,
+                DisplayId(*display_id),
+            ) {
+                Ok(applied) => {
+                    if let other @ IpcResponse::Error { .. } = send_event(
+                        events,
+                        Event::WorkspaceMoveRequested {
+                            name: name.clone(),
+                            display_id: DisplayId(*display_id),
+                        },
+                    ) {
+                        return other;
+                    }
+                    WorkspaceCommandResult::Moved(applied)
+                }
+                Err(refusal) => WorkspaceCommandResult::Refused(refusal),
+            };
+            workspace_answer(result)
+        }
         IpcRequest::FocusDisplay { display_id } => send_event(
             events,
             Event::FocusDisplayRequested {
@@ -1130,6 +1288,15 @@ fn resize_tree(
     };
     IpcResponse::Ok {
         data: Some(serde_json::to_value(result).expect("tree results serialize")),
+    }
+}
+
+/// A workspace lifecycle answer: applied or refused, both as data. The
+/// reducer reaches the same verdict against its own state, so the answer
+/// describes the plan rather than a completed movement.
+fn workspace_answer(result: WorkspaceCommandResult) -> IpcResponse {
+    IpcResponse::Ok {
+        data: Some(serde_json::to_value(result).expect("workspace results serialize")),
     }
 }
 
@@ -2687,5 +2854,192 @@ mod tests {
             }
             other => panic!("expected a verdict, got {other:?}"),
         }
+    }
+
+    fn tiling_engine_with_workspaces(workspaces: &[&str]) -> mosaix_engine::EngineHandle {
+        let display = mosaix_domain::Display {
+            id: DisplayId(1),
+            stable_fingerprint: "MON-A".to_owned(),
+            full_bounds: Rect::new(0, 0, 1920, 1080),
+            work_area: Rect::new(0, 0, 1920, 1080),
+            scale_factor: 1.0,
+            rotation: mosaix_domain::Rotation::Landscape,
+            is_primary: true,
+        };
+        let config_set = mosaix_config::ResolvedConfigSet {
+            base: mosaix_config::ResolvedConfig {
+                workspaces: workspaces
+                    .iter()
+                    .map(|name| mosaix_domain::WorkspaceName::new(name).unwrap())
+                    .collect(),
+                ..mosaix_config::ResolvedConfig::default()
+            },
+            profiles: Vec::new(),
+        };
+        mosaix_engine::spawn_engine(vec![display], config_set)
+    }
+
+    /// The store for a test whose request never writes configuration.
+    fn no_store() -> UnavailableConfigStore {
+        UnavailableConfigStore {
+            reason: "the test scripted no configuration directory".to_owned(),
+        }
+    }
+
+    fn workspace_result(response: IpcResponse) -> mosaix_domain::WorkspaceCommandResult {
+        let IpcResponse::Ok { data: Some(data) } = response else {
+            panic!("expected a typed workspace answer, got {response:?}");
+        };
+        serde_json::from_value(data).unwrap()
+    }
+
+    #[test]
+    fn creating_a_workspace_answers_with_the_typed_result_and_reaches_the_reducer() {
+        let engine = tiling_engine_with_workspaces(&["dev"]);
+        let response = handle_request(
+            &IpcRequest::CreateWorkspace {
+                name: "chat".to_owned(),
+            },
+            &engine.events(),
+            &engine.state_reader(),
+            &no_store(),
+            &no_probe(),
+        );
+
+        assert_eq!(
+            workspace_result(response),
+            mosaix_domain::WorkspaceCommandResult::Created(mosaix_domain::WorkspaceCreateApplied {
+                name: mosaix_domain::WorkspaceName::new("chat").unwrap()
+            })
+        );
+        wait_for_revision(&engine, 1);
+        let snapshot = StateSnapshot::from(engine.snapshot());
+        assert_eq!(
+            snapshot
+                .workspaces
+                .iter()
+                .map(|workspace| (
+                    workspace.name.as_str(),
+                    workspace.origin.as_str(),
+                    workspace.displayed_on
+                ))
+                .collect::<Vec<_>>(),
+            vec![("chat", "command", None), ("dev", "configuration", Some(1))]
+        );
+    }
+
+    #[test]
+    fn naming_an_unknown_workspace_answers_with_a_typed_refusal_not_an_error() {
+        let engine = tiling_engine_with_workspaces(&["dev"]);
+        let response = handle_request(
+            &IpcRequest::FocusWorkspace {
+                name: "typo".to_owned(),
+            },
+            &engine.events(),
+            &engine.state_reader(),
+            &no_store(),
+            &no_probe(),
+        );
+
+        assert_eq!(
+            workspace_result(response),
+            mosaix_domain::WorkspaceCommandResult::Refused(
+                mosaix_domain::WorkspaceRefusal::UnknownWorkspace {
+                    name: "typo".to_owned()
+                }
+            )
+        );
+        assert_eq!(
+            StateSnapshot::from(engine.snapshot()).workspaces.len(),
+            1,
+            "a refused name creates nothing"
+        );
+    }
+
+    #[test]
+    fn deleting_a_declared_workspace_is_refused_by_reason() {
+        let engine = tiling_engine_with_workspaces(&["dev", "chat"]);
+        let response = handle_request(
+            &IpcRequest::DeleteWorkspace {
+                name: "chat".to_owned(),
+            },
+            &engine.events(),
+            &engine.state_reader(),
+            &no_store(),
+            &no_probe(),
+        );
+
+        assert_eq!(
+            workspace_result(response),
+            mosaix_domain::WorkspaceCommandResult::Refused(
+                mosaix_domain::WorkspaceRefusal::DeclaredByConfiguration {
+                    name: mosaix_domain::WorkspaceName::new("chat").unwrap()
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn moving_to_the_only_display_is_refused_with_the_display_named() {
+        let engine = tiling_engine_with_workspaces(&["dev"]);
+        let response = handle_request(
+            &IpcRequest::MoveWorkspace {
+                name: "dev".to_owned(),
+                display_id: 1,
+            },
+            &engine.events(),
+            &engine.state_reader(),
+            &no_store(),
+            &no_probe(),
+        );
+
+        assert_eq!(
+            workspace_result(response),
+            mosaix_domain::WorkspaceCommandResult::Refused(
+                mosaix_domain::WorkspaceRefusal::AlreadyDisplayedThere {
+                    name: mosaix_domain::WorkspaceName::new("dev").unwrap(),
+                    display_id: DisplayId(1),
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn state_snapshot_names_each_windows_workspace_and_lists_members() {
+        let engine = tiling_engine_with_workspaces(&["dev"]);
+        engine
+            .events()
+            .send(Event::WindowsObserved {
+                windows: vec![managed_window(11, Rect::new(0, 0, 400, 300))],
+            })
+            .unwrap();
+        engine
+            .events()
+            .send(Event::WindowFocused {
+                window_id: WindowId(11),
+                display_id: DisplayId(1),
+                bounds: Rect::new(0, 0, 400, 300),
+            })
+            .unwrap();
+        wait_for_revision(&engine, 2);
+
+        let snapshot = StateSnapshot::from(engine.snapshot());
+        assert_eq!(
+            snapshot.managed_windows[0].workspace.as_deref(),
+            Some("dev")
+        );
+        assert_eq!(
+            snapshot.workspaces,
+            vec![WorkspaceSnapshot {
+                name: "dev".to_owned(),
+                origin: "configuration".to_owned(),
+                displayed_on: Some(1),
+                members: vec![11],
+                last_focused_window: Some(11),
+                dormant_positions: 0,
+            }]
+        );
+        let json = serde_json::to_string(&snapshot).unwrap();
+        assert!(!json.contains("non-sensitive-test-title"));
     }
 }

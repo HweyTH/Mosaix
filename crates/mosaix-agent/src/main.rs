@@ -269,6 +269,12 @@ fn main() {
                             display_fingerprint: display_fingerprint.clone(),
                             tree: tree.clone(),
                         },
+                        mosaix_engine::PersistenceIntent::SaveWorkspace(workspace) => {
+                            mosaix_persistence::PersistenceRequest::SaveWorkspace(workspace.clone())
+                        }
+                        mosaix_engine::PersistenceIntent::DeleteWorkspace(name) => {
+                            mosaix_persistence::PersistenceRequest::DeleteWorkspace(name.clone())
+                        }
                     };
                     if worker.submit(request).is_err() {
                         submission_failed = true;
@@ -323,6 +329,9 @@ fn main() {
                     // database once the reducer owns them.
                     if let Some(trees) = update.restored_trees {
                         let _ = events.send(mosaix_engine::Event::ContainerTreesLoaded(trees));
+                    }
+                    if let Some(workspaces) = update.restored_workspaces {
+                        let _ = events.send(mosaix_engine::Event::WorkspacesLoaded(workspaces));
                     }
                 }
 

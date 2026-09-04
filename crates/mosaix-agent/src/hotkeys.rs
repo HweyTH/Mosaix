@@ -109,6 +109,7 @@ pub fn event_for_command(command: &Command, paused: bool) -> Event {
         // a binding to a user-named layout needs nothing looked up here
         // (ADR 0019).
         Command::ApplyLayout { name } => Event::SavedLayoutApplyRequested { name: name.clone() },
+        Command::FocusWorkspace { name } => Event::WorkspaceFocusRequested { name: name.clone() },
     }
 }
 
@@ -264,6 +265,7 @@ pub fn runtime_hotkeys(config: &ResolvedConfig) -> BTreeMap<Command, KeyCombo> {
                         | Command::SnapBottom
                         | Command::TogglePause
                         | Command::ApplyLayout { .. }
+                        | Command::FocusWorkspace { .. }
                 )
         })
         .map(|(command, combo)| (command.clone(), combo.clone()))
@@ -595,5 +597,26 @@ mod tests {
 
         config.automatic_tiling_enabled = true;
         assert!(runtime_hotkeys(&config).contains_key(&Command::FocusLeft));
+    }
+
+    #[test]
+    fn a_workspace_binding_fires_the_workspace_focus_event_with_its_name() {
+        let command = Command::FocusWorkspace {
+            name: "chat".to_owned(),
+        };
+
+        assert!(matches!(
+            event_for_command(&command, false),
+            Event::WorkspaceFocusRequested { name } if name == "chat"
+        ));
+        let hotkeys = BTreeMap::from([(command.clone(), combo("ctrl+alt+2"))]);
+        let manual = ResolvedConfig {
+            hotkeys,
+            ..ResolvedConfig::default()
+        };
+        assert!(
+            runtime_hotkeys(&manual).contains_key(&command),
+            "a workspace can be focused under manual tiling too"
+        );
     }
 }

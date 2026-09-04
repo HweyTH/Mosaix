@@ -9,12 +9,13 @@ use serde::{Deserialize, Serialize};
 /// [`IpcRequest::SaveLayout`] gained its write-destination redirect, and
 /// to 6 for the binding-editing requests, and to 7 when
 /// [`IpcRequest::ProbeHotkey`] gained the command it is probing for, and
-/// to 10 for the four tree-resize requests, and to 11 for
-/// [`IpcRequest::RemoveTreePosition`]. An
+/// to 10 for the four tree-resize requests, to 11 for
+/// [`IpcRequest::RemoveTreePosition`], and to 12 for the four workspace
+/// lifecycle requests and the workspace fields of the state snapshot. An
 /// older agent has no tag for a request this build added -- and no field
 /// for one an existing request grew -- so the version is what makes the
 /// mismatch reportable instead of surfacing as a deserialization failure.
-pub const PROTOCOL_VERSION: u32 = 11;
+pub const PROTOCOL_VERSION: u32 = 12;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct IpcEnvelope {
@@ -73,6 +74,30 @@ pub enum IpcRequest {
     GetPauseState,
     /// Select a display for display-scoped commands, including an empty one.
     FocusDisplay {
+        display_id: isize,
+    },
+    /// Create a hidden, empty logical workspace (CONTEXT.md "Logical
+    /// workspace", ADR 0028). This and the three below are answered with
+    /// a typed [`mosaix_domain::WorkspaceCommandResult`] either way, so a
+    /// refusal is data the caller can inspect. Hence
+    /// [`PROTOCOL_VERSION`] 12.
+    CreateWorkspace {
+        name: String,
+    },
+    /// Delete a hidden, empty, command-created workspace.
+    DeleteWorkspace {
+        name: String,
+    },
+    /// Display a hidden workspace on the focused display, or focus the
+    /// last-focused window of one already displayed elsewhere (CONTEXT.md
+    /// "Workspace focus"). Never moves a displayed workspace.
+    FocusWorkspace {
+        name: String,
+    },
+    /// Move a displayed workspace to `display_id`, exchanging it with
+    /// whatever that display showed.
+    MoveWorkspace {
+        name: String,
         display_id: isize,
     },
     /// Reverse the newest undo transaction, or answer with the typed reason
@@ -300,6 +325,19 @@ mod tests {
             },
             IpcRequest::GetPauseState,
             IpcRequest::FocusDisplay { display_id: 7 },
+            IpcRequest::CreateWorkspace {
+                name: "dev".to_owned(),
+            },
+            IpcRequest::DeleteWorkspace {
+                name: "dev".to_owned(),
+            },
+            IpcRequest::FocusWorkspace {
+                name: "dev".to_owned(),
+            },
+            IpcRequest::MoveWorkspace {
+                name: "dev".to_owned(),
+                display_id: 7,
+            },
             IpcRequest::Undo,
             IpcRequest::ApplyLayout {
                 name: "writing".to_owned(),

@@ -110,6 +110,14 @@ _Avoid_: Virtual desktop, Space, saved workspace
 Displaying a hidden logical workspace on the focused monitor, or focusing its last-focused live window when it is already displayed on another monitor. It never moves a displayed workspace between monitors.
 _Avoid_: Workspace move, display transfer, workspace switch (alone)
 
+**Workspace move**:
+An explicit command that transfers a displayed logical workspace to another monitor, exchanging it with whatever that monitor showed so nothing becomes hidden. Identity, membership, and the container tree travel with it; the last-focused window is retained. It is the only way a displayed workspace changes monitor: `Workspace focus` never moves one.
+_Avoid_: Workspace switch, display transfer (which moves one window)
+
+**Unfilled display**:
+A display for which the workspace pool has no hidden, empty workspace to display. It arranges the windows physically on it exactly as it did before workspaces existed, those windows belong to no workspace, and published state reports both. The engine never invents a workspace name to fill it; declaring or creating one and focusing it there is the remedy.
+_Avoid_: Default workspace, anonymous workspace
+
 **Focused display**:
 The display targeted by display-scoped commands, following the focused managed window when one exists and otherwise retaining the last explicitly targeted display. It remains defined when the displayed logical workspace is empty.
 _Avoid_: Primary display, cursor display, focused window's display

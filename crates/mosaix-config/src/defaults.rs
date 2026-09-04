@@ -60,6 +60,10 @@ pub fn default_base_config() -> BaseConfig {
 
     BaseConfig {
         version: CURRENT_VERSION,
+        // One workspace, so a fresh install tiles exactly as it did before
+        // workspaces existed. More are declared by the user, never
+        // invented by the engine (ADR 0028).
+        workspaces: crate::schema::default_workspaces(),
         hotkeys,
         gaps: Gaps::default(),
         behavior: BehaviorSection::default(),

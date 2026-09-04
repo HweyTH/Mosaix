@@ -83,6 +83,12 @@ enum Command {
         #[command(subcommand)]
         action: LayoutAction,
     },
+    /// Work with logical workspaces: named groups of managed windows,
+    /// each displayed on at most one display at a time.
+    Workspace {
+        #[command(subcommand)]
+        action: WorkspaceAction,
+    },
     /// Reverse the newest placement command.
     ///
     /// Refuses, and keeps the command available to retry, whenever a target
@@ -112,6 +118,47 @@ enum Command {
         json: bool,
     },
     Ping,
+}
+
+#[derive(Debug, Subcommand)]
+enum WorkspaceAction {
+    /// List every workspace, where it is displayed, and its members.
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Create a hidden, empty workspace. Refuses a name that already
+    /// exists under any casing.
+    Create {
+        name: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Delete a workspace. Refuses one that is displayed, still owns a
+    /// window or a dormant position, or is declared in configuration.
+    Delete {
+        name: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Display a hidden workspace on the focused display, or focus the
+    /// last-focused window of one already displayed elsewhere. Never
+    /// moves a displayed workspace; see `move` for that.
+    Focus {
+        name: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Move a displayed workspace to another display, exchanging it with
+    /// whatever that display shows.
+    Move {
+        name: String,
+        /// The display to move it to, by the id `mosaix state` reports.
+        #[arg(long)]
+        display: isize,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -199,6 +246,11 @@ fn main() {
         run_resize(direction, json);
         return;
     }
+    // And every workspace command.
+    if let Command::Workspace { action } = cli.command {
+        run_workspace(action);
+        return;
+    }
     if let Some((request, json)) = match cli.command {
         Command::SwapLeft { json } => Some((IpcRequest::SwapLeft, json)),
         Command::SwapRight { json } => Some((IpcRequest::SwapRight, json)),
@@ -258,6 +310,7 @@ fn main() {
         | Command::Undo { .. }
         | Command::Arrangement { .. }
         | Command::Resize { .. }
+        | Command::Workspace { .. }
         | Command::RemovePosition { .. }
         | Command::SwapLeft { .. }
         | Command::SwapRight { .. }
@@ -528,6 +581,186 @@ fn run_swap(request: mosaix_ipc::IpcRequest, json: bool) {
         println!("{}", format_swap(&result));
     } else {
         eprintln!("{}", format_swap(&result));
+    }
+    if !result.is_applied() {
+        std::process::exit(1);
+    }
+}
+
+/// Renders a workspace command outcome for a person.
+fn format_workspace_result(result: &mosaix_domain::WorkspaceCommandResult) -> String {
+    use mosaix_domain::{WorkspaceCommandResult, WorkspaceFocusApplied};
+    match result {
+        WorkspaceCommandResult::Created(applied) => {
+            format!("created workspace {} (hidden; focus it to display it)", applied.name)
+        }
+        WorkspaceCommandResult::Deleted(applied) => format!("deleted workspace {}", applied.name),
+        WorkspaceCommandResult::Focused(WorkspaceFocusApplied::Displayed {
+            name,
+            display_id,
+            replaced,
+        }) => match replaced {
+            Some(replaced) => format!(
+                "workspace {name} is now displayed on display {} (replacing {replaced}, now hidden)",
+                display_id.0
+            ),
+            None => format!("workspace {name} is now displayed on display {}", display_id.0),
+        },
+        WorkspaceCommandResult::Focused(WorkspaceFocusApplied::FocusedExisting {
+            name,
+            display_id,
+            focused_window,
+        }) => match focused_window {
+            Some(window) => format!(
+                "workspace {name} is already displayed on display {}; focused window {}",
+                display_id.0, window.0
+            ),
+            None => format!(
+                "workspace {name} is already displayed on display {}; it has no window to focus",
+                display_id.0
+            ),
+        },
+        WorkspaceCommandResult::Moved(applied) => match &applied.swapped_with {
+            Some(swapped) => format!(
+                "moved workspace {} from display {} to display {}; {swapped} now occupies display {}",
+                applied.name, applied.from_display_id.0, applied.to_display_id.0, applied.from_display_id.0
+            ),
+            None => format!(
+                "moved workspace {} from display {} to display {}",
+                applied.name, applied.from_display_id.0, applied.to_display_id.0
+            ),
+        },
+        WorkspaceCommandResult::Refused(refusal) => {
+            format!("mosaix: {refusal} ({})", refusal.code())
+        }
+    }
+}
+
+/// Renders the workspace section of published state.
+fn format_workspaces(state: &serde_json::Value) -> String {
+    let Some(workspaces) = state["workspaces"].as_array() else {
+        return "workspaces: none".to_owned();
+    };
+    if workspaces.is_empty() {
+        return "workspaces: none".to_owned();
+    }
+    let mut lines = vec!["workspaces:".to_owned()];
+    for workspace in workspaces {
+        let name = workspace["name"].as_str().unwrap_or("?");
+        let origin = workspace["origin"].as_str().unwrap_or("?");
+        let members: Vec<String> = workspace["members"]
+            .as_array()
+            .map(|members| {
+                members
+                    .iter()
+                    .filter_map(|id| id.as_i64())
+                    .map(|id| id.to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let dormant = workspace["dormant_positions"].as_u64().unwrap_or(0);
+        let place = match workspace["displayed_on"].as_i64() {
+            Some(display) => format!("display {display}"),
+            None => "hidden".to_owned(),
+        };
+        let mut line = format!("  {name}: {place}, from {origin}");
+        if members.is_empty() {
+            line.push_str(", no windows");
+        } else {
+            line.push_str(&format!(", windows {}", members.join(" ")));
+        }
+        if dormant > 0 {
+            line.push_str(&format!(", {dormant} dormant position(s)"));
+        }
+        lines.push(line);
+    }
+    if let Some(refusals) = state["rule_workspace_refusals"].as_array() {
+        for refusal in refusals {
+            lines.push(format!(
+                "  rule {} names unknown workspace {:?} for window {}",
+                refusal["rule_id"].as_str().unwrap_or("?"),
+                refusal["workspace"].as_str().unwrap_or("?"),
+                refusal["window_id"].as_i64().unwrap_or(0)
+            ));
+        }
+    }
+    lines.join("\n")
+}
+
+#[cfg(windows)]
+fn run_workspace(action: WorkspaceAction) {
+    use mosaix_ipc::{send_request, IpcRequest, IpcResponse};
+
+    let (request, json) = match action {
+        WorkspaceAction::List { json } => {
+            let Some(state) = published_persistence() else {
+                eprintln!("mosaix: no agent is running");
+                std::process::exit(1);
+            };
+            if json {
+                let value = serde_json::json!({
+                    "workspaces": state["workspaces"],
+                    "rule_workspace_refusals": state["rule_workspace_refusals"],
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&value).expect("JSON value serializes")
+                );
+            } else {
+                println!("{}", format_workspaces(&state));
+            }
+            return;
+        }
+        WorkspaceAction::Create { name, json } => (IpcRequest::CreateWorkspace { name }, json),
+        WorkspaceAction::Delete { name, json } => (IpcRequest::DeleteWorkspace { name }, json),
+        WorkspaceAction::Focus { name, json } => (IpcRequest::FocusWorkspace { name }, json),
+        WorkspaceAction::Move {
+            name,
+            display,
+            json,
+        } => (
+            IpcRequest::MoveWorkspace {
+                name,
+                display_id: display,
+            },
+            json,
+        ),
+    };
+    let data = match send_request(request) {
+        Ok(IpcResponse::Ok { data: Some(data) }) => data,
+        Ok(IpcResponse::Ok { data: None }) => {
+            eprintln!("mosaix: the agent answered without a workspace result");
+            std::process::exit(2);
+        }
+        Ok(IpcResponse::Error { message }) => {
+            eprintln!("mosaix: {message}");
+            std::process::exit(1);
+        }
+        Ok(IpcResponse::VersionMismatch { server_version }) => {
+            eprintln!("mosaix: protocol version mismatch (server: v{server_version})");
+            std::process::exit(1);
+        }
+        Err(error) => {
+            eprintln!("mosaix: {error}");
+            std::process::exit(2);
+        }
+    };
+    let result: mosaix_domain::WorkspaceCommandResult = match serde_json::from_value(data.clone()) {
+        Ok(result) => result,
+        Err(error) => {
+            eprintln!("mosaix: could not read the agent's workspace result: {error}");
+            std::process::exit(2);
+        }
+    };
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&data).expect("JSON value serializes")
+        );
+    } else if result.is_applied() {
+        println!("{}", format_workspace_result(&result));
+    } else {
+        eprintln!("{}", format_workspace_result(&result));
     }
     if !result.is_applied() {
         std::process::exit(1);
@@ -1060,6 +1293,56 @@ mod tests {
         assert_eq!(
             format_arrangement(&serde_json::json!({})),
             "arrangement: unknown (off)"
+        );
+    }
+
+    #[test]
+    fn workspace_list_names_each_workspace_its_place_and_members() {
+        let state = serde_json::json!({
+            "workspaces": [
+                { "name": "chat", "origin": "command", "displayed_on": null,
+                  "members": [], "last_focused_window": null, "dormant_positions": 2 },
+                { "name": "dev", "origin": "configuration", "displayed_on": 1,
+                  "members": [11, 12], "last_focused_window": 12, "dormant_positions": 0 },
+            ],
+            "rule_workspace_refusals": [
+                { "window_id": 13, "rule_id": "typo", "workspace": "dv" }
+            ],
+        });
+
+        assert_eq!(
+            format_workspaces(&state),
+            "workspaces:\n  chat: hidden, from command, no windows, 2 dormant position(s)\n  dev: display 1, from configuration, windows 11 12\n  rule typo names unknown workspace \"dv\" for window 13"
+        );
+    }
+
+    #[test]
+    fn a_refused_workspace_command_renders_the_reason_and_its_code() {
+        let result = mosaix_domain::WorkspaceCommandResult::Refused(
+            mosaix_domain::WorkspaceRefusal::UnknownWorkspace {
+                name: "typo".to_owned(),
+            },
+        );
+
+        let rendered = format_workspace_result(&result);
+
+        assert!(rendered.starts_with("mosaix: no workspace named \"typo\""));
+        assert!(rendered.ends_with("(unknown_workspace)"));
+    }
+
+    #[test]
+    fn a_workspace_focus_that_displayed_it_says_what_it_replaced() {
+        let result = mosaix_domain::WorkspaceCommandResult::Focused(
+            mosaix_domain::WorkspaceFocusApplied::Displayed {
+                name: mosaix_domain::WorkspaceName::new("chat").unwrap(),
+                display_id: mosaix_domain::DisplayId(1),
+                replaced: Some(mosaix_domain::WorkspaceName::new("dev").unwrap()),
+            },
+        );
+
+        assert_eq!(
+            format_workspace_result(&result),
+            "workspace chat is now displayed on display 1 (replacing dev, now hidden)"
         );
     }
 }

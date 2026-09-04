@@ -22,6 +22,7 @@ use mosaix_domain::undo::{
     now_unix, UndoMember, UndoTransaction, UndoTransactionDraft, UndoTransactionId,
     UndoTreeSnapshot,
 };
+use mosaix_domain::workspace::{PersistedWorkspace, WorkspaceName, WorkspaceOrigin};
 use mosaix_domain::{ApplicationId, Rect, WindowRole};
 use rusqlite::Connection;
 use thiserror::Error;
@@ -117,6 +118,22 @@ const MIGRATIONS: &[Migration] = &[
                          display_fingerprint TEXT NOT NULL,
                          tree TEXT NOT NULL,
                          PRIMARY KEY (transaction_id, display_fingerprint)
+                     );",
+    },
+    // Logical workspaces (ADR 0028). One row per workspace in the global
+    // pool: where it was displayed when last written, and the tree it
+    // owns as a document, for the same reason a container tree is one.
+    // The name is the key because it is the identity (CONTEXT.md
+    // "Logical workspace"): a workspace that moves between monitors keeps
+    // its row, and only `displayed_fingerprint` changes. Membership and
+    // last focus are native window ids and deliberately have no column.
+    Migration {
+        version: 5,
+        statements: "CREATE TABLE workspace (
+                         name TEXT PRIMARY KEY,
+                         origin TEXT NOT NULL,
+                         displayed_fingerprint TEXT,
+                         tree TEXT
                      );",
     },
 ];
@@ -738,6 +755,105 @@ impl Persistence {
         Ok(trees)
     }
 
+    /// Stores one workspace, replacing whatever the pool held under that
+    /// name. An absent tree is stored as NULL rather than as an empty
+    /// document, so a hidden workspace with nothing arranged reads back
+    /// as exactly that.
+    pub fn save_workspace(
+        &mut self,
+        workspace: &PersistedWorkspace,
+    ) -> Result<(), PersistenceError> {
+        let document = workspace
+            .tree
+            .as_ref()
+            .filter(|tree| !tree.is_empty())
+            .map(|tree| serde_json::to_string(tree).map_err(PersistenceError::TreeEncoding))
+            .transpose()?;
+        self.write(|connection| {
+            connection.execute(
+                "INSERT INTO workspace (name, origin, displayed_fingerprint, tree)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT (name) DO UPDATE SET
+                     origin = excluded.origin,
+                     displayed_fingerprint = excluded.displayed_fingerprint,
+                     tree = excluded.tree",
+                rusqlite::params![
+                    workspace.name.as_str(),
+                    workspace.origin.code(),
+                    workspace.displayed_fingerprint,
+                    document,
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Removes a deleted workspace. Answers whether there was one.
+    pub fn delete_workspace(&mut self, name: &WorkspaceName) -> Result<bool, PersistenceError> {
+        self.write(|connection| {
+            let removed =
+                connection.execute("DELETE FROM workspace WHERE name = ?1", [name.as_str()])?;
+            Ok(removed > 0)
+        })
+    }
+
+    /// Every stored workspace, in name order.
+    ///
+    /// A row whose name or origin this build cannot read is skipped with a
+    /// warning, and a tree that cannot be read leaves its workspace with
+    /// no tree: one unreadable row is not a reason to lose the pool.
+    pub fn load_workspaces(&self) -> Result<Vec<PersistedWorkspace>, PersistenceError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT name, origin, displayed_fingerprint, tree FROM workspace ORDER BY name",
+            )
+            .map_err(PersistenceError::Read)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            })
+            .map_err(PersistenceError::Read)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(PersistenceError::Read)?;
+
+        let mut workspaces = Vec::with_capacity(rows.len());
+        for (name, origin, displayed_fingerprint, document) in rows {
+            let (Ok(name), Some(origin)) = (
+                WorkspaceName::new(&name),
+                WorkspaceOrigin::from_code(&origin),
+            ) else {
+                tracing::warn!(%name, "stored workspace could not be read; skipping it");
+                continue;
+            };
+            let tree = document.and_then(|document| {
+                match serde_json::from_str::<PersistedTree>(&document) {
+                    Ok(tree) => Some(tree),
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            %name,
+                            "stored workspace arrangement could not be read; the workspace starts empty"
+                        );
+                        None
+                    }
+                }
+            });
+            workspaces.push(PersistedWorkspace {
+                name,
+                origin,
+                displayed_fingerprint,
+                tree,
+            });
+        }
+        Ok(workspaces)
+    }
+
     /// Runs a write, mapping any failure onto the same sticky degradation
     /// [`Persistence::commit_revision`] uses. Every durable write in this
     /// module goes through here so that one failed write cannot leave the
@@ -840,6 +956,11 @@ pub enum PersistenceRequest {
         display_fingerprint: String,
         tree: Box<PersistedTree>,
     },
+    /// Store one logical workspace: its origin, where it is displayed,
+    /// and the tree it owns.
+    SaveWorkspace(Box<PersistedWorkspace>),
+    /// Forget a deleted workspace.
+    DeleteWorkspace(WorkspaceName),
 }
 
 /// What the worker reports after each request: how durability now stands,
@@ -855,6 +976,9 @@ pub struct PersistenceUpdate {
     /// display's tree is, and the database follows it. Re-sending them
     /// would let a stale arrangement overwrite a live one.
     pub restored_trees: Option<HashMap<String, PersistedTree>>,
+    /// The stored workspace pool, sent only in the worker's first update
+    /// for the same reason `restored_trees` is.
+    pub restored_workspaces: Option<Vec<PersistedWorkspace>>,
 }
 
 #[derive(Debug)]
@@ -901,8 +1025,16 @@ impl PersistenceWorker {
                 None
             }
         };
+        let restored_workspaces = match persistence.load_workspaces() {
+            Ok(workspaces) => Some(workspaces),
+            Err(error) => {
+                tracing::warn!(%error, "stored workspaces could not be read");
+                None
+            }
+        };
         let _ = update_sender.send(PersistenceUpdate {
             restored_trees,
+            restored_workspaces,
             ..snapshot_of(&persistence)
         });
 
@@ -931,6 +1063,12 @@ impl PersistenceWorker {
                         display_fingerprint,
                         tree,
                     } => persistence.save_tree(display_fingerprint, tree),
+                    PersistenceRequest::SaveWorkspace(workspace) => {
+                        persistence.save_workspace(workspace)
+                    }
+                    PersistenceRequest::DeleteWorkspace(name) => {
+                        persistence.delete_workspace(name).map(|_| ())
+                    }
                 };
                 if let Err(error) = outcome {
                     tracing::warn!(
@@ -996,6 +1134,7 @@ fn snapshot_of(persistence: &Persistence) -> PersistenceUpdate {
         health: persistence.health(),
         newest_undo,
         restored_trees: None,
+        restored_workspaces: None,
     }
 }
 
@@ -1055,6 +1194,7 @@ mod tests {
                 },
                 newest_undo: None,
                 restored_trees: Some(HashMap::new()),
+                restored_workspaces: Some(Vec::new()),
             },
             "the worker states what the database already holds before any write"
         );

@@ -848,3 +848,158 @@ fn a_write_failure_never_advances_the_durable_revision() {
         "the revision whose write failed must not survive a restart"
     );
 }
+
+fn stored_workspace(
+    name: &str,
+    origin: mosaix_domain::WorkspaceOrigin,
+    displayed: Option<&str>,
+    tree: Option<mosaix_domain::PersistedTree>,
+) -> mosaix_domain::PersistedWorkspace {
+    mosaix_domain::PersistedWorkspace {
+        name: mosaix_domain::WorkspaceName::new(name).unwrap(),
+        origin,
+        displayed_fingerprint: displayed.map(str::to_owned),
+        tree,
+    }
+}
+
+#[test]
+fn a_workspace_survives_a_restart_with_its_display_origin_and_tree() {
+    let temporary = TempDatabase::new("workspace-restart");
+    let dev = stored_workspace(
+        "dev",
+        mosaix_domain::WorkspaceOrigin::Command,
+        Some("DISPLAY1"),
+        Some(stored_tree(&["Code.exe", "wt.exe"])),
+    );
+    let chat = stored_workspace(
+        "chat",
+        mosaix_domain::WorkspaceOrigin::Configuration,
+        None,
+        None,
+    );
+    {
+        let mut store = Persistence::open(&temporary.path()).expect("database opens");
+        store.save_workspace(&dev).unwrap();
+        store.save_workspace(&chat).unwrap();
+    }
+
+    let restarted = Persistence::open(&temporary.path()).expect("database reopens");
+    let loaded = restarted.load_workspaces().unwrap();
+
+    assert_eq!(loaded, vec![chat, dev], "read back in name order");
+}
+
+#[test]
+fn saving_a_workspace_again_moves_it_rather_than_duplicating_it() {
+    let temporary = TempDatabase::new("workspace-move");
+    let mut store = Persistence::open(&temporary.path()).expect("database opens");
+    store
+        .save_workspace(&stored_workspace(
+            "dev",
+            mosaix_domain::WorkspaceOrigin::Command,
+            Some("DISPLAY1"),
+            Some(stored_tree(&["Code.exe"])),
+        ))
+        .unwrap();
+
+    let moved = stored_workspace(
+        "dev",
+        mosaix_domain::WorkspaceOrigin::Command,
+        Some("DISPLAY2"),
+        Some(stored_tree(&["Code.exe"])),
+    );
+    store.save_workspace(&moved).unwrap();
+
+    assert_eq!(store.load_workspaces().unwrap(), vec![moved]);
+}
+
+#[test]
+fn an_empty_tree_is_stored_as_no_tree() {
+    let temporary = TempDatabase::new("workspace-empty-tree");
+    let mut store = Persistence::open(&temporary.path()).expect("database opens");
+    store
+        .save_workspace(&stored_workspace(
+            "dev",
+            mosaix_domain::WorkspaceOrigin::Command,
+            None,
+            Some(mosaix_domain::PersistedTree::new()),
+        ))
+        .unwrap();
+
+    let loaded = store.load_workspaces().unwrap();
+    assert_eq!(loaded[0].tree, None);
+}
+
+#[test]
+fn deleting_a_workspace_removes_its_row_and_reports_whether_it_existed() {
+    let temporary = TempDatabase::new("workspace-delete");
+    let mut store = Persistence::open(&temporary.path()).expect("database opens");
+    let name = mosaix_domain::WorkspaceName::new("dev").unwrap();
+    store
+        .save_workspace(&stored_workspace(
+            "dev",
+            mosaix_domain::WorkspaceOrigin::Command,
+            None,
+            None,
+        ))
+        .unwrap();
+
+    assert!(store.delete_workspace(&name).unwrap());
+    assert!(!store.delete_workspace(&name).unwrap());
+    assert!(store.load_workspaces().unwrap().is_empty());
+}
+
+#[test]
+fn an_unreadable_workspace_tree_costs_only_that_tree() {
+    let temporary = TempDatabase::new("workspace-unreadable");
+    {
+        let mut store = Persistence::open(&temporary.path()).expect("database opens");
+        store
+            .save_workspace(&stored_workspace(
+                "dev",
+                mosaix_domain::WorkspaceOrigin::Command,
+                Some("DISPLAY1"),
+                Some(stored_tree(&["Code.exe"])),
+            ))
+            .unwrap();
+    }
+    {
+        let connection = rusqlite::Connection::open(temporary.path()).unwrap();
+        connection
+            .execute(
+                "UPDATE workspace SET tree = 'not a tree' WHERE name = 'dev'",
+                [],
+            )
+            .unwrap();
+    }
+
+    let store = Persistence::open(&temporary.path()).expect("database reopens");
+    let loaded = store.load_workspaces().unwrap();
+
+    assert_eq!(loaded.len(), 1);
+    assert_eq!(loaded[0].displayed_fingerprint.as_deref(), Some("DISPLAY1"));
+    assert_eq!(loaded[0].tree, None);
+}
+
+#[test]
+fn stored_workspaces_contain_no_window_titles() {
+    let temporary = TempDatabase::new("workspace-titles");
+    {
+        let mut store = Persistence::open(&temporary.path()).expect("database opens");
+        store
+            .save_workspace(&stored_workspace(
+                "dev",
+                mosaix_domain::WorkspaceOrigin::Command,
+                Some("DISPLAY1"),
+                Some(stored_tree(&["Code.exe"])),
+            ))
+            .unwrap();
+    }
+    let bytes = fs::read(temporary.path()).unwrap();
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(
+        !text.contains("title"),
+        "a stored workspace has no title column and its tree evidence has no title field"
+    );
+}

@@ -14,6 +14,7 @@ use crate::schema::{
     BaseConfig, Command, ConfigLayer, KeyCombo, ProfileConfig, ResolvedConfig, ResolvedConfigSet,
     ResolvedProfile, SavedLayout, TilingMode, BASE_CONFIG_FILE_NAME, CURRENT_VERSION,
 };
+use mosaix_domain::{WorkspaceName, WorkspaceNameError};
 
 /// One profile candidate: its filename (for error messages -- profiles are
 /// matched by content, not filename, per ADR 0004, but the filename is
@@ -111,6 +112,76 @@ pub enum ValidationError {
         binding: String,
         layout: String,
     },
+
+    #[error("{file}: hotkey {binding:?} focuses workspace {workspace:?}, which is not declared")]
+    UnknownWorkspaceBinding {
+        file: String,
+        binding: String,
+        workspace: String,
+    },
+
+    #[error("{file}: workspace name {name:?} is invalid: {reason}")]
+    InvalidWorkspaceName {
+        file: String,
+        name: String,
+        reason: WorkspaceNameError,
+    },
+
+    #[error(
+        "{file}: workspaces {first:?} and {second:?} are the same name; \
+         a workspace may be declared once"
+    )]
+    DuplicateWorkspaceName {
+        file: String,
+        first: String,
+        second: String,
+    },
+}
+
+/// Every rule a declared workspace list must satisfy: each entry a valid
+/// name, and no two entries the same workspace under case folding. A
+/// profile repeating a base name is not a duplicate -- it is the same
+/// workspace, which the merge keeps once -- so this checks one file at a
+/// time.
+fn workspace_errors(file: &str, workspaces: &[String]) -> Vec<ValidationError> {
+    let mut errors = Vec::new();
+    let mut seen: Vec<WorkspaceName> = Vec::new();
+    for raw in workspaces {
+        match WorkspaceName::new(raw) {
+            Ok(name) => {
+                if let Some(first) = seen.iter().find(|seen| seen.collides_with(&name)) {
+                    errors.push(ValidationError::DuplicateWorkspaceName {
+                        file: file.to_owned(),
+                        first: first.as_str().to_owned(),
+                        second: raw.clone(),
+                    });
+                } else {
+                    seen.push(name);
+                }
+            }
+            Err(reason) => errors.push(ValidationError::InvalidWorkspaceName {
+                file: file.to_owned(),
+                name: raw.clone(),
+                reason,
+            }),
+        }
+    }
+    errors
+}
+
+/// The declared workspace names of one layer, in order, skipping any the
+/// validator has already rejected. `merge` runs on unvalidated input too,
+/// so an invalid entry here is dropped rather than trusted.
+fn declared_workspaces(workspaces: &[String]) -> Vec<WorkspaceName> {
+    let mut names: Vec<WorkspaceName> = Vec::new();
+    for raw in workspaces {
+        if let Ok(name) = WorkspaceName::new(raw) {
+            if !names.iter().any(|seen| seen.collides_with(&name)) {
+                names.push(name);
+            }
+        }
+    }
+    names
 }
 
 /// How far past 1.0 a cell edge may land before it counts as outside the
@@ -242,8 +313,16 @@ pub fn merge(base: &BaseConfig, profile: Option<&ProfileConfig>) -> ResolvedConf
         .keys()
         .map(|name| (name.clone(), ConfigLayer::Base))
         .collect();
+    let mut workspaces = declared_workspaces(&base.workspaces);
 
     if let Some(profile) = profile {
+        // Base names first, then the profile's additions: a workspace the
+        // profile repeats is the same workspace and is kept once.
+        for name in declared_workspaces(&profile.workspaces) {
+            if !workspaces.iter().any(|seen| seen.collides_with(&name)) {
+                workspaces.push(name);
+            }
+        }
         for (command, combo) in &profile.hotkeys {
             hotkeys.insert(command.clone(), combo.clone());
             binding_sources.insert(command.clone(), ConfigLayer::Profile);
@@ -279,6 +358,7 @@ pub fn merge(base: &BaseConfig, profile: Option<&ProfileConfig>) -> ResolvedConf
     }
 
     ResolvedConfig {
+        workspaces,
         hotkeys,
         binding_sources,
         gaps,
@@ -357,6 +437,21 @@ fn unknown_layout_bindings(file: &str, resolved: &ResolvedConfig) -> Vec<Validat
                     layout: name.clone(),
                 })
             }
+            // A workspace binding may only name a workspace configuration
+            // declares: a command-created one exists only in the running
+            // agent, and a binding to it would be a binding to nothing
+            // after a restart in which it had been deleted.
+            Command::FocusWorkspace { name }
+                if !resolved.workspaces.iter().any(|declared| {
+                    WorkspaceName::new(name).is_ok_and(|name| declared.collides_with(&name))
+                }) =>
+            {
+                Some(ValidationError::UnknownWorkspaceBinding {
+                    file: file.to_owned(),
+                    binding: combo.to_string(),
+                    workspace: name.clone(),
+                })
+            }
             _ => None,
         })
         .collect()
@@ -403,6 +498,7 @@ pub fn validate(candidate: &CandidateConfig) -> Result<ResolvedConfigSet, Vec<Va
     };
 
     errors.extend(layout_errors(BASE_CONFIG_FILE_NAME, &base.layouts));
+    errors.extend(workspace_errors(BASE_CONFIG_FILE_NAME, &base.workspaces));
 
     let base_resolved = merge(&base, None);
     if !(1..=16).contains(&base_resolved.focus_border.thickness) {
@@ -440,6 +536,7 @@ pub fn validate(candidate: &CandidateConfig) -> Result<ResolvedConfigSet, Vec<Va
             &base.layouts,
             &profile.layouts,
         ));
+        layout_problems.extend(workspace_errors(file_name, &profile.workspaces));
         let referential = unknown_layout_bindings(file_name, &resolved);
         let duplicate = duplicate_binding(file_name, &resolved);
         if duplicate.is_some() || !referential.is_empty() || !layout_problems.is_empty() {
@@ -706,6 +803,7 @@ snap-right = "ctrl+alt+left"
         assert_eq!(
             resolved,
             ResolvedConfig {
+                workspaces: vec![WorkspaceName::new("main").unwrap()],
                 hotkeys: base.hotkeys.clone(),
                 binding_sources: base
                     .hotkeys
@@ -1584,6 +1682,144 @@ snap-right = "ctrl+alt+right"
         assert!(
             !rendered.contains("[layouts]"),
             "rewriting a layout-free profile must not add a header, got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn a_base_config_that_names_no_workspaces_declares_main() {
+        let result = validate(&base_only(VALID_BASE)).unwrap();
+
+        assert_eq!(
+            result.base.workspaces,
+            vec![WorkspaceName::new("main").unwrap()]
+        );
+    }
+
+    #[test]
+    fn declared_workspaces_resolve_in_order_with_the_profiles_additions_after() {
+        let base = VALID_BASE.replace(
+            "version = 1\n",
+            "version = 1\nworkspaces = [\"dev\", \"chat\"]\n",
+        );
+        let profile = r#"
+fingerprint = "MON-A@0,0 1920x1080 scale=1"
+workspaces = ["Chat", "media"]
+"#;
+        let candidate = CandidateConfig {
+            base,
+            profiles: vec![CandidateProfile {
+                file_name: "office.toml".to_owned(),
+                contents: profile.to_owned(),
+            }],
+        };
+
+        let result = validate(&candidate).unwrap();
+
+        let names = |config: &ResolvedConfig| -> Vec<String> {
+            config
+                .workspaces
+                .iter()
+                .map(|name| name.as_str().to_owned())
+                .collect()
+        };
+        assert_eq!(names(&result.base), vec!["dev", "chat"]);
+        assert_eq!(
+            names(&result.profiles[0].config),
+            vec!["dev", "chat", "media"],
+            "a profile repeating a base name is the same workspace, kept once as base spelled it"
+        );
+    }
+
+    #[test]
+    fn an_invalid_workspace_name_rejects_the_whole_candidate_naming_the_file() {
+        let base = VALID_BASE.replace(
+            "version = 1\n",
+            "version = 1\nworkspaces = [\"dev\", \"  \"]\n",
+        );
+
+        let errors = validate(&base_only(&base)).unwrap_err();
+
+        assert_eq!(
+            errors,
+            vec![ValidationError::InvalidWorkspaceName {
+                file: "config.toml".to_owned(),
+                name: "  ".to_owned(),
+                reason: WorkspaceNameError::Empty,
+            }]
+        );
+    }
+
+    #[test]
+    fn two_workspaces_that_differ_only_by_case_are_rejected_in_the_file_that_declares_them() {
+        let profile = r#"
+fingerprint = "MON-A@0,0 1920x1080 scale=1"
+workspaces = ["Dev", "dev"]
+"#;
+        let candidate = CandidateConfig {
+            base: VALID_BASE.to_owned(),
+            profiles: vec![CandidateProfile {
+                file_name: "office.toml".to_owned(),
+                contents: profile.to_owned(),
+            }],
+        };
+
+        let errors = validate(&candidate).unwrap_err();
+
+        assert_eq!(
+            errors,
+            vec![ValidationError::DuplicateWorkspaceName {
+                file: "office.toml".to_owned(),
+                first: "Dev".to_owned(),
+                second: "dev".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn a_workspace_binding_must_name_a_declared_workspace() {
+        let base = VALID_BASE.replace("version = 1\n", "version = 1\nworkspaces = [\"dev\"]\n")
+            + "\n[hotkeys.focus-workspace]\nDev = \"ctrl+alt+1\"\nchat = \"ctrl+alt+2\"\n";
+
+        let errors = validate(&base_only(&base)).unwrap_err();
+
+        assert_eq!(
+            errors,
+            vec![ValidationError::UnknownWorkspaceBinding {
+                file: "config.toml".to_owned(),
+                binding: "ctrl+alt+2".to_owned(),
+                workspace: "chat".to_owned(),
+            }],
+            "the binding to Dev matches the declared dev under case folding; only chat is unknown"
+        );
+    }
+
+    #[test]
+    fn a_profile_may_bind_a_workspace_it_declares_itself() {
+        let profile = r#"
+fingerprint = "MON-A@0,0 1920x1080 scale=1"
+workspaces = ["chat"]
+
+[hotkeys.focus-workspace]
+chat = "ctrl+alt+2"
+"#;
+        let candidate = CandidateConfig {
+            base: VALID_BASE.to_owned(),
+            profiles: vec![CandidateProfile {
+                file_name: "office.toml".to_owned(),
+                contents: profile.to_owned(),
+            }],
+        };
+
+        let result = validate(&candidate).unwrap();
+
+        assert_eq!(
+            result.profiles[0]
+                .config
+                .hotkeys
+                .get(&Command::FocusWorkspace {
+                    name: "chat".to_owned()
+                }),
+            Some(&combo("ctrl+alt+2"))
         );
     }
 }

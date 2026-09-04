@@ -11,7 +11,7 @@ use std::fmt;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use mosaix_domain::{Gaps, NormalizedRect};
+use mosaix_domain::{Gaps, NormalizedRect, WorkspaceName};
 
 /// The base config file's name, and the name validation errors and
 /// provenance use to refer to it. Base config is one fixed file, unlike a
@@ -75,10 +75,19 @@ pub enum Command {
     ApplyLayout {
         name: String,
     },
+    /// Display the logical workspace called `name` on the focused
+    /// display, or focus it where it is already displayed (CONTEXT.md
+    /// "Workspace focus"). The second parameterized command, written the
+    /// same way as `apply-layout`: `[hotkeys.focus-workspace]` with one
+    /// entry per workspace name.
+    FocusWorkspace {
+        name: String,
+    },
 }
 
 /// The TOML verb naming a parameterized command's table.
 const APPLY_LAYOUT_VERB: &str = "apply-layout";
+const FOCUS_WORKSPACE_VERB: &str = "focus-workspace";
 
 impl Command {
     /// The verb this command is written as in a `[hotkeys]` table. For
@@ -107,6 +116,7 @@ impl Command {
             Self::ResizeDown => "resize-down",
             Self::TogglePause => "toggle-pause",
             Self::ApplyLayout { .. } => APPLY_LAYOUT_VERB,
+            Self::FocusWorkspace { .. } => FOCUS_WORKSPACE_VERB,
         }
     }
 
@@ -168,6 +178,9 @@ impl Command {
             Some((APPLY_LAYOUT_VERB, name)) if !name.is_empty() => Some(Self::ApplyLayout {
                 name: name.to_owned(),
             }),
+            Some((FOCUS_WORKSPACE_VERB, name)) if !name.is_empty() => Some(Self::FocusWorkspace {
+                name: name.to_owned(),
+            }),
             Some(_) => None,
             None => Self::unit_from_verb(path),
         }
@@ -180,6 +193,7 @@ impl fmt::Display for Command {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ApplyLayout { name } => write!(f, "{APPLY_LAYOUT_VERB}.{name}"),
+            Self::FocusWorkspace { name } => write!(f, "{FOCUS_WORKSPACE_VERB}.{name}"),
             unit => f.write_str(unit.verb()),
         }
     }
@@ -210,7 +224,7 @@ pub(crate) mod hotkey_bindings {
     use serde::ser::SerializeMap;
     use serde::{Deserializer, Serializer};
 
-    use super::{Command, KeyCombo, APPLY_LAYOUT_VERB};
+    use super::{Command, KeyCombo, APPLY_LAYOUT_VERB, FOCUS_WORKSPACE_VERB};
 
     pub fn serialize<S>(
         bindings: &BTreeMap<Command, KeyCombo>,
@@ -221,24 +235,31 @@ pub(crate) mod hotkey_bindings {
     {
         let mut units: Vec<(&'static str, &KeyCombo)> = Vec::new();
         let mut layouts: BTreeMap<&str, &KeyCombo> = BTreeMap::new();
+        let mut workspaces: BTreeMap<&str, &KeyCombo> = BTreeMap::new();
         for (command, combo) in bindings {
             match command {
                 Command::ApplyLayout { name } => {
                     layouts.insert(name.as_str(), combo);
                 }
+                Command::FocusWorkspace { name } => {
+                    workspaces.insert(name.as_str(), combo);
+                }
                 unit => units.push((unit.verb(), combo)),
             }
         }
 
-        // Every flat entry first, the nested table last: TOML cannot emit
+        // Every flat entry first, the nested tables last: TOML cannot emit
         // a scalar after a table in the same parent.
-        let mut map =
-            serializer.serialize_map(Some(units.len() + usize::from(!layouts.is_empty())))?;
+        let tables = usize::from(!layouts.is_empty()) + usize::from(!workspaces.is_empty());
+        let mut map = serializer.serialize_map(Some(units.len() + tables))?;
         for (verb, combo) in units {
             map.serialize_entry(verb, combo)?;
         }
         if !layouts.is_empty() {
             map.serialize_entry(APPLY_LAYOUT_VERB, &layouts)?;
+        }
+        if !workspaces.is_empty() {
+            map.serialize_entry(FOCUS_WORKSPACE_VERB, &workspaces)?;
         }
         map.end()
     }
@@ -296,6 +317,12 @@ pub(crate) mod hotkey_bindings {
                     if verb == APPLY_LAYOUT_VERB {
                         for (name, combo) in entries.next_value::<BTreeMap<String, KeyCombo>>()? {
                             bindings.insert(Command::ApplyLayout { name }, combo);
+                        }
+                        continue;
+                    }
+                    if verb == FOCUS_WORKSPACE_VERB {
+                        for (name, combo) in entries.next_value::<BTreeMap<String, KeyCombo>>()? {
+                            bindings.insert(Command::FocusWorkspace { name }, combo);
                         }
                         continue;
                     }
@@ -534,6 +561,16 @@ pub struct SavedLayout {
 #[serde(deny_unknown_fields)]
 pub struct BaseConfig {
     pub version: u32,
+    /// The logical workspaces this configuration declares (CONTEXT.md
+    /// "Logical workspace"). Configuration is one of the two ways a
+    /// workspace comes to exist (ADR 0028), and this is the declaration.
+    /// Omitted means one workspace called `main`, so a configuration file
+    /// written before workspaces existed keeps one workspace per display
+    /// it can fill.
+    ///
+    /// A scalar array, so it sits with `version` ahead of every table.
+    #[serde(default = "default_workspaces")]
+    pub workspaces: Vec<String>,
     #[serde(default, with = "hotkey_bindings")]
     pub hotkeys: BTreeMap<Command, KeyCombo>,
     #[serde(default)]
@@ -569,6 +606,11 @@ pub struct GapsOverride {
 #[serde(deny_unknown_fields)]
 pub struct ProfileConfig {
     pub fingerprint: String,
+    /// Workspaces this profile declares in addition to base config's. A
+    /// name base config already declares is the same workspace, not a
+    /// second one. Skipped when empty for the same reason `layouts` is.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workspaces: Vec<String>,
     #[serde(default, with = "hotkey_bindings")]
     pub hotkeys: BTreeMap<Command, KeyCombo>,
     #[serde(default)]
@@ -593,6 +635,14 @@ pub struct ProfileConfig {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub layouts: BTreeMap<String, SavedLayout>,
 }
+
+/// What `workspaces` means when a base config does not mention it.
+pub fn default_workspaces() -> Vec<String> {
+    vec![DEFAULT_WORKSPACE_NAME.to_owned()]
+}
+
+/// The one workspace a configuration that names none is taken to declare.
+pub const DEFAULT_WORKSPACE_NAME: &str = "main";
 
 /// Which configuration layer a resolved value came from.
 ///
@@ -642,6 +692,9 @@ pub fn layout_names_collide(first: &str, second: &str) -> bool {
 /// value [`crate::validate`] itself would ever produce.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ResolvedConfig {
+    /// Every workspace configuration declares for this topology, base
+    /// config's first and then the profile's additions, each name once.
+    pub workspaces: Vec<WorkspaceName>,
     pub hotkeys: BTreeMap<Command, KeyCombo>,
     /// Which layer supplied each binding in `hotkeys`, keyed identically.
     ///
@@ -1033,5 +1086,59 @@ mod tests {
             "the verb alone is a table, and a command cannot be built without the layout name"
         );
         assert_eq!(Command::parse("apply-layout."), None);
+    }
+
+    #[test]
+    fn a_workspace_binding_is_written_as_its_own_nested_table_and_round_trips() {
+        let mut base = BaseConfig {
+            version: CURRENT_VERSION,
+            workspaces: vec!["dev".to_owned(), "chat".to_owned()],
+            hotkeys: BTreeMap::new(),
+            gaps: Gaps::default(),
+            behavior: BehaviorSection::default(),
+            focus_border: FocusBorderSection::default(),
+            layouts: BTreeMap::new(),
+        };
+        base.hotkeys
+            .insert(Command::SnapLeft, KeyCombo::parse("ctrl+alt+left").unwrap());
+        base.hotkeys.insert(
+            Command::ApplyLayout {
+                name: "writing".to_owned(),
+            },
+            KeyCombo::parse("ctrl+alt+1").unwrap(),
+        );
+        base.hotkeys.insert(
+            Command::FocusWorkspace {
+                name: "chat".to_owned(),
+            },
+            KeyCombo::parse("ctrl+alt+2").unwrap(),
+        );
+
+        let rendered = toml::to_string_pretty(&base).unwrap();
+        assert!(
+            rendered.contains("[hotkeys.focus-workspace]\nchat = \"ctrl+alt+2\""),
+            "got:\n{rendered}"
+        );
+        assert!(
+            rendered.find("[hotkeys.apply-layout]") < rendered.find("[hotkeys.focus-workspace]"),
+            "both nested tables follow the flat entries, got:\n{rendered}"
+        );
+        let reparsed: BaseConfig = toml::from_str(&rendered).unwrap();
+        assert_eq!(reparsed, base);
+    }
+
+    #[test]
+    fn a_workspace_binding_parses_from_its_toml_path_and_prints_back_the_same() {
+        let command = Command::parse("focus-workspace.deep.work").unwrap();
+
+        assert_eq!(
+            command,
+            Command::FocusWorkspace {
+                name: "deep.work".to_owned()
+            }
+        );
+        assert_eq!(command.to_string(), "focus-workspace.deep.work");
+        assert_eq!(command.verb(), "focus-workspace");
+        assert_eq!(Command::parse("focus-workspace"), None);
     }
 }
