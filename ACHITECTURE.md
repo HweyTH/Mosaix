@@ -226,7 +226,9 @@ struct Window {
 }
 ```
 
-Native handles must never be persisted as stable identities. Workspace restoration matches windows using scored evidence:
+Native handles must never be persisted as stable identities. Persistent undo and
+workspace restoration share one platform-neutral window-identity matcher using
+scored evidence:
 
 1. Application identity.
 2. Window role/class.
@@ -234,38 +236,192 @@ Native handles must never be persisted as stable identities. Workspace restorati
 4. Document identifier when the OS exposes one.
 5. Launch order and last-known placement as tie-breakers.
 
-The inspector must expose this evidence so users can repair rules.
+The matcher returns `confident`, `ambiguous`, or `no-match` plus the contributing
+evidence and scores. Only `confident` authorizes a persisted placement. The
+inspector must expose the same evidence so users can repair rules.
 
-### 7.3 Workspace and container tree
+### 7.3 Container tree
 
 ```text
 Monitor
-└── Workspace
-    └── ContainerNode (root)
-        ├── ContainerNode (horizontal tiles)
-        │   ├── WindowNode
-        │   └── WindowNode
-        └── ContainerNode (stack)
-            ├── WindowNode
-            └── WindowNode
+└── ContainerNode (root)
+    ├── ContainerNode (horizontal tiles)
+    │   ├── WindowNode
+    │   └── WindowNode
+    └── ContainerNode (vertical tiles)
+        ├── WindowNode
+        └── WindowNode
 ```
+
+The container tree and workspace switching are separate capabilities. Tree-based
+tiling initially exposes one visible root per monitor; the model must still allow
+a logical workspace to own that root later without changing tree semantics.
 
 Container nodes have:
 
-- Layout: horizontal tiles, vertical tiles, stack, or monocle.
+- Layout: horizontal or vertical tiles in the first container-tree release.
 - Child weights.
 - Ordered child nodes.
-- Gaps and padding inherited from workspace settings.
+- Gaps and padding inherited from the containing tiling surface.
+
+The first release uses BSP insertion and weighted horizontal/vertical splits. Stack,
+monocle, tall/wide presets, and additional policies remain deferred until this tree
+ownership, normalization, resizing, persistence, and undo path is proven.
+
+A new tiled window splits the focused tiled leaf into equal-weight siblings along
+that leaf's longer geometric axis. If no tiled window is focused, split the largest
+leaf and break equal-area ties by visual window order. Explicit insertion direction
+and preselection are deferred.
+
+Each tree-resize command shifts the selected split by five percentage points and
+reflows every affected live descendant as one undo transaction. Clamp the change
+before either affected subtree would violate a live window's minimum size. The step
+is fixed rather than configurable in the first release.
+
+Select the closest ancestor split whose axis and sibling position face the requested
+resize direction. Climb outward only when the immediate parent has no applicable
+divider; if no ancestor qualifies, emit no placement effects.
+
+Directional swap reuses directional focus's spatial neighbor selection. When both
+the focused and target windows occupy live, actively arranged tiled leaves, exchange
+only their window bindings; preserve all container identities, parentage, split axes,
+weights, insertion metadata, and dormant leaves. Logical focus follows the same
+window identity into its new leaf, and the resulting placements are one undo
+transaction. If either endpoint is floating or in constraint overflow, or no target
+exists on the same display, return a structured no-target result without mutating
+the tree. Structural directional move and swap behavior for future stack or monocle
+containers are deferred and must use separately specified commands.
 
 Tree normalization runs after structural commands:
 
 - Remove empty containers.
-- Flatten single-child containers except the workspace root.
+- Flatten single-child containers except the root container.
 - Merge redundant adjacent containers where semantics allow it.
 - Clamp weights to valid, non-zero values.
-- Ensure each managed window belongs to exactly one workspace/container.
+- Ensure each tiled managed window belongs to exactly one container tree.
+
+On restart, an unmatched persisted window becomes a dormant tree leaf. Dormant leaves
+remain in the stored structure but consume no planner space; a later confident
+identity match reactivates the prior position. Prune dormant leaves after seven days
+unless saved-scene metadata explicitly retains them. Normalization preserves dormant
+leaves and the ancestors needed to locate them while removing truly empty structure.
+
+Closing a tiled window also makes its leaf dormant rather than deleting its position.
+An explicit remove-position command deletes a dormant leaf immediately and records
+the resulting structural reflow as an undo transaction.
+
+When live minimum-size constraints cannot fit, reduce gaps toward zero first. If the
+tree still cannot fit, temporarily exclude live leaves from newest insertion to
+oldest until the remainder is valid. These constraint-overflow windows remain
+visible, managed, and floating without losing their tree positions, and return
+automatically when the tree can satisfy them. This state is distinct from a rule or
+session-floating choice.
 
 Manual snap mode does not force a window into this tree. A snapped window may remain floating with an optional remembered zone assignment. This prevents manual interactions from unexpectedly turning into automatic rearrangement.
+
+#### 7.3.1 Logical workspace visibility
+
+Logical workspaces form one global pool of unique names. Each owns one container-tree
+root, is displayed on at most one monitor at a time, and may move between monitors
+without changing identity. Supported tree tiling does not depend on multiple
+workspaces or on a mechanism for making non-displayed windows disappear.
+
+Every managed window belongs to exactly one logical workspace, including tiled,
+rule-floating, and session-floating windows. Excluded windows remain outside the
+workspace system and are never parked or restored by workspace commands.
+
+Create a workspace only through configuration or an explicit `workspace create`
+command; command-created workspaces persist in SQLite. Focus, move, and rule targets
+must resolve an existing name and return a typed unknown-workspace error on a typo.
+Delete a workspace only when it is undisplayed and contains no live or dormant
+leaves; otherwise refuse without moving windows or discarding tree state.
+
+Enabling experimental switching requires a resolved configuration that declares
+enough uniquely named workspaces to assign one distinct displayed workspace to every
+active monitor. Reject activation atomically when that invariant is not met. A
+settings flow may offer to create defaults explicitly, but the engine never invents
+persistent workspace names.
+
+Only a matched topology profile may enable experimental switching and map workspace
+names to displays. Base configuration and unmatched topologies remain ordinary
+manual, balanced-grid, or container-tree tiling without workspace parking.
+
+Apply a topology profile's complete workspace-to-display mapping as one atomic
+multi-monitor transition. Preflight every affected window and assignment; if any
+part cannot commit, preserve the prior mapping on every display rather than exposing
+a partially applied profile.
+
+Focusing a hidden workspace displays it on the focused monitor, replacing that
+monitor's displayed workspace. If the target workspace is already displayed on
+another monitor, focus its last-focused live window there instead of moving the
+workspace. Moving a displayed workspace between monitors is a separate explicit
+command.
+
+When a rule assigns a newly opened window to a hidden workspace, persist its
+membership and recovery record, then park it without changing the displayed
+workspace or stealing focus. If the recovery record cannot become durable, leave
+the window visible, report the pending assignment, and enter `persistence-degraded`
+rather than moving it unsafely.
+
+Track focused display explicitly. Managed-window focus updates it to that window's
+display; an explicit display-targeting command also updates it. When no managed
+window is focused, retain the last explicitly targeted display so an empty workspace
+still has an unambiguous command target. If that display disconnects, select the
+nearest surviving display using display-migration geometry and let the primary
+display break an exact tie. This supersedes ADR 0020.
+
+When a monitor disconnects, its displayed workspace becomes hidden and its windows
+park relative to the nearest surviving display after recovery data is durable.
+Workspaces displayed on surviving monitors do not move. Reconnecting a monitor does
+not reveal a workspace unless an explicit focus command or resolved topology-profile
+preference selects it.
+
+Workspace switching is an experimental adapter capability. It uses only public OS
+APIs to park the windows of non-displayed workspaces at reversible edge positions;
+it does not control Windows Virtual Desktops or macOS Spaces and must not use
+private APIs, process injection, or reduced platform security.
+
+Before activation or switching, the adapter must verify a recoverable parking edge
+for the current monitor topology. If none exists, refuse the operation; never fall
+back under the same command to minimizing, hiding, or cloaking windows.
+
+Execute switching as a workspace switch transaction. Preflight every live window
+and durably commit the recovery ledger before emitting the first parking or restore
+effect. If any effect fails, keep the original workspace displayed and compensate
+every completed move. Failed compensation publishes `workspace-switch-degraded`,
+blocks further switches, and requires the explicit restore action; it does not
+mislabel an OS placement failure as `persistence-degraded`.
+A successful switch records the previous displayed-workspace assignment and every
+affected placement as one persistent undo transaction.
+
+An outgoing managed full-screen window fails switch preflight. Report that window
+and leave the displayed workspace unchanged; do not force applications out of
+full-screen to make parking possible.
+
+For a maximized window, record its normal geometry and maximized show state, restore
+it to normal before parking, and re-maximize it when its workspace is displayed.
+Failure to restore or re-maximize is a switch failure and uses the same cancellation
+and compensation path.
+
+Leave minimized windows minimized and do not park them merely because their
+workspace hides. Preserve their membership, normal restore geometry, and minimized
+state. If an application restores a window while its workspace remains hidden,
+durably record recovery data and park it immediately; document possible visual
+flashing as an experimental limitation.
+
+The experiment requires the SQLite state foundation plus a separate current-session
+recovery ledger and out-of-process restore command before it can move a window.
+It graduates to a supported feature only after the crash, force-kill, topology,
+focus, task-switcher, and application-compatibility matrix in
+`docs/research/workspace-feature-strategy.md` passes on both platforms. Failure to
+meet that gate leaves switching experimental without blocking container-tree tiling.
+
+On startup, process the previous session's recovery ledger before restoring logical
+workspace state. Verify that each native handle still belongs to the recorded process
+instance and window evidence, restore verified windows to visible pre-park geometry,
+and report rather than touch stale or reused handles. Reconcile durable identities
+only after this recovery pass, then reapply saved displayed-workspace assignments as
+fresh guarded switch transactions.
 
 ### 7.4 Rules
 
@@ -404,7 +560,7 @@ The automatic planner maps a normalized workspace tree to rectangles. It support
 - User-adjusted weights.
 - Minimum-size-aware degradation.
 
-When constraints make the requested arrangement impossible, the planner returns diagnostics and applies a deterministic degradation policy: reduce gaps, honor minimum sizes, then stack overflow windows. It must never oscillate endlessly between two arrangements.
+When constraints make the requested arrangement impossible, the planner returns diagnostics and applies a deterministic degradation policy: reduce gaps, honor minimum sizes, then mark newest inserted windows as constraint overflow until the remainder fits. It must never oscillate endlessly between two arrangements.
 
 ### 9.4 Focus engine
 
@@ -492,6 +648,26 @@ Configuration reload is atomic:
 
 ### 12.2 SQLite state database
 
+Use `rusqlite` with bundled SQLite behind a dedicated persistence worker. The
+serialized reducer sends committed records to that worker and never executes SQL or
+holds a database connection directly. The worker applies writes in reducer-revision
+order and owns migrations, transactions, retention pruning, and database health.
+
+If a database write fails after live effects have committed, do not attempt to move
+windows back. Continue managing them from in-memory state, publish a visible
+`persistence-degraded` health condition, reject new workspace-parking actions, and
+stop claiming that new undo transactions are durable until ordered writes recover.
+
+If the database is corrupt, its schema is newer than the running application, or a
+migration fails at startup, preserve the database untouched and start in
+`persistence-degraded` mode. Never replace, downgrade, or reset it automatically;
+repair and reset are explicit user actions.
+
+The first release does not add application-level database encryption. Store the
+database in the platform's per-user application-data directory with user-only file
+access, and minimize sensitive persisted evidence. Revisit encryption only against
+a threat model that justifies cross-platform key management.
+
 Use SQLite for:
 
 - Last-known topology and workspace trees.
@@ -501,7 +677,49 @@ Use SQLite for:
 - Permission/onboarding state.
 - Bounded diagnostic events, if the user enables diagnostics.
 
-Do not store native window handles across sessions. Do not store window titles by default in diagnostic logs because they may contain document names or private information.
+Introduce schemas only with a live consumer. The first SQLite milestone contains
+schema-version/migration metadata, database-health support, and persistent-undo
+records; container-tree, scene, diagnostics, and onboarding tables arrive with
+their owning features rather than as speculative placeholders.
+
+Persist undo at the user-visible command boundary: every reversible state change and
+placement produced by one grid reflow, saved-layout application, or workspace action
+belongs to one undo transaction and is reversed as a unit. Undo preflights every member; if any target
+is missing, ambiguous, or below the confidence threshold, the complete transaction
+is refused before any placement effect is emitted.
+
+Retain at most the newest 100 undo transactions and prune every transaction older
+than seven days; whichever bound is reached first applies. These bounds are fixed
+for the first release rather than user-configurable.
+
+Only an explicit placement-changing user command creates an undo transaction. When
+that command triggers a grid reflow, all resulting placements join the same
+transaction. Passive reflows caused by window lifecycle, application state, or
+display topology events are not undoable because Mosaix cannot reverse their cause.
+
+Each transaction records its display-topology fingerprint. Undo requires the current
+fingerprint to match exactly; a mismatch refuses the transaction and retains it for
+retry until the original topology returns or the retention policy prunes it.
+The undo command considers only the newest transaction: if that transaction cannot
+be applied, it reports the reason and never silently skips to an older action.
+A successful undo consumes that transaction. The first release stores no redo
+history; persistent redo is deferred to issue #44.
+
+An undo refusal is a typed IPC result containing the transaction identifier, a
+machine-readable reason, and per-target matching evidence sufficient for the CLI to
+explain the failure. The full graphical evidence and repair inspector remains part
+of identity-based scene restoration in issue #28. Undo exposes no force or
+best-guess override; only repairing the evidence can turn a refusal into an
+applicable transaction.
+
+Do not store native window handles across sessions. Persistent undo resolves targets
+from scored identity evidence after restart; an ambiguous or low-confidence match is
+reported and left unapplied rather than moved speculatively. Persistent undo does
+not capture raw window titles by default; it relies on application identity,
+role/class, safe document identifiers, launch order, and last placement. A title
+pattern may participate only when the user deliberately supplies it through the
+identity-repair workflow. Do not store window titles by default in diagnostic logs
+because they may contain document names or private information.
 
 ## 13. IPC and extension boundary
 
@@ -699,12 +917,27 @@ These are budgets, not guarantees. Measure before using them as release criteria
 - Rules, exclusions, inspector, undo, config reload, and diagnostics.
 - Robust reconciliation, sleep/wake, and display-change handling.
 
-### Phase 3: Automatic tiling
+### State foundation
 
-- Workspace/container tree.
-- Tall, wide, columns, rows, BSP, stack, monocle, and floating modes.
+- SQLite schema migrations, database health, and transactional state access.
+- Persistent undo and the placement/identity evidence it consumes.
+- Container-tree, onboarding, scene, and optional diagnostic schemas added only with their consuming features.
+- A separate current-session native-window recovery ledger and out-of-process repair command.
+
+### Phase 3A: Container-tree tiling
+
+- Normalized container tree over one visible root per monitor.
+- Weighted horizontal/vertical splits with BSP insertion.
 - Directional focus, swap, resize, insertion policy, and tree normalization.
 - External state subscriptions and status-bar integrations.
+
+Deferred tree policies include stack, monocle, tall, wide, rows, and columns.
+
+### Phase 3B: Experimental logical workspace switching
+
+- Named logical workspaces, each owning one container-tree root.
+- Public-API window parking with explicit limitations and restore controls.
+- Graduation only after the cross-platform recovery and compatibility matrix passes.
 
 ### Phase 4: Saved scenes and automation
 
@@ -741,6 +974,7 @@ These are budgets, not guarantees. Measure before using them as release criteria
 | Feature parity encourages private APIs | Capability matrix; unsupported features degrade explicitly instead of silently using private APIs |
 | UI or integration destabilizes the manager | Authoritative headless agent and versioned IPC boundary |
 | Configuration becomes inaccessible to mainstream users | GUI editor backed by the same versioned schema, plus human-editable config for power users |
+| State database becomes unavailable after a live placement | Continue in memory, surface persistence-degraded health, and gate parking and new durability promises until ordered writes recover |
 
 ## 23. Architecture acceptance criteria
 
@@ -759,9 +993,9 @@ The architecture is ready for implementation when:
 These do not block the platform spikes, but should be resolved before the Phase 1 UX is frozen:
 
 1. Is the default experience manual snapping, automatic tiling, or a first-run choice?
-2. Should automatic workspaces emulate independent workspaces or map only to native desktops/Spaces where supported?
-3. Is a radial selector a primary interaction or an optional advanced surface?
-4. Should saved scenes launch applications, or only arrange windows that already exist?
-5. Which macOS versions and Windows editions form the initial support matrix?
-6. Is configuration portability across operating systems a core promise? If so, platform-specific actions need explicit fallbacks.
+2. Is a radial selector a primary interaction or an optional advanced surface?
+3. Should saved scenes launch applications, or only arrange windows that already exist?
+4. Which macOS versions and Windows editions form the initial support matrix?
+5. Is configuration portability across operating systems a core promise? If so, platform-specific actions need explicit fallbacks.
 
+The workspace-emulation decision is resolved by ADR 0023.

@@ -1,6 +1,6 @@
 # ADR 0020: Layout commands target the focused window's display
 
-**Status:** Accepted
+**Status:** Superseded by ADR 0027
 **Date:** 2026-09-02
 
 ## Context

@@ -1,6 +1,6 @@
 # Mosaix
 
-Mosaix augments the native Windows/macOS window manager with manual snapping, automatic tiling, and per-monitor workspaces (see ARCHITECTURE.md for the full design). This glossary tracks domain terms specific to that design as they're pinned down.
+Mosaix augments the native Windows/macOS window manager with manual snapping and automatic tiling (see ARCHITECTURE.md for the full design). This glossary tracks domain terms specific to that design as they're pinned down.
 
 ## Language
 
@@ -18,6 +18,14 @@ A window's current position within its zone cycle -- which of half/third/two-thi
 **Placement transaction correlation**:
 The mechanism (ARCHITECTURE.md section 8.3) by which Mosaix compares an observed window placement with its expected placement, distinguishing its own move from an external move or a rejected placement.
 _Avoid_: Transaction (alone, without "placement" -- too generic)
+
+**Persistent undo**:
+A history of the newest 100 committed undo transactions from the last seven days that remains available after the agent restarts and identifies its target windows without relying on native window handles. An entry whose target cannot be matched confidently is refused rather than applied to a guessed window.
+_Avoid_: Restore (the existing command remembers only one in-session placement), rollback
+
+**Undo transaction**:
+The complete reversible state change and window placements committed by one explicit placement-changing user command on one display topology, reversed as one operation even when it moved several windows or changed the displayed workspace. Passive reflows create no undo transaction; a topology mismatch or any missing or uncertain target refuses the whole transaction before any window moves, without skipping to older history.
+_Avoid_: Undo entry (when referring to an individual window placement), placement transaction
 
 **Base config**:
 The settings in `config.toml` -- hotkeys, gaps, behavior flags -- that apply whenever the current display topology matches no saved profile. Not itself called a "profile"; profiles are overlays *on top of* base config, not siblings of it.
@@ -70,16 +78,64 @@ _Avoid_: Window inventory (which also contains currently excluded windows)
 A managed window temporarily removed from the active tiling set by an explicit manual placement, such as a zone snap or maximize, while automatic tiling is active. It remains observed and manually placeable, returns through `toggle-floating`, and does not persist across an agent restart unless a rule also makes it float.
 _Avoid_: Floating rule, excluded window, unmanaged window
 
+**Constraint-overflow window**:
+A managed tiled window temporarily shown outside the tree arrangement because the display cannot satisfy every live leaf's minimum size after gaps reach zero. Newer insertions overflow first and automatically reclaim their saved tree positions when space permits.
+_Avoid_: Session-floating window, placement rejection, dormant tree leaf
+
 **Visual window order**:
 The stable order used to assign a display's windows to balanced-grid cells. Startup seeds it from observed positions top-to-bottom then left-to-right (native window ID breaks final ties); new eligible windows append, temporarily ineligible windows retain their slot, and only directional swap deliberately changes it.
 _Avoid_: Enumeration order, handle order
 
+**Container tree**:
+A normalized hierarchy that owns the ordered tiled windows and nested layout groups for one automatic-tiling surface. It is independent of whether Mosaix exposes multiple switchable workspaces.
+_Avoid_: Workspace tree, layout (alone)
+
+**BSP insertion**:
+Adding a tiled window by dividing the focused tiled leaf into equal siblings along that leaf's longer axis. With no focused tiled leaf, the largest leaf is divided, with visual window order breaking size ties.
+_Avoid_: Append, preselection, insertion direction
+
+**Dormant tree leaf**:
+A persisted window position whose window is closed or not currently matched, retained without consuming screen space so a later confident match can reclaim its structural position. It expires after seven days unless a saved scene retains it, and an explicit remove-position command deletes it immediately.
+_Avoid_: Empty tile, placeholder window, missing window
+
+**Tree resize**:
+Moving the closest container-tree divider facing the requested direction by five percentage points per command while keeping every affected window at or above its minimum size. The resulting placements form one undo transaction.
+_Avoid_: Window resize (alone), free resize, pixel resize
+
+**Logical workspace**:
+A member of Mosaix's global pool of uniquely named managed-window groups, created through configuration or an explicit command, owning one container-tree root and displayed on at most one monitor at a time. Every tiled or floating managed window belongs to exactly one; excluded windows belong to none, and focus, move, or rule targets never create one implicitly.
+_Avoid_: Virtual desktop, Space, saved workspace
+
+**Workspace focus**:
+Displaying a hidden logical workspace on the focused monitor, or focusing its last-focused live window when it is already displayed on another monitor. It never moves a displayed workspace between monitors.
+_Avoid_: Workspace move, display transfer, workspace switch (alone)
+
+**Focused display**:
+The display targeted by display-scoped commands, following the focused managed window when one exists and otherwise retaining the last explicitly targeted display. It remains defined when the displayed logical workspace is empty.
+_Avoid_: Primary display, cursor display, focused window's display
+
+**Window parking**:
+The reversible relocation of windows from a non-displayed logical workspace to a recoverable edge position while their workspace membership remains unchanged.
+_Avoid_: Hide, cloak, minimize
+
+**Workspace switch transaction**:
+An all-or-nothing change of the logical workspace displayed on one monitor, durably recording recovery data before parking or restoring windows. Any placement failure cancels the switch and compensates completed moves; success creates one undo transaction covering both assignment and placements.
+_Avoid_: Placement transaction, partial workspace switch
+
+**Workspace-switch degraded**:
+A health condition in which compensation for a failed workspace switch could not restore every moved window. Further switching remains blocked until the explicit restore action reconciles the affected windows.
+_Avoid_: Persistence-degraded, degraded tiling
+
+**Window identity match**:
+A scored comparison between durable evidence and live managed windows that yields one of three outcomes: confident, ambiguous, or no match. Only a confident outcome may authorize a persisted placement.
+_Avoid_: Handle match, title match, best guess
+
 **Directional focus**:
-A display-local command that focuses the managed window occupying the nearest grid cell in a requested cardinal direction without changing visual window order. It does not wrap or cross a display boundary when no neighbor exists.
+A display-local command that focuses the nearest eligible window in a requested cardinal direction without changing layout state. In balanced-grid mode candidates occupy active grid cells; in container-tree mode candidates occupy live, actively arranged tiled leaves. It does not wrap or cross a display boundary when no neighbor exists.
 _Avoid_: Focus cycle, directional navigation
 
 **Directional swap**:
-A display-local command that exchanges the focused managed window's place in visual window order with its directional neighbor, then recomputes their balanced-grid placements. It does not wrap or cross a display boundary when no neighbor exists.
+A display-local command that exchanges the focused managed window with the same neighbor that `Directional focus` would select. In balanced-grid mode it exchanges their places in visual window order. In container-tree mode both endpoints must be live, actively arranged tiled leaves; it exchanges only their window bindings while preserving every container, split axis, weight, and dormant leaf. Focus follows the same window identity to its new place, the exchange is one undo transaction, and floating or constraint-overflow windows do not participate. It does not wrap or cross a display boundary when no neighbor exists.
 _Avoid_: Directional move, window move
 
 **Display migration**:
@@ -101,6 +157,10 @@ _Avoid_: Resize failure (a placement may fail while moving, resizing, or both)
 **Degraded tiling**:
 A health condition in which automatic tiling remains active for eligible windows while one or more managed windows are temporarily excluded by a placement or adapter failure. Diagnostics retain each affected window and exclusion reason; degraded tiling is neither pause nor automatic-tiling suspension.
 _Avoid_: Failed tiling, paused, suspended
+
+**Persistence-degraded**:
+A health condition in which live window management continues but the latest committed state is not durable. New persistent-undo entries and workspace parking remain unavailable until persistence recovers.
+_Avoid_: Degraded tiling, read-only mode, paused
 
 **Snap preview overlay**:
 A single layered, click-through rectangle drawn by the agent to show where a window will land (ADR 0009). Two triggers: (1) *post-commit flash* — after a zone-snap hotkey, the overlay shows the engine's committed placement for a short dwell; (2) *edge-triggered drag-to-snap* — during an interactive move/resize, the overlay shows the half-zone under the cursor when near a work-area edge, and dropping there commits via `Event::WindowPlaced`. In automatic tiling, either explicit zone-placement path also makes the window session-floating. Not a settings surface and not a full FancyZones-style always-on zone map.
