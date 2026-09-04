@@ -235,26 +235,69 @@ fn main() {
         let events = engine.events();
         let bridge = std::thread::spawn(move || {
             let mut submitted_revision = None;
+            // Intents accumulate in reducer state and are consumed by
+            // index, the same way the placement executor consumes effects.
+            let mut next_intent = 0usize;
             loop {
                 if stop_rx.try_recv().is_ok() {
                     break;
                 }
-                let revision = state_reader.revision();
-                if submitted_revision != Some(revision) {
-                    if worker.commit(revision).is_err() {
-                        let _ = events.send(mosaix_engine::Event::PersistenceHealthChanged(
-                            mosaix_persistence::PersistenceHealth::Degraded {
-                                last_durable_revision: submitted_revision.unwrap_or(0),
-                                reason: mosaix_persistence::PersistenceFailure::WriteFailed,
-                            },
-                        ));
+                let snapshot = state_reader.snapshot();
+
+                // Undo writes go first. A revision commit that overtook the
+                // transaction it describes would claim durability for a
+                // command whose record had not been stored yet.
+                let mut submission_failed = false;
+                for intent in snapshot.persistence_intents.iter().skip(next_intent) {
+                    let request = match intent {
+                        mosaix_engine::PersistenceIntent::RecordUndoTransaction(draft) => {
+                            mosaix_persistence::PersistenceRequest::RecordUndoTransaction(
+                                draft.clone(),
+                            )
+                        }
+                        mosaix_engine::PersistenceIntent::ConsumeUndoTransaction(id) => {
+                            mosaix_persistence::PersistenceRequest::ConsumeUndoTransaction(*id)
+                        }
+                    };
+                    if worker.submit(request).is_err() {
+                        submission_failed = true;
                         break;
                     }
-                    if let Ok(health) = worker.next_update() {
-                        let _ = events.send(mosaix_engine::Event::PersistenceHealthChanged(health));
-                    }
-                    submitted_revision = Some(revision);
                 }
+                if !submission_failed {
+                    next_intent = snapshot.persistence_intents.len();
+                }
+
+                let revision = snapshot.revision;
+                if !submission_failed && submitted_revision != Some(revision) {
+                    if worker.commit(revision).is_err() {
+                        submission_failed = true;
+                    } else {
+                        submitted_revision = Some(revision);
+                    }
+                }
+
+                if submission_failed {
+                    let _ = events.send(mosaix_engine::Event::PersistenceHealthChanged(
+                        mosaix_persistence::PersistenceHealth::Degraded {
+                            last_durable_revision: submitted_revision.unwrap_or(0),
+                            reason: mosaix_persistence::PersistenceFailure::WriteFailed,
+                        },
+                    ));
+                    break;
+                }
+
+                // Draining without blocking keeps this loop responsive to
+                // the stop signal even while the worker is busy.
+                while let Some(update) = worker.try_next_update() {
+                    let _ = events.send(mosaix_engine::Event::PersistenceHealthChanged(
+                        update.health,
+                    ));
+                    let _ = events.send(mosaix_engine::Event::UndoHistoryLoaded(
+                        update.newest_undo.map(Box::new),
+                    ));
+                }
+
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
             worker.stop();

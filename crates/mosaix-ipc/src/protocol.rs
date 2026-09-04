@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 /// older agent has no tag for a request this build added -- and no field
 /// for one an existing request grew -- so the version is what makes the
 /// mismatch reportable instead of surfacing as a deserialization failure.
-pub const PROTOCOL_VERSION: u32 = 8;
+pub const PROTOCOL_VERSION: u32 = 9;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct IpcEnvelope {
@@ -55,6 +55,10 @@ pub enum IpcRequest {
     FocusDisplay {
         display_id: isize,
     },
+    /// Reverse the newest undo transaction, or answer with the typed reason
+    /// it was refused (ADR 0024). Carries no options: there is deliberately
+    /// no force or best-guess variant, hence [`PROTOCOL_VERSION`] 9.
+    Undo,
     /// Apply the saved layout called `name` to the focused display. The
     /// first request carrying a payload, hence
     /// [`PROTOCOL_VERSION`] 2.
@@ -268,6 +272,7 @@ mod tests {
             IpcRequest::SwapDown,
             IpcRequest::GetPauseState,
             IpcRequest::FocusDisplay { display_id: 7 },
+            IpcRequest::Undo,
             IpcRequest::ApplyLayout {
                 name: "writing".to_owned(),
             },

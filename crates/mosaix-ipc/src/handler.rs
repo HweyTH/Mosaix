@@ -7,6 +7,7 @@ use mosaix_config::{
 use mosaix_engine::{
     EligibilityReason, EngineState, Event, EventSender, StateReader, ZoneSnapDirection,
 };
+use mosaix_domain::undo::UndoResult;
 use mosaix_persistence::PersistenceHealth;
 use mosaix_rules::ManageAction;
 use serde::{Deserialize, Serialize};
@@ -688,6 +689,27 @@ pub fn handle_request(
                 display_id: mosaix_domain::DisplayId(*display_id),
             },
         ),
+        IpcRequest::Undo => {
+            // Preflighting here is what lets a refusal carry its evidence.
+            // The reducer re-reaches the verdict against its own state, so
+            // this answer describes the plan, not a completed movement.
+            let planned = mosaix_engine::plan_undo(&state_reader.snapshot());
+            let payload = serde_json::to_value(&planned).expect("undo results serialize");
+            match planned {
+                UndoResult::Applied(_) => match send_event(events, Event::UndoRequested) {
+                    IpcResponse::Ok { .. } => IpcResponse::Ok {
+                        data: Some(payload),
+                    },
+                    other => other,
+                },
+                // A refusal is an answer, not a transport failure, so it
+                // comes back as data the caller can inspect rather than as
+                // a string it would have to parse.
+                UndoResult::Refused(_) => IpcResponse::Ok {
+                    data: Some(payload),
+                },
+            }
+        }
         IpcRequest::ApplyLayout { name } => {
             // The reducer would reach the same verdict, but only a log
             // would come of it. Asking first is what lets the caller be
@@ -961,6 +983,30 @@ mod tests {
 
         assert_eq!(json["degraded_windows"][0]["window_id"], 41);
         assert_eq!(json["degraded_windows"][0]["reason"], "circuit_open");
+    }
+
+    #[test]
+    fn an_undo_with_no_history_answers_with_a_typed_refusal_not_an_error() {
+        let engine = mosaix_engine::spawn_engine(Vec::new(), Default::default());
+
+        let response = handle_request(
+            &IpcRequest::Undo,
+            &engine.events(),
+            &engine.state_reader(),
+            &RecordingStore::wrote("config.toml", &[]),
+            &no_probe(),
+        );
+
+        // A refusal is an answer about windows, not a transport failure.
+        // Returning it as data is what lets a caller read the reason code
+        // and evidence instead of parsing a sentence.
+        let IpcResponse::Ok { data: Some(data) } = response else {
+            panic!("expected a typed answer, got {response:?}");
+        };
+        assert_eq!(data["refused"], "nothing_to_undo");
+        let parsed: UndoResult =
+            serde_json::from_value(data).expect("the CLI can read what the agent sent");
+        assert!(!parsed.is_applied());
     }
 
     #[test]

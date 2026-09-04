@@ -42,6 +42,15 @@ enum Command {
         #[command(subcommand)]
         action: LayoutAction,
     },
+    /// Reverse the newest placement command.
+    ///
+    /// Refuses, and keeps the command available to retry, whenever a target
+    /// window cannot be identified beyond doubt or your displays have
+    /// changed. There is no way to force it.
+    Undo {
+        #[arg(long)]
+        json: bool,
+    },
     /// Inspect or recover the durable state database.
     Persistence {
         #[command(subcommand)]
@@ -110,6 +119,12 @@ fn main() {
         run_persistence(action);
         return;
     }
+    // Undo answers with a typed result either way, so a refusal has to be
+    // rendered rather than printed as a bare error string.
+    if let Command::Undo { json } = cli.command {
+        run_undo(json);
+        return;
+    }
     let state_json = matches!(&cli.command, Command::State { json: true });
     let request = match cli.command {
         Command::Snap {
@@ -150,7 +165,7 @@ fn main() {
         } => IpcRequest::ApplyLayout { name },
         Command::State { .. } => IpcRequest::GetState,
         Command::Ping => IpcRequest::Ping,
-        Command::Persistence { .. } => unreachable!("handled above"),
+        Command::Persistence { .. } | Command::Undo { .. } => unreachable!("handled above"),
     };
     match send_request(request) {
         Ok(IpcResponse::Ok { data: Some(data) }) if state_json => {
@@ -173,6 +188,133 @@ fn main() {
             eprintln!("mosaix: {error}");
             std::process::exit(2);
         }
+    }
+}
+
+#[cfg(windows)]
+fn run_undo(json: bool) {
+    use mosaix_domain::undo::{UndoRefusal, UndoResult};
+    use mosaix_ipc::{send_request, IpcRequest, IpcResponse};
+
+    let data = match send_request(IpcRequest::Undo) {
+        Ok(IpcResponse::Ok { data: Some(data) }) => data,
+        Ok(IpcResponse::Ok { data: None }) => {
+            eprintln!("mosaix: the agent answered without an undo result");
+            std::process::exit(2);
+        }
+        Ok(IpcResponse::Error { message }) => {
+            eprintln!("mosaix: {message}");
+            std::process::exit(1);
+        }
+        Ok(IpcResponse::VersionMismatch { server_version }) => {
+            eprintln!("mosaix: protocol version mismatch (server: v{server_version})");
+            std::process::exit(1);
+        }
+        Err(error) => {
+            eprintln!("mosaix: {error}");
+            std::process::exit(2);
+        }
+    };
+
+    let result: UndoResult = match serde_json::from_value(data.clone()) {
+        Ok(result) => result,
+        Err(error) => {
+            eprintln!("mosaix: could not read the agent's undo result: {error}");
+            std::process::exit(2);
+        }
+    };
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&data).expect("JSON value serializes")
+        );
+        // A refusal is a normal answer to report, but it is still a
+        // failure to act on, so scripts see it in the exit status too.
+        if !result.is_applied() {
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    match result {
+        UndoResult::Applied(applied) => {
+            let count = applied.restored.len();
+            let plural = if count == 1 { "window" } else { "windows" };
+            println!("undid {} ({count} {plural})", applied.command);
+            for restored in applied.restored {
+                println!(
+                    "  window {} back to {}x{} at {},{} on display {}",
+                    restored.window_id.0,
+                    restored.placement.width,
+                    restored.placement.height,
+                    restored.placement.x,
+                    restored.placement.y,
+                    restored.display_id.0,
+                );
+            }
+        }
+        UndoResult::Refused(refusal) => {
+            eprintln!("mosaix: {refusal}");
+            match &refusal {
+                UndoRefusal::TopologyChanged {
+                    recorded_fingerprint,
+                    current_fingerprint,
+                    ..
+                } => {
+                    eprintln!("  recorded on: {recorded_fingerprint}");
+                    eprintln!("  now:         {current_fingerprint}");
+                    eprintln!("  reconnect that arrangement and try again");
+                }
+                UndoRefusal::TargetsUnresolved { targets, .. } => {
+                    for target in targets {
+                        eprintln!(
+                            "  target {} ({}): {}",
+                            target.ordinal,
+                            target.application,
+                            target.outcome.code()
+                        );
+                        for candidate in match_candidates(&target.outcome) {
+                            eprintln!(
+                                "      candidate window {} scored {}",
+                                candidate.window_id.0, candidate.score
+                            );
+                        }
+                    }
+                }
+                UndoRefusal::TargetsCollide {
+                    window_id,
+                    ordinals,
+                    ..
+                } => {
+                    eprintln!(
+                        "  targets {ordinals:?} all matched window {}",
+                        window_id.0
+                    );
+                }
+                UndoRefusal::PersistenceDegraded { reason, .. } => {
+                    eprintln!("  reason: {reason}");
+                    eprintln!("  see `mosaix persistence status`");
+                }
+                UndoRefusal::NothingToUndo => {}
+            }
+            std::process::exit(1);
+        }
+    }
+}
+
+/// The scored candidates a refusal has to show, whichever shape the
+/// outcome took.
+#[cfg(windows)]
+fn match_candidates(
+    outcome: &mosaix_domain::MatchOutcome,
+) -> &[mosaix_domain::ScoredCandidate] {
+    use mosaix_domain::MatchOutcome;
+
+    match outcome {
+        MatchOutcome::Confident(_) => &[],
+        MatchOutcome::Ambiguous { candidates } => candidates,
+        MatchOutcome::NoMatch { considered } => considered,
     }
 }
 

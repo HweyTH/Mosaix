@@ -49,6 +49,11 @@ use mosaix_layout::{
     snap_to_half, throw_preserving_ratio, CycleStep, DisplayDirection, HalfZone,
     HorizontalDirection,
 };
+use mosaix_domain::identity::{match_window_with_order, WindowEvidence};
+use mosaix_domain::undo::{
+    UndoApplied, UndoMember, UndoRefusal, UndoRestoredWindow, UndoResult, UndoTargetOutcome,
+    UndoTransaction, UndoTransactionDraft, UndoTransactionId,
+};
 use mosaix_persistence::PersistenceHealth;
 use mosaix_rules::{builtin_rules, ManageAction, Rule, RuleEvaluator};
 
@@ -80,6 +85,22 @@ pub enum EngineEffect {
     },
     /// Requests a fresh native display/window observation before recovery.
     ReconcileWindows,
+}
+
+/// A durable write the reducer has committed to but does not perform.
+///
+/// The reducer owns no SQL connection (ADR 0025), so it records what must
+/// become durable and the persistence worker drains these in order, the
+/// same way the placement executor drains [`EngineEffect`]. Kept separate
+/// from effects because an effect touches the desktop and an intent
+/// touches the disk -- and because a storage failure must never look like
+/// a placement failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PersistenceIntent {
+    /// Store one explicit command's reversible placements.
+    RecordUndoTransaction(UndoTransactionDraft),
+    /// Remove a transaction that has just been undone successfully.
+    ConsumeUndoTransaction(UndoTransactionId),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -124,6 +145,21 @@ pub struct InteractivePlacementSession {
     pub display_id: DisplayId,
 }
 
+/// Everything one explicit command has moved so far, gathered so it can be
+/// reversed as a unit (ADR 0024).
+///
+/// A window is captured the first time the command moves it, at the
+/// position it held beforehand. Moving it again within the same command --
+/// as an automatic reflow does -- does not overwrite that, because undo
+/// restores where the window was before the *command*, not before its last
+/// internal step.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UndoScope {
+    command: String,
+    members: Vec<UndoMember>,
+    claimed: HashSet<WindowId>,
+}
+
 /// State the reducer owns and is the only writer of.
 ///
 /// Display topology and per-window placement exist as real domain state
@@ -137,6 +173,20 @@ pub struct EngineState {
     /// Whether committed state is currently durable independently of the
     /// reducer's in-memory authority.
     pub persistence_health: PersistenceHealth,
+    /// Durable writes the reducer has committed to, drained in order by
+    /// the persistence worker. Appended to, never rewritten.
+    pub persistence_intents: Vec<PersistenceIntent>,
+    /// The only transaction undo will consider (ADR 0024). Published by
+    /// the agent from the state database, so the reducer never reads SQL
+    /// to decide what undo would do.
+    pub newest_undo: Option<UndoTransaction>,
+    /// What the last undo request concluded, kept so IPC and the CLI can
+    /// report a refusal that happened between requests.
+    pub last_undo_result: Option<UndoResult>,
+    /// Transient: the explicit command currently being applied, collecting
+    /// everything it moves. Lives only for the duration of one [`apply`]
+    /// call, and is `None` between events.
+    undo_scope: Option<UndoScope>,
     pub displays: Vec<Display>,
     /// Where each tracked window currently sits, keyed by window. Entries
     /// are created (and their `previous_placement` remembered) by
@@ -322,6 +372,17 @@ pub enum ZoneSnapDirection {
     Bottom,
 }
 
+/// The command name an undo transaction records for a zone snap. Stable
+/// text, because it is stored and shown back to the user later.
+const fn zone_snap_command(direction: ZoneSnapDirection) -> &'static str {
+    match direction {
+        ZoneSnapDirection::Left => "snap-left",
+        ZoneSnapDirection::Right => "snap-right",
+        ZoneSnapDirection::Top => "snap-top",
+        ZoneSnapDirection::Bottom => "snap-bottom",
+    }
+}
+
 impl ZoneSnapDirection {
     /// The matching [`HorizontalDirection`] for `Left`/`Right`, `None` for
     /// `Top`/`Bottom` (which stay single-shot and never cycle).
@@ -348,6 +409,14 @@ pub enum Event {
 
     /// Ordered persistence acknowledgement or failure from the worker.
     PersistenceHealthChanged(PersistenceHealth),
+
+    /// The newest stored undo transaction, or `None` for empty history.
+    /// Published by the agent at startup and after every durable write, so
+    /// the reducer's view of history matches the database's.
+    UndoHistoryLoaded(Option<Box<UndoTransaction>>),
+
+    /// Reverse the newest transaction, or refuse and keep it (ADR 0024).
+    UndoRequested,
 
     /// A window was snapped or otherwise placed at `bounds` on
     /// `display_id`. Producers (a zone-snap command that resolved bounds
@@ -799,6 +868,49 @@ fn apply(state: &mut EngineState, event: Event) {
                 state.persistence_health = health;
             }
         }
+
+        Event::UndoHistoryLoaded(transaction) => {
+            let transaction = transaction.map(|boxed| *boxed);
+            if state.newest_undo != transaction {
+                state.newest_undo = transaction;
+                state.revision += 1;
+            }
+        }
+
+        Event::UndoRequested => {
+            if state.paused {
+                tracing::debug!("undo requested while paused; ignoring");
+                return;
+            }
+            let result = plan_undo(state);
+            if let UndoResult::Applied(applied) = &result {
+                // No scope is opened here: undo is not itself undoable.
+                // Persistent redo is deferred to issue #44, and recording
+                // one would make a second undo reverse the first.
+                for restored in &applied.restored {
+                    place_window(
+                        state,
+                        restored.window_id,
+                        restored.display_id,
+                        restored.placement,
+                        None,
+                    );
+                }
+                state
+                    .persistence_intents
+                    .push(PersistenceIntent::ConsumeUndoTransaction(
+                        applied.transaction_id,
+                    ));
+                // The agent republishes whatever the database holds next.
+                // Clearing it here stops a second undo re-applying a
+                // transaction whose deletion has not landed yet.
+                state.newest_undo = None;
+            } else {
+                tracing::info!(result = ?result, "undo refused; the transaction is kept");
+            }
+            state.last_undo_result = Some(result);
+            state.revision += 1;
+        }
         Event::DisplayTopologyChanged(displays) => {
             if displays.is_empty() {
                 tracing::warn!("empty display observation; retaining last usable topology");
@@ -1025,6 +1137,10 @@ fn apply(state: &mut EngineState, event: Event) {
                 }
             }
 
+            // Everything this command moves -- the snapped window and the
+            // reflow it provokes below -- belongs to one undo transaction.
+            open_undo_scope(state, zone_snap_command(direction));
+
             // Re-borrow immutably after the mutable get above.
             let placement = state.windows.get(&window_id).expect("checked above");
             if let Some(horizontal_direction) = direction.horizontal() {
@@ -1059,6 +1175,7 @@ fn apply(state: &mut EngineState, event: Event) {
                 set_session_floating(state, window_id, true);
                 reconcile_balanced_grids(state);
             }
+            close_undo_scope(state);
         }
 
         Event::WindowBoundsObserved {
@@ -1837,6 +1954,251 @@ pub fn diff_placements(
         .collect()
 }
 
+/// Decides what undoing the newest transaction would do, without doing it.
+///
+/// Every refusal path returns before a single placement is planned, which
+/// is what makes undo all-or-nothing (ADR 0024): there is no state in which
+/// some members have moved and a later one turns out to be unresolvable.
+/// The same function answers the IPC preflight and drives the reducer, so a
+/// caller is never told something different from what happens.
+pub fn plan_undo(state: &EngineState) -> UndoResult {
+    let Some(transaction) = state.newest_undo.as_ref() else {
+        return UndoResult::Refused(UndoRefusal::NothingToUndo);
+    };
+
+    // Undoing without being able to consume the transaction would leave it
+    // available to apply a second time, so a degraded database refuses
+    // rather than risking a double undo.
+    if let PersistenceHealth::Degraded { reason, .. } = &state.persistence_health {
+        return UndoResult::Refused(UndoRefusal::PersistenceDegraded {
+            transaction_id: transaction.id,
+            reason: reason.code().to_owned(),
+        });
+    }
+
+    let current_fingerprint = mosaix_domain::topology_fingerprint(&state.displays);
+    if current_fingerprint != transaction.topology_fingerprint {
+        return UndoResult::Refused(UndoRefusal::TopologyChanged {
+            transaction_id: transaction.id,
+            recorded_fingerprint: transaction.topology_fingerprint.clone(),
+            current_fingerprint,
+        });
+    }
+
+    let candidates: Vec<&Window> = state
+        .inventory
+        .values()
+        .map(|managed| &managed.window)
+        .collect();
+    let targets: Vec<UndoTargetOutcome> = transaction
+        .members
+        .iter()
+        .map(|member| UndoTargetOutcome {
+            ordinal: member.ordinal,
+            application: member.evidence.application_id.0.clone(),
+            outcome: match_window_with_order(
+                &member.evidence,
+                candidates.iter().copied(),
+                |window| display_fingerprint_of(state, window.display_id),
+                |window| Some(launch_order_of(state, window.id)),
+            ),
+        })
+        .collect();
+
+    if targets.iter().any(|target| !target.is_resolved()) {
+        return UndoResult::Refused(UndoRefusal::TargetsUnresolved {
+            transaction_id: transaction.id,
+            targets,
+        });
+    }
+
+    // Two members claiming one window means at least one match is wrong,
+    // and there is no way to tell which -- so neither moves.
+    let mut claims: HashMap<WindowId, Vec<u32>> = HashMap::new();
+    for target in &targets {
+        if let Some(window_id) = target.outcome.confident_window() {
+            claims.entry(window_id).or_default().push(target.ordinal);
+        }
+    }
+    if let Some((window_id, ordinals)) = claims
+        .into_iter()
+        .filter(|(_, ordinals)| ordinals.len() > 1)
+        .min_by_key(|(window_id, _)| window_id.0)
+    {
+        let mut ordinals = ordinals;
+        ordinals.sort_unstable();
+        return UndoResult::Refused(UndoRefusal::TargetsCollide {
+            transaction_id: transaction.id,
+            window_id,
+            ordinals,
+        });
+    }
+
+    let mut restored = Vec::with_capacity(transaction.members.len());
+    for (member, target) in transaction.members.iter().zip(&targets) {
+        let Some(display_id) = display_id_of(state, &member.prior_display_fingerprint) else {
+            // The whole-topology fingerprint matched, so this should not
+            // happen; treating it as a topology change is the honest
+            // reading if it ever does.
+            return UndoResult::Refused(UndoRefusal::TopologyChanged {
+                transaction_id: transaction.id,
+                recorded_fingerprint: transaction.topology_fingerprint.clone(),
+                current_fingerprint,
+            });
+        };
+        restored.push(UndoRestoredWindow {
+            ordinal: member.ordinal,
+            window_id: target
+                .outcome
+                .confident_window()
+                .expect("every target is resolved by this point"),
+            display_id,
+            placement: member.prior_placement,
+        });
+    }
+
+    UndoResult::Applied(UndoApplied {
+        transaction_id: transaction.id,
+        command: transaction.command.clone(),
+        restored,
+    })
+}
+
+fn display_fingerprint_of(state: &EngineState, display_id: DisplayId) -> Option<String> {
+    state
+        .displays
+        .iter()
+        .find(|display| display.id == display_id)
+        .map(|display| display.stable_fingerprint.clone())
+}
+
+fn display_id_of(state: &EngineState, fingerprint: &str) -> Option<DisplayId> {
+    state
+        .displays
+        .iter()
+        .find(|display| display.stable_fingerprint == fingerprint)
+        .map(|display| display.id)
+}
+
+/// A window's ordinal among its own application's managed windows.
+///
+/// Two windows of one application agree on every other durable signal, so
+/// without this the matcher could only ever call them ambiguous. Ordered by
+/// native handle, which is allocation-ordered in practice and, more to the
+/// point, does not depend on hash iteration order.
+fn launch_order_of(state: &EngineState, window_id: WindowId) -> u32 {
+    let Some(managed) = state.inventory.get(&window_id) else {
+        return 0;
+    };
+    let mut siblings: Vec<WindowId> = state
+        .inventory
+        .values()
+        .filter(|other| other.window.application_id == managed.window.application_id)
+        .map(|other| other.window.id)
+        .collect();
+    siblings.sort_unstable_by_key(|id| id.0);
+    siblings
+        .iter()
+        .position(|id| *id == window_id)
+        .unwrap_or(0) as u32
+}
+
+/// Opens an undo scope for `command`.
+///
+/// Everything [`place_window`] moves before the matching
+/// [`close_undo_scope`] becomes one reversible transaction, including the
+/// automatic reflow an explicit command provokes (spec user story 10).
+fn open_undo_scope(state: &mut EngineState, command: &str) {
+    state.undo_scope = Some(UndoScope {
+        command: command.to_owned(),
+        members: Vec::new(),
+        claimed: HashSet::new(),
+    });
+}
+
+/// Closes the open scope, recording a transaction if it moved anything.
+///
+/// A command that moved nothing -- refused, suppressed by a circuit
+/// breaker, or a no-op -- records nothing, so undo never offers to reverse
+/// something the user never saw happen.
+fn close_undo_scope(state: &mut EngineState) {
+    let Some(scope) = state.undo_scope.take() else {
+        return;
+    };
+    if scope.members.is_empty() {
+        return;
+    }
+    state
+        .persistence_intents
+        .push(PersistenceIntent::RecordUndoTransaction(
+            UndoTransactionDraft {
+                command: scope.command,
+                recorded_at_unix: now_unix(),
+                topology_fingerprint: mosaix_domain::topology_fingerprint(&state.displays),
+                durable_revision: state.revision,
+                members: scope.members,
+            },
+        ));
+}
+
+/// Adds `window_id` to the open scope, if there is one and it is not
+/// already captured. `previous` is where the window sat before this
+/// placement; without it there is nothing for undo to restore.
+fn record_undo_member(
+    state: &mut EngineState,
+    window_id: WindowId,
+    previous: Option<(DisplayId, Rect)>,
+) {
+    let (already_claimed, ordinal) = match state.undo_scope.as_ref() {
+        Some(scope) => (
+            scope.claimed.contains(&window_id),
+            scope.members.len() as u32,
+        ),
+        None => return,
+    };
+    if already_claimed {
+        return;
+    }
+    let Some((previous_display, previous_bounds)) = previous else {
+        return;
+    };
+    let Some(prior_display_fingerprint) = display_fingerprint_of(state, previous_display) else {
+        return;
+    };
+    let Some(managed) = state.inventory.get(&window_id) else {
+        return;
+    };
+    // Evidence describes where the window is *now*, because that is where
+    // a later session has to find it. The prior placement is what undo
+    // restores it to.
+    let Some(current_fingerprint) = display_fingerprint_of(state, managed.window.display_id) else {
+        return;
+    };
+    let member = UndoMember {
+        ordinal,
+        prior_placement: previous_bounds,
+        prior_display_fingerprint,
+        evidence: WindowEvidence::capture(
+            &managed.window,
+            launch_order_of(state, window_id),
+            &current_fingerprint,
+        ),
+    };
+    if let Some(scope) = state.undo_scope.as_mut() {
+        scope.claimed.insert(window_id);
+        scope.members.push(member);
+    }
+}
+
+/// Seconds since the Unix epoch, for retention bounds. A clock that has
+/// gone backwards yields zero rather than panicking; retention treats such
+/// an entry as ancient, which errs toward pruning rather than hoarding.
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs() as i64)
+}
+
 /// Records `bounds` as `window_id`'s current placement on `display_id`,
 /// stashing wherever it was before (if it was already tracked) as the one
 /// step [`Event::WindowRestoreRequested`] can undo, and bumps the
@@ -1892,6 +2254,9 @@ fn place_window(
         managed.window.display_id = display_id;
         managed.window.bounds = bounds;
     }
+    // After the inventory is updated, so captured evidence describes where
+    // the window now is rather than where it was.
+    record_undo_member(state, window_id, previous_placement);
     state.effects.push(EngineEffect::PlaceWindow {
         window_id,
         display_id,
@@ -2188,6 +2553,10 @@ pub fn spawn_engine_with_capacity(
         persistence_health: PersistenceHealth::Healthy {
             last_durable_revision: 0,
         },
+        persistence_intents: Vec::new(),
+        newest_undo: None,
+        last_undo_result: None,
+        undo_scope: None,
         displays: initial_displays,
         windows: HashMap::new(),
         inventory: HashMap::new(),
@@ -6109,6 +6478,398 @@ mod tests {
             Event::DisplayTopologyChanged(vec![display(2, "primary", 0)]),
         );
         assert_eq!(state.focused_display, Some(DisplayId(2)));
+    }
+
+    // ---- Persistent undo (issue #48) ----------------------------------
+
+    /// A state with one display, one managed window, and that window
+    /// focused -- the smallest situation in which an explicit command has
+    /// something to move and therefore something to record.
+    fn state_ready_to_snap() -> EngineState {
+        let mut state = EngineState {
+            displays: vec![display(1, "DISPLAY1", 0)],
+            ..EngineState::default()
+        };
+        apply(
+            &mut state,
+            Event::WindowsObserved {
+                windows: vec![window_at(7, 1, Rect::new(10, 10, 500, 500))],
+            },
+        );
+        apply(
+            &mut state,
+            Event::WindowFocused {
+                window_id: WindowId(7),
+                display_id: DisplayId(1),
+                bounds: Rect::new(10, 10, 500, 500),
+            },
+        );
+        state.effects.clear();
+        state.persistence_intents.clear();
+        state
+    }
+
+    fn recorded_drafts(state: &EngineState) -> Vec<&UndoTransactionDraft> {
+        state
+            .persistence_intents
+            .iter()
+            .filter_map(|intent| match intent {
+                PersistenceIntent::RecordUndoTransaction(draft) => Some(draft),
+                PersistenceIntent::ConsumeUndoTransaction(_) => None,
+            })
+            .collect()
+    }
+
+    /// Turns the draft an explicit command produced into the stored
+    /// transaction the agent would publish back, which is what undo reads.
+    fn stored(draft: &UndoTransactionDraft, id: i64) -> UndoTransaction {
+        UndoTransaction {
+            id: UndoTransactionId(id),
+            command: draft.command.clone(),
+            recorded_at_unix: draft.recorded_at_unix,
+            topology_fingerprint: draft.topology_fingerprint.clone(),
+            durable_revision: draft.durable_revision,
+            members: draft.members.clone(),
+        }
+    }
+
+    #[test]
+    fn an_explicit_snap_records_one_undo_transaction_with_the_prior_placement() {
+        let mut state = state_ready_to_snap();
+
+        apply(
+            &mut state,
+            Event::ZoneSnapRequested {
+                direction: ZoneSnapDirection::Left,
+            },
+        );
+
+        let drafts = recorded_drafts(&state);
+        assert_eq!(drafts.len(), 1, "one command records one transaction");
+        let draft = drafts[0];
+        assert_eq!(draft.command, "snap-left");
+        assert_eq!(
+            draft.topology_fingerprint,
+            mosaix_domain::topology_fingerprint(&state.displays)
+        );
+        assert_eq!(draft.members.len(), 1);
+        let member = &draft.members[0];
+        assert_eq!(
+            member.prior_placement,
+            Rect::new(10, 10, 500, 500),
+            "undo restores where the window was before the command"
+        );
+        assert_eq!(member.prior_display_fingerprint, "DISPLAY1");
+        assert_eq!(
+            member.evidence.last_placement,
+            Rect::new(0, 0, 960, 1080),
+            "evidence describes where the window is now, which is where a \
+             later session has to find it"
+        );
+    }
+
+    #[test]
+    fn recorded_evidence_never_contains_the_window_title() {
+        let mut state = state_ready_to_snap();
+        state
+            .inventory
+            .get_mut(&WindowId(7))
+            .expect("the window is managed")
+            .window
+            .title = "Quarterly salary review.xlsx".to_owned();
+
+        apply(
+            &mut state,
+            Event::ZoneSnapRequested {
+                direction: ZoneSnapDirection::Left,
+            },
+        );
+
+        let recorded = format!("{:?}", recorded_drafts(&state));
+        assert!(
+            !recorded.contains("Quarterly salary review"),
+            "a document name must never reach a durable record: {recorded}"
+        );
+    }
+
+    #[test]
+    fn passive_observation_records_no_undo_transaction() {
+        let mut state = state_ready_to_snap();
+
+        apply(
+            &mut state,
+            Event::WindowsObserved {
+                windows: vec![window_at(7, 1, Rect::new(300, 300, 500, 500))],
+            },
+        );
+        apply(
+            &mut state,
+            Event::DisplayTopologyChanged(vec![display(1, "DISPLAY1", 0)]),
+        );
+
+        assert!(
+            recorded_drafts(&state).is_empty(),
+            "undo must never offer to reverse something the user did not do"
+        );
+    }
+
+    #[test]
+    fn undo_restores_the_prior_placement_and_consumes_the_transaction() {
+        let mut state = state_ready_to_snap();
+        apply(
+            &mut state,
+            Event::ZoneSnapRequested {
+                direction: ZoneSnapDirection::Left,
+            },
+        );
+        let transaction = stored(recorded_drafts(&state)[0], 1);
+        state.persistence_intents.clear();
+        state.effects.clear();
+        apply(
+            &mut state,
+            Event::UndoHistoryLoaded(Some(Box::new(transaction))),
+        );
+
+        apply(&mut state, Event::UndoRequested);
+
+        assert_eq!(
+            placements(&state),
+            vec![(WindowId(7), DisplayId(1), Rect::new(10, 10, 500, 500))],
+            "undo puts the window back where the command found it"
+        );
+        assert_eq!(
+            state.persistence_intents,
+            vec![PersistenceIntent::ConsumeUndoTransaction(
+                UndoTransactionId(1)
+            )],
+            "a successful undo consumes its transaction"
+        );
+        assert!(state.newest_undo.is_none());
+        assert!(matches!(state.last_undo_result, Some(UndoResult::Applied(_))));
+    }
+
+    #[test]
+    fn undo_records_no_transaction_of_its_own() {
+        let mut state = state_ready_to_snap();
+        apply(
+            &mut state,
+            Event::ZoneSnapRequested {
+                direction: ZoneSnapDirection::Left,
+            },
+        );
+        let transaction = stored(recorded_drafts(&state)[0], 1);
+        apply(
+            &mut state,
+            Event::UndoHistoryLoaded(Some(Box::new(transaction))),
+        );
+        state.persistence_intents.clear();
+
+        apply(&mut state, Event::UndoRequested);
+
+        assert!(
+            recorded_drafts(&state).is_empty(),
+            "redo is deferred to issue #44; undo must not become undoable"
+        );
+    }
+
+    #[test]
+    fn undo_refuses_and_keeps_the_transaction_when_the_topology_changed() {
+        let mut state = state_ready_to_snap();
+        apply(
+            &mut state,
+            Event::ZoneSnapRequested {
+                direction: ZoneSnapDirection::Left,
+            },
+        );
+        let transaction = stored(recorded_drafts(&state)[0], 1);
+        apply(
+            &mut state,
+            Event::UndoHistoryLoaded(Some(Box::new(transaction.clone()))),
+        );
+        apply(
+            &mut state,
+            Event::DisplayTopologyChanged(vec![
+                display(1, "DISPLAY1", 0),
+                display(2, "DISPLAY2", 1920),
+            ]),
+        );
+        state.effects.clear();
+        state.persistence_intents.clear();
+
+        apply(&mut state, Event::UndoRequested);
+
+        assert!(
+            placements(&state).is_empty(),
+            "a refusal must happen before any window moves"
+        );
+        assert!(state.persistence_intents.is_empty());
+        assert_eq!(
+            state.newest_undo,
+            Some(transaction),
+            "a refused transaction is kept for retry"
+        );
+        let Some(UndoResult::Refused(refusal)) = &state.last_undo_result else {
+            panic!("expected a refusal, got {:?}", state.last_undo_result);
+        };
+        assert_eq!(refusal.code(), "topology_changed");
+        assert_eq!(refusal.transaction_id(), Some(UndoTransactionId(1)));
+    }
+
+    #[test]
+    fn undo_refuses_when_the_target_window_is_gone() {
+        let mut state = state_ready_to_snap();
+        apply(
+            &mut state,
+            Event::ZoneSnapRequested {
+                direction: ZoneSnapDirection::Left,
+            },
+        );
+        let transaction = stored(recorded_drafts(&state)[0], 1);
+        apply(
+            &mut state,
+            Event::UndoHistoryLoaded(Some(Box::new(transaction.clone()))),
+        );
+        apply(&mut state, Event::WindowsObserved { windows: vec![] });
+        state.effects.clear();
+        state.persistence_intents.clear();
+
+        apply(&mut state, Event::UndoRequested);
+
+        assert!(placements(&state).is_empty());
+        assert_eq!(state.newest_undo, Some(transaction));
+        let Some(UndoResult::Refused(refusal)) = &state.last_undo_result else {
+            panic!("expected a refusal");
+        };
+        assert_eq!(refusal.code(), "targets_unresolved");
+    }
+
+    #[test]
+    fn undo_refuses_rather_than_guessing_between_two_identical_windows() {
+        let mut state = state_ready_to_snap();
+        apply(
+            &mut state,
+            Event::ZoneSnapRequested {
+                direction: ZoneSnapDirection::Left,
+            },
+        );
+        let transaction = stored(recorded_drafts(&state)[0], 1);
+        apply(
+            &mut state,
+            Event::UndoHistoryLoaded(Some(Box::new(transaction.clone()))),
+        );
+        // A second window of the same application, in the same place, with
+        // the same everything. The snapped window is now indistinguishable
+        // from its twin.
+        apply(
+            &mut state,
+            Event::WindowsObserved {
+                windows: vec![
+                    window_at(7, 1, Rect::new(0, 0, 960, 1080)),
+                    window_at(8, 1, Rect::new(0, 0, 960, 1080)),
+                ],
+            },
+        );
+        state.effects.clear();
+        state.persistence_intents.clear();
+
+        apply(&mut state, Event::UndoRequested);
+
+        assert!(
+            placements(&state).is_empty(),
+            "Mosaix must never move the wrong window"
+        );
+        assert_eq!(state.newest_undo, Some(transaction));
+        let Some(UndoResult::Refused(UndoRefusal::TargetsUnresolved { targets, .. })) =
+            &state.last_undo_result
+        else {
+            panic!("expected an unresolved refusal, got {:?}", state.last_undo_result);
+        };
+        assert_eq!(targets.len(), 1);
+        assert_eq!(
+            targets[0].outcome.code(),
+            "ambiguous",
+            "the refusal must say it was a tie, not that the window vanished"
+        );
+    }
+
+    #[test]
+    fn undo_refuses_while_the_state_database_is_degraded() {
+        let mut state = state_ready_to_snap();
+        apply(
+            &mut state,
+            Event::ZoneSnapRequested {
+                direction: ZoneSnapDirection::Left,
+            },
+        );
+        let transaction = stored(recorded_drafts(&state)[0], 1);
+        apply(
+            &mut state,
+            Event::UndoHistoryLoaded(Some(Box::new(transaction.clone()))),
+        );
+        apply(
+            &mut state,
+            Event::PersistenceHealthChanged(PersistenceHealth::Degraded {
+                last_durable_revision: 4,
+                reason: mosaix_persistence::PersistenceFailure::WriteFailed,
+            }),
+        );
+        state.effects.clear();
+        state.persistence_intents.clear();
+
+        apply(&mut state, Event::UndoRequested);
+
+        assert!(
+            placements(&state).is_empty(),
+            "undo that cannot be consumed could be applied twice"
+        );
+        assert_eq!(state.newest_undo, Some(transaction));
+        let Some(UndoResult::Refused(refusal)) = &state.last_undo_result else {
+            panic!("expected a refusal");
+        };
+        assert_eq!(refusal.code(), "persistence_degraded");
+    }
+
+    #[test]
+    fn undo_with_empty_history_refuses_without_naming_a_transaction() {
+        let mut state = state_ready_to_snap();
+
+        apply(&mut state, Event::UndoRequested);
+
+        assert!(placements(&state).is_empty());
+        assert_eq!(
+            state.last_undo_result,
+            Some(UndoResult::Refused(UndoRefusal::NothingToUndo))
+        );
+    }
+
+    #[test]
+    fn there_is_no_way_to_force_a_refused_undo() {
+        // The absence of an override is a contract, so it is asserted
+        // rather than left to review: every refusal reached through the
+        // public planner leaves the transaction and moves nothing.
+        let mut state = state_ready_to_snap();
+        apply(
+            &mut state,
+            Event::ZoneSnapRequested {
+                direction: ZoneSnapDirection::Left,
+            },
+        );
+        let transaction = stored(recorded_drafts(&state)[0], 1);
+        apply(
+            &mut state,
+            Event::UndoHistoryLoaded(Some(Box::new(transaction.clone()))),
+        );
+        apply(&mut state, Event::WindowsObserved { windows: vec![] });
+
+        for _ in 0..5 {
+            state.effects.clear();
+            apply(&mut state, Event::UndoRequested);
+            assert!(
+                placements(&state).is_empty(),
+                "repeating a refused undo must not wear it down into a guess"
+            );
+            assert_eq!(state.newest_undo, Some(transaction.clone()));
+        }
     }
 
     #[test]

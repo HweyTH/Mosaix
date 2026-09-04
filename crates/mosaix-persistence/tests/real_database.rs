@@ -246,6 +246,151 @@ fn resetting_is_explicit_and_preserves_the_unusable_database() {
     );
 }
 
+fn evidence(application: &str, launch_order: u32) -> mosaix_domain::WindowEvidence {
+    mosaix_domain::WindowEvidence {
+        application_id: mosaix_domain::ApplicationId(application.to_owned()),
+        executable_path: Some(format!("C:/apps/{application}")),
+        native_class: Some("Chrome_WidgetWin_1".to_owned()),
+        role: mosaix_domain::WindowRole::Normal,
+        launch_order,
+        last_placement: mosaix_domain::Rect::new(960, 0, 960, 1080),
+        display_fingerprint: "DISPLAY1".to_owned(),
+    }
+}
+
+fn draft(command: &str, applications: &[&str]) -> mosaix_domain::UndoTransactionDraft {
+    mosaix_domain::UndoTransactionDraft {
+        command: command.to_owned(),
+        recorded_at_unix: 1_756_000_000,
+        topology_fingerprint: "DISPLAY1@0,0 1920x1080 scale=1".to_owned(),
+        durable_revision: 12,
+        members: applications
+            .iter()
+            .enumerate()
+            .map(|(index, application)| mosaix_domain::UndoMember {
+                ordinal: index as u32,
+                prior_placement: mosaix_domain::Rect::new(0, 0, 800, 600),
+                prior_display_fingerprint: "DISPLAY1".to_owned(),
+                evidence: evidence(application, index as u32),
+            })
+            .collect(),
+    }
+}
+
+#[test]
+fn a_recorded_transaction_survives_a_restart_intact() {
+    let temporary = TempDatabase::new("undo-restart");
+    let recorded = draft("snap-left", &["Code.exe"]);
+
+    let id = {
+        let mut store = Persistence::open(&temporary.path()).expect("database opens");
+        store
+            .record_transaction(&recorded)
+            .expect("the transaction records")
+    };
+
+    let restarted = Persistence::open(&temporary.path()).expect("database reopens");
+    let loaded = restarted
+        .newest_transaction()
+        .expect("history is readable")
+        .expect("the transaction is still there");
+
+    assert_eq!(loaded.id, id);
+    assert_eq!(loaded.command, recorded.command);
+    assert_eq!(loaded.recorded_at_unix, recorded.recorded_at_unix);
+    assert_eq!(loaded.topology_fingerprint, recorded.topology_fingerprint);
+    assert_eq!(loaded.durable_revision, recorded.durable_revision);
+    assert_eq!(loaded.members, recorded.members);
+}
+
+#[test]
+fn undo_history_reads_newest_first() {
+    let temporary = TempDatabase::new("undo-newest");
+    let mut store = Persistence::open(&temporary.path()).expect("database opens");
+
+    store.record_transaction(&draft("snap-left", &["Code.exe"])).unwrap();
+    let newest = store
+        .record_transaction(&draft("snap-right", &["firefox.exe"]))
+        .unwrap();
+
+    let loaded = store.newest_transaction().unwrap().expect("history is not empty");
+
+    assert_eq!(loaded.id, newest);
+    assert_eq!(loaded.command, "snap-right");
+}
+
+#[test]
+fn consuming_a_transaction_removes_it_and_its_members() {
+    let temporary = TempDatabase::new("undo-consume");
+    let mut store = Persistence::open(&temporary.path()).expect("database opens");
+    let older = store.record_transaction(&draft("snap-left", &["Code.exe"])).unwrap();
+    let newest = store
+        .record_transaction(&draft("snap-right", &["firefox.exe"]))
+        .unwrap();
+
+    assert!(store.consume_transaction(newest).unwrap());
+
+    let remaining = store.newest_transaction().unwrap().expect("the older one survives");
+    assert_eq!(remaining.id, older);
+    let orphaned: i64 = rusqlite::Connection::open(temporary.path())
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM undo_member WHERE transaction_id = ?1",
+            [newest.0],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(orphaned, 0, "a consumed transaction leaves no member rows");
+}
+
+#[test]
+fn consuming_a_transaction_that_is_already_gone_reports_that_it_did_nothing() {
+    let temporary = TempDatabase::new("undo-consume-missing");
+    let mut store = Persistence::open(&temporary.path()).expect("database opens");
+    let id = store.record_transaction(&draft("snap-left", &["Code.exe"])).unwrap();
+
+    assert!(store.consume_transaction(id).unwrap());
+    assert!(
+        !store.consume_transaction(id).unwrap(),
+        "consuming twice must not silently claim success"
+    );
+    assert_eq!(store.newest_transaction().unwrap(), None);
+}
+
+#[test]
+fn stored_undo_records_contain_no_window_titles() {
+    let temporary = TempDatabase::new("undo-privacy");
+    let mut store = Persistence::open(&temporary.path()).expect("database opens");
+    store
+        .record_transaction(&draft("snap-left", &["Code.exe"]))
+        .unwrap();
+    drop(store);
+
+    let bytes = fs::read(temporary.path()).expect("database is readable");
+    let text = String::from_utf8_lossy(&bytes);
+
+    // The evidence model has no title field at all, so the assertion that
+    // matters is structural: no column exists that could hold one.
+    let columns: Vec<String> = {
+        let connection = rusqlite::Connection::open(temporary.path()).unwrap();
+        let mut statement = connection.prepare("PRAGMA table_info(undo_member)").unwrap();
+        let names = statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        names
+    };
+    assert!(
+        !columns.iter().any(|column| column.contains("title")),
+        "undo records must have nowhere to store a window title, found {columns:?}"
+    );
+    assert!(
+        !text.contains("a document nobody should be storing"),
+        "no captured title may reach the database file"
+    );
+}
+
 #[test]
 fn a_locked_database_degrades_the_write_and_recovers_when_the_lock_clears() {
     let temporary = TempDatabase::new("locked");

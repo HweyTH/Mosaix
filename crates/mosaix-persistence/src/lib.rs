@@ -15,6 +15,9 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use mosaix_domain::identity::WindowEvidence;
+use mosaix_domain::undo::{UndoMember, UndoTransaction, UndoTransactionDraft, UndoTransactionId};
+use mosaix_domain::{ApplicationId, Rect, WindowRole};
 use rusqlite::Connection;
 use thiserror::Error;
 
@@ -40,15 +43,54 @@ pub struct Migration {
 /// The schema, in order. Per the spec, tables arrive with the slice that
 /// consumes them -- speculative tables would become a permanent
 /// compatibility obligation for no live reader.
-const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    statements: "CREATE TABLE persistence_metadata (
-                     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-                     last_durable_revision INTEGER NOT NULL
-                 );
-                 INSERT INTO persistence_metadata (singleton, last_durable_revision)
-                     VALUES (1, 0);",
-}];
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        statements: "CREATE TABLE persistence_metadata (
+                         singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                         last_durable_revision INTEGER NOT NULL
+                     );
+                     INSERT INTO persistence_metadata (singleton, last_durable_revision)
+                         VALUES (1, 0);",
+    },
+    // Persistent undo (ADR 0024). Members cascade from their transaction,
+    // so consuming a transaction cannot leave rows describing a command
+    // that no longer exists. There is deliberately no title column: the
+    // evidence model has nowhere to put one.
+    Migration {
+        version: 2,
+        statements: "CREATE TABLE undo_transaction (
+                         id INTEGER PRIMARY KEY AUTOINCREMENT,
+                         command TEXT NOT NULL,
+                         recorded_at_unix INTEGER NOT NULL,
+                         topology_fingerprint TEXT NOT NULL,
+                         durable_revision INTEGER NOT NULL
+                     );
+                     CREATE TABLE undo_member (
+                         transaction_id INTEGER NOT NULL
+                             REFERENCES undo_transaction (id) ON DELETE CASCADE,
+                         ordinal INTEGER NOT NULL,
+                         prior_x INTEGER NOT NULL,
+                         prior_y INTEGER NOT NULL,
+                         prior_width INTEGER NOT NULL,
+                         prior_height INTEGER NOT NULL,
+                         prior_display_fingerprint TEXT NOT NULL,
+                         application_id TEXT NOT NULL,
+                         executable_path TEXT,
+                         native_class TEXT,
+                         role TEXT NOT NULL,
+                         launch_order INTEGER NOT NULL,
+                         last_x INTEGER NOT NULL,
+                         last_y INTEGER NOT NULL,
+                         last_width INTEGER NOT NULL,
+                         last_height INTEGER NOT NULL,
+                         evidence_display_fingerprint TEXT NOT NULL,
+                         PRIMARY KEY (transaction_id, ordinal)
+                     );
+                     CREATE INDEX undo_transaction_recorded_at
+                         ON undo_transaction (recorded_at_unix);",
+    },
+];
 
 /// The newest schema this build understands.
 pub const SUPPORTED_SCHEMA_VERSION: i32 = MIGRATIONS[MIGRATIONS.len() - 1].version;
@@ -371,6 +413,193 @@ impl Persistence {
             }
         }
     }
+
+    /// Stores one undo transaction and every window it moved, atomically.
+    ///
+    /// A half-written transaction would be worse than none at all -- undo
+    /// would preflight members it could see and silently omit the ones it
+    /// could not -- so the parent row and its members share one SQL
+    /// transaction.
+    pub fn record_transaction(
+        &mut self,
+        draft: &UndoTransactionDraft,
+    ) -> Result<UndoTransactionId, PersistenceError> {
+        let outcome = self.write(|connection| {
+            let transaction = connection.unchecked_transaction()?;
+            transaction.execute(
+                "INSERT INTO undo_transaction
+                     (command, recorded_at_unix, topology_fingerprint, durable_revision)
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![
+                    draft.command,
+                    draft.recorded_at_unix,
+                    draft.topology_fingerprint,
+                    draft.durable_revision,
+                ],
+            )?;
+            let id = UndoTransactionId(transaction.last_insert_rowid());
+            for member in &draft.members {
+                transaction.execute(
+                    "INSERT INTO undo_member (
+                         transaction_id, ordinal,
+                         prior_x, prior_y, prior_width, prior_height,
+                         prior_display_fingerprint,
+                         application_id, executable_path, native_class, role, launch_order,
+                         last_x, last_y, last_width, last_height,
+                         evidence_display_fingerprint
+                     ) VALUES (
+                         ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                         ?13, ?14, ?15, ?16, ?17
+                     )",
+                    rusqlite::params![
+                        id.0,
+                        member.ordinal,
+                        member.prior_placement.x,
+                        member.prior_placement.y,
+                        member.prior_placement.width,
+                        member.prior_placement.height,
+                        member.prior_display_fingerprint,
+                        member.evidence.application_id.0,
+                        member.evidence.executable_path,
+                        member.evidence.native_class,
+                        member.evidence.role.code(),
+                        member.evidence.launch_order,
+                        member.evidence.last_placement.x,
+                        member.evidence.last_placement.y,
+                        member.evidence.last_placement.width,
+                        member.evidence.last_placement.height,
+                        member.evidence.display_fingerprint,
+                    ],
+                )?;
+            }
+            transaction.commit()?;
+            Ok(id)
+        })?;
+        Ok(outcome)
+    }
+
+    /// The transaction undo would examine next, or `None` when history is
+    /// empty. Undo never looks past this one (ADR 0024).
+    pub fn newest_transaction(&self) -> Result<Option<UndoTransaction>, PersistenceError> {
+        let header = self
+            .connection
+            .query_row(
+                "SELECT id, command, recorded_at_unix, topology_fingerprint, durable_revision
+                 FROM undo_transaction ORDER BY id DESC LIMIT 1",
+                [],
+                |row| {
+                    Ok((
+                        UndoTransactionId(row.get(0)?),
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, u64>(4)?,
+                    ))
+                },
+            )
+            .optional_row()?;
+        let Some((id, command, recorded_at_unix, topology_fingerprint, durable_revision)) = header
+        else {
+            return Ok(None);
+        };
+        Ok(Some(UndoTransaction {
+            id,
+            command,
+            recorded_at_unix,
+            topology_fingerprint,
+            durable_revision,
+            members: self.members_of(id)?,
+        }))
+    }
+
+    fn members_of(&self, id: UndoTransactionId) -> Result<Vec<UndoMember>, PersistenceError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT ordinal,
+                        prior_x, prior_y, prior_width, prior_height, prior_display_fingerprint,
+                        application_id, executable_path, native_class, role, launch_order,
+                        last_x, last_y, last_width, last_height, evidence_display_fingerprint
+                 FROM undo_member WHERE transaction_id = ?1 ORDER BY ordinal",
+            )
+            .map_err(PersistenceError::Read)?;
+        let members = statement
+            .query_map([id.0], |row| {
+                Ok(UndoMember {
+                    ordinal: row.get(0)?,
+                    prior_placement: Rect::new(row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?),
+                    prior_display_fingerprint: row.get(5)?,
+                    evidence: WindowEvidence {
+                        application_id: ApplicationId(row.get(6)?),
+                        executable_path: row.get(7)?,
+                        native_class: row.get(8)?,
+                        role: WindowRole::from_code(&row.get::<_, String>(9)?),
+                        launch_order: row.get(10)?,
+                        last_placement: Rect::new(
+                            row.get(11)?,
+                            row.get(12)?,
+                            row.get(13)?,
+                            row.get(14)?,
+                        ),
+                        display_fingerprint: row.get(15)?,
+                    },
+                })
+            })
+            .map_err(PersistenceError::Read)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(PersistenceError::Read)?;
+        Ok(members)
+    }
+
+    /// Removes a transaction after it has been successfully undone.
+    /// Answers whether there was one to remove, so a caller cannot mistake
+    /// "already gone" for "consumed".
+    pub fn consume_transaction(
+        &mut self,
+        id: UndoTransactionId,
+    ) -> Result<bool, PersistenceError> {
+        self.write(|connection| {
+            let removed = connection.execute("DELETE FROM undo_transaction WHERE id = ?1", [id.0])?;
+            Ok(removed > 0)
+        })
+    }
+
+    /// Runs a write, mapping any failure onto the same sticky degradation
+    /// [`Persistence::commit_revision`] uses. Every durable write in this
+    /// module goes through here so that one failed write cannot leave the
+    /// store claiming health it does not have.
+    fn write<T>(
+        &mut self,
+        action: impl FnOnce(&Connection) -> Result<T, rusqlite::Error>,
+    ) -> Result<T, PersistenceError> {
+        match action(&self.connection) {
+            Ok(value) => {
+                self.degraded = None;
+                Ok(value)
+            }
+            Err(source) => {
+                self.degraded = Some(PersistenceFailure::WriteFailed);
+                Err(PersistenceError::Write(source))
+            }
+        }
+    }
+}
+
+/// `query_row` treats "no rows" as an error; every caller here treats it as
+/// an empty history. This turns that one case into `None` and leaves every
+/// other failure alone.
+trait OptionalRow<T> {
+    fn optional_row(self) -> Result<Option<T>, PersistenceError>;
+}
+
+impl<T> OptionalRow<T> for Result<T, rusqlite::Error> {
+    fn optional_row(self) -> Result<Option<T>, PersistenceError> {
+        match self {
+            Ok(value) => Ok(Some(value)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(source) => Err(PersistenceError::Read(source)),
+        }
+    }
 }
 
 fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
@@ -399,9 +628,29 @@ fn quarantine_path(path: &Path) -> PathBuf {
     sidecar_path(path, &format!(".quarantine-{stamp}-last"))
 }
 
+/// A durable write for the worker to perform, in the order submitted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PersistenceRequest {
+    /// Record committed state through `revision` as durable.
+    Commit { revision: u64 },
+    /// Store one explicit command's reversible placements.
+    RecordUndoTransaction(UndoTransactionDraft),
+    /// Remove a transaction that has just been undone.
+    ConsumeUndoTransaction(UndoTransactionId),
+}
+
+/// What the worker reports after each request: how durability now stands,
+/// and what undo would find. Both travel together so the agent never
+/// publishes a health state and an undo history from different moments.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistenceUpdate {
+    pub health: PersistenceHealth,
+    pub newest_undo: Option<UndoTransaction>,
+}
+
 #[derive(Debug)]
 enum WorkerMessage {
-    Commit { revision: u64 },
+    Request(PersistenceRequest),
     Stop,
 }
 
@@ -415,7 +664,7 @@ pub struct WorkerStopped;
 
 pub struct PersistenceWorker {
     sender: Sender<WorkerMessage>,
-    updates: Receiver<PersistenceHealth>,
+    updates: Receiver<PersistenceUpdate>,
     join: Option<JoinHandle<()>>,
 }
 
@@ -424,25 +673,40 @@ impl PersistenceWorker {
         let mut persistence = Persistence::open(path.as_ref())?;
         let (sender, receiver) = mpsc::channel();
         let (update_sender, updates) = mpsc::channel();
+
+        // The first update is sent before any request arrives, so a caller
+        // learns what undo history the database already holds without
+        // having to write something first.
+        let _ = update_sender.send(snapshot_of(&persistence));
+
         let join = thread::spawn(move || {
             while let Ok(message) = receiver.recv() {
-                match message {
-                    WorkerMessage::Stop => break,
-                    WorkerMessage::Commit { revision } => {
-                        // The store itself tracks whether the write landed,
-                        // so the health it reports here is the truth rather
-                        // than this thread's guess at it.
-                        if let Err(error) = persistence.commit_revision(revision) {
-                            tracing::warn!(
-                                %error,
-                                revision,
-                                "state write failed; live window management continues \
-                                 without a durability promise"
-                            );
-                        }
-                        let _ = update_sender.send(persistence.health());
+                let WorkerMessage::Request(request) = message else {
+                    break;
+                };
+                // The store itself tracks whether each write landed, so the
+                // health reported here is the truth rather than this
+                // thread's guess at it.
+                let outcome = match &request {
+                    PersistenceRequest::Commit { revision } => {
+                        persistence.commit_revision(*revision).map(|_| ())
                     }
+                    PersistenceRequest::RecordUndoTransaction(draft) => {
+                        persistence.record_transaction(draft).map(|_| ())
+                    }
+                    PersistenceRequest::ConsumeUndoTransaction(id) => {
+                        persistence.consume_transaction(*id).map(|_| ())
+                    }
+                };
+                if let Err(error) = outcome {
+                    tracing::warn!(
+                        %error,
+                        ?request,
+                        "state write failed; live window management continues \
+                         without a durability promise"
+                    );
                 }
+                let _ = update_sender.send(snapshot_of(&persistence));
             }
         });
         Ok(Self {
@@ -452,14 +716,27 @@ impl PersistenceWorker {
         })
     }
 
-    pub fn commit(&self, revision: u64) -> Result<(), WorkerStopped> {
+    /// Queues one durable write. Requests are performed in the order they
+    /// are submitted, which is what makes a consume that follows a record
+    /// safe to submit without waiting.
+    pub fn submit(&self, request: PersistenceRequest) -> Result<(), WorkerStopped> {
         self.sender
-            .send(WorkerMessage::Commit { revision })
+            .send(WorkerMessage::Request(request))
             .map_err(|_| WorkerStopped)
     }
 
-    pub fn next_update(&self) -> Result<PersistenceHealth, WorkerStopped> {
+    pub fn commit(&self, revision: u64) -> Result<(), WorkerStopped> {
+        self.submit(PersistenceRequest::Commit { revision })
+    }
+
+    pub fn next_update(&self) -> Result<PersistenceUpdate, WorkerStopped> {
         self.updates.recv().map_err(|_| WorkerStopped)
+    }
+
+    /// The next update if one is already waiting. Lets a caller drain
+    /// everything the worker has said without blocking its own loop.
+    pub fn try_next_update(&self) -> Option<PersistenceUpdate> {
+        self.updates.try_recv().ok()
     }
 
     pub fn stop(mut self) {
@@ -467,6 +744,23 @@ impl PersistenceWorker {
         if let Some(join) = self.join.take() {
             let _ = join.join();
         }
+    }
+}
+
+/// Health and undo history read together, so the two can never describe
+/// different moments. A history that cannot be read is reported as empty
+/// rather than as a stale earlier answer.
+fn snapshot_of(persistence: &Persistence) -> PersistenceUpdate {
+    let newest_undo = match persistence.newest_transaction() {
+        Ok(newest) => newest,
+        Err(error) => {
+            tracing::warn!(%error, "undo history could not be read");
+            None
+        }
+    };
+    PersistenceUpdate {
+        health: persistence.health(),
+        newest_undo,
     }
 }
 
@@ -518,16 +812,27 @@ mod tests {
         let path = directory.join("state.db");
 
         let worker = PersistenceWorker::start(&path).unwrap();
+        assert_eq!(
+            worker.next_update().unwrap(),
+            PersistenceUpdate {
+                health: PersistenceHealth::Healthy {
+                    last_durable_revision: 0
+                },
+                newest_undo: None,
+            },
+            "the worker states what the database already holds before any write"
+        );
+
         worker.commit(1).unwrap();
         worker.commit(2).unwrap();
         assert_eq!(
-            worker.next_update().unwrap(),
+            worker.next_update().unwrap().health,
             PersistenceHealth::Healthy {
                 last_durable_revision: 1
             }
         );
         assert_eq!(
-            worker.next_update().unwrap(),
+            worker.next_update().unwrap().health,
             PersistenceHealth::Healthy {
                 last_durable_revision: 2
             }
