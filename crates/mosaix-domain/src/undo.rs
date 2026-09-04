@@ -15,6 +15,7 @@ use crate::geometry::Rect;
 use crate::id::{DisplayId, WindowId};
 use crate::identity::{MatchOutcome, WindowEvidence};
 use crate::tree::PersistedTree;
+use crate::workspace::WorkspaceRefusal;
 
 /// Seconds since the Unix epoch, as retention bounds measure time.
 ///
@@ -68,6 +69,20 @@ pub struct UndoTreeSnapshot {
     pub tree: PersistedTree,
 }
 
+/// Which logical workspace one display showed before the command, so
+/// undoing a workspace switch puts the assignment back and not only the
+/// windows (CONTEXT.md "Workspace switch transaction").
+///
+/// Recorded by fingerprint for the same reason a tree is: a display id is
+/// a native handle and means nothing in a later session. `workspace` is
+/// `None` for a display that showed no workspace at all -- an unfilled
+/// display is a state a switch can leave and undo has to restore.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UndoAssignment {
+    pub display_fingerprint: String,
+    pub workspace: Option<String>,
+}
+
 /// Everything one explicit command changed, reversed as one operation.
 ///
 /// Not `Eq`: a container tree carries float weights.
@@ -87,6 +102,18 @@ pub struct UndoTransaction {
     /// Empty for a command that changed no tree.
     #[serde(default)]
     pub prior_trees: Vec<UndoTreeSnapshot>,
+    /// The displayed workspace assignments the command changed, as they
+    /// were before it. Empty for every command but a workspace switch.
+    #[serde(default)]
+    pub prior_assignments: Vec<UndoAssignment>,
+}
+
+impl UndoTransaction {
+    /// Whether reversing this transaction means switching a display back
+    /// to another workspace, rather than only moving windows.
+    pub fn changes_workspace_assignment(&self) -> bool {
+        !self.prior_assignments.is_empty()
+    }
 }
 
 /// A transaction that has not been stored yet, and so has no id.
@@ -99,6 +126,8 @@ pub struct UndoTransactionDraft {
     pub members: Vec<UndoMember>,
     #[serde(default)]
     pub prior_trees: Vec<UndoTreeSnapshot>,
+    #[serde(default)]
+    pub prior_assignments: Vec<UndoAssignment>,
 }
 
 /// What the matcher concluded about one member of a transaction.
@@ -151,6 +180,15 @@ pub enum UndoRefusal {
         transaction_id: UndoTransactionId,
         reason: String,
     },
+    /// Reversing this transaction means switching a display back to
+    /// another workspace, and that switch would itself be refused. It
+    /// carries the switch's own typed refusal, so a caller can tell a
+    /// blocked degraded condition from an unauthorised profile without
+    /// reading prose.
+    WorkspaceSwitchRefused {
+        transaction_id: UndoTransactionId,
+        reason: WorkspaceRefusal,
+    },
 }
 
 impl UndoRefusal {
@@ -162,6 +200,7 @@ impl UndoRefusal {
             Self::TargetsUnresolved { .. } => "targets_unresolved",
             Self::TargetsCollide { .. } => "targets_collide",
             Self::PersistenceDegraded { .. } => "persistence_degraded",
+            Self::WorkspaceSwitchRefused { .. } => "workspace_switch_refused",
         }
     }
 
@@ -172,7 +211,8 @@ impl UndoRefusal {
             Self::TopologyChanged { transaction_id, .. }
             | Self::TargetsUnresolved { transaction_id, .. }
             | Self::TargetsCollide { transaction_id, .. }
-            | Self::PersistenceDegraded { transaction_id, .. } => Some(*transaction_id),
+            | Self::PersistenceDegraded { transaction_id, .. }
+            | Self::WorkspaceSwitchRefused { transaction_id, .. } => Some(*transaction_id),
         }
     }
 }
@@ -205,6 +245,10 @@ impl std::fmt::Display for UndoRefusal {
             ),
             Self::PersistenceDegraded { .. } => formatter.write_str(
                 "the state database is degraded, so undo cannot record that it happened",
+            ),
+            Self::WorkspaceSwitchRefused { reason, .. } => write!(
+                formatter,
+                "undoing that command means switching a display back to another workspace, and that switch was refused: {reason}"
             ),
         }
     }

@@ -212,32 +212,39 @@ pub fn plan_recovery(
             if claimants > 1 {
                 return (entry.id, HandleVerdict::Ambiguous { claimants });
             }
-            let Some(live) = probe(entry.draft.native_handle) else {
-                return (entry.id, HandleVerdict::Stale);
-            };
-            let recorded = entry.draft.process;
-            let same_process = live.process.process_id == recorded.process_id
-                && (recorded.creation_time == 0
-                    || live.process.creation_time == recorded.creation_time);
-            let same_class = match (&entry.draft.native_class, &live.native_class) {
-                (Some(recorded), Some(live)) => recorded == live,
-                _ => true,
-            };
-            if same_process && same_class {
-                (entry.id, HandleVerdict::Verified)
-            } else {
-                (
-                    entry.id,
-                    HandleVerdict::Reused {
-                        recorded,
-                        live: live.process,
-                        recorded_class: entry.draft.native_class.clone(),
-                        live_class: live.native_class,
-                    },
-                )
-            }
+            (
+                entry.id,
+                verdict_for(entry, probe(entry.draft.native_handle)),
+            )
         })
         .collect()
+}
+
+/// What one entry's handle means now, given what a live probe reported
+/// for it: the same process instance and class verify it, anything else
+/// is a reused handle, and no window at all is stale. Ambiguity between
+/// entries is [`plan_recovery`]'s to decide; this looks at one entry.
+pub fn verdict_for(entry: &RecoveryEntry, live: Option<LiveHandleEvidence>) -> HandleVerdict {
+    let Some(live) = live else {
+        return HandleVerdict::Stale;
+    };
+    let recorded = entry.draft.process;
+    let same_process = live.process.process_id == recorded.process_id
+        && (recorded.creation_time == 0 || live.process.creation_time == recorded.creation_time);
+    let same_class = match (&entry.draft.native_class, &live.native_class) {
+        (Some(recorded), Some(live)) => recorded == live,
+        _ => true,
+    };
+    if same_process && same_class {
+        HandleVerdict::Verified
+    } else {
+        HandleVerdict::Reused {
+            recorded,
+            live: live.process,
+            recorded_class: entry.draft.native_class.clone(),
+            live_class: live.native_class,
+        }
+    }
 }
 
 /// What recovery did about one entry.
@@ -252,6 +259,36 @@ pub struct RecoveryOutcome {
     pub restored: bool,
     /// The platform's reason when a verified restore failed.
     pub failure: Option<String>,
+}
+
+/// Which native step of parking failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ParkingStage {
+    /// Moving the window out of visible geometry.
+    Park,
+    /// Putting a parked window back.
+    Restore,
+}
+
+impl ParkingStage {
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::Park => "park",
+            Self::Restore => "restore",
+        }
+    }
+}
+
+/// A native parking step the adapter could not carry out, with the
+/// platform's reason. A failed park leaves the window where it was and
+/// its entry recorded but never parked; a failed restore leaves the
+/// window parked with its entry open, so recovery can still find it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParkingFailure {
+    pub window_id: WindowId,
+    pub entry_id: RecoveryEntryId,
+    pub stage: ParkingStage,
+    pub reason: String,
 }
 
 /// Why the engine will not authorise parking a window right now. Every
@@ -269,6 +306,9 @@ pub enum ParkingRefusal {
     ParkingRefused { reason: String },
     /// A full-screen window is never forced out of full-screen.
     Fullscreen { window_id: WindowId },
+    /// A minimized window occupies no screen and is left minimized; it
+    /// is never restored in order to be parked (ADR 0029).
+    Minimized { window_id: WindowId },
     /// The window's display is not in the topology, so there is no
     /// original display to record.
     UnknownDisplay { window_id: WindowId },
@@ -284,6 +324,7 @@ impl ParkingRefusal {
             Self::ParkingCapabilityUnverified => "parking_capability_unverified",
             Self::ParkingRefused { .. } => "parking_refused",
             Self::Fullscreen { .. } => "fullscreen",
+            Self::Minimized { .. } => "minimized",
             Self::UnknownDisplay { .. } => "unknown_display",
             Self::AlreadyPending { .. } => "already_pending",
         }
@@ -310,6 +351,11 @@ impl std::fmt::Display for ParkingRefusal {
                 "window {} is full-screen and is never forced out of it",
                 window_id.0
             ),
+            Self::Minimized { window_id } => write!(
+                formatter,
+                "window {} is minimized and occupies no screen, so it is left as it is",
+                window_id.0
+            ),
             Self::UnknownDisplay { window_id } => write!(
                 formatter,
                 "window {} is on a display that is not connected",
@@ -321,6 +367,21 @@ impl std::fmt::Display for ParkingRefusal {
                 window_id.0
             ),
         }
+    }
+}
+
+/// The typed answer to an explicit request to park one window: the
+/// request was accepted and recovery data is being recorded, or it was
+/// refused before anything was written.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ParkWindowResult {
+    Requested { window_id: WindowId },
+    Refused(ParkingRefusal),
+}
+
+impl ParkWindowResult {
+    pub const fn is_applied(&self) -> bool {
+        matches!(self, Self::Requested { .. })
     }
 }
 
@@ -506,6 +567,10 @@ mod tests {
             }
             .code(),
             ParkingRefusal::Fullscreen {
+                window_id: WindowId(1),
+            }
+            .code(),
+            ParkingRefusal::Minimized {
                 window_id: WindowId(1),
             }
             .code(),

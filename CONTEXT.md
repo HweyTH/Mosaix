@@ -107,7 +107,7 @@ A member of Mosaix's global pool of uniquely named managed-window groups, create
 _Avoid_: Virtual desktop, Space, saved workspace
 
 **Workspace focus**:
-Displaying a hidden logical workspace on the focused monitor, or focusing its last-focused live window when it is already displayed on another monitor. It never moves a displayed workspace between monitors.
+Displaying a hidden logical workspace on the focused monitor, or focusing its last-focused live window when it is already displayed on another monitor. It never moves a displayed workspace between monitors. Displaying one runs as a `Workspace switch transaction`, so it is refused whenever that transaction would be: with a window to move and switching not authorised, with a full-screen member, or while an earlier switch is in flight or left the display workspace-switch degraded.
 _Avoid_: Workspace move, display transfer, workspace switch (alone)
 
 **Workspace move**:
@@ -123,15 +123,19 @@ The display targeted by display-scoped commands, following the focused managed w
 _Avoid_: Primary display, cursor display, focused window's display
 
 **Window parking**:
-The reversible relocation of windows from a non-displayed logical workspace to a recoverable edge position while their workspace membership remains unchanged.
+The reversible relocation of windows from a non-displayed logical workspace to a recoverable edge position while their workspace membership remains unchanged. On Windows the position is a parking site beyond the virtual screen (ADR 0029); the window keeps its show state, styles, taskbar button, and Alt-Tab entry, and is never activated on the way out or back. A maximized window is taken to its normal size first and re-maximized on restore; a minimized window is left minimized and unmoved, and so is a full-screen one. It happens whenever a managed window and its workspace disagree about being on screen, not only during a `Workspace switch transaction`: a monitor disconnecting takes its displayed workspace with it, a rule can send a brand-new window to a hidden workspace, an application can restore a window that was minimized while hidden, and a restart reapplies stored assignments. Every one of those records the way back first, and refuses rather than reaching for another mechanism when it cannot.
 _Avoid_: Hide, cloak, minimize
+
+**Parking site**:
+The place the platform adapter has verified, for the current topology, that a parked window can be moved to without any monitor covering it: beyond one edge of the virtual screen by a fixed margin, chosen from the reported display geometry and confirmed against the live desktop with `MonitorFromRect` (ADR 0029). It is re-validated on every topology change, and its absence is a typed refusal that parks nothing rather than a fallback to another mechanism.
+_Avoid_: Off-screen corner, hiding position, parking edge (when the whole validated site is meant)
 
 **Recovery ledger**:
 A small SQLite file beside the state database, written before any window is parked, that records the native handle, the owning process instance (process id plus kernel creation time), the window class, the original display, the visible and normal bounds, and the show state. An entry is acknowledged durable before the engine authorises the parking effect it describes. Startup and the out-of-process `restore-windows` command read it before any identity reconciliation and touch only a handle whose live evidence still matches; a stale, reused, or ambiguous handle is reported and left alone. It is never cross-session identity: the state database holds no native handle.
 _Avoid_: Undo history, session state, handle cache
 
 **Workspace switch transaction**:
-An all-or-nothing change of the logical workspace displayed on one monitor, durably recording recovery data before parking or restoring windows. Any placement failure cancels the switch and compensates completed moves; success creates one undo transaction covering both assignment and placements.
+An all-or-nothing change of the logical workspace displayed on one monitor, durably recording recovery data before parking or restoring windows. The outgoing workspace's windows all leave the screen before any of the target's come back, and the displayed assignment changes only once every move has landed. Any placement failure cancels the switch and compensates completed moves in the mirror order; success creates one undo transaction covering both assignment and placements. A switch that would move no window at all is pure bookkeeping: it needs no parking site and no authorised switching, because the desktop never sees it.
 _Avoid_: Placement transaction, partial workspace switch
 
 **Workspace switching status**:
@@ -139,8 +143,16 @@ One of four states published for the current topology: disabled (no matched prof
 _Avoid_: Enabled (which does not say whether parking is authorised), workspace mode
 
 **Workspace-switch degraded**:
-A health condition in which compensation for a failed workspace switch could not restore every moved window. Further switching remains blocked until the explicit restore action reconciles the affected windows.
+A health condition in which compensation for a failed workspace switch could not restore every moved window. Further switching remains blocked until the explicit restore action reconciles every `Stranded window`, and it clears as each one reaches the place its workspace says it belongs, from whichever path put it there.
 _Avoid_: Persistence-degraded, degraded tiling
+
+**Stranded window**:
+A managed window a failed workspace switch left where neither the switch nor the user put it, because compensation could not move it back. It is named in published state until it reaches the place its workspace says it belongs: on screen when that workspace is displayed, at the parking site when it is hidden. Being stranded says nothing about where the window currently is -- a failed re-park leaves one visible and a failed restore leaves one parked -- so reconciling it means moving it in whichever direction its workspace requires, not restoring it.
+_Avoid_: Orphaned window, lost window, unaccounted window
+
+**Health condition precedence**:
+The one fixed order in which the three distinct health conditions are published, so every interface leads with the same one instead of each inventing a ranking: `workspace-switch degraded` first, because windows are off screen and switching is blocked until someone acts; `persistence-degraded` next, because nothing new becomes durable; `degraded tiling` last, because live management continues for everything else. The conditions stay separate facts with their own detail in published state; this only ranks them, and never hides the ones it does not lead with.
+_Avoid_: Health status, severity level (the conditions are not levels of one scale)
 
 **Window identity match**:
 A scored comparison between durable evidence and live managed windows that yields one of three outcomes: confident, ambiguous, or no match. Only a confident outcome may authorize a persisted placement.

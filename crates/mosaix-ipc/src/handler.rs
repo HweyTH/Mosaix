@@ -91,6 +91,42 @@ pub struct WorkspaceSwitchingSnapshot {
     pub parking_capability: String,
 }
 
+/// Experimental switching as it is actually behaving right now: what is
+/// in flight, and what an earlier failure left behind (CONTEXT.md
+/// "Workspace switch transaction", "Workspace-switch degraded").
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceSwitchSnapshot {
+    /// The switch in flight, if any.
+    #[serde(default)]
+    pub in_flight: Option<WorkspaceSwitchInFlightSnapshot>,
+    /// The windows an earlier compensation could not put back. Present
+    /// only while the degraded condition stands, and switching is blocked
+    /// for as long as it is.
+    #[serde(default)]
+    pub degraded: Option<WorkspaceSwitchDegradedSnapshot>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceSwitchInFlightSnapshot {
+    pub display_id: isize,
+    pub target: String,
+    pub outgoing: Option<String>,
+    /// `recording`, `parking`, `restoring`, `compensating_park`, or
+    /// `compensating_restore`.
+    pub phase: String,
+    pub parked_windows: Vec<isize>,
+    pub restored_windows: Vec<isize>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceSwitchDegradedSnapshot {
+    pub display_id: isize,
+    pub target: String,
+    pub outgoing: Option<String>,
+    pub stranded_windows: Vec<isize>,
+    pub reason: String,
+}
+
 /// The recovery ledger as published state describes it (ADR 0023).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct RecoverySnapshot {
@@ -102,8 +138,21 @@ pub struct RecoverySnapshot {
     pub parked_windows: Vec<isize>,
     /// Why the last parking request was refused, if it was.
     pub last_parking_refusal: Option<String>,
+    /// The last native park or restore the adapter could not carry out.
+    #[serde(default)]
+    pub last_parking_failure: Option<ParkingFailureSnapshot>,
     /// What startup recovery did with the previous session's entries.
     pub outcomes: Vec<RecoveryOutcomeSnapshot>,
+}
+
+/// A native parking step that failed, with the platform's reason.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ParkingFailureSnapshot {
+    pub window_id: isize,
+    pub entry_id: i64,
+    /// `park` or `restore`.
+    pub stage: String,
+    pub reason: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -166,11 +215,36 @@ pub struct StateSnapshot {
     /// startup recovery found.
     #[serde(default)]
     pub recovery: Option<RecoverySnapshot>,
+    /// A switch in flight, and any condition a failed one left behind.
+    /// `None` when neither is true, which is the normal case.
+    #[serde(default)]
+    pub workspace_switch: Option<WorkspaceSwitchSnapshot>,
     pub paused: bool,
     pub automatic_tiling_active: bool,
     pub automatic_tiling_suspended: bool,
     /// One precedence-resolved status for human-facing clients.
     pub mode: String,
+    /// Every health condition that currently holds, most serious first
+    /// (issue #61).
+    ///
+    /// The three conditions are deliberately distinct facts, each with
+    /// its own detail elsewhere in this snapshot -- `workspace_switch`,
+    /// `persistence_status`, and `degraded_windows` -- because they mean
+    /// different things and clear in different ways. This is the one
+    /// place that orders them, so every client leads with the same one
+    /// rather than each inventing a precedence.
+    ///
+    /// The order is fixed: `workspace_switch_degraded` first, because
+    /// windows are off screen and switching is blocked until someone
+    /// acts; `persistence_degraded` next, because nothing new becomes
+    /// durable; `degraded_tiling` last, because live management
+    /// continues for everything else.
+    #[serde(default)]
+    pub conditions: Vec<String>,
+    /// The condition a client should lead with, or `None` when none
+    /// holds. Always `conditions`' first entry.
+    #[serde(default)]
+    pub primary_condition: Option<String>,
     /// Number of windows whose circuit breaker is currently open (Feature 31).
     /// These windows are excluded from automatic placement until the user
     /// explicitly resets them with a zone-snap command.
@@ -455,6 +529,20 @@ impl From<EngineState> for StateSnapshot {
             "manual"
         }
         .to_owned();
+        let mut conditions: Vec<String> = Vec::new();
+        if state.switch_degraded.is_some() {
+            conditions.push("workspace_switch_degraded".to_owned());
+        }
+        if matches!(
+            state.persistence_health,
+            mosaix_persistence::PersistenceHealth::Degraded { .. }
+        ) {
+            conditions.push("persistence_degraded".to_owned());
+        }
+        if state.automatic_tiling_active && circuit_breaker_count > 0 {
+            conditions.push("degraded_tiling".to_owned());
+        }
+        let primary_condition = conditions.first().cloned();
         let degraded_windows = state
             .windows
             .iter()
@@ -529,6 +617,14 @@ impl From<EngineState> for StateSnapshot {
                 .last_parking_refusal
                 .as_ref()
                 .map(|refusal| refusal.code().to_owned()),
+            last_parking_failure: state.last_parking_failure.as_ref().map(|failure| {
+                ParkingFailureSnapshot {
+                    window_id: failure.window_id.0,
+                    entry_id: failure.entry_id.0,
+                    stage: failure.stage.code().to_owned(),
+                    reason: failure.reason.clone(),
+                }
+            }),
             outcomes: state
                 .recovery_outcomes
                 .iter()
@@ -542,6 +638,40 @@ impl From<EngineState> for StateSnapshot {
                 })
                 .collect(),
         });
+        let workspace_switch =
+            (state.switch.is_some() || state.switch_degraded.is_some()).then(|| {
+                WorkspaceSwitchSnapshot {
+                    in_flight: state.switch.as_ref().map(|switch| {
+                        WorkspaceSwitchInFlightSnapshot {
+                            display_id: switch.display_id.0,
+                            target: switch.target.as_str().to_owned(),
+                            outgoing: switch
+                                .outgoing
+                                .as_ref()
+                                .map(|name| name.as_str().to_owned()),
+                            phase: switch.phase.code().to_owned(),
+                            parked_windows: switch.parked.iter().map(|id| id.0).collect(),
+                            restored_windows: switch.restored.iter().map(|id| id.0).collect(),
+                        }
+                    }),
+                    degraded: state.switch_degraded.as_ref().map(|degraded| {
+                        WorkspaceSwitchDegradedSnapshot {
+                            display_id: degraded.display_id.0,
+                            target: degraded.target.as_str().to_owned(),
+                            outgoing: degraded
+                                .outgoing
+                                .as_ref()
+                                .map(|name| name.as_str().to_owned()),
+                            stranded_windows: degraded
+                                .stranded_windows
+                                .iter()
+                                .map(|id| id.0)
+                                .collect(),
+                            reason: degraded.reason.clone(),
+                        }
+                    }),
+                }
+            });
         let switching_status = state.workspace_switching_status();
         let workspace_switching = Some(WorkspaceSwitchingSnapshot {
             status: switching_status.code().to_owned(),
@@ -666,6 +796,9 @@ impl From<EngineState> for StateSnapshot {
             rule_workspace_refusals,
             workspace_switching,
             recovery,
+            workspace_switch,
+            conditions,
+            primary_condition,
             paused: state.paused,
             automatic_tiling_active: state.automatic_tiling_active,
             automatic_tiling_suspended: state.automatic_tiling_suspended,
@@ -1090,6 +1223,64 @@ pub fn handle_request(
                 Err(refusal) => WorkspaceCommandResult::Refused(refusal),
             };
             workspace_answer(result)
+        }
+        IpcRequest::ParkWindow { window_id } => {
+            let window_id = mosaix_domain::WindowId(*window_id);
+            // The reducer re-reaches this verdict against its own state;
+            // preflighting here is what lets a refusal carry its reason.
+            let result = match mosaix_engine::plan_parking_authorization(
+                &state_reader.snapshot(),
+                window_id,
+            ) {
+                Ok(_) => {
+                    if let other @ IpcResponse::Error { .. } =
+                        send_event(events, Event::ParkingAuthorizationRequested { window_id })
+                    {
+                        return other;
+                    }
+                    mosaix_domain::ParkWindowResult::Requested { window_id }
+                }
+                Err(refusal) => mosaix_domain::ParkWindowResult::Refused(refusal),
+            };
+            IpcResponse::Ok {
+                data: Some(serde_json::to_value(result).expect("park results serialize")),
+            }
+        }
+        IpcRequest::RestoreWorkspaceSwitch => {
+            // Preflighted here so the answer names the windows the
+            // reducer will actually ask for, and refuses to claim a
+            // reconciliation that is not happening.
+            let result = mosaix_engine::plan_workspace_switch_restore(&state_reader.snapshot());
+            if !matches!(
+                result,
+                mosaix_domain::WorkspaceSwitchRestoreResult::NotDegraded
+            ) {
+                if let other @ IpcResponse::Error { .. } =
+                    send_event(events, Event::WorkspaceSwitchRestoreRequested)
+                {
+                    return other;
+                }
+            }
+            IpcResponse::Ok {
+                data: Some(serde_json::to_value(result).expect("switch restore results serialize")),
+            }
+        }
+        IpcRequest::RestoreParkedWindows => {
+            let mut parked: Vec<isize> = state_reader
+                .snapshot()
+                .parked_windows
+                .keys()
+                .map(|window_id| window_id.0)
+                .collect();
+            parked.sort_unstable();
+            if let other @ IpcResponse::Error { .. } =
+                send_event(events, Event::RestoreParkedWindowsRequested)
+            {
+                return other;
+            }
+            IpcResponse::Ok {
+                data: Some(serde_json::json!({ "parked_windows": parked })),
+            }
         }
         IpcRequest::FocusDisplay { display_id } => send_event(
             events,
@@ -1714,6 +1905,7 @@ mod tests {
             durable_revision: 3,
             members: Vec::new(),
             prior_trees: Vec::new(),
+            prior_assignments: Vec::new(),
         });
         state.persistence_health = PersistenceHealth::Degraded {
             last_durable_revision: 3,
@@ -3069,6 +3261,184 @@ mod tests {
             1,
             "a refused name creates nothing"
         );
+    }
+
+    #[test]
+    fn the_three_health_conditions_are_distinct_facts_in_one_fixed_order() {
+        // All three at once: each keeps its own detail elsewhere in the
+        // snapshot, and the order they are listed in is what every client
+        // leads with.
+        let mut state = EngineState::default();
+        state.switch_degraded = Some(mosaix_domain::WorkspaceSwitchDegraded {
+            display_id: mosaix_domain::DisplayId(1),
+            target: mosaix_domain::WorkspaceName::new("chat").unwrap(),
+            outgoing: None,
+            stranded_windows: vec![mosaix_domain::WindowId(41)],
+            reason: "the window would not come back".to_owned(),
+        });
+        state.persistence_health = PersistenceHealth::Degraded {
+            last_durable_revision: 3,
+            reason: mosaix_persistence::PersistenceFailure::WriteFailed,
+        };
+        state.automatic_tiling_active = true;
+        state.windows.insert(
+            WindowId(41),
+            WindowPlacement {
+                display_id: DisplayId(1),
+                bounds: Rect::new(0, 0, 100, 100),
+                observed_bounds: Rect::new(0, 0, 100, 100),
+                previous_placement: None,
+                cycle_step: None,
+                rejection_count: CIRCUIT_BREAKER_THRESHOLD,
+            },
+        );
+
+        let snapshot = StateSnapshot::from(state);
+
+        assert_eq!(
+            snapshot.conditions,
+            vec![
+                "workspace_switch_degraded".to_owned(),
+                "persistence_degraded".to_owned(),
+                "degraded_tiling".to_owned(),
+            ]
+        );
+        assert_eq!(
+            snapshot.primary_condition.as_deref(),
+            Some("workspace_switch_degraded")
+        );
+        assert_eq!(snapshot.persistence_status, "degraded");
+        assert_eq!(snapshot.degraded_windows.len(), 1);
+        assert!(snapshot.workspace_switch.is_some());
+    }
+
+    #[test]
+    fn a_healthy_agent_reports_no_conditions_at_all() {
+        let engine = tiling_engine_with_workspaces(&["dev"]);
+
+        let snapshot = StateSnapshot::from(engine.snapshot());
+
+        assert!(snapshot.conditions.is_empty());
+        assert_eq!(snapshot.primary_condition, None);
+    }
+
+    #[test]
+    fn a_state_snapshot_carries_no_switch_section_when_nothing_is_switching() {
+        let engine = tiling_engine_with_workspaces(&["dev"]);
+
+        let snapshot = StateSnapshot::from(engine.snapshot());
+
+        assert_eq!(
+            snapshot.workspace_switch, None,
+            "the normal case says nothing rather than saying nothing is wrong"
+        );
+    }
+
+    #[test]
+    fn a_degraded_switch_is_published_with_the_windows_it_left_behind() {
+        let mut state = EngineState::default();
+        state.switch_degraded = Some(mosaix_domain::WorkspaceSwitchDegraded {
+            display_id: mosaix_domain::DisplayId(1),
+            target: mosaix_domain::WorkspaceName::new("chat").unwrap(),
+            outgoing: Some(mosaix_domain::WorkspaceName::new("dev").unwrap()),
+            stranded_windows: vec![mosaix_domain::WindowId(41)],
+            reason: "the window would not come back".to_owned(),
+        });
+
+        let json = serde_json::to_value(StateSnapshot::from(state)).unwrap();
+
+        assert_eq!(json["workspace_switch"]["degraded"]["display_id"], 1);
+        assert_eq!(json["workspace_switch"]["degraded"]["target"], "chat");
+        assert_eq!(json["workspace_switch"]["degraded"]["outgoing"], "dev");
+        assert_eq!(
+            json["workspace_switch"]["degraded"]["stranded_windows"],
+            serde_json::json!([41])
+        );
+        assert_eq!(
+            json["workspace_switch"]["in_flight"],
+            serde_json::Value::Null
+        );
+    }
+
+    #[test]
+    fn reconciling_a_switch_that_is_not_degraded_answers_with_a_typed_result_not_an_error() {
+        let engine = tiling_engine_with_workspaces(&["dev"]);
+
+        let response = handle_request(
+            &IpcRequest::RestoreWorkspaceSwitch,
+            &engine.events(),
+            &engine.state_reader(),
+            &no_store(),
+            &no_probe(),
+        );
+
+        let IpcResponse::Ok { data: Some(data) } = response else {
+            panic!("nothing to reconcile is data, not an error: {response:?}");
+        };
+        let result: mosaix_domain::WorkspaceSwitchRestoreResult =
+            serde_json::from_value(data).unwrap();
+        assert_eq!(
+            result,
+            mosaix_domain::WorkspaceSwitchRestoreResult::NotDegraded
+        );
+    }
+
+    #[test]
+    fn parking_an_unmanaged_window_answers_with_a_typed_refusal_not_an_error() {
+        let engine = tiling_engine_with_workspaces(&["dev"]);
+        let response = handle_request(
+            &IpcRequest::ParkWindow { window_id: 404 },
+            &engine.events(),
+            &engine.state_reader(),
+            &no_store(),
+            &no_probe(),
+        );
+
+        let IpcResponse::Ok { data: Some(data) } = response else {
+            panic!("a refusal is data, not an error: {response:?}");
+        };
+        let result: mosaix_domain::ParkWindowResult = serde_json::from_value(data).unwrap();
+        assert_eq!(
+            result,
+            mosaix_domain::ParkWindowResult::Refused(mosaix_domain::ParkingRefusal::NotManaged {
+                window_id: mosaix_domain::WindowId(404),
+            })
+        );
+        assert!(!result.is_applied());
+    }
+
+    #[test]
+    fn restoring_parked_windows_answers_with_the_windows_asked_for() {
+        let engine = tiling_engine_with_workspaces(&["dev"]);
+        let response = handle_request(
+            &IpcRequest::RestoreParkedWindows,
+            &engine.events(),
+            &engine.state_reader(),
+            &no_store(),
+            &no_probe(),
+        );
+
+        let IpcResponse::Ok { data: Some(data) } = response else {
+            panic!("restore answers with data: {response:?}");
+        };
+        assert_eq!(data["parked_windows"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn state_snapshot_reports_the_last_parking_failure_with_its_stage() {
+        let mut state = EngineState::default();
+        state.last_parking_failure = Some(mosaix_domain::ParkingFailure {
+            window_id: mosaix_domain::WindowId(7),
+            entry_id: mosaix_domain::RecoveryEntryId(3),
+            stage: mosaix_domain::ParkingStage::Restore,
+            reason: "SetWindowPlacement failed".to_owned(),
+        });
+
+        let json = serde_json::to_value(StateSnapshot::from(state)).unwrap();
+
+        assert_eq!(json["recovery"]["last_parking_failure"]["window_id"], 7);
+        assert_eq!(json["recovery"]["last_parking_failure"]["entry_id"], 3);
+        assert_eq!(json["recovery"]["last_parking_failure"]["stage"], "restore");
     }
 
     #[test]

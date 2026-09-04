@@ -199,7 +199,19 @@ fn main() {
         }
     };
 
+    // A recoverable parking site is validated for the initial topology
+    // before anything can ask to park (ADR 0023, ADR 0029), and again on
+    // every topology change below. The site itself stays with the agent;
+    // the engine only learns whether one is verified.
+    let parking_site: recovery::SharedParkingSite = Default::default();
+    let initial_parking = recovery::report_parking_capability(&initial_displays, &parking_site);
+
     let engine = mosaix_engine::spawn_engine(initial_displays, initial_config_set);
+    let _ = engine
+        .events()
+        .send(mosaix_engine::Event::ParkingCapabilityReported(
+            initial_parking,
+        ));
 
     // Recovery first (ADR 0023). Before the state database is opened,
     // before any window is observed, and before any stored identity is
@@ -541,13 +553,26 @@ fn main() {
     let watcher_and_forwarder = match mosaix_platform_windows::watch_display_topology() {
         Ok((watcher, topology_events)) => {
             let events = engine.events();
+            let parking_site = parking_site.clone();
             let forwarder = std::thread::spawn(move || {
                 for event in topology_events {
                     match event {
                         mosaix_platform_windows::TopologyEvent::Changed(displays) => {
                             let displays = retry_empty_topology(displays);
+                            // The site is only as good as its topology: a
+                            // display connected beyond the parking edge would
+                            // make parked windows visible, so it is re-validated
+                            // before the engine hears about the change.
+                            //
+                            // The capability goes first, because the topology
+                            // arm is where a vanished display's windows are
+                            // parked (issue #61) and it must decide that
+                            // against the new topology's site, not the old
+                            // one's.
+                            let capability =
+                                recovery::report_parking_capability(&displays, &parking_site);
                             if events
-                                .send(mosaix_engine::Event::DisplayTopologyChanged(displays))
+                                .send(mosaix_engine::Event::ParkingCapabilityReported(capability))
                                 .is_err()
                             {
                                 tracing::warn!(
@@ -555,6 +580,8 @@ fn main() {
                                 );
                                 break;
                             }
+                            let _ =
+                                events.send(mosaix_engine::Event::DisplayTopologyChanged(displays));
                         }
                         // Feature 29 — sleep/wake recovery.
                         //
@@ -576,11 +603,10 @@ fn main() {
                                 window_count = windows.as_ref().map_or(0, Vec::len),
                                 "forwarding wake reconciliation to engine"
                             );
+                            let capability =
+                                recovery::report_parking_capability(&displays, &parking_site);
                             if events
-                                .send(mosaix_engine::Event::WakeReconciliation {
-                                    displays,
-                                    windows,
-                                })
+                                .send(mosaix_engine::Event::ParkingCapabilityReported(capability))
                                 .is_err()
                             {
                                 tracing::warn!(
@@ -588,6 +614,10 @@ fn main() {
                                 );
                                 break;
                             }
+                            let _ = events.send(mosaix_engine::Event::WakeReconciliation {
+                                displays,
+                                windows,
+                            });
                         }
                     }
                 }
@@ -973,6 +1003,8 @@ fn main() {
     let executor_forwarder = {
         let state_reader = engine.state_reader();
         let rejection_events = engine.events();
+        let parking_site = parking_site.clone();
+        let executor_ledger_path = ledger_path.clone();
         std::thread::spawn(move || {
             let mut next_effect = 0usize;
             loop {
@@ -1015,15 +1047,56 @@ fn main() {
                                 entry_id,
                             } => {
                                 // Recovery data for this window is durable, so
-                                // parking is authorised. The parking mechanism
-                                // itself is the subject of the prototype
-                                // (issue #59) and the switch transaction; until
-                                // it lands the window stays visible and no
-                                // parked mark is written.
-                                tracing::warn!(
-                                    ?window_id,
-                                    entry = entry_id.0,
-                                    "parking authorised but no parking mechanism is wired; leaving the window visible"
+                                // parking is authorised (ADR 0023). The window is
+                                // moved beyond the validated edge without
+                                // activation; the reducer marks the entry parked
+                                // only when the move verifiably landed.
+                                let _ = rejection_events.send(
+                                    match recovery::park(window_id, &parking_site) {
+                                        Ok(parked_as) => {
+                                            tracing::info!(
+                                                ?window_id,
+                                                entry = entry_id.0,
+                                                ?parked_as,
+                                                "window parked"
+                                            );
+                                            mosaix_engine::Event::WindowParked {
+                                                window_id,
+                                                entry_id,
+                                            }
+                                        }
+                                        Err(reason) => mosaix_engine::Event::WindowParkFailed {
+                                            window_id,
+                                            entry_id,
+                                            reason,
+                                        },
+                                    },
+                                );
+                            }
+                            mosaix_engine::EngineEffect::RestoreWindow {
+                                window_id,
+                                entry_id,
+                            } => {
+                                let _ = rejection_events.send(
+                                    match recovery::restore_parked_window(
+                                        executor_ledger_path.as_deref(),
+                                        window_id,
+                                        entry_id,
+                                    ) {
+                                        Ok(()) => {
+                                            tracing::info!(
+                                                ?window_id,
+                                                entry = entry_id.0,
+                                                "parked window restored"
+                                            );
+                                            mosaix_engine::Event::WindowRestored { window_id }
+                                        }
+                                        Err(reason) => mosaix_engine::Event::WindowRestoreFailed {
+                                            window_id,
+                                            entry_id,
+                                            reason,
+                                        },
+                                    },
                                 );
                             }
                             mosaix_engine::EngineEffect::PlaceWindow { .. } => unreachable!(),

@@ -10,12 +10,17 @@ use serde::{Deserialize, Serialize};
 /// to 6 for the binding-editing requests, and to 7 when
 /// [`IpcRequest::ProbeHotkey`] gained the command it is probing for, and
 /// to 10 for the four tree-resize requests, to 11 for
-/// [`IpcRequest::RemoveTreePosition`], and to 12 for the four workspace
-/// lifecycle requests and the workspace fields of the state snapshot. An
+/// [`IpcRequest::RemoveTreePosition`], to 12 for the four workspace
+/// lifecycle requests and the workspace fields of the state snapshot, and
+/// to 13 for the experimental parking pair ([`IpcRequest::ParkWindow`],
+/// [`IpcRequest::RestoreParkedWindows`]) and the parking-failure field of
+/// the recovery snapshot, and to 14 for
+/// [`IpcRequest::RestoreWorkspaceSwitch`] and the switch fields of the
+/// state snapshot. An
 /// older agent has no tag for a request this build added -- and no field
 /// for one an existing request grew -- so the version is what makes the
 /// mismatch reportable instead of surfacing as a deserialization failure.
-pub const PROTOCOL_VERSION: u32 = 12;
+pub const PROTOCOL_VERSION: u32 = 14;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct IpcEnvelope {
@@ -100,6 +105,24 @@ pub enum IpcRequest {
         name: String,
         display_id: isize,
     },
+    /// Ask to park one managed window through the experimental public-API
+    /// parking path (CONTEXT.md "Window parking", ADR 0023): recovery data
+    /// is recorded first, and the window leaves visible geometry only once
+    /// that is durable. Answered with a typed
+    /// [`mosaix_domain::ParkWindowResult`]. Hence [`PROTOCOL_VERSION`] 13.
+    ParkWindow {
+        window_id: isize,
+    },
+    /// Put back every window this session parked, through the verified
+    /// restore path. Answered with the windows a restore was asked for.
+    RestoreParkedWindows,
+    /// Reconcile the windows a failed switch compensation left
+    /// unaccounted for, which is the only way out of the
+    /// workspace-switch-degraded condition (CONTEXT.md
+    /// "Workspace-switch degraded"). Answered with a typed
+    /// [`mosaix_domain::WorkspaceSwitchRestoreResult`], hence
+    /// [`PROTOCOL_VERSION`] 14.
+    RestoreWorkspaceSwitch,
     /// Reverse the newest undo transaction, or answer with the typed reason
     /// it was refused (ADR 0024). Carries no options: there is deliberately
     /// no force or best-guess variant, hence [`PROTOCOL_VERSION`] 9.
@@ -338,6 +361,9 @@ mod tests {
                 name: "dev".to_owned(),
                 display_id: 7,
             },
+            IpcRequest::ParkWindow { window_id: 41 },
+            IpcRequest::RestoreParkedWindows,
+            IpcRequest::RestoreWorkspaceSwitch,
             IpcRequest::Undo,
             IpcRequest::ApplyLayout {
                 name: "writing".to_owned(),

@@ -27,21 +27,24 @@ pub use identity::{
     ScoredCandidate, WindowEvidence,
 };
 pub use recovery::{
-    plan_recovery, HandleVerdict, LiveHandleEvidence, ParkingRefusal, ProcessInstance,
-    RecoveryDraft, RecoveryEntry, RecoveryEntryId, RecoveryOutcome, ShowState,
+    plan_recovery, verdict_for, HandleVerdict, LiveHandleEvidence, ParkWindowResult,
+    ParkingFailure, ParkingRefusal, ParkingStage, ProcessInstance, RecoveryDraft, RecoveryEntry,
+    RecoveryEntryId, RecoveryOutcome, ShowState,
 };
 pub use tree::{
     Child, ContainerTree, DividerChange, DormantPosition, Leaf, LeafFate, Node, Occupant,
     PersistedTree, SplitAxis, Toward, Tree, DORMANT_RETENTION_SECONDS,
 };
 pub use undo::{
-    UndoApplied, UndoMember, UndoRefusal, UndoRestoredWindow, UndoResult, UndoTargetOutcome,
-    UndoTransaction, UndoTransactionDraft, UndoTransactionId, UndoTreeSnapshot,
+    UndoApplied, UndoAssignment, UndoMember, UndoRefusal, UndoRestoredWindow, UndoResult,
+    UndoTargetOutcome, UndoTransaction, UndoTransactionDraft, UndoTransactionId, UndoTreeSnapshot,
 };
 pub use window::{Window, WindowCapabilities, WindowLifecycle, WindowRole};
 pub use workspace::{
     ParkingCapability, PersistedWorkspace, SwitchingPending, Workspace, WorkspaceCommandResult,
     WorkspaceCreateApplied, WorkspaceDeleteApplied, WorkspaceFocusApplied, WorkspaceMoveApplied,
     WorkspaceName, WorkspaceNameError, WorkspaceOrigin, WorkspacePool, WorkspaceRefusal,
-    WorkspaceSwitchingStatus, WorkspaceSwitchingUnavailable, MAX_WORKSPACE_NAME_CHARS,
+    WorkspaceSwitchDegraded, WorkspaceSwitchFailed, WorkspaceSwitchPhase,
+    WorkspaceSwitchRestoreResult, WorkspaceSwitchingStatus, WorkspaceSwitchingUnavailable,
+    MAX_WORKSPACE_NAME_CHARS,
 };

@@ -18,6 +18,7 @@ use std::collections::{BTreeMap, HashMap};
 use serde::{Deserialize, Serialize};
 
 use crate::id::{DisplayId, WindowId};
+use crate::recovery::ParkingRefusal;
 use crate::tree::{ContainerTree, PersistedTree};
 
 /// The longest name a workspace may have, in characters. Long enough for
@@ -201,6 +202,42 @@ pub enum WorkspaceRefusal {
     },
     /// Window management is paused.
     Paused,
+    /// The switch would have to move a window, and experimental switching
+    /// is not authorised for this topology. Carries the switching status
+    /// code and the reason behind it, so the caller is told which of the
+    /// four states stands rather than only that it is not `experimental`.
+    SwitchingNotAuthorised {
+        status: String,
+        reason: Option<String>,
+    },
+    /// Committed state is not durable, so no recovery data could be
+    /// promised for the windows the switch would park.
+    PersistenceDegraded,
+    /// Compensation for an earlier switch left windows unaccounted for.
+    /// Switching stays blocked until `restore-switch` reconciles them
+    /// (CONTEXT.md "Workspace-switch degraded").
+    SwitchDegraded { stranded_windows: usize },
+    /// A switch is already in flight; a second one would interleave two
+    /// sets of native moves over the same windows.
+    SwitchInFlight { display_id: DisplayId },
+    /// A window the switch would have to move is full-screen, and no
+    /// window is ever forced out of full-screen (ADR 0029).
+    FullscreenMember {
+        name: WorkspaceName,
+        window_id: WindowId,
+    },
+    /// A window the switch would have to move cannot be parked, for a
+    /// reason the parking authorisation gives. Reached in preflight, so
+    /// nothing has moved.
+    MemberNotParkable {
+        name: WorkspaceName,
+        window_id: WindowId,
+        reason: ParkingRefusal,
+    },
+    /// The display should end up showing no workspace at all, and no
+    /// command does that: every switch names a workspace to show. Reached
+    /// when undo would have to restore an unfilled display.
+    CannotHideWithoutReplacement { display_fingerprint: String },
 }
 
 impl WorkspaceRefusal {
@@ -218,6 +255,13 @@ impl WorkspaceRefusal {
             Self::UnknownDisplay { .. } => "unknown_display",
             Self::AlreadyDisplayedThere { .. } => "already_displayed_there",
             Self::Paused => "paused",
+            Self::SwitchingNotAuthorised { .. } => "switching_not_authorised",
+            Self::PersistenceDegraded => "persistence_degraded",
+            Self::SwitchDegraded { .. } => "switch_degraded",
+            Self::SwitchInFlight { .. } => "switch_in_flight",
+            Self::FullscreenMember { .. } => "fullscreen_member",
+            Self::MemberNotParkable { .. } => "member_not_parkable",
+            Self::CannotHideWithoutReplacement { .. } => "cannot_hide_without_replacement",
         }
     }
 }
@@ -263,6 +307,47 @@ impl std::fmt::Display for WorkspaceRefusal {
                 display_id.0
             ),
             Self::Paused => formatter.write_str("window management is paused"),
+            Self::SwitchingNotAuthorised { status, reason } => match reason {
+                Some(reason) => write!(
+                    formatter,
+                    "experimental workspace switching is {status}: {reason}"
+                ),
+                None => write!(formatter, "experimental workspace switching is {status}"),
+            },
+            Self::PersistenceDegraded => formatter.write_str(
+                "the state database is not durable, so no window may be parked for a switch",
+            ),
+            Self::SwitchDegraded { stranded_windows } => write!(
+                formatter,
+                "an earlier switch left {stranded_windows} window(s) unaccounted for; \
+                 run `workspace restore-switch` before switching again"
+            ),
+            Self::SwitchInFlight { display_id } => write!(
+                formatter,
+                "a workspace switch is already in flight on display {}",
+                display_id.0
+            ),
+            Self::FullscreenMember { name, window_id } => write!(
+                formatter,
+                "window {} of workspace {name} is full-screen and is never forced out of it",
+                window_id.0
+            ),
+            Self::MemberNotParkable {
+                name,
+                window_id,
+                reason,
+            } => write!(
+                formatter,
+                "window {} of workspace {name} cannot be parked: {reason}",
+                window_id.0
+            ),
+            Self::CannotHideWithoutReplacement {
+                display_fingerprint,
+            } => write!(
+                formatter,
+                "display {display_fingerprint:?} showed no workspace, and no command hides one \
+                 without showing another"
+            ),
         }
     }
 }
@@ -286,6 +371,19 @@ pub enum WorkspaceFocusApplied {
         display_id: DisplayId,
         focused_window: Option<WindowId>,
     },
+    /// The switch has windows to move, so it runs as a transaction
+    /// (CONTEXT.md "Workspace switch transaction") and has only started.
+    /// The displayed assignment does not change until every move lands;
+    /// a failure compensates and leaves `replaced` displayed.
+    SwitchStarted {
+        name: WorkspaceName,
+        display_id: DisplayId,
+        replaced: Option<WorkspaceName>,
+        /// How many windows leave the screen.
+        parking: usize,
+        /// How many of the target workspace's parked windows come back.
+        restoring: usize,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -308,6 +406,22 @@ pub struct WorkspaceDeleteApplied {
     pub name: WorkspaceName,
 }
 
+/// A workspace switch that could not be completed. The displayed
+/// assignment is unchanged either way: what differs is whether every
+/// window this transaction had already moved got back where it was.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceSwitchFailed {
+    pub name: WorkspaceName,
+    pub display_id: DisplayId,
+    /// The platform's reason for the move that failed.
+    pub reason: String,
+    /// Whether compensation put every moved window back.
+    pub compensated: bool,
+    /// The windows compensation could not account for. Empty when
+    /// `compensated`.
+    pub stranded_windows: Vec<WindowId>,
+}
+
 /// The typed answer to any workspace lifecycle command.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WorkspaceCommandResult {
@@ -315,12 +429,15 @@ pub enum WorkspaceCommandResult {
     Deleted(WorkspaceDeleteApplied),
     Focused(WorkspaceFocusApplied),
     Moved(WorkspaceMoveApplied),
+    /// A switch transaction ran and was cancelled. Distinct from
+    /// `Refused`, which means nothing moved at all.
+    SwitchFailed(WorkspaceSwitchFailed),
     Refused(WorkspaceRefusal),
 }
 
 impl WorkspaceCommandResult {
     pub const fn is_applied(&self) -> bool {
-        !matches!(self, Self::Refused(_))
+        !matches!(self, Self::Refused(_) | Self::SwitchFailed(_))
     }
 }
 
@@ -435,6 +552,90 @@ impl WorkspaceSwitchingStatus {
             Self::Requested { .. } => "requested",
             Self::Unavailable { .. } => "unavailable",
             Self::Experimental => "experimental",
+        }
+    }
+}
+
+/// Which step of a workspace switch transaction is in flight (CONTEXT.md
+/// "Workspace switch transaction").
+///
+/// The two forward phases run in order: everything the outgoing workspace
+/// still shows leaves the screen before anything the target workspace
+/// parked comes back, so the two sets never overlap. The two compensating
+/// phases undo that in the mirror order for the same reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WorkspaceSwitchPhase {
+    /// Recovery data is being recorded for the outgoing windows. No
+    /// window has moved yet, so cancelling here moves nothing back.
+    Recording,
+    /// The outgoing workspace's windows are being parked.
+    Parking,
+    /// The target workspace's parked windows are being restored.
+    Restoring,
+    /// A failure was seen; windows this transaction restored are going
+    /// back to the parking site.
+    CompensatingPark,
+    /// Windows this transaction parked are going back on screen.
+    CompensatingRestore,
+}
+
+impl WorkspaceSwitchPhase {
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::Recording => "recording",
+            Self::Parking => "parking",
+            Self::Restoring => "restoring",
+            Self::CompensatingPark => "compensating_park",
+            Self::CompensatingRestore => "compensating_restore",
+        }
+    }
+
+    /// Whether the transaction is undoing its own work rather than
+    /// carrying the switch forward.
+    pub const fn is_compensating(&self) -> bool {
+        matches!(self, Self::CompensatingPark | Self::CompensatingRestore)
+    }
+}
+
+/// The health condition a failed compensation leaves behind (CONTEXT.md
+/// "Workspace-switch degraded").
+///
+/// It names the windows compensation could not account for, because those
+/// are what the explicit restore path has to reconcile. Switching stays
+/// blocked while this stands: a second switch over windows whose real
+/// position is unknown would compound the problem rather than fix it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceSwitchDegraded {
+    pub display_id: DisplayId,
+    /// The workspace the failed switch was trying to display.
+    pub target: WorkspaceName,
+    /// The workspace that was displayed, and still is: a failed switch
+    /// never changes the displayed assignment.
+    pub outgoing: Option<WorkspaceName>,
+    /// The windows compensation could not put back where they were.
+    pub stranded_windows: Vec<WindowId>,
+    /// The platform's reason for the failure that started this.
+    pub reason: String,
+}
+
+/// What an explicit `restore-switch` did about a degraded switch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WorkspaceSwitchRestoreResult {
+    /// Every stranded window was put back and switching is unblocked.
+    Reconciled { restored_windows: Vec<WindowId> },
+    /// Restoration was asked for and windows are on their way back; the
+    /// condition clears when the last one lands.
+    Requested { windows: Vec<WindowId> },
+    /// There was no degraded switch to reconcile.
+    NotDegraded,
+}
+
+impl WorkspaceSwitchRestoreResult {
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::Reconciled { .. } => "reconciled",
+            Self::Requested { .. } => "requested",
+            Self::NotDegraded => "not_degraded",
         }
     }
 }
@@ -715,7 +916,7 @@ mod tests {
     #[test]
     fn names_are_trimmed_and_refuse_empty_long_and_forbidden() {
         assert_eq!(name("  dev ").as_str(), "dev");
-        assert_eq!(WorkspaceName::new("   "), Err(WorkspaceNameError::Empty));
+        assert_eq!(WorkspaceName::new(" "), Err(WorkspaceNameError::Empty));
         assert_eq!(
             WorkspaceName::new(&"x".repeat(65)),
             Err(WorkspaceNameError::TooLong { chars: 65 })
