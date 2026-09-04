@@ -6,6 +6,7 @@ pub mod display;
 pub mod geometry;
 pub mod id;
 pub mod identity;
+pub mod recovery;
 pub mod tree;
 pub mod undo;
 pub mod window;
@@ -24,6 +25,10 @@ pub use id::{ApplicationId, DisplayId, WindowId};
 pub use identity::{
     match_window, match_window_with_order, EvidenceContribution, EvidenceSignal, MatchOutcome,
     ScoredCandidate, WindowEvidence,
+};
+pub use recovery::{
+    plan_recovery, HandleVerdict, LiveHandleEvidence, ParkingRefusal, ProcessInstance,
+    RecoveryDraft, RecoveryEntry, RecoveryEntryId, RecoveryOutcome, ShowState,
 };
 pub use tree::{
     Child, ContainerTree, DividerChange, DormantPosition, Leaf, LeafFate, Node, Occupant,

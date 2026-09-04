@@ -113,6 +113,21 @@ enum Command {
         #[command(subcommand)]
         action: PersistenceAction,
     },
+    /// Put back every window a Mosaix session parked and never restored,
+    /// without the agent running.
+    ///
+    /// Reads the recovery ledger directly and touches only a handle that
+    /// still verifiably names the window it recorded: same process
+    /// instance, same window class. A stale, reused, or ambiguous handle
+    /// is reported and left alone. Refuses while an agent is running,
+    /// because the running agent owns the ledger; stop it first, or pass
+    /// `--force` to proceed anyway.
+    RestoreWindows {
+        #[arg(long)]
+        force: bool,
+        #[arg(long)]
+        json: bool,
+    },
     State {
         #[arg(long)]
         json: bool,
@@ -232,6 +247,10 @@ fn main() {
         run_persistence(action);
         return;
     }
+    if let Command::RestoreWindows { force, json } = cli.command {
+        run_restore_windows(force, json);
+        return;
+    }
     // Arrangement reads fields the agent already publishes and renders
     // them, rather than asking for a report the agent does not have.
     if let Command::Arrangement { json } = cli.command {
@@ -314,6 +333,7 @@ fn main() {
         Command::State { .. } => IpcRequest::GetState,
         Command::Ping => IpcRequest::Ping,
         Command::Persistence { .. }
+        | Command::RestoreWindows { .. }
         | Command::Undo { .. }
         | Command::Arrangement { .. }
         | Command::Resize { .. }
@@ -1067,6 +1087,102 @@ fn published_persistence() -> Option<serde_json::Value> {
     }
 }
 
+/// Renders recovery outcomes for a person, one line per entry.
+fn format_recovery(outcomes: &[mosaix_domain::RecoveryOutcome]) -> String {
+    if outcomes.is_empty() {
+        return "no parked windows to restore".to_owned();
+    }
+    let mut lines = Vec::with_capacity(outcomes.len() + 1);
+    let restored = outcomes.iter().filter(|outcome| outcome.restored).count();
+    lines.push(format!(
+        "restored {restored} of {} parked window(s)",
+        outcomes.len()
+    ));
+    for outcome in outcomes {
+        let what = match (&outcome.verdict, outcome.restored, &outcome.failure) {
+            (mosaix_domain::HandleVerdict::Verified, true, _) => "restored".to_owned(),
+            (mosaix_domain::HandleVerdict::Verified, false, Some(failure)) => {
+                format!("verified but not restored: {failure}")
+            }
+            (mosaix_domain::HandleVerdict::Verified, false, None) => {
+                "verified but not restored".to_owned()
+            }
+            (mosaix_domain::HandleVerdict::Stale, ..) => {
+                "left alone: the handle no longer names a window".to_owned()
+            }
+            (mosaix_domain::HandleVerdict::Reused { .. }, ..) => {
+                "left alone: the handle now names a different window".to_owned()
+            }
+            (mosaix_domain::HandleVerdict::Ambiguous { claimants }, ..) => {
+                format!("left alone: {claimants} entries claim this handle")
+            }
+        };
+        lines.push(format!(
+            "  entry {} window {} ({}): {what}",
+            outcome.entry_id.0, outcome.native_handle, outcome.application_id.0
+        ));
+    }
+    lines.join("\n")
+}
+
+#[cfg(windows)]
+fn run_restore_windows(force: bool, json: bool) {
+    use mosaix_ipc::{send_request, IpcRequest, IpcResponse};
+
+    if !force {
+        if let Ok(IpcResponse::Ok { .. }) = send_request(IpcRequest::Ping) {
+            eprintln!(
+                "mosaix: an agent is running and owns the recovery ledger; \
+                 stop it first, or pass --force to restore anyway"
+            );
+            std::process::exit(1);
+        }
+    }
+    let Some(path) = mosaix_persistence::default_ledger_path() else {
+        eprintln!("mosaix: this platform has no recovery ledger location");
+        std::process::exit(2);
+    };
+    let mut ledger = match mosaix_persistence::RecoveryLedger::open(&path) {
+        Ok(ledger) => ledger,
+        Err(error) => {
+            eprintln!("mosaix: could not open the recovery ledger: {error}");
+            std::process::exit(2);
+        }
+    };
+    let outcomes = match mosaix_persistence::recover_parked_windows(
+        &mut ledger,
+        |handle| {
+            mosaix_platform_windows::probe_handle(mosaix_platform_windows::WindowHandle(handle))
+        },
+        |entry| {
+            mosaix_platform_windows::restore_window(
+                mosaix_platform_windows::WindowHandle(entry.draft.native_handle),
+                entry,
+            )
+            .map_err(|error| error.to_string())
+        },
+    ) {
+        Ok(outcomes) => outcomes,
+        Err(error) => {
+            eprintln!("mosaix: could not read the recovery ledger: {error}");
+            std::process::exit(2);
+        }
+    };
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&outcomes).expect("outcomes serialize")
+        );
+    } else {
+        println!("{}", format_recovery(&outcomes));
+    }
+    if outcomes.iter().any(|outcome| {
+        outcome.verdict == mosaix_domain::HandleVerdict::Verified && !outcome.restored
+    }) {
+        std::process::exit(1);
+    }
+}
+
 #[cfg(windows)]
 fn run_persistence(action: PersistenceAction) {
     match action {
@@ -1431,5 +1547,34 @@ mod tests {
         });
 
         assert!(format_switching(&state).starts_with("workspace switching: disabled"));
+    }
+
+    #[test]
+    fn restore_windows_renders_each_verdict_and_the_count_restored() {
+        let outcome = |id: i64, verdict: mosaix_domain::HandleVerdict, restored: bool| {
+            mosaix_domain::RecoveryOutcome {
+                entry_id: mosaix_domain::RecoveryEntryId(id),
+                native_handle: 100 + id as isize,
+                application_id: mosaix_domain::ApplicationId("code.exe".to_owned()),
+                verdict,
+                restored,
+                failure: None,
+            }
+        };
+        let outcomes = vec![
+            outcome(1, mosaix_domain::HandleVerdict::Verified, true),
+            outcome(2, mosaix_domain::HandleVerdict::Stale, false),
+            outcome(
+                3,
+                mosaix_domain::HandleVerdict::Ambiguous { claimants: 2 },
+                false,
+            ),
+        ];
+
+        assert_eq!(
+            format_recovery(&outcomes),
+            "restored 1 of 3 parked window(s)\n  entry 1 window 101 (code.exe): restored\n  entry 2 window 102 (code.exe): left alone: the handle no longer names a window\n  entry 3 window 103 (code.exe): left alone: 2 entries claim this handle"
+        );
+        assert_eq!(format_recovery(&[]), "no parked windows to restore");
     }
 }

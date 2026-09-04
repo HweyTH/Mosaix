@@ -21,6 +21,8 @@
 mod hotkeys;
 #[cfg(windows)]
 mod overlay;
+#[cfg(windows)]
+mod recovery;
 
 /// Starts `RegisterHotKey` registration for `bindings` and a forwarder
 /// thread translating each firing into `Event::ZoneSnapRequested`,
@@ -199,13 +201,56 @@ fn main() {
 
     let engine = mosaix_engine::spawn_engine(initial_displays, initial_config_set);
 
+    // Recovery first (ADR 0023). Before the state database is opened,
+    // before any window is observed, and before any stored identity is
+    // matched, every window a previous session parked and never put back
+    // is restored -- if its handle still verifiably names that window.
+    // A stale or reused handle is reported and left alone. Doing this
+    // before the worker starts is what makes "recovery precedes
+    // reconciliation" a fact of ordering rather than a hope.
+    let session_id = engine.state_reader().snapshot().session_id;
+    let ledger_path = mosaix_persistence::default_ledger_path();
+    if let Some(path) = &ledger_path {
+        match mosaix_persistence::RecoveryLedger::open(path) {
+            Ok(mut ledger) => {
+                let outcomes = recovery::recover_with_platform(&mut ledger);
+                match &outcomes {
+                    Ok(outcomes) => {
+                        for outcome in outcomes {
+                            tracing::info!(
+                                entry = outcome.entry_id.0,
+                                handle = outcome.native_handle,
+                                verdict = outcome.verdict.code(),
+                                restored = outcome.restored,
+                                failure = outcome.failure.as_deref().unwrap_or(""),
+                                "startup recovery"
+                            );
+                        }
+                        let _ = engine
+                            .events()
+                            .send(mosaix_engine::Event::RecoveryReported(outcomes.clone()));
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, "startup recovery could not read the ledger");
+                    }
+                }
+                if let Err(error) = ledger.prune(&session_id) {
+                    tracing::warn!(%error, "recovery ledger could not be pruned");
+                }
+            }
+            Err(error) => {
+                tracing::error!(%error, "recovery ledger could not be opened; no window will be parked this session");
+            }
+        }
+    }
+
     // The worker owns the per-user bundled-SQLite connection. A failure is
     // deliberately reflected into reducer state instead of aborting live
     // window management.
     let persistence_path = mosaix_persistence::default_database_path();
     let persistence_start_failure = std::sync::Arc::new(std::sync::Mutex::new(None));
     let persistence_worker = persistence_path.as_ref().and_then(|path| {
-        mosaix_persistence::PersistenceWorker::start(path)
+        mosaix_persistence::PersistenceWorker::start_with_ledger(path, ledger_path.as_deref())
             .map_err(|error| {
                 tracing::error!(%error, "persistence worker could not start");
                 *persistence_start_failure
@@ -275,6 +320,24 @@ fn main() {
                         mosaix_engine::PersistenceIntent::DeleteWorkspace(name) => {
                             mosaix_persistence::PersistenceRequest::DeleteWorkspace(name.clone())
                         }
+                        mosaix_engine::PersistenceIntent::RecordRecovery { token, draft } => {
+                            // The reducer has no platform access, so the
+                            // process instance and the true show state are
+                            // read here, from the live window, before the
+                            // entry is written.
+                            let mut draft = (**draft).clone();
+                            recovery::enrich_draft(&mut draft);
+                            mosaix_persistence::PersistenceRequest::RecordRecovery {
+                                token: *token,
+                                draft: Box::new(draft),
+                            }
+                        }
+                        mosaix_engine::PersistenceIntent::MarkParked(id) => {
+                            mosaix_persistence::PersistenceRequest::MarkParked(*id)
+                        }
+                        mosaix_engine::PersistenceIntent::MarkRestored(id) => {
+                            mosaix_persistence::PersistenceRequest::MarkRestored(*id)
+                        }
                     };
                     if worker.submit(request).is_err() {
                         submission_failed = true;
@@ -332,6 +395,14 @@ fn main() {
                     }
                     if let Some(workspaces) = update.restored_workspaces {
                         let _ = events.send(mosaix_engine::Event::WorkspacesLoaded(workspaces));
+                    }
+                    for (token, entry) in update.recovery_acknowledged {
+                        let _ = events.send(match entry {
+                            Some(entry_id) => {
+                                mosaix_engine::Event::RecoveryEntryDurable { token, entry_id }
+                            }
+                            None => mosaix_engine::Event::RecoveryEntryRefused { token },
+                        });
                     }
                 }
 
@@ -939,6 +1010,22 @@ fn main() {
                                     }
                                 }
                             }
+                            mosaix_engine::EngineEffect::ParkWindow {
+                                window_id,
+                                entry_id,
+                            } => {
+                                // Recovery data for this window is durable, so
+                                // parking is authorised. The parking mechanism
+                                // itself is the subject of the prototype
+                                // (issue #59) and the switch transaction; until
+                                // it lands the window stays visible and no
+                                // parked mark is written.
+                                tracing::warn!(
+                                    ?window_id,
+                                    entry = entry_id.0,
+                                    "parking authorised but no parking mechanism is wired; leaving the window visible"
+                                );
+                            }
                             mosaix_engine::EngineEffect::PlaceWindow { .. } => unreachable!(),
                         }
                         continue;
@@ -1173,6 +1260,29 @@ fn main() {
         server.stop();
     }
     engine.stop();
+
+    // A clean exit puts back everything this session parked, through the
+    // same verified path startup recovery uses, so a stop-and-uninstall
+    // never leaves a window off screen (ADR 0023). The worker has stopped
+    // by now, so the ledger is reopened here without contention.
+    if let Some(path) = &ledger_path {
+        match mosaix_persistence::RecoveryLedger::open(path) {
+            Ok(mut ledger) => match recovery::recover_with_platform(&mut ledger) {
+                Ok(outcomes) => {
+                    let restored = outcomes.iter().filter(|outcome| outcome.restored).count();
+                    if !outcomes.is_empty() {
+                        tracing::info!(
+                            restored,
+                            total = outcomes.len(),
+                            "clean exit restored parked windows"
+                        );
+                    }
+                }
+                Err(error) => tracing::error!(%error, "clean exit could not read the ledger"),
+            },
+            Err(error) => tracing::error!(%error, "clean exit could not open the ledger"),
+        }
+    }
     tracing::info!("mosaix-agent stopped");
 }
 

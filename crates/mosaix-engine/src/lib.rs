@@ -46,6 +46,7 @@ use mosaix_domain::commands::{
     TreeResizeApplied, TreeResizeRefusal, TREE_RESIZE_STEP_PERCENT,
 };
 use mosaix_domain::identity::{match_window_with_order, MatchOutcome, WindowEvidence};
+use mosaix_domain::recovery::{ParkingRefusal, RecoveryDraft, RecoveryEntryId, RecoveryOutcome};
 use mosaix_domain::tree::{
     ContainerTree, DormantPosition, LeafFate, Occupant, PersistedTree, SplitAxis, Toward,
 };
@@ -98,6 +99,15 @@ pub enum EngineEffect {
     },
     /// Requests a fresh native display/window observation before recovery.
     ReconcileWindows,
+    /// Move `window_id` out of visible geometry. Emitted only once the
+    /// recovery ledger has acknowledged entry `entry_id` as durable
+    /// (ADR 0023), so a crash between this effect and its completion
+    /// still leaves enough on disk to put the window back. The adapter
+    /// answers with [`Event::WindowParked`] when the move landed.
+    ParkWindow {
+        window_id: WindowId,
+        entry_id: RecoveryEntryId,
+    },
 }
 
 /// A durable write the reducer has committed to but does not perform.
@@ -129,6 +139,25 @@ pub enum PersistenceIntent {
     SaveWorkspace(Box<PersistedWorkspace>),
     /// Forget a workspace the user deleted.
     DeleteWorkspace(WorkspaceName),
+    /// Record recovery data for a window about to be parked. Acknowledged
+    /// back through [`Event::RecoveryEntryDurable`] with the same token;
+    /// until then the window is pending and no parking effect exists.
+    RecordRecovery {
+        token: u64,
+        draft: Box<RecoveryDraft>,
+    },
+    /// The parking effect for this entry was carried out.
+    MarkParked(RecoveryEntryId),
+    /// The window this entry describes is back in visible geometry.
+    MarkRestored(RecoveryEntryId),
+}
+
+/// A window waiting for its recovery entry to become durable before it
+/// may be parked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingParking {
+    pub token: u64,
+    pub window_id: WindowId,
 }
 
 /// A rule named a workspace the pool does not hold. The window stays in
@@ -295,6 +324,21 @@ pub struct EngineState {
     /// site for this topology (ADR 0023). Parking is authorised only on
     /// `Verified`; nothing in the reducer verifies it.
     pub parking_capability: ParkingCapability,
+    /// This agent session's identity in the recovery ledger, so a later
+    /// session can tell its own entries from a previous session's.
+    pub session_id: String,
+    /// Windows whose recovery entry has been requested but not yet
+    /// acknowledged durable. No parking effect exists for any of them.
+    pub pending_parking: Vec<PendingParking>,
+    next_parking_token: u64,
+    /// Every window this session has parked, with the ledger entry that
+    /// authorised it. Restoration consumes the entry.
+    pub parked_windows: HashMap<WindowId, RecoveryEntryId>,
+    /// What the last parking authorisation request concluded.
+    pub last_parking_refusal: Option<ParkingRefusal>,
+    /// What startup recovery did with the previous session's ledger:
+    /// each open entry's verdict and whether its window was put back.
+    pub recovery_outcomes: Vec<RecoveryOutcome>,
     pub displays: Vec<Display>,
     /// Where each tracked window currently sits, keyed by window. Entries
     /// are created (and their `previous_placement` remembered) by
@@ -639,6 +683,46 @@ pub enum Event {
         name: String,
         display_id: DisplayId,
     },
+
+    /// What the platform adapter concluded about a recoverable parking
+    /// site for the current topology (ADR 0023).
+    ParkingCapabilityReported(ParkingCapability),
+
+    /// Ask to park `window_id`. Every refusal is typed and reached by
+    /// [`plan_parking_authorization`] before any write; on success the
+    /// reducer records a recovery intent and waits, emitting no parking
+    /// effect until [`Event::RecoveryEntryDurable`] answers.
+    ParkingAuthorizationRequested {
+        window_id: WindowId,
+    },
+
+    /// The ledger made the entry for `token` durable. This, and only
+    /// this, authorises the parking effect.
+    RecoveryEntryDurable {
+        token: u64,
+        entry_id: RecoveryEntryId,
+    },
+
+    /// The ledger could not write the entry for `token`. The window
+    /// stays visible.
+    RecoveryEntryRefused {
+        token: u64,
+    },
+
+    /// The adapter carried out the parking effect for `entry_id`.
+    WindowParked {
+        window_id: WindowId,
+        entry_id: RecoveryEntryId,
+    },
+
+    /// The window `entry_id` described is back in visible geometry.
+    WindowRestored {
+        window_id: WindowId,
+    },
+
+    /// What startup recovery did with the previous session's ledger,
+    /// published so state and clients can report it.
+    RecoveryReported(Vec<RecoveryOutcome>),
 
     /// A window was snapped or otherwise placed at `bounds` on
     /// `display_id`. Producers (a zone-snap command that resolved bounds
@@ -1363,6 +1447,97 @@ fn apply(state: &mut EngineState, event: Event) {
                 }
             };
             state.last_workspace_result = Some(result);
+            state.revision += 1;
+        }
+
+        Event::ParkingCapabilityReported(capability) => {
+            if state.parking_capability != capability {
+                state.parking_capability = capability;
+                state.revision += 1;
+            }
+        }
+
+        Event::ParkingAuthorizationRequested { window_id } => {
+            match plan_parking_authorization(state, window_id) {
+                Ok(draft) => {
+                    state.next_parking_token += 1;
+                    let token = state.next_parking_token;
+                    state
+                        .pending_parking
+                        .push(PendingParking { token, window_id });
+                    state
+                        .persistence_intents
+                        .push(PersistenceIntent::RecordRecovery {
+                            token,
+                            draft: Box::new(draft),
+                        });
+                    state.last_parking_refusal = None;
+                }
+                Err(refusal) => {
+                    tracing::info!(%refusal, "parking refused; the window stays visible");
+                    state.last_parking_refusal = Some(refusal);
+                }
+            }
+            state.revision += 1;
+        }
+
+        Event::RecoveryEntryDurable { token, entry_id } => {
+            let Some(index) = state
+                .pending_parking
+                .iter()
+                .position(|pending| pending.token == token)
+            else {
+                return;
+            };
+            let pending = state.pending_parking.remove(index);
+            // Recovery data is durable; the window may leave visible
+            // geometry now, and not before (ADR 0023). A window that has
+            // since left management is not parked at all.
+            if state.inventory.contains_key(&pending.window_id) {
+                state.effects.push(EngineEffect::ParkWindow {
+                    window_id: pending.window_id,
+                    entry_id,
+                });
+            }
+            state.revision += 1;
+        }
+
+        Event::RecoveryEntryRefused { token } => {
+            let before = state.pending_parking.len();
+            state
+                .pending_parking
+                .retain(|pending| pending.token != token);
+            if state.pending_parking.len() != before {
+                tracing::warn!(
+                    token,
+                    "recovery data was not durable; the window stays visible"
+                );
+                state.revision += 1;
+            }
+        }
+
+        Event::WindowParked {
+            window_id,
+            entry_id,
+        } => {
+            state.parked_windows.insert(window_id, entry_id);
+            state
+                .persistence_intents
+                .push(PersistenceIntent::MarkParked(entry_id));
+            state.revision += 1;
+        }
+
+        Event::WindowRestored { window_id } => {
+            if let Some(entry_id) = state.parked_windows.remove(&window_id) {
+                state
+                    .persistence_intents
+                    .push(PersistenceIntent::MarkRestored(entry_id));
+                state.revision += 1;
+            }
+        }
+
+        Event::RecoveryReported(outcomes) => {
+            state.recovery_outcomes = outcomes;
             state.revision += 1;
         }
 
@@ -2839,6 +3014,63 @@ fn persist_workspaces(state: &mut EngineState) {
     }
 }
 
+/// Decides whether `window_id` may be parked, and with what recovery
+/// data, without recording anything (ADR 0023).
+///
+/// Every refusal comes before the draft exists: a degraded state
+/// database, an unverified or refused parking site, a full-screen
+/// window, or a window the topology cannot place. The draft's process
+/// creation time is left for the agent, which has platform access, to
+/// fill in before the entry is written.
+pub fn plan_parking_authorization(
+    state: &EngineState,
+    window_id: WindowId,
+) -> Result<RecoveryDraft, ParkingRefusal> {
+    let managed = state
+        .inventory
+        .get(&window_id)
+        .ok_or(ParkingRefusal::NotManaged { window_id })?;
+    if matches!(state.persistence_health, PersistenceHealth::Degraded { .. }) {
+        return Err(ParkingRefusal::PersistenceDegraded);
+    }
+    match &state.parking_capability {
+        ParkingCapability::Verified => {}
+        ParkingCapability::Unverified => return Err(ParkingRefusal::ParkingCapabilityUnverified),
+        ParkingCapability::Refused { reason } => {
+            return Err(ParkingRefusal::ParkingRefused {
+                reason: reason.clone(),
+            })
+        }
+    }
+    if managed.window.lifecycle == WindowLifecycle::Fullscreen {
+        return Err(ParkingRefusal::Fullscreen { window_id });
+    }
+    if state
+        .pending_parking
+        .iter()
+        .any(|pending| pending.window_id == window_id)
+    {
+        return Err(ParkingRefusal::AlreadyPending { window_id });
+    }
+    let fingerprint = display_fingerprint_of(state, managed.window.display_id)
+        .ok_or(ParkingRefusal::UnknownDisplay { window_id })?;
+    // The normal bounds are the placement the reducer intends when the
+    // window is not maximised; a maximised window's `bounds` is its
+    // maximised extent, so the last intended placement stands in.
+    let normal_bounds = state
+        .windows
+        .get(&window_id)
+        .map(|placement| placement.bounds)
+        .unwrap_or(managed.window.bounds);
+    Ok(RecoveryDraft::capture(
+        &managed.window,
+        &state.session_id,
+        &fingerprint,
+        normal_bounds,
+        now_unix(),
+    ))
+}
+
 /// Decides what creating a workspace would do, without doing it.
 pub fn plan_workspace_create(
     state: &EngineState,
@@ -4287,6 +4519,15 @@ pub fn spawn_engine_with_capacity(
         rule_workspace_refusals: Vec::new(),
         switching_unavailable: None,
         parking_capability: ParkingCapability::Unverified,
+        // One identity per process start: a restarted agent has a new
+        // one, so a previous session's ledger entries are never mistaken
+        // for this session's own.
+        session_id: format!("{}-{}", std::process::id(), now_unix()),
+        pending_parking: Vec::new(),
+        next_parking_token: 0,
+        parked_windows: HashMap::new(),
+        last_parking_refusal: None,
+        recovery_outcomes: Vec::new(),
         displays: initial_displays,
         windows: HashMap::new(),
         inventory: HashMap::new(),
@@ -8264,7 +8505,10 @@ mod tests {
                 PersistenceIntent::ConsumeUndoTransaction(_)
                 | PersistenceIntent::SaveContainerTree { .. }
                 | PersistenceIntent::SaveWorkspace(_)
-                | PersistenceIntent::DeleteWorkspace(_) => None,
+                | PersistenceIntent::DeleteWorkspace(_)
+                | PersistenceIntent::RecordRecovery { .. }
+                | PersistenceIntent::MarkParked(_)
+                | PersistenceIntent::MarkRestored(_) => None,
             })
             .collect()
     }
@@ -12025,5 +12269,273 @@ mod tests {
             state.workspaces.displayed(),
             vec![(DisplayId(1), ws("chat"))]
         );
+    }
+
+    // ---- Recovery ledger authorisation (ADR 0023, issue #58) ----------
+
+    fn parkable_state() -> EngineState {
+        let mut state = workspace_state(&[1], &["dev"]);
+        state.session_id = "session-1".to_owned();
+        state.parking_capability = ParkingCapability::Verified;
+        observe(
+            &mut state,
+            vec![app_window_at(1, "a.exe", 1, Rect::new(0, 0, 400, 300))],
+        );
+        state
+    }
+
+    fn recovery_intents(state: &EngineState) -> Vec<&PersistenceIntent> {
+        state
+            .persistence_intents
+            .iter()
+            .filter(|intent| {
+                matches!(
+                    intent,
+                    PersistenceIntent::RecordRecovery { .. }
+                        | PersistenceIntent::MarkParked(_)
+                        | PersistenceIntent::MarkRestored(_)
+                )
+            })
+            .collect()
+    }
+
+    fn park_effects(state: &EngineState) -> Vec<(WindowId, RecoveryEntryId)> {
+        state
+            .effects
+            .iter()
+            .filter_map(|effect| match effect {
+                EngineEffect::ParkWindow {
+                    window_id,
+                    entry_id,
+                } => Some((*window_id, *entry_id)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn parking_is_authorised_only_after_the_ledger_acknowledges_the_entry() {
+        let mut state = parkable_state();
+
+        apply(
+            &mut state,
+            Event::ParkingAuthorizationRequested {
+                window_id: WindowId(1),
+            },
+        );
+
+        assert_eq!(state.last_parking_refusal, None);
+        assert_eq!(
+            state.pending_parking,
+            vec![PendingParking {
+                token: 1,
+                window_id: WindowId(1)
+            }]
+        );
+        let intents = recovery_intents(&state);
+        assert_eq!(intents.len(), 1);
+        let PersistenceIntent::RecordRecovery { token, draft } = intents[0] else {
+            panic!("expected a recovery intent");
+        };
+        assert_eq!(*token, 1);
+        assert_eq!(draft.session_id, "session-1");
+        assert_eq!(draft.native_handle, 1);
+        assert_eq!(draft.original_display_fingerprint, "DISPLAY1");
+        assert_eq!(draft.visible_bounds, Rect::new(0, 0, 1920, 1080));
+        assert!(
+            park_effects(&state).is_empty(),
+            "nothing may move before the entry is durable"
+        );
+
+        apply(
+            &mut state,
+            Event::RecoveryEntryDurable {
+                token: 1,
+                entry_id: RecoveryEntryId(9),
+            },
+        );
+
+        assert!(state.pending_parking.is_empty());
+        assert_eq!(
+            park_effects(&state),
+            vec![(WindowId(1), RecoveryEntryId(9))]
+        );
+    }
+
+    #[test]
+    fn a_refused_ledger_write_parks_nothing() {
+        let mut state = parkable_state();
+        apply(
+            &mut state,
+            Event::ParkingAuthorizationRequested {
+                window_id: WindowId(1),
+            },
+        );
+
+        apply(&mut state, Event::RecoveryEntryRefused { token: 1 });
+
+        assert!(state.pending_parking.is_empty());
+        assert!(park_effects(&state).is_empty());
+    }
+
+    #[test]
+    fn a_degraded_state_database_refuses_new_parking_but_tiling_continues() {
+        let mut state = parkable_state();
+        apply(
+            &mut state,
+            Event::PersistenceHealthChanged(PersistenceHealth::Degraded {
+                last_durable_revision: 1,
+                reason: mosaix_persistence::PersistenceFailure::WriteFailed,
+            }),
+        );
+
+        apply(
+            &mut state,
+            Event::ParkingAuthorizationRequested {
+                window_id: WindowId(1),
+            },
+        );
+        assert_eq!(
+            state.last_parking_refusal,
+            Some(ParkingRefusal::PersistenceDegraded)
+        );
+        assert!(recovery_intents(&state).is_empty());
+
+        // Ordinary in-memory tiling is untouched: a second window still
+        // gets arranged.
+        observe(
+            &mut state,
+            vec![
+                app_window_at(1, "a.exe", 1, Rect::new(0, 0, 1920, 1080)),
+                app_window_at(2, "b.exe", 1, Rect::new(0, 0, 400, 300)),
+            ],
+        );
+        assert_eq!(
+            arrangement(&state),
+            vec![
+                (1, Rect::new(0, 0, 960, 1080)),
+                (2, Rect::new(960, 0, 960, 1080))
+            ]
+        );
+    }
+
+    #[test]
+    fn parking_refuses_without_a_verified_site_a_fullscreen_window_or_an_unmanaged_one() {
+        let mut state = parkable_state();
+        state.parking_capability = ParkingCapability::Unverified;
+        assert_eq!(
+            plan_parking_authorization(&state, WindowId(1)),
+            Err(ParkingRefusal::ParkingCapabilityUnverified)
+        );
+        state.parking_capability = ParkingCapability::Refused {
+            reason: "no edge".to_owned(),
+        };
+        assert_eq!(
+            plan_parking_authorization(&state, WindowId(1)),
+            Err(ParkingRefusal::ParkingRefused {
+                reason: "no edge".to_owned()
+            })
+        );
+        state.parking_capability = ParkingCapability::Verified;
+        assert_eq!(
+            plan_parking_authorization(&state, WindowId(99)),
+            Err(ParkingRefusal::NotManaged {
+                window_id: WindowId(99)
+            })
+        );
+        let mut fullscreen = app_window_at(1, "a.exe", 1, Rect::new(0, 0, 1920, 1080));
+        fullscreen.lifecycle = WindowLifecycle::Fullscreen;
+        observe(&mut state, vec![fullscreen]);
+        assert_eq!(
+            plan_parking_authorization(&state, WindowId(1)),
+            Err(ParkingRefusal::Fullscreen {
+                window_id: WindowId(1)
+            })
+        );
+    }
+
+    #[test]
+    fn a_parked_window_is_marked_in_the_ledger_and_restoration_consumes_the_entry() {
+        let mut state = parkable_state();
+        apply(
+            &mut state,
+            Event::ParkingAuthorizationRequested {
+                window_id: WindowId(1),
+            },
+        );
+        apply(
+            &mut state,
+            Event::RecoveryEntryDurable {
+                token: 1,
+                entry_id: RecoveryEntryId(9),
+            },
+        );
+
+        apply(
+            &mut state,
+            Event::WindowParked {
+                window_id: WindowId(1),
+                entry_id: RecoveryEntryId(9),
+            },
+        );
+        assert_eq!(
+            state.parked_windows.get(&WindowId(1)),
+            Some(&RecoveryEntryId(9))
+        );
+        assert_eq!(
+            plan_parking_authorization(&state, WindowId(1)).map(|_| ()),
+            Ok(()),
+            "a parked window may be re-recorded; the ledger keeps every entry"
+        );
+
+        apply(
+            &mut state,
+            Event::WindowRestored {
+                window_id: WindowId(1),
+            },
+        );
+        assert!(state.parked_windows.is_empty());
+        assert!(recovery_intents(&state)
+            .iter()
+            .any(|intent| matches!(intent, PersistenceIntent::MarkRestored(RecoveryEntryId(9)))));
+    }
+
+    #[test]
+    fn an_acknowledgement_for_a_window_that_left_management_parks_nothing() {
+        let mut state = parkable_state();
+        apply(
+            &mut state,
+            Event::ParkingAuthorizationRequested {
+                window_id: WindowId(1),
+            },
+        );
+        observe(&mut state, vec![]);
+
+        apply(
+            &mut state,
+            Event::RecoveryEntryDurable {
+                token: 1,
+                entry_id: RecoveryEntryId(9),
+            },
+        );
+
+        assert!(park_effects(&state).is_empty());
+    }
+
+    #[test]
+    fn startup_recovery_outcomes_are_published() {
+        let mut state = parkable_state();
+        let outcome = RecoveryOutcome {
+            entry_id: RecoveryEntryId(3),
+            native_handle: 77,
+            application_id: mosaix_domain::ApplicationId("code.exe".to_owned()),
+            verdict: mosaix_domain::HandleVerdict::Stale,
+            restored: false,
+            failure: None,
+        };
+
+        apply(&mut state, Event::RecoveryReported(vec![outcome.clone()]));
+
+        assert_eq!(state.recovery_outcomes, vec![outcome]);
     }
 }

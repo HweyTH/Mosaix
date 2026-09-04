@@ -10,6 +10,10 @@
 //! failed migration is preserved byte-for-byte until a user asks for
 //! [`Persistence::reset`].
 
+mod ledger;
+
+pub use ledger::{default_ledger_path, recover_parked_windows, RecoveryLedger};
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -17,6 +21,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use mosaix_domain::identity::WindowEvidence;
+use mosaix_domain::recovery::{RecoveryDraft, RecoveryEntryId};
 use mosaix_domain::tree::PersistedTree;
 use mosaix_domain::undo::{
     now_unix, UndoMember, UndoTransaction, UndoTransactionDraft, UndoTransactionId,
@@ -961,6 +966,19 @@ pub enum PersistenceRequest {
     SaveWorkspace(Box<PersistedWorkspace>),
     /// Forget a deleted workspace.
     DeleteWorkspace(WorkspaceName),
+    /// Record recovery data for a window about to be parked, in the
+    /// current-session ledger. Answered through
+    /// [`PersistenceUpdate::recovery_acknowledged`] with the same token,
+    /// which is what lets the engine authorise the parking effect only
+    /// once the entry is durable (ADR 0023).
+    RecordRecovery {
+        token: u64,
+        draft: Box<RecoveryDraft>,
+    },
+    /// The parking effect an entry authorised was carried out.
+    MarkParked(RecoveryEntryId),
+    /// The window an entry describes is back in visible geometry.
+    MarkRestored(RecoveryEntryId),
 }
 
 /// What the worker reports after each request: how durability now stands,
@@ -979,6 +997,9 @@ pub struct PersistenceUpdate {
     /// The stored workspace pool, sent only in the worker's first update
     /// for the same reason `restored_trees` is.
     pub restored_workspaces: Option<Vec<PersistedWorkspace>>,
+    /// Ledger writes answered by this update: each token with the durable
+    /// entry it produced, or `None` when the ledger could not write it.
+    pub recovery_acknowledged: Vec<(u64, Option<RecoveryEntryId>)>,
 }
 
 #[derive(Debug)]
@@ -1002,8 +1023,30 @@ pub struct PersistenceWorker {
 }
 
 impl PersistenceWorker {
+    /// Starts the worker over the state database at `path` alone. Ledger
+    /// requests are answered as refused, so nothing can be parked.
     pub fn start(path: impl AsRef<Path>) -> Result<Self, PersistenceError> {
+        Self::start_with_ledger(path, None)
+    }
+
+    /// Starts the worker over the state database at `path` and the
+    /// recovery ledger at `ledger_path`, so ledger writes are ordered
+    /// with every other durable write.
+    pub fn start_with_ledger(
+        path: impl AsRef<Path>,
+        ledger_path: Option<&Path>,
+    ) -> Result<Self, PersistenceError> {
         let mut persistence = Persistence::open(path.as_ref())?;
+        let mut ledger = match ledger_path {
+            Some(ledger_path) => match RecoveryLedger::open(ledger_path) {
+                Ok(ledger) => Some(ledger),
+                Err(error) => {
+                    tracing::error!(%error, "recovery ledger could not be opened; no window will be parked");
+                    None
+                }
+            },
+            None => None,
+        };
 
         // History that aged out while the agent was not running is dropped
         // before anyone is told what undo would do, so a stale transaction
@@ -1046,10 +1089,28 @@ impl PersistenceWorker {
                 // The store itself tracks whether each write landed, so the
                 // health reported here is the truth rather than this
                 // thread's guess at it.
+                let mut recovery_acknowledged = Vec::new();
                 let outcome = match &request {
                     PersistenceRequest::Commit { revision } => {
                         persistence.commit_revision(*revision).map(|_| ())
                     }
+                    PersistenceRequest::RecordRecovery { token, draft } => {
+                        let recorded = ledger.as_mut().and_then(|ledger| ledger.record(draft).ok());
+                        recovery_acknowledged.push((*token, recorded));
+                        if recorded.is_none() {
+                            tracing::warn!(
+                                token,
+                                "recovery data could not be made durable; parking is not authorised"
+                            );
+                        }
+                        Ok(())
+                    }
+                    PersistenceRequest::MarkParked(id) => ledger
+                        .as_mut()
+                        .map_or(Ok(()), |ledger| ledger.mark_parked(*id).map(|_| ())),
+                    PersistenceRequest::MarkRestored(id) => ledger
+                        .as_mut()
+                        .map_or(Ok(()), |ledger| ledger.mark_restored(*id).map(|_| ())),
                     PersistenceRequest::RecordUndoTransaction(draft) => {
                         persistence.record_transaction(draft).map(|_| ())
                     }
@@ -1078,7 +1139,10 @@ impl PersistenceWorker {
                          without a durability promise"
                     );
                 }
-                let _ = update_sender.send(snapshot_of(&persistence));
+                let _ = update_sender.send(PersistenceUpdate {
+                    recovery_acknowledged,
+                    ..snapshot_of(&persistence)
+                });
             }
         });
         Ok(Self {
@@ -1135,6 +1199,7 @@ fn snapshot_of(persistence: &Persistence) -> PersistenceUpdate {
         newest_undo,
         restored_trees: None,
         restored_workspaces: None,
+        recovery_acknowledged: Vec::new(),
     }
 }
 
@@ -1195,6 +1260,7 @@ mod tests {
                 newest_undo: None,
                 restored_trees: Some(HashMap::new()),
                 restored_workspaces: Some(Vec::new()),
+                recovery_acknowledged: Vec::new(),
             },
             "the worker states what the database already holds before any write"
         );

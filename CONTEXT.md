@@ -126,6 +126,10 @@ _Avoid_: Primary display, cursor display, focused window's display
 The reversible relocation of windows from a non-displayed logical workspace to a recoverable edge position while their workspace membership remains unchanged.
 _Avoid_: Hide, cloak, minimize
 
+**Recovery ledger**:
+A small SQLite file beside the state database, written before any window is parked, that records the native handle, the owning process instance (process id plus kernel creation time), the window class, the original display, the visible and normal bounds, and the show state. An entry is acknowledged durable before the engine authorises the parking effect it describes. Startup and the out-of-process `restore-windows` command read it before any identity reconciliation and touch only a handle whose live evidence still matches; a stale, reused, or ambiguous handle is reported and left alone. It is never cross-session identity: the state database holds no native handle.
+_Avoid_: Undo history, session state, handle cache
+
 **Workspace switch transaction**:
 An all-or-nothing change of the logical workspace displayed on one monitor, durably recording recovery data before parking or restoring windows. Any placement failure cancels the switch and compensates completed moves; success creates one undo transaction covering both assignment and placements.
 _Avoid_: Placement transaction, partial workspace switch

@@ -1003,3 +1003,285 @@ fn stored_workspaces_contain_no_window_titles() {
         "a stored workspace has no title column and its tree evidence has no title field"
     );
 }
+
+// ---- The recovery ledger (issue #58) ----------------------------------
+
+fn ledger_draft(session: &str, handle: isize, pid: u32) -> mosaix_domain::RecoveryDraft {
+    mosaix_domain::RecoveryDraft {
+        session_id: session.to_owned(),
+        native_handle: handle,
+        process: mosaix_domain::ProcessInstance {
+            process_id: pid,
+            creation_time: 133_000_000_000_000_000,
+        },
+        application_id: mosaix_domain::ApplicationId("code.exe".to_owned()),
+        executable_path: Some("C:/apps/code.exe".to_owned()),
+        native_class: Some("Chrome_WidgetWin_1".to_owned()),
+        original_display_fingerprint: "DISPLAY1".to_owned(),
+        visible_bounds: mosaix_domain::Rect::new(10, 20, 800, 600),
+        normal_bounds: mosaix_domain::Rect::new(30, 40, 700, 500),
+        show_state: mosaix_domain::ShowState::Maximized,
+        recorded_at_unix: 1_756_000_000,
+    }
+}
+
+fn ledger_path(temporary: &TempDatabase) -> PathBuf {
+    temporary.path().with_file_name("recovery-ledger.db")
+}
+
+#[test]
+fn a_recorded_entry_is_durable_before_the_id_is_returned_and_survives_a_restart() {
+    let temporary = TempDatabase::new("ledger-record");
+    let draft = ledger_draft("s1", 0x1234, 77);
+    let id = {
+        let mut ledger =
+            mosaix_persistence::RecoveryLedger::open(&ledger_path(&temporary)).unwrap();
+        let id = ledger.record(&draft).unwrap();
+        ledger.mark_parked(id).unwrap();
+        id
+    };
+
+    // Reopened cold, as the restore command does after a crash: the
+    // entry is there with every field, and it is open.
+    let ledger = mosaix_persistence::RecoveryLedger::open(&ledger_path(&temporary)).unwrap();
+    let entries = ledger.entries().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].id, id);
+    assert_eq!(entries[0].draft, draft);
+    assert!(entries[0].parked);
+    assert!(!entries[0].restored);
+    assert_eq!(ledger.open_entries().unwrap().len(), 1);
+}
+
+#[test]
+fn an_entry_recorded_but_never_parked_is_not_open_and_is_pruned_by_a_later_session() {
+    let temporary = TempDatabase::new("ledger-unparked");
+    let mut ledger = mosaix_persistence::RecoveryLedger::open(&ledger_path(&temporary)).unwrap();
+    ledger.record(&ledger_draft("s1", 1, 7)).unwrap();
+
+    assert!(
+        ledger.open_entries().unwrap().is_empty(),
+        "a window that never left visible geometry needs no recovery"
+    );
+    assert_eq!(
+        ledger.prune("s1").unwrap(),
+        0,
+        "the recording session keeps it"
+    );
+    assert_eq!(ledger.prune("s2").unwrap(), 1, "a later session drops it");
+}
+
+#[test]
+fn a_clean_exit_marks_entries_restored_and_the_next_session_finds_nothing_to_recover() {
+    let temporary = TempDatabase::new("ledger-clean-exit");
+    {
+        let mut ledger =
+            mosaix_persistence::RecoveryLedger::open(&ledger_path(&temporary)).unwrap();
+        let id = ledger.record(&ledger_draft("s1", 1, 7)).unwrap();
+        ledger.mark_parked(id).unwrap();
+        ledger.mark_restored(id).unwrap();
+    }
+    let mut ledger = mosaix_persistence::RecoveryLedger::open(&ledger_path(&temporary)).unwrap();
+    assert!(ledger.open_entries().unwrap().is_empty());
+    assert_eq!(ledger.prune("s2").unwrap(), 1);
+    assert!(ledger.entries().unwrap().is_empty());
+}
+
+#[test]
+fn an_interrupted_write_leaves_no_partial_entry() {
+    let temporary = TempDatabase::new("ledger-interrupted");
+    let path = ledger_path(&temporary);
+    mosaix_persistence::RecoveryLedger::open(&path).unwrap();
+    {
+        // A transaction that never commits, as a process killed mid-write
+        // leaves behind: SQLite rolls it back on the next open.
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection.execute_batch("BEGIN;").unwrap();
+        connection
+            .execute(
+                "INSERT INTO recovery_entry (
+                     session_id, native_handle, process_id, process_creation_time,
+                     application_id, original_display_fingerprint,
+                     visible_x, visible_y, visible_width, visible_height,
+                     normal_x, normal_y, normal_width, normal_height,
+                     show_state, recorded_at_unix, parked
+                 ) VALUES ('s1', 1, 7, 0, 'code.exe', 'D', 0, 0, 1, 1, 0, 0, 1, 1, 'normal', 1, 1)",
+                [],
+            )
+            .unwrap();
+        // Dropped without COMMIT.
+    }
+    let ledger = mosaix_persistence::RecoveryLedger::open(&path).unwrap();
+    assert!(ledger.entries().unwrap().is_empty());
+}
+
+#[test]
+fn recovery_restores_only_verified_handles_and_reports_the_rest_untouched() {
+    let temporary = TempDatabase::new("ledger-recover");
+    let mut ledger = mosaix_persistence::RecoveryLedger::open(&ledger_path(&temporary)).unwrap();
+    let verified = ledger.record(&ledger_draft("s1", 100, 7)).unwrap();
+    let stale = ledger.record(&ledger_draft("s1", 200, 8)).unwrap();
+    let reused = ledger.record(&ledger_draft("s1", 300, 9)).unwrap();
+    let ambiguous_a = ledger.record(&ledger_draft("s0", 400, 10)).unwrap();
+    let ambiguous_b = ledger.record(&ledger_draft("s1", 400, 10)).unwrap();
+    for id in [verified, stale, reused, ambiguous_a, ambiguous_b] {
+        ledger.mark_parked(id).unwrap();
+    }
+
+    let mut restored_handles = Vec::new();
+    let outcomes = mosaix_persistence::recover_parked_windows(
+        &mut ledger,
+        |handle| match handle {
+            100 => Some(mosaix_domain::LiveHandleEvidence {
+                process: mosaix_domain::ProcessInstance {
+                    process_id: 7,
+                    creation_time: 133_000_000_000_000_000,
+                },
+                native_class: Some("Chrome_WidgetWin_1".to_owned()),
+            }),
+            300 => Some(mosaix_domain::LiveHandleEvidence {
+                process: mosaix_domain::ProcessInstance {
+                    process_id: 9,
+                    creation_time: 1,
+                },
+                native_class: Some("Notepad".to_owned()),
+            }),
+            400 => Some(mosaix_domain::LiveHandleEvidence {
+                process: mosaix_domain::ProcessInstance {
+                    process_id: 10,
+                    creation_time: 133_000_000_000_000_000,
+                },
+                native_class: Some("Chrome_WidgetWin_1".to_owned()),
+            }),
+            _ => None,
+        },
+        |entry| {
+            restored_handles.push(entry.draft.native_handle);
+            Ok(())
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        restored_handles,
+        vec![100],
+        "only the verified handle was touched"
+    );
+    let by_id = |id: mosaix_domain::RecoveryEntryId| {
+        outcomes
+            .iter()
+            .find(|outcome| outcome.entry_id == id)
+            .unwrap()
+    };
+    assert_eq!(
+        by_id(verified).verdict,
+        mosaix_domain::HandleVerdict::Verified
+    );
+    assert!(by_id(verified).restored);
+    assert_eq!(by_id(stale).verdict, mosaix_domain::HandleVerdict::Stale);
+    assert!(matches!(
+        by_id(reused).verdict,
+        mosaix_domain::HandleVerdict::Reused { .. }
+    ));
+    assert_eq!(
+        by_id(ambiguous_a).verdict,
+        mosaix_domain::HandleVerdict::Ambiguous { claimants: 2 }
+    );
+    let open: Vec<_> = ledger
+        .open_entries()
+        .unwrap()
+        .into_iter()
+        .map(|entry| entry.id)
+        .collect();
+    assert_eq!(
+        open,
+        vec![stale, reused, ambiguous_a, ambiguous_b],
+        "unverified entries stay open as evidence rather than being forgotten"
+    );
+}
+
+#[test]
+fn a_failed_restore_keeps_the_entry_open_and_reports_the_reason() {
+    let temporary = TempDatabase::new("ledger-restore-fails");
+    let mut ledger = mosaix_persistence::RecoveryLedger::open(&ledger_path(&temporary)).unwrap();
+    let id = ledger.record(&ledger_draft("s1", 100, 7)).unwrap();
+    ledger.mark_parked(id).unwrap();
+
+    let outcomes = mosaix_persistence::recover_parked_windows(
+        &mut ledger,
+        |_| {
+            Some(mosaix_domain::LiveHandleEvidence {
+                process: mosaix_domain::ProcessInstance {
+                    process_id: 7,
+                    creation_time: 133_000_000_000_000_000,
+                },
+                native_class: None,
+            })
+        },
+        |_| Err("SetWindowPlacement failed".to_owned()),
+    )
+    .unwrap();
+
+    assert!(!outcomes[0].restored);
+    assert_eq!(
+        outcomes[0].failure.as_deref(),
+        Some("SetWindowPlacement failed")
+    );
+    assert_eq!(ledger.open_entries().unwrap().len(), 1);
+}
+
+#[test]
+fn the_worker_acknowledges_a_ledger_write_with_its_token_and_refuses_without_a_ledger() {
+    let temporary = TempDatabase::new("ledger-worker");
+    let worker = mosaix_persistence::PersistenceWorker::start_with_ledger(
+        temporary.path(),
+        Some(&ledger_path(&temporary)),
+    )
+    .unwrap();
+    let _first = worker.next_update().unwrap();
+
+    worker
+        .submit(mosaix_persistence::PersistenceRequest::RecordRecovery {
+            token: 41,
+            draft: Box::new(ledger_draft("s1", 5, 7)),
+        })
+        .unwrap();
+    let update = worker.next_update().unwrap();
+    assert_eq!(update.recovery_acknowledged.len(), 1);
+    assert_eq!(update.recovery_acknowledged[0].0, 41);
+    let id = update.recovery_acknowledged[0]
+        .1
+        .expect("the entry is durable");
+    worker
+        .submit(mosaix_persistence::PersistenceRequest::MarkParked(id))
+        .unwrap();
+    let _ = worker.next_update().unwrap();
+    worker.stop();
+
+    let ledger = mosaix_persistence::RecoveryLedger::open(&ledger_path(&temporary)).unwrap();
+    assert_eq!(ledger.open_entries().unwrap().len(), 1);
+
+    let without = mosaix_persistence::PersistenceWorker::start(temporary.path()).unwrap();
+    let _first = without.next_update().unwrap();
+    without
+        .submit(mosaix_persistence::PersistenceRequest::RecordRecovery {
+            token: 42,
+            draft: Box::new(ledger_draft("s1", 6, 7)),
+        })
+        .unwrap();
+    let update = without.next_update().unwrap();
+    assert_eq!(update.recovery_acknowledged, vec![(42, None)]);
+    without.stop();
+}
+
+#[test]
+fn the_ledger_stores_no_window_titles() {
+    let temporary = TempDatabase::new("ledger-titles");
+    {
+        let mut ledger =
+            mosaix_persistence::RecoveryLedger::open(&ledger_path(&temporary)).unwrap();
+        ledger.record(&ledger_draft("s1", 1, 7)).unwrap();
+    }
+    let bytes = fs::read(ledger_path(&temporary)).unwrap();
+    assert!(!String::from_utf8_lossy(&bytes).contains("title"));
+}

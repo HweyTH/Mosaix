@@ -91,6 +91,32 @@ pub struct WorkspaceSwitchingSnapshot {
     pub parking_capability: String,
 }
 
+/// The recovery ledger as published state describes it (ADR 0023).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct RecoverySnapshot {
+    /// This agent session's identity in the ledger.
+    pub session_id: String,
+    /// Windows whose recovery entry is not yet durable; none is parked.
+    pub pending_parking: Vec<isize>,
+    /// Windows this session has parked and not yet restored.
+    pub parked_windows: Vec<isize>,
+    /// Why the last parking request was refused, if it was.
+    pub last_parking_refusal: Option<String>,
+    /// What startup recovery did with the previous session's entries.
+    pub outcomes: Vec<RecoveryOutcomeSnapshot>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct RecoveryOutcomeSnapshot {
+    pub entry_id: i64,
+    pub native_handle: isize,
+    pub application: String,
+    /// `verified`, `stale`, `reused`, or `ambiguous`.
+    pub verdict: String,
+    pub restored: bool,
+    pub failure: Option<String>,
+}
+
 /// A rule that named a workspace the pool does not hold, so the window
 /// stayed in the workspace of the display it appeared on (ADR 0028).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -136,6 +162,10 @@ pub struct StateSnapshot {
     /// Experimental switching for the current topology.
     #[serde(default)]
     pub workspace_switching: Option<WorkspaceSwitchingSnapshot>,
+    /// The recovery ledger: what is pending, what is parked, and what
+    /// startup recovery found.
+    #[serde(default)]
+    pub recovery: Option<RecoverySnapshot>,
     pub paused: bool,
     pub automatic_tiling_active: bool,
     pub automatic_tiling_suspended: bool,
@@ -485,6 +515,33 @@ impl From<EngineState> for StateSnapshot {
                 workspace: refusal.workspace.clone(),
             })
             .collect();
+        let mut parked_windows: Vec<isize> = state.parked_windows.keys().map(|id| id.0).collect();
+        parked_windows.sort_unstable();
+        let recovery = Some(RecoverySnapshot {
+            session_id: state.session_id.clone(),
+            pending_parking: state
+                .pending_parking
+                .iter()
+                .map(|pending| pending.window_id.0)
+                .collect(),
+            parked_windows,
+            last_parking_refusal: state
+                .last_parking_refusal
+                .as_ref()
+                .map(|refusal| refusal.code().to_owned()),
+            outcomes: state
+                .recovery_outcomes
+                .iter()
+                .map(|outcome| RecoveryOutcomeSnapshot {
+                    entry_id: outcome.entry_id.0,
+                    native_handle: outcome.native_handle,
+                    application: outcome.application_id.0.clone(),
+                    verdict: outcome.verdict.code().to_owned(),
+                    restored: outcome.restored,
+                    failure: outcome.failure.clone(),
+                })
+                .collect(),
+        });
         let switching_status = state.workspace_switching_status();
         let workspace_switching = Some(WorkspaceSwitchingSnapshot {
             status: switching_status.code().to_owned(),
@@ -608,6 +665,7 @@ impl From<EngineState> for StateSnapshot {
             workspaces,
             rule_workspace_refusals,
             workspace_switching,
+            recovery,
             paused: state.paused,
             automatic_tiling_active: state.automatic_tiling_active,
             automatic_tiling_suspended: state.automatic_tiling_suspended,
@@ -3159,5 +3217,34 @@ mod tests {
         );
         assert_eq!(json["workspace_switching"]["profile_file"], "office.toml");
         assert_eq!(json["workspace_switching"]["displayed"]["MON-A"], "dev");
+    }
+
+    #[test]
+    fn state_snapshot_reports_recovery_outcomes_pending_and_parked_windows() {
+        let mut state = EngineState::default();
+        state.session_id = "42-1".to_owned();
+        state
+            .parked_windows
+            .insert(WindowId(7), mosaix_domain::RecoveryEntryId(3));
+        state.last_parking_refusal = Some(mosaix_domain::ParkingRefusal::PersistenceDegraded);
+        state.recovery_outcomes = vec![mosaix_domain::RecoveryOutcome {
+            entry_id: mosaix_domain::RecoveryEntryId(2),
+            native_handle: 99,
+            application_id: mosaix_domain::ApplicationId("code.exe".to_owned()),
+            verdict: mosaix_domain::HandleVerdict::Stale,
+            restored: false,
+            failure: None,
+        }];
+
+        let json = serde_json::to_value(StateSnapshot::from(state)).unwrap();
+
+        assert_eq!(json["recovery"]["session_id"], "42-1");
+        assert_eq!(json["recovery"]["parked_windows"], serde_json::json!([7]));
+        assert_eq!(
+            json["recovery"]["last_parking_refusal"],
+            "persistence_degraded"
+        );
+        assert_eq!(json["recovery"]["outcomes"][0]["verdict"], "stale");
+        assert_eq!(json["recovery"]["outcomes"][0]["native_handle"], 99);
     }
 }
