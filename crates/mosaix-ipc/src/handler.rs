@@ -224,6 +224,27 @@ pub struct StateSnapshot {
     pub automatic_tiling_suspended: bool,
     /// One precedence-resolved status for human-facing clients.
     pub mode: String,
+    /// Every health condition that currently holds, most serious first
+    /// (issue #61).
+    ///
+    /// The three conditions are deliberately distinct facts, each with
+    /// its own detail elsewhere in this snapshot -- `workspace_switch`,
+    /// `persistence_status`, and `degraded_windows` -- because they mean
+    /// different things and clear in different ways. This is the one
+    /// place that orders them, so every client leads with the same one
+    /// rather than each inventing a precedence.
+    ///
+    /// The order is fixed: `workspace_switch_degraded` first, because
+    /// windows are off screen and switching is blocked until someone
+    /// acts; `persistence_degraded` next, because nothing new becomes
+    /// durable; `degraded_tiling` last, because live management
+    /// continues for everything else.
+    #[serde(default)]
+    pub conditions: Vec<String>,
+    /// The condition a client should lead with, or `None` when none
+    /// holds. Always `conditions`' first entry.
+    #[serde(default)]
+    pub primary_condition: Option<String>,
     /// Number of windows whose circuit breaker is currently open (Feature 31).
     /// These windows are excluded from automatic placement until the user
     /// explicitly resets them with a zone-snap command.
@@ -508,6 +529,20 @@ impl From<EngineState> for StateSnapshot {
             "manual"
         }
         .to_owned();
+        let mut conditions: Vec<String> = Vec::new();
+        if state.switch_degraded.is_some() {
+            conditions.push("workspace_switch_degraded".to_owned());
+        }
+        if matches!(
+            state.persistence_health,
+            mosaix_persistence::PersistenceHealth::Degraded { .. }
+        ) {
+            conditions.push("persistence_degraded".to_owned());
+        }
+        if state.automatic_tiling_active && circuit_breaker_count > 0 {
+            conditions.push("degraded_tiling".to_owned());
+        }
+        let primary_condition = conditions.first().cloned();
         let degraded_windows = state
             .windows
             .iter()
@@ -762,6 +797,8 @@ impl From<EngineState> for StateSnapshot {
             workspace_switching,
             recovery,
             workspace_switch,
+            conditions,
+            primary_condition,
             paused: state.paused,
             automatic_tiling_active: state.automatic_tiling_active,
             automatic_tiling_suspended: state.automatic_tiling_suspended,
@@ -3224,6 +3261,65 @@ mod tests {
             1,
             "a refused name creates nothing"
         );
+    }
+
+    #[test]
+    fn the_three_health_conditions_are_distinct_facts_in_one_fixed_order() {
+        // All three at once: each keeps its own detail elsewhere in the
+        // snapshot, and the order they are listed in is what every client
+        // leads with.
+        let mut state = EngineState::default();
+        state.switch_degraded = Some(mosaix_domain::WorkspaceSwitchDegraded {
+            display_id: mosaix_domain::DisplayId(1),
+            target: mosaix_domain::WorkspaceName::new("chat").unwrap(),
+            outgoing: None,
+            stranded_windows: vec![mosaix_domain::WindowId(41)],
+            reason: "the window would not come back".to_owned(),
+        });
+        state.persistence_health = PersistenceHealth::Degraded {
+            last_durable_revision: 3,
+            reason: mosaix_persistence::PersistenceFailure::WriteFailed,
+        };
+        state.automatic_tiling_active = true;
+        state.windows.insert(
+            WindowId(41),
+            WindowPlacement {
+                display_id: DisplayId(1),
+                bounds: Rect::new(0, 0, 100, 100),
+                observed_bounds: Rect::new(0, 0, 100, 100),
+                previous_placement: None,
+                cycle_step: None,
+                rejection_count: CIRCUIT_BREAKER_THRESHOLD,
+            },
+        );
+
+        let snapshot = StateSnapshot::from(state);
+
+        assert_eq!(
+            snapshot.conditions,
+            vec![
+                "workspace_switch_degraded".to_owned(),
+                "persistence_degraded".to_owned(),
+                "degraded_tiling".to_owned(),
+            ]
+        );
+        assert_eq!(
+            snapshot.primary_condition.as_deref(),
+            Some("workspace_switch_degraded")
+        );
+        assert_eq!(snapshot.persistence_status, "degraded");
+        assert_eq!(snapshot.degraded_windows.len(), 1);
+        assert!(snapshot.workspace_switch.is_some());
+    }
+
+    #[test]
+    fn a_healthy_agent_reports_no_conditions_at_all() {
+        let engine = tiling_engine_with_workspaces(&["dev"]);
+
+        let snapshot = StateSnapshot::from(engine.snapshot());
+
+        assert!(snapshot.conditions.is_empty());
+        assert_eq!(snapshot.primary_condition, None);
     }
 
     #[test]

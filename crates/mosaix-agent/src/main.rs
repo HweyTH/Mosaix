@@ -563,10 +563,16 @@ fn main() {
                             // display connected beyond the parking edge would
                             // make parked windows visible, so it is re-validated
                             // before the engine hears about the change.
+                            //
+                            // The capability goes first, because the topology
+                            // arm is where a vanished display's windows are
+                            // parked (issue #61) and it must decide that
+                            // against the new topology's site, not the old
+                            // one's.
                             let capability =
                                 recovery::report_parking_capability(&displays, &parking_site);
                             if events
-                                .send(mosaix_engine::Event::DisplayTopologyChanged(displays))
+                                .send(mosaix_engine::Event::ParkingCapabilityReported(capability))
                                 .is_err()
                             {
                                 tracing::warn!(
@@ -574,8 +580,8 @@ fn main() {
                                 );
                                 break;
                             }
-                            let _ = events
-                                .send(mosaix_engine::Event::ParkingCapabilityReported(capability));
+                            let _ =
+                                events.send(mosaix_engine::Event::DisplayTopologyChanged(displays));
                         }
                         // Feature 29 — sleep/wake recovery.
                         //
@@ -600,10 +606,7 @@ fn main() {
                             let capability =
                                 recovery::report_parking_capability(&displays, &parking_site);
                             if events
-                                .send(mosaix_engine::Event::WakeReconciliation {
-                                    displays,
-                                    windows,
-                                })
+                                .send(mosaix_engine::Event::ParkingCapabilityReported(capability))
                                 .is_err()
                             {
                                 tracing::warn!(
@@ -611,8 +614,10 @@ fn main() {
                                 );
                                 break;
                             }
-                            let _ = events
-                                .send(mosaix_engine::Event::ParkingCapabilityReported(capability));
+                            let _ = events.send(mosaix_engine::Event::WakeReconciliation {
+                                displays,
+                                windows,
+                            });
                         }
                     }
                 }

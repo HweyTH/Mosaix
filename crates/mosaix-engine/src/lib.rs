@@ -1456,6 +1456,7 @@ fn apply(state: &mut EngineState, event: Event) {
             // remembered (ADR 0028).
             apply_switching_mapping(state);
             assign_unassigned_windows(state);
+            reconcile_hidden_workspace_windows(state);
             reconcile_arrangements(state);
             persist_workspaces(state);
             state.revision += 1;
@@ -1957,6 +1958,7 @@ fn apply(state: &mut EngineState, event: Event) {
             fill_empty_displays(state);
             apply_switching_mapping(state);
             assign_unassigned_windows(state);
+            reconcile_hidden_workspace_windows(state);
             reconcile_arrangements(state);
             persist_workspaces(state);
             state.revision += 1;
@@ -2269,6 +2271,7 @@ fn apply(state: &mut EngineState, event: Event) {
             fill_empty_displays(state);
             apply_switching_mapping(state);
             assign_unassigned_windows(state);
+            reconcile_hidden_workspace_windows(state);
             reconcile_arrangements(state);
             persist_workspaces(state);
             state.revision += 1;
@@ -3033,7 +3036,103 @@ fn replace_inventory_from_observations(state: &mut EngineState, observed: Vec<Wi
         }
     }
     assign_unassigned_windows(state);
+    reconcile_hidden_workspace_windows(state);
     inventory_changed || placements_changed
+}
+
+/// Brings the parking site into agreement with the displayed assignment:
+/// a managed window whose workspace is hidden belongs there, and one
+/// whose workspace is displayed does not (issue #61).
+///
+/// The switch transaction moves windows when the *assignment* changes.
+/// This covers everything else that can put the two out of step without
+/// a switch: a monitor disappearing and taking its displayed workspace
+/// with it, a rule sending a brand-new window to a hidden workspace, an
+/// application restoring a window that was minimized while hidden, and a
+/// restart that reapplies stored assignments. Every one of those goes
+/// through the same durable-first path a switch uses, so a window never
+/// leaves the screen without its way back already on disk (ADR 0023).
+///
+/// It stands aside entirely while a switch is in flight or a failed one
+/// is unreconciled: both mean the truth about where windows are is the
+/// transaction's to settle, and a second mover would fight it.
+fn reconcile_hidden_workspace_windows(state: &mut EngineState) {
+    if state.switch.is_some() || state.switch_degraded.is_some() {
+        return;
+    }
+    let mut to_park: Vec<WindowId> = Vec::new();
+    let mut to_restore: Vec<WindowId> = Vec::new();
+    for (window_id, managed) in &state.inventory {
+        let hidden = match state.workspaces.workspace_of(*window_id) {
+            Some(name) => !state.workspaces.is_displayed(name),
+            // A window that belongs to no workspace is on an unfilled
+            // display, where it is arranged exactly as it was before
+            // workspaces existed.
+            None => false,
+        };
+        let parked = state.parked_windows.contains_key(window_id);
+        let pending = state
+            .pending_parking
+            .iter()
+            .any(|waiting| waiting.window_id == *window_id);
+        if hidden && !parked && !pending {
+            // A minimized window occupies no screen, and restoring it in
+            // order to park it would change a state the user chose
+            // (ADR 0029). A full-screen window is never forced out of
+            // full-screen either; it simply stays where it is.
+            if matches!(
+                managed.window.lifecycle,
+                WindowLifecycle::Minimized | WindowLifecycle::Fullscreen
+            ) {
+                continue;
+            }
+            to_park.push(*window_id);
+        } else if !hidden && parked {
+            to_restore.push(*window_id);
+        }
+    }
+    to_park.sort_by_key(|window_id| window_id.0);
+    to_restore.sort_by_key(|window_id| window_id.0);
+
+    for window_id in to_park {
+        match plan_parking_authorization(state, window_id) {
+            Ok(draft) => {
+                state.next_parking_token += 1;
+                let token = state.next_parking_token;
+                state.pending_parking.push(PendingParking {
+                    token,
+                    window_id,
+                    transaction: None,
+                });
+                state
+                    .persistence_intents
+                    .push(PersistenceIntent::RecordRecovery {
+                        token,
+                        draft: Box::new(draft),
+                    });
+            }
+            Err(refusal) => {
+                // Nothing is forced. The window stays visible where it
+                // is, which is honest about what the engine could do,
+                // and the reason is published rather than swallowed.
+                tracing::info!(
+                    ?window_id,
+                    %refusal,
+                    "a window of a hidden workspace cannot be parked; it stays visible"
+                );
+                state.last_parking_refusal = Some(refusal);
+            }
+        }
+    }
+    for window_id in to_restore {
+        let Some(entry_id) = state.parked_windows.get(&window_id).copied() else {
+            continue;
+        };
+        state.effects.push(EngineEffect::RestoreWindow {
+            window_id,
+            entry_id,
+        });
+    }
 }
 
 /// The display `window_id` should be arranged on: where its workspace is
@@ -13659,6 +13758,418 @@ mod tests {
             vec![(DisplayId(1), ws("chat"))],
             "a refused undo changes nothing"
         );
+    }
+
+    // -- Hidden-workspace lifecycle and recovery (issue #61) ----------
+
+    /// A two-display state with experimental switching authorised, `dev`
+    /// on display 1 and `chat` on display 2.
+    fn two_display_switching_state() -> EngineState {
+        let mut state = workspace_state(&[1, 2], &["dev", "chat"]);
+        let set = switching_set(
+            &state.displays,
+            &["dev", "chat"],
+            true,
+            &[("DISPLAY1", "dev"), ("DISPLAY2", "chat")],
+        );
+        apply(&mut state, Event::ConfigChanged(Box::new(set)));
+        apply(
+            &mut state,
+            Event::ParkingCapabilityReported(ParkingCapability::Verified),
+        );
+        state
+    }
+
+    /// The recovery drafts the reducer has asked to be made durable, in
+    /// the order it asked.
+    fn recorded_recovery(state: &EngineState) -> Vec<&RecoveryDraft> {
+        state
+            .persistence_intents
+            .iter()
+            .filter_map(|intent| match intent {
+                PersistenceIntent::RecordRecovery { draft, .. } => Some(&**draft),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn disconnecting_a_monitor_parks_the_windows_of_the_workspace_it_took_with_it() {
+        let mut state = two_display_switching_state();
+        observe(
+            &mut state,
+            vec![
+                app_window_at(1, "a.exe", 1, Rect::new(0, 0, 400, 300)),
+                app_window_at(2, "b.exe", 2, Rect::new(1920, 0, 400, 300)),
+            ],
+        );
+        assert_eq!(
+            state.workspaces.workspace_of(WindowId(2)),
+            Some(&ws("chat"))
+        );
+        let cursor = state.effects.len();
+
+        apply(
+            &mut state,
+            Event::DisplayTopologyChanged(vec![display(1, "DISPLAY1", 0)]),
+        );
+
+        assert_eq!(
+            state.workspaces.displayed(),
+            vec![(DisplayId(1), ws("dev"))],
+            "the surviving display keeps the workspace it showed"
+        );
+        assert!(
+            !state.workspaces.is_displayed(&ws("chat")),
+            "the vanished display's workspace is hidden, not moved onto a survivor"
+        );
+        let drafts = recorded_recovery(&state);
+        assert_eq!(drafts.len(), 1, "one window has to leave the screen");
+        assert_eq!(drafts[0].native_handle, 2);
+        assert_eq!(
+            drafts[0].original_display_fingerprint, "DISPLAY1",
+            "the window is recorded against the survivor it migrated to"
+        );
+
+        settle_switch_from(&mut state, cursor, &mut |_, _| None);
+
+        assert_eq!(sorted_parked(&state), vec![WindowId(2)]);
+        assert_eq!(
+            state.workspaces.workspace_of(WindowId(2)),
+            Some(&ws("chat")),
+            "membership is unchanged; only where the window sits is"
+        );
+    }
+
+    #[test]
+    fn reconnecting_a_monitor_does_not_reveal_a_hidden_workspace_that_has_windows() {
+        let mut state = two_display_switching_state();
+        observe(
+            &mut state,
+            vec![
+                app_window_at(1, "a.exe", 1, Rect::new(0, 0, 400, 300)),
+                app_window_at(2, "b.exe", 2, Rect::new(1920, 0, 400, 300)),
+            ],
+        );
+        let cursor = state.effects.len();
+        apply(
+            &mut state,
+            Event::DisplayTopologyChanged(vec![display(1, "DISPLAY1", 0)]),
+        );
+        settle_switch_from(&mut state, cursor, &mut |_, _| None);
+        assert_eq!(sorted_parked(&state), vec![WindowId(2)]);
+
+        // The profile's mapping names both displays, so reconnecting the
+        // second one is exactly the case where a valid topology profile
+        // selects a workspace -- and chat goes back to display 2.
+        apply(
+            &mut state,
+            Event::DisplayTopologyChanged(vec![
+                display(1, "DISPLAY1", 0),
+                display(2, "DISPLAY2", 1920),
+            ]),
+        );
+
+        assert_eq!(
+            state.workspaces.displayed(),
+            vec![(DisplayId(1), ws("dev")), (DisplayId(2), ws("chat"))],
+            "the profile's mapping is what selects a workspace on reconnect"
+        );
+    }
+
+    #[test]
+    fn reconnecting_a_monitor_leaves_a_hidden_workspace_hidden_when_nothing_selects_it() {
+        // No profile mapping, so nothing selects a workspace for the
+        // display that comes back: a hidden workspace with windows stays
+        // hidden rather than being revealed by the reconnect itself.
+        let mut state = workspace_state(&[1, 2], &["dev", "chat"]);
+        apply(
+            &mut state,
+            Event::ParkingCapabilityReported(ParkingCapability::Verified),
+        );
+        observe(
+            &mut state,
+            vec![
+                app_window_at(1, "a.exe", 1, Rect::new(0, 0, 400, 300)),
+                app_window_at(2, "b.exe", 2, Rect::new(1920, 0, 400, 300)),
+            ],
+        );
+        apply(
+            &mut state,
+            Event::DisplayTopologyChanged(vec![display(1, "DISPLAY1", 0)]),
+        );
+        assert!(!state.workspaces.is_displayed(&ws("chat")));
+
+        apply(
+            &mut state,
+            Event::DisplayTopologyChanged(vec![
+                display(1, "DISPLAY1", 0),
+                display(2, "DISPLAY2", 1920),
+            ]),
+        );
+
+        assert!(
+            !state.workspaces.is_displayed(&ws("chat")),
+            "a reconnect reveals nothing on its own"
+        );
+        assert_eq!(
+            state.workspaces.displayed(),
+            vec![(DisplayId(1), ws("dev"))]
+        );
+    }
+
+    #[test]
+    fn a_rule_sending_a_new_window_to_a_hidden_workspace_parks_it_without_switching_or_focus() {
+        let mut state = switching_state(&["dev"], "dev");
+        create(&mut state, "chat");
+        state.rules = vec![Rule {
+            id: "chat".to_owned(),
+            priority: 10,
+            enabled: true,
+            matcher: mosaix_rules::WindowMatcher {
+                application_id: Some("slack.exe".to_owned()),
+                application_regex: None,
+                title_regex: None,
+                native_class: None,
+                class_regex: None,
+                exe_path_regex: None,
+                exe_path: None,
+                role: None,
+            },
+            actions: mosaix_rules::RuleActions {
+                manage: ManageAction::Tile,
+                workspace: Some("chat".to_owned()),
+            },
+        }];
+        let cursor = state.effects.len();
+
+        observe(
+            &mut state,
+            vec![app_window_at(1, "slack.exe", 1, Rect::new(0, 0, 400, 300))],
+        );
+
+        assert_eq!(
+            state.workspaces.workspace_of(WindowId(1)),
+            Some(&ws("chat"))
+        );
+        assert_eq!(
+            state.workspaces.displayed(),
+            vec![(DisplayId(1), ws("dev"))],
+            "a rule target never switches the displayed workspace"
+        );
+        let drafts = recorded_recovery(&state);
+        assert_eq!(
+            drafts.len(),
+            1,
+            "the way back is recorded before the window leaves the screen"
+        );
+        assert_eq!(state.pending_parking.len(), 1);
+        assert!(
+            park_effects(&state).is_empty(),
+            "nothing parks until the entry is durable"
+        );
+
+        settle_switch_from(&mut state, cursor, &mut |_, _| None);
+
+        assert_eq!(sorted_parked(&state), vec![WindowId(1)]);
+        assert!(
+            !state.effects[cursor..]
+                .iter()
+                .any(|effect| matches!(effect, EngineEffect::FocusWindow { .. })),
+            "a window parked into a hidden workspace never takes the focus"
+        );
+    }
+
+    #[test]
+    fn a_minimized_member_stays_unparked_while_hidden_and_parks_when_its_application_restores_it() {
+        let mut state = switching_state(&["dev"], "dev");
+        create(&mut state, "chat");
+        let mut minimized = app_window_at(1, "a.exe", 1, Rect::new(0, 0, 400, 300));
+        minimized.lifecycle = WindowLifecycle::Minimized;
+        observe(&mut state, vec![minimized.clone()]);
+        // Put the window in chat, which is hidden.
+        let chat = ws("chat");
+        state.workspaces.assign(WindowId(1), &chat);
+        let cursor = state.effects.len();
+        observe(&mut state, vec![minimized]);
+
+        assert!(
+            recorded_recovery(&state).is_empty(),
+            "a minimized window occupies no screen and is left as it is (ADR 0029)"
+        );
+
+        // The application restores it: it is on screen now, in a hidden
+        // workspace, so it has to leave -- with its way back written
+        // first, like every other park.
+        observe(
+            &mut state,
+            vec![app_window_at(1, "a.exe", 1, Rect::new(0, 0, 400, 300))],
+        );
+
+        let drafts = recorded_recovery(&state);
+        assert_eq!(drafts.len(), 1);
+        assert_eq!(
+            drafts[0].show_state,
+            mosaix_domain::recovery::ShowState::Normal
+        );
+        assert!(
+            state.parked_windows.is_empty(),
+            "nothing has moved while the entry is still pending"
+        );
+
+        settle_switch_from(&mut state, cursor, &mut |_, _| None);
+
+        assert_eq!(sorted_parked(&state), vec![WindowId(1)]);
+    }
+
+    #[test]
+    fn a_maximized_window_records_its_show_state_and_normal_bounds_before_parking() {
+        let mut state = switching_state(&["dev"], "dev");
+        observe(
+            &mut state,
+            vec![app_window_at(1, "a.exe", 1, Rect::new(0, 0, 400, 300))],
+        );
+        create(&mut state, "chat");
+        // The reflow placed it; maximizing it does not change the
+        // placement the reducer intends, which is what it goes back to.
+        let normal = state.windows[&WindowId(1)].bounds;
+        let mut maximized = app_window_at(1, "a.exe", 1, Rect::new(-8, -8, 1936, 1096));
+        maximized.lifecycle = WindowLifecycle::Maximized;
+        observe(&mut state, vec![maximized]);
+
+        focus_workspace(&mut state, "chat");
+
+        let drafts = recorded_recovery(&state);
+        assert_eq!(drafts.len(), 1);
+        assert_eq!(
+            drafts[0].show_state,
+            mosaix_domain::recovery::ShowState::Maximized,
+            "the show state is on disk before the window is taken out of it"
+        );
+        assert_eq!(
+            drafts[0].normal_bounds, normal,
+            "the size it returns to is recorded, not its maximized extent"
+        );
+        assert_eq!(
+            drafts[0].visible_bounds,
+            Rect::new(-8, -8, 1936, 1096),
+            "where it was on screen is recorded too"
+        );
+    }
+
+    #[test]
+    fn a_full_screen_member_of_a_hidden_workspace_is_never_forced_out_of_full_screen() {
+        let mut state = switching_state(&["dev"], "dev");
+        create(&mut state, "chat");
+        let mut full_screen = app_window_at(1, "a.exe", 1, Rect::new(0, 0, 1920, 1080));
+        full_screen.lifecycle = WindowLifecycle::Fullscreen;
+        observe(&mut state, vec![full_screen.clone()]);
+        let chat = ws("chat");
+        state.workspaces.assign(WindowId(1), &chat);
+
+        observe(&mut state, vec![full_screen]);
+
+        assert!(
+            recorded_recovery(&state).is_empty(),
+            "nothing forces a full-screen window out of full-screen (ADR 0029)"
+        );
+        assert!(state.parked_windows.is_empty());
+    }
+
+    #[test]
+    fn stored_assignments_are_reapplied_by_parking_through_the_ledger() {
+        // What startup does: the pool comes back, and every window whose
+        // workspace the stored assignment leaves hidden goes to the
+        // parking site through the same durable-first path a switch uses.
+        let mut state = switching_state(&["dev"], "dev");
+        create(&mut state, "chat");
+        observe(
+            &mut state,
+            vec![app_window_at(1, "a.exe", 1, Rect::new(0, 0, 400, 300))],
+        );
+        let chat = ws("chat");
+        state.workspaces.assign(WindowId(1), &chat);
+        let cursor = state.effects.len();
+
+        apply(
+            &mut state,
+            Event::WorkspacesLoaded(vec![
+                PersistedWorkspace {
+                    name: ws("chat"),
+                    origin: WorkspaceOrigin::Command,
+                    displayed_fingerprint: None,
+                    tree: None,
+                },
+                PersistedWorkspace {
+                    name: ws("dev"),
+                    origin: WorkspaceOrigin::Configuration,
+                    displayed_fingerprint: Some("DISPLAY1".to_owned()),
+                    tree: None,
+                },
+            ]),
+        );
+
+        assert_eq!(
+            recorded_recovery(&state).len(),
+            1,
+            "no window leaves the screen without its way back on disk"
+        );
+        settle_switch_from(&mut state, cursor, &mut |_, _| None);
+        assert_eq!(sorted_parked(&state), vec![WindowId(1)]);
+    }
+
+    #[test]
+    fn a_window_of_a_hidden_workspace_stays_visible_when_no_parking_site_is_verified() {
+        // Explicit failure over silent misbehaviour: without a site the
+        // engine parks nothing and publishes why, rather than reaching
+        // for another way to hide the window.
+        let mut state = switching_state(&["dev"], "dev");
+        apply(
+            &mut state,
+            Event::ParkingCapabilityReported(ParkingCapability::Refused {
+                reason: "every edge is covered by a display".to_owned(),
+            }),
+        );
+        create(&mut state, "chat");
+        observe(
+            &mut state,
+            vec![app_window_at(1, "a.exe", 1, Rect::new(0, 0, 400, 300))],
+        );
+        let chat = ws("chat");
+        state.workspaces.assign(WindowId(1), &chat);
+
+        observe(
+            &mut state,
+            vec![app_window_at(1, "a.exe", 1, Rect::new(0, 0, 400, 300))],
+        );
+
+        assert!(recorded_recovery(&state).is_empty());
+        assert!(state.parked_windows.is_empty());
+        assert_eq!(
+            state.last_parking_refusal,
+            Some(ParkingRefusal::ParkingRefused {
+                reason: "every edge is covered by a display".to_owned()
+            })
+        );
+    }
+
+    #[test]
+    fn the_reconciler_stands_aside_while_a_switch_is_in_flight() {
+        let mut state = switch_fixture();
+
+        focus_workspace(&mut state, "chat");
+        let pending_before = state.pending_parking.len();
+        // An observation mid-switch must not start a second set of moves
+        // over the same windows.
+        observe(
+            &mut state,
+            vec![
+                app_window_at(1, "a.exe", 1, Rect::new(0, 0, 400, 300)),
+                app_window_at(2, "b.exe", 1, Rect::new(500, 0, 400, 300)),
+            ],
+        );
+
+        assert_eq!(state.pending_parking.len(), pending_before);
     }
 
     #[test]

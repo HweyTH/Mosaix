@@ -417,6 +417,12 @@ fn format_arrangement(state: &serde_json::Value) -> String {
         "off"
     };
     let mut rendered = format!("arrangement: {mode} ({status})");
+    if let Some(condition) = format_conditions(state) {
+        rendered.push_str(&format!(
+            "
+  {condition}"
+        ));
+    }
 
     let trees = state["container_trees"].as_array();
     match trees {
@@ -711,6 +717,48 @@ fn format_workspace_result(result: &mosaix_domain::WorkspaceCommandResult) -> St
             format!("mosaix: {refusal} ({})", refusal.code())
         }
     }
+}
+
+/// The health condition a person should be told about first, if any.
+///
+/// Published state orders the conditions once (issue #61) and every
+/// client reads that order rather than inventing one, so what the CLI
+/// leads with and what any other interface leads with are the same fact.
+fn format_conditions(state: &serde_json::Value) -> Option<String> {
+    let conditions: Vec<&str> = state["conditions"]
+        .as_array()
+        .map(|conditions| {
+            conditions
+                .iter()
+                .filter_map(|condition| condition.as_str())
+                .collect()
+        })
+        .unwrap_or_default();
+    let leading = *conditions.first()?;
+    let described = match leading {
+        "workspace_switch_degraded" => {
+            "workspace-switch degraded: a failed switch left windows unaccounted for;              switching is blocked until `mosaix workspace restore-switch`"
+        }
+        "persistence_degraded" => {
+            "persistence degraded: live management continues, but nothing new is durable;              see `mosaix persistence status`"
+        }
+        "degraded_tiling" => {
+            "degraded tiling: automatic tiling continues, with some windows excluded by a              placement failure"
+        }
+        other => return Some(format!("{other} (and {} more)", conditions.len() - 1)),
+    };
+    let rest = conditions.len() - 1;
+    Some(match rest {
+        0 => described.to_owned(),
+        1 => format!(
+            "{described}
+  (1 other condition also holds)"
+        ),
+        more => format!(
+            "{described}
+  ({more} other conditions also hold)"
+        ),
+    })
 }
 
 /// Renders the switching section of published state.
@@ -1777,6 +1825,57 @@ mod tests {
             format_workspaces(&state),
             "workspaces:\n  chat: hidden, from command, no windows, 2 dormant position(s)\n  dev: display 1, from configuration, windows 11 12\n  rule typo names unknown workspace \"dv\" for window 13"
         );
+    }
+
+    #[test]
+    fn the_leading_health_condition_is_the_one_published_state_ordered_first() {
+        let state = serde_json::json!({
+            "tiling_mode": "tree",
+            "automatic_tiling_active": true,
+            "automatic_tiling_suspended": false,
+            "conditions": ["workspace_switch_degraded", "persistence_degraded"],
+            "primary_condition": "workspace_switch_degraded",
+        });
+
+        let rendered = format_arrangement(&state);
+
+        assert!(rendered.contains("workspace-switch degraded"), "{rendered}");
+        assert!(
+            rendered.contains("mosaix workspace restore-switch"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("(1 other condition also holds)"),
+            "the other conditions are not hidden, only ranked: {rendered}"
+        );
+    }
+
+    #[test]
+    fn a_healthy_arrangement_report_mentions_no_condition() {
+        let state = serde_json::json!({
+            "tiling_mode": "tree",
+            "automatic_tiling_active": true,
+            "automatic_tiling_suspended": false,
+            "conditions": [],
+            "primary_condition": null,
+        });
+
+        assert_eq!(
+            format_arrangement(&state),
+            "arrangement: tree (active)
+  no display is arranging windows yet"
+        );
+        assert_eq!(format_conditions(&state), None);
+    }
+
+    #[test]
+    fn degraded_tiling_leads_only_when_nothing_more_serious_holds() {
+        let state = serde_json::json!({ "conditions": ["degraded_tiling"] });
+
+        let rendered = format_conditions(&state).expect("a condition holds");
+
+        assert!(rendered.starts_with("degraded tiling:"), "{rendered}");
+        assert!(!rendered.contains("also hold"), "{rendered}");
     }
 
     #[test]

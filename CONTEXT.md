@@ -123,7 +123,7 @@ The display targeted by display-scoped commands, following the focused managed w
 _Avoid_: Primary display, cursor display, focused window's display
 
 **Window parking**:
-The reversible relocation of windows from a non-displayed logical workspace to a recoverable edge position while their workspace membership remains unchanged. On Windows the position is a parking site beyond the virtual screen (ADR 0029); the window keeps its show state, styles, taskbar button, and Alt-Tab entry, and is never activated on the way out or back. A maximized window is taken to its normal size first and re-maximized on restore; a minimized window is left minimized and unmoved.
+The reversible relocation of windows from a non-displayed logical workspace to a recoverable edge position while their workspace membership remains unchanged. On Windows the position is a parking site beyond the virtual screen (ADR 0029); the window keeps its show state, styles, taskbar button, and Alt-Tab entry, and is never activated on the way out or back. A maximized window is taken to its normal size first and re-maximized on restore; a minimized window is left minimized and unmoved, and so is a full-screen one. It happens whenever a managed window and its workspace disagree about being on screen, not only during a `Workspace switch transaction`: a monitor disconnecting takes its displayed workspace with it, a rule can send a brand-new window to a hidden workspace, an application can restore a window that was minimized while hidden, and a restart reapplies stored assignments. Every one of those records the way back first, and refuses rather than reaching for another mechanism when it cannot.
 _Avoid_: Hide, cloak, minimize
 
 **Parking site**:
@@ -143,8 +143,12 @@ One of four states published for the current topology: disabled (no matched prof
 _Avoid_: Enabled (which does not say whether parking is authorised), workspace mode
 
 **Workspace-switch degraded**:
-A health condition in which compensation for a failed workspace switch could not restore every moved window. Further switching remains blocked until the explicit restore action reconciles the affected windows.
+A health condition in which compensation for a failed workspace switch could not restore every moved window. Further switching remains blocked until the explicit restore action reconciles the affected windows, and it clears as soon as the last of them is back on screen, from whichever path put it there.
 _Avoid_: Persistence-degraded, degraded tiling
+
+**Health condition precedence**:
+The one fixed order in which the three distinct health conditions are published, so every interface leads with the same one instead of each inventing a ranking: `workspace-switch degraded` first, because windows are off screen and switching is blocked until someone acts; `persistence-degraded` next, because nothing new becomes durable; `degraded tiling` last, because live management continues for everything else. The conditions stay separate facts with their own detail in published state; this only ranks them, and never hides the ones it does not lead with.
+_Avoid_: Health status, severity level (the conditions are not levels of one scale)
 
 **Window identity match**:
 A scored comparison between durable evidence and live managed windows that yields one of three outcomes: confident, ambiguous, or no match. Only a confident outcome may authorize a persisted placement.
