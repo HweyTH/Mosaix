@@ -27,8 +27,9 @@ pub use identity::{
     ScoredCandidate, WindowEvidence,
 };
 pub use recovery::{
-    plan_recovery, HandleVerdict, LiveHandleEvidence, ParkingRefusal, ProcessInstance,
-    RecoveryDraft, RecoveryEntry, RecoveryEntryId, RecoveryOutcome, ShowState,
+    plan_recovery, verdict_for, HandleVerdict, LiveHandleEvidence, ParkWindowResult,
+    ParkingFailure, ParkingRefusal, ParkingStage, ProcessInstance, RecoveryDraft, RecoveryEntry,
+    RecoveryEntryId, RecoveryOutcome, ShowState,
 };
 pub use tree::{
     Child, ContainerTree, DividerChange, DormantPosition, Leaf, LeafFate, Node, Occupant,

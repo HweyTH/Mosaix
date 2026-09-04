@@ -123,8 +123,12 @@ The display targeted by display-scoped commands, following the focused managed w
 _Avoid_: Primary display, cursor display, focused window's display
 
 **Window parking**:
-The reversible relocation of windows from a non-displayed logical workspace to a recoverable edge position while their workspace membership remains unchanged.
+The reversible relocation of windows from a non-displayed logical workspace to a recoverable edge position while their workspace membership remains unchanged. On Windows the position is a parking site beyond the virtual screen (ADR 0029); the window keeps its show state, styles, taskbar button, and Alt-Tab entry, and is never activated on the way out or back. A maximized window is taken to its normal size first and re-maximized on restore; a minimized window is left minimized and unmoved.
 _Avoid_: Hide, cloak, minimize
+
+**Parking site**:
+The place the platform adapter has verified, for the current topology, that a parked window can be moved to without any monitor covering it: beyond one edge of the virtual screen by a fixed margin, chosen from the reported display geometry and confirmed against the live desktop with `MonitorFromRect` (ADR 0029). It is re-validated on every topology change, and its absence is a typed refusal that parks nothing rather than a fallback to another mechanism.
+_Avoid_: Off-screen corner, hiding position, parking edge (when the whole validated site is meant)
 
 **Recovery ledger**:
 A small SQLite file beside the state database, written before any window is parked, that records the native handle, the owning process instance (process id plus kernel creation time), the window class, the original display, the visible and normal bounds, and the show state. An entry is acknowledged durable before the engine authorises the parking effect it describes. Startup and the out-of-process `restore-windows` command read it before any identity reconciliation and touch only a handle whose live evidence still matches; a stale, reused, or ambiguous handle is reported and left alone. It is never cross-session identity: the state database holds no native handle.

@@ -25,6 +25,8 @@ pub mod hotkeys;
 #[cfg(windows)]
 pub mod overlay;
 #[cfg(windows)]
+pub mod parking;
+#[cfg(windows)]
 pub mod recovery;
 #[cfg(windows)]
 pub mod shutdown;
@@ -52,6 +54,11 @@ pub use hotkeys::{
 };
 #[cfg(windows)]
 pub use overlay::{start_preview_overlay, PreviewOverlay};
+#[cfg(windows)]
+pub use parking::{
+    find_parking_site, is_parked, park_window, parking_capability, plan_parking_sites,
+    verify_parking_site, ParkedAs, ParkingEdge, ParkingSite, ParkingSiteRefusal,
+};
 #[cfg(windows)]
 pub use recovery::{probe_handle, process_creation_time, restore_window, window_placement};
 #[cfg(windows)]
@@ -92,6 +99,8 @@ pub enum WindowError {
     HotkeyRegistrationFailed(windows::core::Error),
     #[error("failed to start hotkey registration thread")]
     HotkeyThreadStartFailed,
+    #[error("the window was moved but a monitor still covers it, so it is not parked")]
+    ParkingNotEffective,
 }
 
 #[cfg(windows)]

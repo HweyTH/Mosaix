@@ -102,8 +102,21 @@ pub struct RecoverySnapshot {
     pub parked_windows: Vec<isize>,
     /// Why the last parking request was refused, if it was.
     pub last_parking_refusal: Option<String>,
+    /// The last native park or restore the adapter could not carry out.
+    #[serde(default)]
+    pub last_parking_failure: Option<ParkingFailureSnapshot>,
     /// What startup recovery did with the previous session's entries.
     pub outcomes: Vec<RecoveryOutcomeSnapshot>,
+}
+
+/// A native parking step that failed, with the platform's reason.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ParkingFailureSnapshot {
+    pub window_id: isize,
+    pub entry_id: i64,
+    /// `park` or `restore`.
+    pub stage: String,
+    pub reason: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -529,6 +542,14 @@ impl From<EngineState> for StateSnapshot {
                 .last_parking_refusal
                 .as_ref()
                 .map(|refusal| refusal.code().to_owned()),
+            last_parking_failure: state.last_parking_failure.as_ref().map(|failure| {
+                ParkingFailureSnapshot {
+                    window_id: failure.window_id.0,
+                    entry_id: failure.entry_id.0,
+                    stage: failure.stage.code().to_owned(),
+                    reason: failure.reason.clone(),
+                }
+            }),
             outcomes: state
                 .recovery_outcomes
                 .iter()
@@ -1090,6 +1111,45 @@ pub fn handle_request(
                 Err(refusal) => WorkspaceCommandResult::Refused(refusal),
             };
             workspace_answer(result)
+        }
+        IpcRequest::ParkWindow { window_id } => {
+            let window_id = mosaix_domain::WindowId(*window_id);
+            // The reducer re-reaches this verdict against its own state;
+            // preflighting here is what lets a refusal carry its reason.
+            let result = match mosaix_engine::plan_parking_authorization(
+                &state_reader.snapshot(),
+                window_id,
+            ) {
+                Ok(_) => {
+                    if let other @ IpcResponse::Error { .. } =
+                        send_event(events, Event::ParkingAuthorizationRequested { window_id })
+                    {
+                        return other;
+                    }
+                    mosaix_domain::ParkWindowResult::Requested { window_id }
+                }
+                Err(refusal) => mosaix_domain::ParkWindowResult::Refused(refusal),
+            };
+            IpcResponse::Ok {
+                data: Some(serde_json::to_value(result).expect("park results serialize")),
+            }
+        }
+        IpcRequest::RestoreParkedWindows => {
+            let mut parked: Vec<isize> = state_reader
+                .snapshot()
+                .parked_windows
+                .keys()
+                .map(|window_id| window_id.0)
+                .collect();
+            parked.sort_unstable();
+            if let other @ IpcResponse::Error { .. } =
+                send_event(events, Event::RestoreParkedWindowsRequested)
+            {
+                return other;
+            }
+            IpcResponse::Ok {
+                data: Some(serde_json::json!({ "parked_windows": parked })),
+            }
         }
         IpcRequest::FocusDisplay { display_id } => send_event(
             events,
@@ -3069,6 +3129,64 @@ mod tests {
             1,
             "a refused name creates nothing"
         );
+    }
+
+    #[test]
+    fn parking_an_unmanaged_window_answers_with_a_typed_refusal_not_an_error() {
+        let engine = tiling_engine_with_workspaces(&["dev"]);
+        let response = handle_request(
+            &IpcRequest::ParkWindow { window_id: 404 },
+            &engine.events(),
+            &engine.state_reader(),
+            &no_store(),
+            &no_probe(),
+        );
+
+        let IpcResponse::Ok { data: Some(data) } = response else {
+            panic!("a refusal is data, not an error: {response:?}");
+        };
+        let result: mosaix_domain::ParkWindowResult = serde_json::from_value(data).unwrap();
+        assert_eq!(
+            result,
+            mosaix_domain::ParkWindowResult::Refused(mosaix_domain::ParkingRefusal::NotManaged {
+                window_id: mosaix_domain::WindowId(404),
+            })
+        );
+        assert!(!result.is_applied());
+    }
+
+    #[test]
+    fn restoring_parked_windows_answers_with_the_windows_asked_for() {
+        let engine = tiling_engine_with_workspaces(&["dev"]);
+        let response = handle_request(
+            &IpcRequest::RestoreParkedWindows,
+            &engine.events(),
+            &engine.state_reader(),
+            &no_store(),
+            &no_probe(),
+        );
+
+        let IpcResponse::Ok { data: Some(data) } = response else {
+            panic!("restore answers with data: {response:?}");
+        };
+        assert_eq!(data["parked_windows"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn state_snapshot_reports_the_last_parking_failure_with_its_stage() {
+        let mut state = EngineState::default();
+        state.last_parking_failure = Some(mosaix_domain::ParkingFailure {
+            window_id: mosaix_domain::WindowId(7),
+            entry_id: mosaix_domain::RecoveryEntryId(3),
+            stage: mosaix_domain::ParkingStage::Restore,
+            reason: "SetWindowPlacement failed".to_owned(),
+        });
+
+        let json = serde_json::to_value(StateSnapshot::from(state)).unwrap();
+
+        assert_eq!(json["recovery"]["last_parking_failure"]["window_id"], 7);
+        assert_eq!(json["recovery"]["last_parking_failure"]["entry_id"], 3);
+        assert_eq!(json["recovery"]["last_parking_failure"]["stage"], "restore");
     }
 
     #[test]

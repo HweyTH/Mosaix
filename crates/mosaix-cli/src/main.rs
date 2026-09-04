@@ -181,6 +181,23 @@ enum WorkspaceAction {
         #[arg(long)]
         json: bool,
     },
+    /// Experimental: park one managed window through the public-API
+    /// parking path. Recovery data is written to the ledger first, and the
+    /// window leaves visible geometry only once that is durable. Refuses,
+    /// and moves nothing, without a verified parking site.
+    Park {
+        /// The window, by the id `mosaix state` reports.
+        window: isize,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Put back every window this agent session parked, through the
+    /// verified restore path. With no agent running, use
+    /// `mosaix restore-windows` instead.
+    Restore {
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -691,6 +708,27 @@ fn format_switching(state: &serde_json::Value) -> String {
     if let Some(capability) = switching["parking_capability"].as_str() {
         lines.push(format!("  parking site: {capability}"));
     }
+    let recovery = &state["recovery"];
+    if let Some(parked) = recovery["parked_windows"].as_array() {
+        if !parked.is_empty() {
+            lines.push(format!(
+                "  parked windows: {}",
+                parked
+                    .iter()
+                    .map(|id| id.to_string())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            ));
+        }
+    }
+    if let Some(failure) = recovery["last_parking_failure"].as_object() {
+        lines.push(format!(
+            "  last parking failure: {} of window {} failed: {}",
+            failure["stage"].as_str().unwrap_or("?"),
+            failure["window_id"],
+            failure["reason"].as_str().unwrap_or("?")
+        ));
+    }
     lines.join("\n")
 }
 
@@ -785,6 +823,14 @@ fn run_workspace(action: WorkspaceAction) {
             }
             return;
         }
+        WorkspaceAction::Park { window, json } => {
+            run_park_window(window, json);
+            return;
+        }
+        WorkspaceAction::Restore { json } => {
+            run_restore_parked(json);
+            return;
+        }
         WorkspaceAction::Create { name, json } => (IpcRequest::CreateWorkspace { name }, json),
         WorkspaceAction::Delete { name, json } => (IpcRequest::DeleteWorkspace { name }, json),
         WorkspaceAction::Focus { name, json } => (IpcRequest::FocusWorkspace { name }, json),
@@ -838,6 +884,110 @@ fn run_workspace(action: WorkspaceAction) {
     }
     if !result.is_applied() {
         std::process::exit(1);
+    }
+}
+
+#[cfg(windows)]
+fn run_park_window(window: isize, json: bool) {
+    use mosaix_ipc::{send_request, IpcRequest, IpcResponse};
+
+    let data = match send_request(IpcRequest::ParkWindow { window_id: window }) {
+        Ok(IpcResponse::Ok { data: Some(data) }) => data,
+        Ok(IpcResponse::Ok { data: None }) => {
+            eprintln!("mosaix: the agent answered without a parking result");
+            std::process::exit(2);
+        }
+        Ok(IpcResponse::Error { message }) => {
+            eprintln!("mosaix: {message}");
+            std::process::exit(1);
+        }
+        Ok(IpcResponse::VersionMismatch { server_version }) => {
+            eprintln!("mosaix: protocol version mismatch (server: v{server_version})");
+            std::process::exit(1);
+        }
+        Err(error) => {
+            eprintln!("mosaix: {error}");
+            std::process::exit(2);
+        }
+    };
+    let result: mosaix_domain::ParkWindowResult = match serde_json::from_value(data.clone()) {
+        Ok(result) => result,
+        Err(error) => {
+            eprintln!("mosaix: could not read the agent's parking result: {error}");
+            std::process::exit(2);
+        }
+    };
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&data).expect("JSON value serializes")
+        );
+    } else {
+        match &result {
+            mosaix_domain::ParkWindowResult::Requested { window_id } => println!(
+                "parking requested for window {}; it leaves the screen once its recovery data is durable",
+                window_id.0
+            ),
+            mosaix_domain::ParkWindowResult::Refused(refusal) => eprintln!("mosaix: {refusal}"),
+        }
+    }
+    if !result.is_applied() {
+        std::process::exit(1);
+    }
+}
+
+#[cfg(windows)]
+fn run_restore_parked(json: bool) {
+    use mosaix_ipc::{send_request, IpcRequest, IpcResponse};
+
+    let data = match send_request(IpcRequest::RestoreParkedWindows) {
+        Ok(IpcResponse::Ok { data: Some(data) }) => data,
+        Ok(IpcResponse::Ok { data: None }) => {
+            eprintln!("mosaix: the agent answered without a result");
+            std::process::exit(2);
+        }
+        Ok(IpcResponse::Error { message }) => {
+            eprintln!("mosaix: {message}");
+            std::process::exit(1);
+        }
+        Ok(IpcResponse::VersionMismatch { server_version }) => {
+            eprintln!("mosaix: protocol version mismatch (server: v{server_version})");
+            std::process::exit(1);
+        }
+        Err(error) => {
+            eprintln!("mosaix: {error}");
+            std::process::exit(2);
+        }
+    };
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&data).expect("JSON value serializes")
+        );
+        return;
+    }
+    let parked: Vec<isize> = data["parked_windows"]
+        .as_array()
+        .map(|windows| {
+            windows
+                .iter()
+                .filter_map(|w| w.as_i64())
+                .map(|w| w as isize)
+                .collect()
+        })
+        .unwrap_or_default();
+    if parked.is_empty() {
+        println!("no parked windows to restore");
+    } else {
+        println!(
+            "restore requested for {} parked window(s): {}",
+            parked.len(),
+            parked
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
     }
 }
 

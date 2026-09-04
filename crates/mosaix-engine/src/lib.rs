@@ -46,7 +46,9 @@ use mosaix_domain::commands::{
     TreeResizeApplied, TreeResizeRefusal, TREE_RESIZE_STEP_PERCENT,
 };
 use mosaix_domain::identity::{match_window_with_order, MatchOutcome, WindowEvidence};
-use mosaix_domain::recovery::{ParkingRefusal, RecoveryDraft, RecoveryEntryId, RecoveryOutcome};
+use mosaix_domain::recovery::{
+    ParkingFailure, ParkingRefusal, ParkingStage, RecoveryDraft, RecoveryEntryId, RecoveryOutcome,
+};
 use mosaix_domain::tree::{
     ContainerTree, DormantPosition, LeafFate, Occupant, PersistedTree, SplitAxis, Toward,
 };
@@ -105,6 +107,14 @@ pub enum EngineEffect {
     /// still leaves enough on disk to put the window back. The adapter
     /// answers with [`Event::WindowParked`] when the move landed.
     ParkWindow {
+        window_id: WindowId,
+        entry_id: RecoveryEntryId,
+    },
+    /// Put the parked `window_id` back where ledger entry `entry_id`
+    /// recorded it, without activating it. The adapter reads the entry,
+    /// verifies the handle still names that window, and answers with
+    /// [`Event::WindowRestored`] or [`Event::WindowRestoreFailed`].
+    RestoreWindow {
         window_id: WindowId,
         entry_id: RecoveryEntryId,
     },
@@ -336,6 +346,8 @@ pub struct EngineState {
     pub parked_windows: HashMap<WindowId, RecoveryEntryId>,
     /// What the last parking authorisation request concluded.
     pub last_parking_refusal: Option<ParkingRefusal>,
+    /// The last native park or restore the adapter could not carry out.
+    pub last_parking_failure: Option<ParkingFailure>,
     /// What startup recovery did with the previous session's ledger:
     /// each open entry's verdict and whether its window was put back.
     pub recovery_outcomes: Vec<RecoveryOutcome>,
@@ -715,10 +727,32 @@ pub enum Event {
         entry_id: RecoveryEntryId,
     },
 
+    /// The adapter could not carry out the parking effect for `entry_id`.
+    /// The window stays where it was; the entry stays recorded but never
+    /// parked, which restoration ignores.
+    WindowParkFailed {
+        window_id: WindowId,
+        entry_id: RecoveryEntryId,
+        reason: String,
+    },
+
     /// The window `entry_id` described is back in visible geometry.
     WindowRestored {
         window_id: WindowId,
     },
+
+    /// The adapter could not put the parked window back. It stays
+    /// parked with its entry open, so recovery can still find it.
+    WindowRestoreFailed {
+        window_id: WindowId,
+        entry_id: RecoveryEntryId,
+        reason: String,
+    },
+
+    /// Put back every window this session parked, through the verified
+    /// restore path. The explicit restore action published state points
+    /// at, usable whether or not anything is degraded.
+    RestoreParkedWindowsRequested,
 
     /// What startup recovery did with the previous session's ledger,
     /// published so state and clients can report it.
@@ -1521,19 +1555,67 @@ fn apply(state: &mut EngineState, event: Event) {
             entry_id,
         } => {
             state.parked_windows.insert(window_id, entry_id);
+            state.last_parking_failure = None;
             state
                 .persistence_intents
                 .push(PersistenceIntent::MarkParked(entry_id));
             state.revision += 1;
         }
 
+        Event::WindowParkFailed {
+            window_id,
+            entry_id,
+            reason,
+        } => {
+            tracing::warn!(?window_id, entry = entry_id.0, %reason, "parking failed; the window stays visible");
+            state.last_parking_failure = Some(ParkingFailure {
+                window_id,
+                entry_id,
+                stage: ParkingStage::Park,
+                reason,
+            });
+            state.revision += 1;
+        }
+
         Event::WindowRestored { window_id } => {
             if let Some(entry_id) = state.parked_windows.remove(&window_id) {
+                state.last_parking_failure = None;
                 state
                     .persistence_intents
                     .push(PersistenceIntent::MarkRestored(entry_id));
                 state.revision += 1;
             }
+        }
+
+        Event::WindowRestoreFailed {
+            window_id,
+            entry_id,
+            reason,
+        } => {
+            tracing::warn!(?window_id, entry = entry_id.0, %reason, "restoring a parked window failed; it stays parked with its entry open");
+            state.last_parking_failure = Some(ParkingFailure {
+                window_id,
+                entry_id,
+                stage: ParkingStage::Restore,
+                reason,
+            });
+            state.revision += 1;
+        }
+
+        Event::RestoreParkedWindowsRequested => {
+            let mut parked: Vec<(WindowId, RecoveryEntryId)> = state
+                .parked_windows
+                .iter()
+                .map(|(window_id, entry_id)| (*window_id, *entry_id))
+                .collect();
+            parked.sort_by_key(|(window_id, _)| window_id.0);
+            for (window_id, entry_id) in parked {
+                state.effects.push(EngineEffect::RestoreWindow {
+                    window_id,
+                    entry_id,
+                });
+            }
+            state.revision += 1;
         }
 
         Event::RecoveryReported(outcomes) => {
@@ -2694,6 +2776,21 @@ fn replace_inventory_from_observations(state: &mut EngineState, observed: Vec<Wi
     state
         .rule_workspace_refusals
         .retain(|refusal| managed_ids.contains(&refusal.window_id));
+    // A parked window that closed has nothing left to restore. Its entry
+    // becomes history now, so the ledger does not carry a dead handle
+    // forward for every later session to probe and report as stale.
+    let closed_parked: Vec<(WindowId, RecoveryEntryId)> = state
+        .parked_windows
+        .iter()
+        .filter(|(id, _)| !managed_ids.contains(id))
+        .map(|(id, entry_id)| (*id, *entry_id))
+        .collect();
+    for (window_id, entry_id) in closed_parked {
+        state.parked_windows.remove(&window_id);
+        state
+            .persistence_intents
+            .push(PersistenceIntent::MarkRestored(entry_id));
+    }
     state.inventory = next;
     // Rule targets first, so a window a rule sends elsewhere is never
     // first placed in the workspace of the display it appeared on.
@@ -3044,6 +3141,9 @@ pub fn plan_parking_authorization(
     }
     if managed.window.lifecycle == WindowLifecycle::Fullscreen {
         return Err(ParkingRefusal::Fullscreen { window_id });
+    }
+    if managed.window.lifecycle == WindowLifecycle::Minimized {
+        return Err(ParkingRefusal::Minimized { window_id });
     }
     if state
         .pending_parking
@@ -4527,6 +4627,7 @@ pub fn spawn_engine_with_capacity(
         next_parking_token: 0,
         parked_windows: HashMap::new(),
         last_parking_refusal: None,
+        last_parking_failure: None,
         recovery_outcomes: Vec::new(),
         displays: initial_displays,
         windows: HashMap::new(),
@@ -12420,7 +12521,8 @@ mod tests {
     }
 
     #[test]
-    fn parking_refuses_without_a_verified_site_a_fullscreen_window_or_an_unmanaged_one() {
+    fn parking_refuses_without_a_verified_site_a_fullscreen_or_minimized_window_or_an_unmanaged_one(
+    ) {
         let mut state = parkable_state();
         state.parking_capability = ParkingCapability::Unverified;
         assert_eq!(
@@ -12451,6 +12553,16 @@ mod tests {
             Err(ParkingRefusal::Fullscreen {
                 window_id: WindowId(1)
             })
+        );
+        let mut minimized = app_window_at(1, "a.exe", 1, Rect::new(0, 0, 400, 300));
+        minimized.lifecycle = WindowLifecycle::Minimized;
+        observe(&mut state, vec![minimized]);
+        assert_eq!(
+            plan_parking_authorization(&state, WindowId(1)),
+            Err(ParkingRefusal::Minimized {
+                window_id: WindowId(1)
+            }),
+            "a minimized window occupies no screen and is left as it is"
         );
     }
 
@@ -12520,6 +12632,165 @@ mod tests {
         );
 
         assert!(park_effects(&state).is_empty());
+    }
+
+    fn restore_effects(state: &EngineState) -> Vec<(WindowId, RecoveryEntryId)> {
+        state
+            .effects
+            .iter()
+            .filter_map(|effect| match effect {
+                EngineEffect::RestoreWindow {
+                    window_id,
+                    entry_id,
+                } => Some((*window_id, *entry_id)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn park(state: &mut EngineState, window_id: isize, entry: i64) {
+        apply(
+            state,
+            Event::ParkingAuthorizationRequested {
+                window_id: WindowId(window_id),
+            },
+        );
+        let token = state
+            .pending_parking
+            .iter()
+            .find(|pending| pending.window_id == WindowId(window_id))
+            .expect("the request was accepted")
+            .token;
+        apply(
+            state,
+            Event::RecoveryEntryDurable {
+                token,
+                entry_id: RecoveryEntryId(entry),
+            },
+        );
+        apply(
+            state,
+            Event::WindowParked {
+                window_id: WindowId(window_id),
+                entry_id: RecoveryEntryId(entry),
+            },
+        );
+    }
+
+    #[test]
+    fn a_failed_park_is_recorded_and_leaves_the_window_unparked() {
+        let mut state = parkable_state();
+        apply(
+            &mut state,
+            Event::ParkingAuthorizationRequested {
+                window_id: WindowId(1),
+            },
+        );
+        apply(
+            &mut state,
+            Event::RecoveryEntryDurable {
+                token: 1,
+                entry_id: RecoveryEntryId(9),
+            },
+        );
+
+        apply(
+            &mut state,
+            Event::WindowParkFailed {
+                window_id: WindowId(1),
+                entry_id: RecoveryEntryId(9),
+                reason: "SetWindowPos failed".to_owned(),
+            },
+        );
+
+        assert!(state.parked_windows.is_empty());
+        assert_eq!(
+            state.last_parking_failure,
+            Some(ParkingFailure {
+                window_id: WindowId(1),
+                entry_id: RecoveryEntryId(9),
+                stage: ParkingStage::Park,
+                reason: "SetWindowPos failed".to_owned(),
+            })
+        );
+        assert!(
+            !recovery_intents(&state)
+                .iter()
+                .any(|intent| matches!(intent, PersistenceIntent::MarkParked(_))),
+            "an entry whose park failed is never marked parked"
+        );
+    }
+
+    #[test]
+    fn restoring_parked_windows_asks_for_each_and_a_failed_restore_keeps_the_entry_open() {
+        let mut state = parkable_state();
+        observe(
+            &mut state,
+            vec![
+                app_window_at(1, "a.exe", 1, Rect::new(0, 0, 400, 300)),
+                app_window_at(2, "b.exe", 1, Rect::new(0, 0, 400, 300)),
+            ],
+        );
+        park(&mut state, 1, 9);
+        park(&mut state, 2, 10);
+
+        apply(&mut state, Event::RestoreParkedWindowsRequested);
+
+        assert_eq!(
+            restore_effects(&state),
+            vec![
+                (WindowId(1), RecoveryEntryId(9)),
+                (WindowId(2), RecoveryEntryId(10))
+            ]
+        );
+
+        apply(
+            &mut state,
+            Event::WindowRestored {
+                window_id: WindowId(1),
+            },
+        );
+        apply(
+            &mut state,
+            Event::WindowRestoreFailed {
+                window_id: WindowId(2),
+                entry_id: RecoveryEntryId(10),
+                reason: "SetWindowPlacement failed".to_owned(),
+            },
+        );
+
+        assert_eq!(
+            state.parked_windows.get(&WindowId(2)),
+            Some(&RecoveryEntryId(10)),
+            "a window whose restore failed stays parked, so recovery still finds it"
+        );
+        assert!(!state.parked_windows.contains_key(&WindowId(1)));
+        assert_eq!(
+            state
+                .last_parking_failure
+                .as_ref()
+                .map(|failure| failure.stage),
+            Some(ParkingStage::Restore)
+        );
+        assert!(recovery_intents(&state)
+            .iter()
+            .any(|intent| matches!(intent, PersistenceIntent::MarkRestored(RecoveryEntryId(9)))));
+        assert!(!recovery_intents(&state)
+            .iter()
+            .any(|intent| matches!(intent, PersistenceIntent::MarkRestored(RecoveryEntryId(10)))));
+    }
+
+    #[test]
+    fn a_parked_window_that_closes_releases_its_entry() {
+        let mut state = parkable_state();
+        park(&mut state, 1, 9);
+
+        observe(&mut state, vec![]);
+
+        assert!(state.parked_windows.is_empty());
+        assert!(recovery_intents(&state)
+            .iter()
+            .any(|intent| matches!(intent, PersistenceIntent::MarkRestored(RecoveryEntryId(9)))));
     }
 
     #[test]
