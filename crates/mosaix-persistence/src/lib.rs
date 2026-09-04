@@ -20,6 +20,7 @@ use mosaix_domain::identity::WindowEvidence;
 use mosaix_domain::tree::PersistedTree;
 use mosaix_domain::undo::{
     now_unix, UndoMember, UndoTransaction, UndoTransactionDraft, UndoTransactionId,
+    UndoTreeSnapshot,
 };
 use mosaix_domain::{ApplicationId, Rect, WindowRole};
 use rusqlite::Connection;
@@ -103,6 +104,19 @@ const MIGRATIONS: &[Migration] = &[
         statements: "CREATE TABLE container_tree (
                          display_fingerprint TEXT PRIMARY KEY,
                          tree TEXT NOT NULL
+                     );",
+    },
+    // The container trees a command reshaped, as they stood before it, so
+    // undo restores structure as well as placements. Cascades with the
+    // transaction for the same reason members do.
+    Migration {
+        version: 4,
+        statements: "CREATE TABLE undo_tree (
+                         transaction_id INTEGER NOT NULL
+                             REFERENCES undo_transaction (id) ON DELETE CASCADE,
+                         display_fingerprint TEXT NOT NULL,
+                         tree TEXT NOT NULL,
+                         PRIMARY KEY (transaction_id, display_fingerprint)
                      );",
     },
 ];
@@ -295,7 +309,10 @@ impl Persistence {
         // The state database sits beside the configuration directory but
         // does not depend on it having been created, so it makes its own
         // parent rather than assuming another subsystem already did.
-        if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
             std::fs::create_dir_all(parent).map_err(PersistenceError::Directory)?;
         }
         let connection = Connection::open(path).map_err(PersistenceError::Open)?;
@@ -332,12 +349,12 @@ impl Persistence {
             .iter()
             .filter(move |step| step.version > already_applied)
         {
-            let transaction = connection
-                .unchecked_transaction()
-                .map_err(|source| PersistenceError::Migration {
+            let transaction = connection.unchecked_transaction().map_err(|source| {
+                PersistenceError::Migration {
                     version: migration.version,
                     source,
-                })?;
+                }
+            })?;
             // The version bump rides inside the same transaction, so a
             // migration that fails halfway leaves neither its tables nor
             // its version number behind.
@@ -452,6 +469,18 @@ impl Persistence {
         &mut self,
         draft: &UndoTransactionDraft,
     ) -> Result<UndoTransactionId, PersistenceError> {
+        // Encoded before the write begins, so an unencodable tree fails
+        // the whole record rather than a transaction with its structure
+        // silently missing.
+        let trees: Vec<(String, String)> = draft
+            .prior_trees
+            .iter()
+            .map(|snapshot| {
+                serde_json::to_string(&snapshot.tree)
+                    .map(|document| (snapshot.display_fingerprint.clone(), document))
+                    .map_err(PersistenceError::TreeEncoding)
+            })
+            .collect::<Result<_, _>>()?;
         let outcome = self.write(|connection| {
             let transaction = connection.unchecked_transaction()?;
             transaction.execute(
@@ -498,6 +527,13 @@ impl Persistence {
                         member.evidence.last_placement.height,
                         member.evidence.display_fingerprint,
                     ],
+                )?;
+            }
+            for (display_fingerprint, document) in &trees {
+                transaction.execute(
+                    "INSERT INTO undo_tree (transaction_id, display_fingerprint, tree)
+                     VALUES (?1, ?2, ?3)",
+                    rusqlite::params![id.0, display_fingerprint, document],
                 )?;
             }
             // Pruning rides inside the insert's transaction, so history is
@@ -553,7 +589,35 @@ impl Persistence {
             topology_fingerprint,
             durable_revision,
             members: self.members_of(id)?,
+            prior_trees: self.trees_of(id)?,
         }))
+    }
+
+    fn trees_of(&self, id: UndoTransactionId) -> Result<Vec<UndoTreeSnapshot>, PersistenceError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT display_fingerprint, tree FROM undo_tree
+                 WHERE transaction_id = ?1 ORDER BY display_fingerprint",
+            )
+            .map_err(PersistenceError::Read)?;
+        let rows = statement
+            .query_map([id.0], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(PersistenceError::Read)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(PersistenceError::Read)?;
+        rows.into_iter()
+            .map(|(display_fingerprint, document)| {
+                serde_json::from_str::<PersistedTree>(&document)
+                    .map(|tree| UndoTreeSnapshot {
+                        display_fingerprint,
+                        tree,
+                    })
+                    .map_err(PersistenceError::TreeEncoding)
+            })
+            .collect()
     }
 
     fn members_of(&self, id: UndoTransactionId) -> Result<Vec<UndoMember>, PersistenceError> {
@@ -598,12 +662,10 @@ impl Persistence {
     /// Removes a transaction after it has been successfully undone.
     /// Answers whether there was one to remove, so a caller cannot mistake
     /// "already gone" for "consumed".
-    pub fn consume_transaction(
-        &mut self,
-        id: UndoTransactionId,
-    ) -> Result<bool, PersistenceError> {
+    pub fn consume_transaction(&mut self, id: UndoTransactionId) -> Result<bool, PersistenceError> {
         self.write(|connection| {
-            let removed = connection.execute("DELETE FROM undo_transaction WHERE id = ?1", [id.0])?;
+            let removed =
+                connection.execute("DELETE FROM undo_transaction WHERE id = ?1", [id.0])?;
             Ok(removed > 0)
         })
     }

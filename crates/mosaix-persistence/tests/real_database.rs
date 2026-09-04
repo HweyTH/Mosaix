@@ -230,7 +230,9 @@ fn resetting_is_explicit_and_preserves_the_unusable_database() {
 
     let outcome = Persistence::reset(&temporary.path()).expect("an explicit reset succeeds");
 
-    let preserved = outcome.preserved.expect("the unusable database is preserved");
+    let preserved = outcome
+        .preserved
+        .expect("the unusable database is preserved");
     assert_eq!(
         fs::read(&preserved).expect("preserved copy is readable"),
         corrupt_bytes,
@@ -274,7 +276,51 @@ fn draft(command: &str, applications: &[&str]) -> mosaix_domain::UndoTransaction
                 evidence: evidence(application, index as u32),
             })
             .collect(),
+        prior_trees: Vec::new(),
     }
+}
+
+#[test]
+fn a_transaction_keeps_the_arrangement_it_reshaped_across_a_restart() {
+    let temporary = TempDatabase::new("undo-tree");
+    let mut recorded = draft("resize-left", &["Code.exe", "firefox.exe"]);
+    recorded.prior_trees = vec![mosaix_domain::UndoTreeSnapshot {
+        display_fingerprint: "DISPLAY1".to_owned(),
+        tree: stored_tree(&["Code.exe", "firefox.exe"]),
+    }];
+
+    {
+        let mut store = Persistence::open(&temporary.path()).expect("database opens");
+        store.record_transaction(&recorded).expect("records");
+    }
+
+    let restarted = Persistence::open(&temporary.path()).expect("database reopens");
+    let loaded = restarted.newest_transaction().unwrap().unwrap();
+
+    assert_eq!(
+        loaded.prior_trees, recorded.prior_trees,
+        "undo must be able to put the structure back, not only the windows"
+    );
+}
+
+#[test]
+fn consuming_a_transaction_removes_its_arrangement_snapshot_too() {
+    let temporary = TempDatabase::new("undo-tree-consume");
+    let mut store = Persistence::open(&temporary.path()).expect("database opens");
+    let mut recorded = draft("swap-left", &["Code.exe"]);
+    recorded.prior_trees = vec![mosaix_domain::UndoTreeSnapshot {
+        display_fingerprint: "DISPLAY1".to_owned(),
+        tree: stored_tree(&["Code.exe"]),
+    }];
+    let id = store.record_transaction(&recorded).unwrap();
+
+    assert!(store.consume_transaction(id).unwrap());
+
+    let connection = rusqlite::Connection::open(temporary.path()).unwrap();
+    let remaining: i64 = connection
+        .query_row("SELECT COUNT(*) FROM undo_tree", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(remaining, 0, "snapshots cascade with their transaction");
 }
 
 #[test]
@@ -306,7 +352,10 @@ fn a_recorded_transaction_survives_a_restart_intact() {
 #[test]
 fn a_multi_window_transaction_survives_a_restart_with_every_member() {
     let temporary = TempDatabase::new("undo-multi-restart");
-    let recorded = draft("apply-layout halves", &["Code.exe", "firefox.exe", "wt.exe"]);
+    let recorded = draft(
+        "apply-layout halves",
+        &["Code.exe", "firefox.exe", "wt.exe"],
+    );
 
     {
         let mut store = Persistence::open(&temporary.path()).expect("database opens");
@@ -321,7 +370,11 @@ fn a_multi_window_transaction_survives_a_restart_with_every_member() {
         "a transaction that loses a member on reload would undo only part of a command"
     );
     assert_eq!(
-        loaded.members.iter().map(|member| member.ordinal).collect::<Vec<_>>(),
+        loaded
+            .members
+            .iter()
+            .map(|member| member.ordinal)
+            .collect::<Vec<_>>(),
         vec![0, 1, 2],
         "members come back in their recorded order"
     );
@@ -332,12 +385,17 @@ fn undo_history_reads_newest_first() {
     let temporary = TempDatabase::new("undo-newest");
     let mut store = Persistence::open(&temporary.path()).expect("database opens");
 
-    store.record_transaction(&draft("snap-left", &["Code.exe"])).unwrap();
+    store
+        .record_transaction(&draft("snap-left", &["Code.exe"]))
+        .unwrap();
     let newest = store
         .record_transaction(&draft("snap-right", &["firefox.exe"]))
         .unwrap();
 
-    let loaded = store.newest_transaction().unwrap().expect("history is not empty");
+    let loaded = store
+        .newest_transaction()
+        .unwrap()
+        .expect("history is not empty");
 
     assert_eq!(loaded.id, newest);
     assert_eq!(loaded.command, "snap-right");
@@ -347,14 +405,19 @@ fn undo_history_reads_newest_first() {
 fn consuming_a_transaction_removes_it_and_its_members() {
     let temporary = TempDatabase::new("undo-consume");
     let mut store = Persistence::open(&temporary.path()).expect("database opens");
-    let older = store.record_transaction(&draft("snap-left", &["Code.exe"])).unwrap();
+    let older = store
+        .record_transaction(&draft("snap-left", &["Code.exe"]))
+        .unwrap();
     let newest = store
         .record_transaction(&draft("snap-right", &["firefox.exe"]))
         .unwrap();
 
     assert!(store.consume_transaction(newest).unwrap());
 
-    let remaining = store.newest_transaction().unwrap().expect("the older one survives");
+    let remaining = store
+        .newest_transaction()
+        .unwrap()
+        .expect("the older one survives");
     assert_eq!(remaining.id, older);
     let orphaned: i64 = rusqlite::Connection::open(temporary.path())
         .unwrap()
@@ -371,7 +434,9 @@ fn consuming_a_transaction_removes_it_and_its_members() {
 fn consuming_a_transaction_that_is_already_gone_reports_that_it_did_nothing() {
     let temporary = TempDatabase::new("undo-consume-missing");
     let mut store = Persistence::open(&temporary.path()).expect("database opens");
-    let id = store.record_transaction(&draft("snap-left", &["Code.exe"])).unwrap();
+    let id = store
+        .record_transaction(&draft("snap-left", &["Code.exe"]))
+        .unwrap();
 
     assert!(store.consume_transaction(id).unwrap());
     assert!(
@@ -397,7 +462,9 @@ fn stored_undo_records_contain_no_window_titles() {
     // matters is structural: no column exists that could hold one.
     let columns: Vec<String> = {
         let connection = rusqlite::Connection::open(temporary.path()).unwrap();
-        let mut statement = connection.prepare("PRAGMA table_info(undo_member)").unwrap();
+        let mut statement = connection
+            .prepare("PRAGMA table_info(undo_member)")
+            .unwrap();
         let names = statement
             .query_map([], |row| row.get::<_, String>(1))
             .unwrap()
@@ -417,6 +484,7 @@ fn stored_undo_records_contain_no_window_titles() {
 
 fn dated_draft(command: &str, recorded_at_unix: i64) -> mosaix_domain::UndoTransactionDraft {
     mosaix_domain::UndoTransactionDraft {
+        prior_trees: Vec::new(),
         recorded_at_unix,
         ..draft(command, &["Code.exe"])
     }
@@ -425,7 +493,9 @@ fn dated_draft(command: &str, recorded_at_unix: i64) -> mosaix_domain::UndoTrans
 fn transaction_count(path: &Path) -> i64 {
     rusqlite::Connection::open(path)
         .unwrap()
-        .query_row("SELECT COUNT(*) FROM undo_transaction", [], |row| row.get(0))
+        .query_row("SELECT COUNT(*) FROM undo_transaction", [], |row| {
+            row.get(0)
+        })
         .unwrap()
 }
 
@@ -472,9 +542,15 @@ fn history_drops_transactions_older_than_the_retention_window() {
     let window = mosaix_persistence::UNDO_RETENTION_SECONDS;
 
     // Exactly at the boundary, one second inside it, and one second past.
-    store.record_transaction(&dated_draft("too-old", now - window - 1)).unwrap();
-    store.record_transaction(&dated_draft("exactly-at-the-edge", now - window)).unwrap();
-    store.record_transaction(&dated_draft("inside", now - window + 1)).unwrap();
+    store
+        .record_transaction(&dated_draft("too-old", now - window - 1))
+        .unwrap();
+    store
+        .record_transaction(&dated_draft("exactly-at-the-edge", now - window))
+        .unwrap();
+    store
+        .record_transaction(&dated_draft("inside", now - window + 1))
+        .unwrap();
     assert_eq!(transaction_count(&temporary.path()), 3);
 
     let pruned = store.prune_history(now).expect("pruning succeeds");
@@ -504,7 +580,9 @@ fn pruning_is_durable_across_a_restart() {
         store
             .record_transaction(&dated_draft("ancient", now - 400_000_000))
             .unwrap();
-        store.record_transaction(&dated_draft("recent", now)).unwrap();
+        store
+            .record_transaction(&dated_draft("recent", now))
+            .unwrap();
         store.prune_history(now).unwrap();
     }
 
@@ -522,7 +600,9 @@ fn pruning_an_already_bounded_history_changes_nothing() {
     let temporary = TempDatabase::new("retention-idempotent");
     let mut store = Persistence::open(&temporary.path()).expect("database opens");
     let now = 1_756_000_000;
-    store.record_transaction(&dated_draft("recent", now)).unwrap();
+    store
+        .record_transaction(&dated_draft("recent", now))
+        .unwrap();
 
     assert_eq!(store.prune_history(now).unwrap(), 0);
     assert_eq!(store.prune_history(now).unwrap(), 0);
@@ -571,12 +651,18 @@ fn saving_an_arrangement_replaces_the_one_that_display_held() {
     let temporary = TempDatabase::new("tree-replace");
     let mut store = Persistence::open(&temporary.path()).expect("database opens");
 
-    store.save_tree("DISPLAY1", &stored_tree(&["Code.exe"])).unwrap();
+    store
+        .save_tree("DISPLAY1", &stored_tree(&["Code.exe"]))
+        .unwrap();
     let replacement = stored_tree(&["firefox.exe", "wt.exe"]);
     store.save_tree("DISPLAY1", &replacement).unwrap();
 
     let loaded = store.load_trees().unwrap();
-    assert_eq!(loaded.len(), 1, "a display holds one arrangement, not a history");
+    assert_eq!(
+        loaded.len(),
+        1,
+        "a display holds one arrangement, not a history"
+    );
     assert_eq!(loaded["DISPLAY1"], replacement);
 }
 
@@ -584,7 +670,9 @@ fn saving_an_arrangement_replaces_the_one_that_display_held() {
 fn saving_an_empty_arrangement_forgets_the_display_rather_than_storing_emptiness() {
     let temporary = TempDatabase::new("tree-empty");
     let mut store = Persistence::open(&temporary.path()).expect("database opens");
-    store.save_tree("DISPLAY1", &stored_tree(&["Code.exe"])).unwrap();
+    store
+        .save_tree("DISPLAY1", &stored_tree(&["Code.exe"]))
+        .unwrap();
 
     store
         .save_tree("DISPLAY1", &mosaix_domain::PersistedTree::new())
@@ -601,8 +689,12 @@ fn each_display_keeps_its_own_arrangement() {
     let temporary = TempDatabase::new("tree-per-display");
     let mut store = Persistence::open(&temporary.path()).expect("database opens");
 
-    store.save_tree("DISPLAY1", &stored_tree(&["Code.exe"])).unwrap();
-    store.save_tree("DISPLAY2", &stored_tree(&["firefox.exe"])).unwrap();
+    store
+        .save_tree("DISPLAY1", &stored_tree(&["Code.exe"]))
+        .unwrap();
+    store
+        .save_tree("DISPLAY2", &stored_tree(&["firefox.exe"]))
+        .unwrap();
 
     let loaded = store.load_trees().unwrap();
     assert_eq!(loaded.len(), 2);
@@ -614,8 +706,12 @@ fn an_unreadable_arrangement_does_not_cost_the_others() {
     let temporary = TempDatabase::new("tree-unreadable");
     {
         let mut store = Persistence::open(&temporary.path()).expect("database opens");
-        store.save_tree("DISPLAY1", &stored_tree(&["Code.exe"])).unwrap();
-        store.save_tree("DISPLAY2", &stored_tree(&["firefox.exe"])).unwrap();
+        store
+            .save_tree("DISPLAY1", &stored_tree(&["Code.exe"]))
+            .unwrap();
+        store
+            .save_tree("DISPLAY2", &stored_tree(&["firefox.exe"]))
+            .unwrap();
     }
     rusqlite::Connection::open(temporary.path())
         .unwrap()
@@ -656,7 +752,9 @@ fn stored_arrangements_contain_no_window_titles() {
 fn a_locked_database_degrades_the_write_and_recovers_when_the_lock_clears() {
     let temporary = TempDatabase::new("locked");
     let mut store = Persistence::open(&temporary.path()).expect("database opens");
-    store.commit_revision(1).expect("the first revision commits");
+    store
+        .commit_revision(1)
+        .expect("the first revision commits");
 
     let blocker = rusqlite::Connection::open(temporary.path()).expect("blocking connection opens");
     blocker
@@ -695,7 +793,9 @@ fn a_locked_database_degrades_the_write_and_recovers_when_the_lock_clears() {
 fn a_write_failure_never_advances_the_durable_revision() {
     let temporary = TempDatabase::new("no-false-promise");
     let mut store = Persistence::open(&temporary.path()).expect("database opens");
-    store.commit_revision(7).expect("the first revision commits");
+    store
+        .commit_revision(7)
+        .expect("the first revision commits");
 
     let blocker = rusqlite::Connection::open(temporary.path()).expect("blocking connection opens");
     blocker.execute_batch("BEGIN EXCLUSIVE").unwrap();

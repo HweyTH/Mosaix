@@ -41,11 +41,12 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 use mosaix_config::{Command, ResolvedConfig, ResolvedConfigSet, TilingMode};
+use mosaix_domain::commands::{TreeResizeApplied, TreeResizeRefusal, TREE_RESIZE_STEP_PERCENT};
 use mosaix_domain::identity::{match_window_with_order, WindowEvidence};
-use mosaix_domain::tree::{ContainerTree, PersistedTree};
+use mosaix_domain::tree::{ContainerTree, PersistedTree, SplitAxis, Toward};
 use mosaix_domain::undo::{
     now_unix, UndoApplied, UndoMember, UndoRefusal, UndoRestoredWindow, UndoResult,
-    UndoTargetOutcome, UndoTransaction, UndoTransactionDraft, UndoTransactionId,
+    UndoTargetOutcome, UndoTransaction, UndoTransactionDraft, UndoTransactionId, UndoTreeSnapshot,
 };
 use mosaix_domain::{
     topology_fingerprint, Display, DisplayId, Rect, Window, WindowId, WindowLifecycle,
@@ -163,11 +164,15 @@ pub struct InteractivePlacementSession {
 /// as an automatic reflow does -- does not overwrite that, because undo
 /// restores where the window was before the *command*, not before its last
 /// internal step.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 struct UndoScope {
     command: String,
     members: Vec<UndoMember>,
     claimed: HashSet<WindowId>,
+    /// Each container tree the command is about to reshape, as it stood
+    /// when the command started. Captured once per display; the first
+    /// capture wins for the same reason the first placement does.
+    prior_trees: Vec<(DisplayId, ContainerTree)>,
 }
 
 /// State the reducer owns and is the only writer of.
@@ -430,6 +435,26 @@ const fn swap_command(direction: CardinalDirection) -> &'static str {
     }
 }
 
+/// The stored command name for a tree resize.
+const fn resize_command(direction: CardinalDirection) -> &'static str {
+    match direction {
+        CardinalDirection::Left => "resize-left",
+        CardinalDirection::Right => "resize-right",
+        CardinalDirection::Up => "resize-up",
+        CardinalDirection::Down => "resize-down",
+    }
+}
+
+/// The container axis a cardinal direction moves along, and which way.
+const fn divider_for(direction: CardinalDirection) -> (SplitAxis, Toward) {
+    match direction {
+        CardinalDirection::Left => (SplitAxis::Horizontal, Toward::Start),
+        CardinalDirection::Right => (SplitAxis::Horizontal, Toward::End),
+        CardinalDirection::Up => (SplitAxis::Vertical, Toward::Start),
+        CardinalDirection::Down => (SplitAxis::Vertical, Toward::End),
+    }
+}
+
 /// The stored command name for a throw to an adjacent display.
 const fn throw_command(direction: DisplayDirection) -> &'static str {
     match direction {
@@ -613,6 +638,16 @@ pub enum Event {
     /// Swaps the focused window with its nearest display-local cardinal
     /// neighbor, then recomputes the affected Balanced grid.
     DirectionalSwapRequested {
+        direction: CardinalDirection,
+    },
+
+    /// Move the nearest container-tree divider facing `direction` by
+    /// [`TREE_RESIZE_STEP_PERCENT`] points, growing the focused window's
+    /// side (CONTEXT.md "Tree resize"). Every way it can change nothing is
+    /// a typed [`TreeResizeRefusal`], reached by [`plan_tree_resize`] so a
+    /// synchronous caller can report it; the reducer reaches the same
+    /// verdict and, on a refusal, mutates nothing.
+    TreeResizeRequested {
         direction: CardinalDirection,
     },
 
@@ -966,6 +1001,28 @@ fn apply(state: &mut EngineState, event: Event) {
                 // No scope is opened here: undo is not itself undoable.
                 // Persistent redo is deferred to issue #44, and recording
                 // one would make a second undo reverse the first.
+                //
+                // Structure first, then windows. The trees the command
+                // reshaped go back to what they were, through the same
+                // confident matching a stored arrangement uses, so the
+                // next reflow agrees with the restored placements rather
+                // than quietly redoing the command.
+                let prior_trees = state
+                    .newest_undo
+                    .as_ref()
+                    .map(|transaction| transaction.prior_trees.clone())
+                    .unwrap_or_default();
+                let mut restored_structure = false;
+                for snapshot in &prior_trees {
+                    let Some(display_id) = display_id_of(state, &snapshot.display_fingerprint)
+                    else {
+                        continue;
+                    };
+                    let active = active_tiled_windows_on(state, display_id);
+                    let restored = restore_tree(state, &snapshot.tree, &active);
+                    state.trees.insert(display_id, restored);
+                    restored_structure = true;
+                }
                 for restored in &applied.restored {
                     place_window(
                         state,
@@ -974,6 +1031,13 @@ fn apply(state: &mut EngineState, event: Event) {
                         restored.placement,
                         None,
                     );
+                }
+                if restored_structure {
+                    // Passive: no scope is open, so whatever this moves is
+                    // part of the undo rather than a new transaction. With
+                    // consistent snapshots it moves nothing, and stores
+                    // the restored tree.
+                    reconcile_arrangements(state);
                 }
                 state
                     .persistence_intents
@@ -1445,6 +1509,9 @@ fn apply(state: &mut EngineState, event: Event) {
                 return;
             };
             order.swap(focused_index, neighbor_index);
+            // The scope opens before the tree changes, so the transaction
+            // can carry the structure as it was and not only the windows.
+            open_undo_scope(state, swap_command(direction));
             // In tree mode the arrangement comes from the tree, not from
             // visual order, so the exchange has to happen there too. It is
             // an exchange of the two leaves' occupants and nothing else:
@@ -1452,11 +1519,28 @@ fn apply(state: &mut EngineState, event: Event) {
             // were (ADR 0026). Focus is deliberately not moved, so the user
             // keeps controlling the window they just moved.
             if state.resolved_config.tiling_mode == TilingMode::Tree {
+                capture_tree_for_undo(state, display_id);
                 if let Some(tree) = state.trees.get_mut(&display_id) {
                     tree.swap_leaves(&focused, &neighbor);
                 }
             }
-            open_undo_scope(state, swap_command(direction));
+            reconcile_arrangements(state);
+            state.revision += 1;
+            close_undo_scope(state);
+        }
+
+        Event::TreeResizeRequested { direction } => {
+            let plan = match plan_tree_resize(state, direction) {
+                Ok(plan) => plan,
+                Err(refusal) => {
+                    tracing::info!(%refusal, "tree resize refused; nothing changed");
+                    return;
+                }
+            };
+            let display_id = plan.applied.display_id;
+            open_undo_scope(state, resize_command(direction));
+            capture_tree_for_undo(state, display_id);
+            state.trees.insert(display_id, plan.tree);
             reconcile_arrangements(state);
             state.revision += 1;
             close_undo_scope(state);
@@ -2319,6 +2403,119 @@ pub fn diff_placements(
 /// some members have moved and a later one turns out to be unresolvable.
 /// The same function answers the IPC preflight and drives the reducer, so a
 /// caller is never told something different from what happens.
+/// The windows currently eligible to occupy leaves of `display_id`'s tree:
+/// tiled, on that display, and not temporarily ineligible.
+fn active_tiled_windows_on(state: &EngineState, display_id: DisplayId) -> Vec<WindowId> {
+    let mut active: Vec<WindowId> = state
+        .inventory
+        .values()
+        .filter(|managed| {
+            managed.window.display_id == display_id
+                && (managed.action == ManageAction::Tile
+                    || state.session_tiled.contains(&managed.window.id))
+                && managed.eligibility == EligibilityReason::Eligible
+        })
+        .map(|managed| managed.window.id)
+        .collect();
+    active.sort_unstable_by_key(|id| id.0);
+    active
+}
+
+/// A resize the reducer would apply: the typed outcome to report, and the
+/// reshaped tree to adopt.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TreeResizePlan {
+    pub applied: TreeResizeApplied,
+    pub tree: ContainerTree,
+}
+
+/// What resizing the focused window's tree in `direction` would do
+/// against `state` right now, or the typed reason it would do nothing.
+///
+/// Pure over `state`, so the IPC handler and the reducer reach the same
+/// verdict from the same state. The full five-point step is taken when
+/// every arranged window stays at or above its minimum size with the
+/// gaps it has; otherwise the largest smaller whole step that does is
+/// taken, and if not even one point is legal the command is refused
+/// without touching the tree (spec user stories 33, 34, and 37).
+/// "Legal" means the resize neither overflows a window that was arranged
+/// nor costs any decoration: a resize is a request about weights, and
+/// it must not be answered by degrading the arrangement.
+pub fn plan_tree_resize(
+    state: &EngineState,
+    direction: CardinalDirection,
+) -> Result<TreeResizePlan, TreeResizeRefusal> {
+    let command = resize_command(direction).to_owned();
+    if state.paused {
+        return Err(TreeResizeRefusal::Paused);
+    }
+    if state.resolved_config.tiling_mode != TilingMode::Tree || !state.automatic_tiling_active {
+        return Err(TreeResizeRefusal::NotTreeMode);
+    }
+    let window_id = state
+        .focused_window
+        .ok_or(TreeResizeRefusal::NoFocusedWindow)?;
+    let display_id = state
+        .inventory
+        .get(&window_id)
+        .map(|managed| managed.window.display_id)
+        .ok_or(TreeResizeRefusal::NoFocusedWindow)?;
+    let work_area = work_area_of(&state.displays, display_id)
+        .ok_or(TreeResizeRefusal::DisplayUnavailable { display_id })?;
+    if !arranged_in_tree(state, display_id, window_id) {
+        return Err(TreeResizeRefusal::NotArranged { window_id });
+    }
+    let tree = state
+        .trees
+        .get(&display_id)
+        .ok_or(TreeResizeRefusal::NotArranged { window_id })?;
+    let (axis, toward) = divider_for(direction);
+    if !tree.has_divider_toward(&window_id, axis, toward) {
+        return Err(TreeResizeRefusal::NoDivider { command });
+    }
+
+    let minimum_size = |id: WindowId| {
+        state
+            .inventory
+            .get(&id)
+            .and_then(|managed| managed.window.minimum_size)
+    };
+    let gaps = state.resolved_config.gaps;
+    let current = plan_tree_constrained(tree, work_area, gaps, minimum_size);
+
+    for points in (1..=TREE_RESIZE_STEP_PERCENT).rev() {
+        let mut candidate = tree.clone();
+        let Some(change) =
+            candidate.resize_toward(&window_id, axis, toward, f64::from(points) / 100.0)
+        else {
+            continue;
+        };
+        let planned = plan_tree_constrained(&candidate, work_area, gaps, minimum_size);
+        let no_new_overflow = planned
+            .overflow
+            .iter()
+            .all(|id| current.overflow.contains(id));
+        let no_lost_decoration =
+            planned.gaps.outer >= current.gaps.outer && planned.gaps.inner >= current.gaps.inner;
+        if no_new_overflow && no_lost_decoration {
+            return Ok(TreeResizePlan {
+                applied: TreeResizeApplied {
+                    command,
+                    display_id,
+                    window_id,
+                    percentage_points: points,
+                    grew: change.grew,
+                    shrank: change.shrank,
+                    weights_before: change.weights_before,
+                    weights_after: change.weights_after,
+                },
+                tree: candidate,
+            });
+        }
+    }
+    Err(TreeResizeRefusal::MinimumSizeReached { command })
+}
+
 pub fn plan_undo(state: &EngineState) -> UndoResult {
     let Some(transaction) = state.newest_undo.as_ref() else {
         return UndoResult::Refused(UndoRefusal::NothingToUndo);
@@ -2468,19 +2665,46 @@ fn open_undo_scope(state: &mut EngineState, command: &str) {
         command: command.to_owned(),
         members: Vec::new(),
         claimed: HashSet::new(),
+        prior_trees: Vec::new(),
     });
 }
 
-/// Closes the open scope, recording a transaction if it moved anything.
+/// Records `display_id`'s container tree in the open scope, as it stands
+/// now, before the command reshapes it. Call it before the mutation; a
+/// second call for the same display is ignored.
+fn capture_tree_for_undo(state: &mut EngineState, display_id: DisplayId) {
+    let tree = state.trees.get(&display_id).cloned().unwrap_or_default();
+    if let Some(scope) = state.undo_scope.as_mut() {
+        if !scope.prior_trees.iter().any(|(id, _)| *id == display_id) {
+            scope.prior_trees.push((display_id, tree));
+        }
+    }
+}
+
+/// Closes the open scope, recording a transaction if it changed anything.
 ///
-/// A command that moved nothing -- refused, suppressed by a circuit
-/// breaker, or a no-op -- records nothing, so undo never offers to reverse
-/// something the user never saw happen.
+/// A command that moved nothing and reshaped nothing -- refused,
+/// suppressed by a circuit breaker, or a no-op -- records nothing, so undo
+/// never offers to reverse something the user never saw happen. A tree
+/// captured but left as it was is not a change either.
 fn close_undo_scope(state: &mut EngineState) {
     let Some(scope) = state.undo_scope.take() else {
         return;
     };
-    if scope.members.is_empty() {
+    let prior_trees: Vec<UndoTreeSnapshot> = scope
+        .prior_trees
+        .iter()
+        .filter(|(display_id, prior)| {
+            state.trees.get(display_id).unwrap_or(&ContainerTree::new()) != prior
+        })
+        .filter_map(|(display_id, prior)| {
+            Some(UndoTreeSnapshot {
+                display_fingerprint: display_fingerprint_of(state, *display_id)?,
+                tree: durable_tree(state, prior),
+            })
+        })
+        .collect();
+    if scope.members.is_empty() && prior_trees.is_empty() {
         return;
     }
     state
@@ -2492,6 +2716,7 @@ fn close_undo_scope(state: &mut EngineState) {
                 topology_fingerprint: mosaix_domain::topology_fingerprint(&state.displays),
                 durable_revision: state.revision,
                 members: scope.members,
+                prior_trees,
             },
         ));
 }
@@ -6890,6 +7115,7 @@ mod tests {
             topology_fingerprint: draft.topology_fingerprint.clone(),
             durable_revision: draft.durable_revision,
             members: draft.members.clone(),
+            prior_trees: draft.prior_trees.clone(),
         }
     }
 
@@ -8009,6 +8235,342 @@ mod tests {
             "both swapped windows are reversible together, found {:?}",
             drafts[0].members.len()
         );
+    }
+
+    // ---- Tree resize (issue #52) ---------------------------------------
+
+    /// H[ 1, V[ 2, 3 ] ] on a 1920x1080 display: window 1 takes the left
+    /// half, windows 2 and 3 stack on the right.
+    fn nested_tree_state() -> EngineState {
+        let mut state = tree_state();
+        observe(&mut state, vec![window_at(1, 1, Rect::new(0, 0, 400, 300))]);
+        observe(
+            &mut state,
+            vec![
+                window_at(1, 1, Rect::new(0, 0, 1920, 1080)),
+                window_at(2, 1, Rect::new(0, 0, 400, 300)),
+            ],
+        );
+        focus(&mut state, 2, Rect::new(960, 0, 960, 1080));
+        observe(
+            &mut state,
+            vec![
+                window_at(1, 1, Rect::new(0, 0, 960, 1080)),
+                window_at(2, 1, Rect::new(960, 0, 960, 1080)),
+                window_at(3, 1, Rect::new(0, 0, 400, 300)),
+            ],
+        );
+        assert_eq!(
+            arrangement(&state),
+            vec![
+                (1, Rect::new(0, 0, 960, 1080)),
+                (2, Rect::new(960, 0, 960, 540)),
+                (3, Rect::new(960, 540, 960, 540)),
+            ]
+        );
+        state.effects.clear();
+        state.persistence_intents.clear();
+        state
+    }
+
+    fn focus(state: &mut EngineState, id: isize, bounds: Rect) {
+        apply(
+            state,
+            Event::WindowFocused {
+                window_id: WindowId(id),
+                display_id: DisplayId(1),
+                bounds,
+            },
+        );
+    }
+
+    fn resize(state: &mut EngineState, direction: CardinalDirection) {
+        apply(state, Event::TreeResizeRequested { direction });
+    }
+
+    #[test]
+    fn resizing_moves_the_nearest_divider_by_five_points_and_reflows() {
+        let mut state = nested_tree_state();
+        focus(&mut state, 3, Rect::new(960, 540, 960, 540));
+
+        // Up from window 3 moves the divider between 2 and 3: 3 grows to
+        // 55% of the right column's 1080px, 2 shrinks to 45%.
+        resize(&mut state, CardinalDirection::Up);
+
+        assert_eq!(
+            arrangement(&state),
+            vec![
+                (1, Rect::new(0, 0, 960, 1080)),
+                (2, Rect::new(960, 0, 960, 486)),
+                (3, Rect::new(960, 486, 960, 594)),
+            ],
+            "the focused window grew upward and its sibling gave the space; nothing else moved"
+        );
+    }
+
+    #[test]
+    fn resizing_climbs_to_the_outer_divider_when_the_parent_cannot_face_that_way() {
+        let mut state = nested_tree_state();
+        focus(&mut state, 3, Rect::new(960, 540, 960, 540));
+
+        // Left from window 3: its parent is vertical, so the horizontal
+        // root divider moves and the whole right column grows.
+        resize(&mut state, CardinalDirection::Left);
+
+        assert_eq!(
+            arrangement(&state),
+            vec![
+                (1, Rect::new(0, 0, 864, 1080)),
+                (2, Rect::new(864, 0, 1056, 540)),
+                (3, Rect::new(864, 540, 1056, 540)),
+            ]
+        );
+    }
+
+    #[test]
+    fn resizing_at_the_arrangement_edge_is_a_typed_no_op() {
+        let mut state = nested_tree_state();
+        focus(&mut state, 1, Rect::new(0, 0, 960, 1080));
+        let before = state.trees[&DisplayId(1)].clone();
+
+        assert_eq!(
+            plan_tree_resize(&state, CardinalDirection::Left),
+            Err(TreeResizeRefusal::NoDivider {
+                command: "resize-left".to_owned()
+            })
+        );
+        assert!(matches!(
+            plan_tree_resize(&state, CardinalDirection::Up),
+            Err(TreeResizeRefusal::NoDivider { .. })
+        ));
+        resize(&mut state, CardinalDirection::Left);
+
+        assert_eq!(
+            state.trees[&DisplayId(1)],
+            before,
+            "no unrelated axis was touched"
+        );
+        assert!(placements(&state).is_empty());
+        assert!(
+            recorded_drafts(&state).is_empty(),
+            "a refused resize records no transaction"
+        );
+    }
+
+    #[test]
+    fn resizing_is_refused_for_windows_the_tree_does_not_arrange() {
+        let mut state = nested_tree_state();
+        assert_eq!(
+            plan_tree_resize(&EngineState::default(), CardinalDirection::Left),
+            Err(TreeResizeRefusal::NotTreeMode)
+        );
+        state.focused_window = None;
+        assert_eq!(
+            plan_tree_resize(&state, CardinalDirection::Left),
+            Err(TreeResizeRefusal::NoFocusedWindow)
+        );
+
+        // A session-floating window has no leaf.
+        focus(&mut state, 2, Rect::new(960, 0, 960, 540));
+        apply(&mut state, Event::ToggleFloatingRequested);
+        assert_eq!(
+            plan_tree_resize(&state, CardinalDirection::Left),
+            Err(TreeResizeRefusal::NotArranged {
+                window_id: WindowId(2)
+            })
+        );
+
+        state.paused = true;
+        assert_eq!(
+            plan_tree_resize(&state, CardinalDirection::Left),
+            Err(TreeResizeRefusal::Paused)
+        );
+    }
+
+    #[test]
+    fn resizing_clamps_to_the_largest_step_that_respects_minimum_sizes() {
+        // Two windows side by side on 1920px. Window 1 needs 940px; it
+        // holds 960, so the divider can move 20px toward it: 1% of 1920
+        // is 19.2px, 2% is 38.4px. Only the one-point step is legal.
+        let mut state = tree_state();
+        observe(
+            &mut state,
+            vec![
+                window_needing(1, 1, Rect::new(0, 0, 400, 300), (940, 100)),
+                window_at(2, 1, Rect::new(500, 0, 400, 300)),
+            ],
+        );
+        focus(&mut state, 2, Rect::new(960, 0, 960, 1080));
+        state.persistence_intents.clear();
+
+        let plan = plan_tree_resize(&state, CardinalDirection::Left).expect("one point fits");
+        assert_eq!(plan.applied.percentage_points, 1);
+        resize(&mut state, CardinalDirection::Left);
+        assert_eq!(state.windows[&WindowId(1)].bounds.width, 941);
+        assert!(
+            state.constraint_overflow.is_empty(),
+            "the clamp never overflows a window"
+        );
+
+        // Now window 1 is at 941px: not even one more point is legal.
+        assert_eq!(
+            plan_tree_resize(&state, CardinalDirection::Left),
+            Err(TreeResizeRefusal::MinimumSizeReached {
+                command: "resize-left".to_owned()
+            })
+        );
+        let before = state.trees[&DisplayId(1)].clone();
+        resize(&mut state, CardinalDirection::Left);
+        assert_eq!(state.trees[&DisplayId(1)], before);
+    }
+
+    #[test]
+    fn resizing_never_pays_for_itself_with_gaps() {
+        // With 20px gaps, window 1 at 960px raw is 946px placed and needs
+        // 940. A one-point move (19px) would put it below 940 -- and the
+        // planner could rescue that by shrinking the gaps, which a resize
+        // must not do.
+        let mut state = tree_state();
+        state.resolved_config.gaps = mosaix_domain::Gaps::new(20, 12);
+        observe(
+            &mut state,
+            vec![
+                window_needing(1, 1, Rect::new(0, 0, 400, 300), (940, 100)),
+                window_at(2, 1, Rect::new(500, 0, 400, 300)),
+            ],
+        );
+        focus(&mut state, 2, Rect::new(960, 0, 960, 1080));
+
+        assert!(matches!(
+            plan_tree_resize(&state, CardinalDirection::Left),
+            Err(TreeResizeRefusal::MinimumSizeReached { .. })
+        ));
+    }
+
+    #[test]
+    fn a_resize_and_its_placements_are_one_undo_transaction_that_restores_the_tree() {
+        let mut state = nested_tree_state();
+        focus(&mut state, 3, Rect::new(960, 540, 960, 540));
+        let tree_before = state.trees[&DisplayId(1)].clone();
+        let arrangement_before = arrangement(&state);
+
+        resize(&mut state, CardinalDirection::Up);
+
+        let drafts = recorded_drafts(&state);
+        assert_eq!(drafts.len(), 1, "one command, one transaction");
+        assert_eq!(drafts[0].command, "resize-up");
+        assert_eq!(drafts[0].members.len(), 2, "both moved windows are members");
+        assert_eq!(
+            drafts[0].prior_trees.len(),
+            1,
+            "and the tree as it was rides along"
+        );
+        assert_eq!(drafts[0].prior_trees[0].display_fingerprint, "DISPLAY1");
+
+        // Publish it back as stored history and undo it.
+        let stored = stored(drafts[0], 1);
+        apply(&mut state, Event::UndoHistoryLoaded(Some(Box::new(stored))));
+        state.effects.clear();
+        apply(&mut state, Event::UndoRequested);
+
+        assert!(matches!(
+            state.last_undo_result,
+            Some(UndoResult::Applied(_))
+        ));
+        assert_eq!(
+            arrangement(&state),
+            arrangement_before,
+            "the windows are back"
+        );
+        assert_eq!(
+            state.trees[&DisplayId(1)],
+            tree_before,
+            "and so are the weights, so the next reflow does not redo the resize"
+        );
+
+        // A later passive reflow moves nothing.
+        state.effects.clear();
+        observe(
+            &mut state,
+            vec![
+                window_at(1, 1, Rect::new(0, 0, 960, 1080)),
+                window_at(2, 1, Rect::new(960, 0, 960, 540)),
+                window_at(3, 1, Rect::new(960, 540, 960, 540)),
+            ],
+        );
+        assert!(placements(&state).is_empty());
+    }
+
+    #[test]
+    fn undoing_a_swap_restores_the_tree_as_well_as_the_windows() {
+        let mut state = nested_tree_state();
+        focus(&mut state, 1, Rect::new(0, 0, 960, 1080));
+        let tree_before = state.trees[&DisplayId(1)].clone();
+
+        apply(
+            &mut state,
+            Event::DirectionalSwapRequested {
+                direction: CardinalDirection::Right,
+            },
+        );
+        assert_ne!(state.trees[&DisplayId(1)], tree_before);
+        let drafts = recorded_drafts(&state);
+        assert_eq!(drafts.len(), 1);
+        assert_eq!(drafts[0].prior_trees.len(), 1);
+        let stored = stored(drafts[0], 1);
+        apply(&mut state, Event::UndoHistoryLoaded(Some(Box::new(stored))));
+
+        apply(&mut state, Event::UndoRequested);
+
+        assert_eq!(state.trees[&DisplayId(1)], tree_before);
+    }
+
+    #[test]
+    fn resize_survives_deep_unbalanced_odd_and_negative_origin_arrangements() {
+        // A five-window tree on an oddly sized display left of the primary,
+        // resized repeatedly in every direction: every plan must keep
+        // tiling exactly, and every resize must be reversible by the
+        // opposite resize on the sibling.
+        let mut state = tree_state();
+        state.displays[0].full_bounds = Rect::new(-1367, -13, 1367, 769);
+        state.displays[0].work_area = Rect::new(-1367, -13, 1367, 741);
+        state.displays[0].scale_factor = 1.25;
+        let mut windows = Vec::new();
+        for id in 1..=5 {
+            windows.push(window_at(
+                id,
+                1,
+                Rect::new(-1300 + id as i32 * 10, 0, 300, 200),
+            ));
+            observe(&mut state, windows.clone());
+            let bounds = state.windows[&WindowId(id)].bounds;
+            focus(&mut state, id, bounds);
+        }
+        let work_area = state.displays[0].work_area;
+        for (id, direction) in [
+            (5, CardinalDirection::Left),
+            (5, CardinalDirection::Up),
+            (3, CardinalDirection::Down),
+            (2, CardinalDirection::Right),
+            (4, CardinalDirection::Left),
+        ] {
+            let bounds = state.windows[&WindowId(id)].bounds;
+            focus(&mut state, id, bounds);
+            resize(&mut state, direction);
+            let placed = arrangement(&state);
+            let covered: i64 = placed
+                .iter()
+                .map(|(_, rect)| (rect.width as i64) * (rect.height as i64))
+                .sum();
+            assert_eq!(
+                covered,
+                (work_area.width as i64) * (work_area.height as i64),
+                "after {direction:?} on {id}: the tiling must still cover the work area exactly"
+            );
+            for (_, rect) in &placed {
+                assert!(work_area.contains(rect), "{rect:?} escaped {work_area:?}");
+            }
+        }
     }
 
     // ---- Constraint overflow (issue #54) ------------------------------

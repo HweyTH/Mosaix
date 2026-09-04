@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use crate::geometry::Rect;
 use crate::id::{DisplayId, WindowId};
 use crate::identity::{MatchOutcome, WindowEvidence};
+use crate::tree::PersistedTree;
 
 /// Seconds since the Unix epoch, as retention bounds measure time.
 ///
@@ -53,8 +54,24 @@ pub struct UndoMember {
     pub evidence: WindowEvidence,
 }
 
+/// One display's container tree as it stood before the command, so undo
+/// can put the structure back and not only the windows.
+///
+/// Without this, undoing a swap or a resize would restore every window's
+/// rectangle and leave the tree describing the new arrangement -- and the
+/// next reflow would quietly redo the command. Stored in the durable
+/// form, so it is restored through the same confident matching a saved
+/// arrangement is (ADR 0024: "every reversible state change").
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct UndoTreeSnapshot {
+    pub display_fingerprint: String,
+    pub tree: PersistedTree,
+}
+
 /// Everything one explicit command changed, reversed as one operation.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Not `Eq`: a container tree carries float weights.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct UndoTransaction {
     pub id: UndoTransactionId,
     /// The command that created it, for display in refusal messages.
@@ -66,16 +83,22 @@ pub struct UndoTransaction {
     /// The reducer revision this transaction was committed against.
     pub durable_revision: u64,
     pub members: Vec<UndoMember>,
+    /// The container trees the command reshaped, as they were before it.
+    /// Empty for a command that changed no tree.
+    #[serde(default)]
+    pub prior_trees: Vec<UndoTreeSnapshot>,
 }
 
 /// A transaction that has not been stored yet, and so has no id.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct UndoTransactionDraft {
     pub command: String,
     pub recorded_at_unix: i64,
     pub topology_fingerprint: String,
     pub durable_revision: u64,
     pub members: Vec<UndoMember>,
+    #[serde(default)]
+    pub prior_trees: Vec<UndoTreeSnapshot>,
 }
 
 /// What the matcher concluded about one member of a transaction.
@@ -163,7 +186,10 @@ impl std::fmt::Display for UndoRefusal {
                  using geometry that no longer means the same thing",
             ),
             Self::TargetsUnresolved { targets, .. } => {
-                let unresolved = targets.iter().filter(|target| !target.is_resolved()).count();
+                let unresolved = targets
+                    .iter()
+                    .filter(|target| !target.is_resolved())
+                    .count();
                 write!(
                     formatter,
                     "{unresolved} of {} windows from that command could not be identified \

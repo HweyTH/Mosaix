@@ -98,11 +98,7 @@ fn window(id: isize, application: &str, class: &str) -> Window {
     }
 }
 
-fn settle<T>(
-    reader: &StateReader,
-    what: &str,
-    condition: impl Fn(&EngineState) -> Option<T>,
-) -> T {
+fn settle<T>(reader: &StateReader, what: &str, condition: impl Fn(&EngineState) -> Option<T>) -> T {
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
         if let Some(value) = condition(&reader.snapshot()) {
@@ -127,7 +123,10 @@ fn order_by_application(state: &EngineState) -> Vec<String> {
         })
         .collect();
     placed.sort_by_key(|(x, _)| *x);
-    placed.into_iter().map(|(_, application)| application).collect()
+    placed
+        .into_iter()
+        .map(|(_, application)| application)
+        .collect()
 }
 
 #[test]
@@ -170,13 +169,17 @@ fn a_user_shaped_arrangement_comes_back_after_a_restart() {
         });
 
         let saved = settle(&reader, "the arrangement to be stored", |state| {
-            state.persistence_intents.iter().rev().find_map(|intent| match intent {
-                PersistenceIntent::SaveContainerTree {
-                    display_fingerprint,
-                    tree,
-                } => Some((display_fingerprint.clone(), (**tree).clone())),
-                _ => None,
-            })
+            state
+                .persistence_intents
+                .iter()
+                .rev()
+                .find_map(|intent| match intent {
+                    PersistenceIntent::SaveContainerTree {
+                        display_fingerprint,
+                        tree,
+                    } => Some((display_fingerprint.clone(), (**tree).clone())),
+                    _ => None,
+                })
         });
         engine.stop();
         saved
@@ -221,6 +224,118 @@ fn a_user_shaped_arrangement_comes_back_after_a_restart() {
     engine.stop();
 }
 
+/// Each arranged window's width, by application, left to right.
+fn widths_by_application(state: &EngineState) -> Vec<(String, i32)> {
+    let mut placed: Vec<(i32, String, i32)> = state
+        .trees
+        .values()
+        .flat_map(|tree| tree.windows())
+        .filter_map(|window_id| {
+            let managed = state.inventory.get(window_id)?;
+            let placement = state.windows.get(window_id)?;
+            Some((
+                placement.bounds.x,
+                managed.window.application_id.0.clone(),
+                placement.bounds.width,
+            ))
+        })
+        .collect();
+    placed.sort_by_key(|(x, _, _)| *x);
+    placed
+        .into_iter()
+        .map(|(_, application, width)| (application, width))
+        .collect()
+}
+
+#[test]
+fn resized_divider_weights_come_back_after_a_restart() {
+    let temporary = TempDatabase::new("resize");
+
+    // --- session one: two windows, then grow the right one twice ---
+    let saved = {
+        let engine = spawn_engine(vec![display()], tree_config());
+        let events = engine.events();
+        let reader = engine.state_reader();
+        let _ = events.send(Event::WindowsObserved {
+            windows: vec![
+                window(11, "alpha.exe", "AlphaClass"),
+                window(12, "beta.exe", "BetaClass"),
+            ],
+        });
+        settle(&reader, "the first arrangement", |state| {
+            (order_by_application(state).len() == 2).then_some(())
+        });
+        let _ = events.send(Event::WindowFocused {
+            window_id: WindowId(12),
+            display_id: mosaix_domain::DisplayId(1),
+            bounds: Rect::new(960, 0, 960, 1080),
+        });
+        for _ in 0..2 {
+            let _ = events.send(Event::TreeResizeRequested {
+                direction: CardinalDirection::Left,
+            });
+        }
+        settle(&reader, "both resizes", |state| {
+            (widths_by_application(state)
+                == vec![("alpha.exe".to_owned(), 768), ("beta.exe".to_owned(), 1152)])
+            .then_some(())
+        });
+        let transactions = reader
+            .snapshot()
+            .persistence_intents
+            .iter()
+            .filter(|intent| matches!(intent, PersistenceIntent::RecordUndoTransaction(_)))
+            .count();
+        assert_eq!(transactions, 2, "each resize is its own undo transaction");
+
+        let saved = settle(&reader, "the arrangement to be stored", |state| {
+            state
+                .persistence_intents
+                .iter()
+                .rev()
+                .find_map(|intent| match intent {
+                    PersistenceIntent::SaveContainerTree {
+                        display_fingerprint,
+                        tree,
+                    } => Some((display_fingerprint.clone(), (**tree).clone())),
+                    _ => None,
+                })
+        });
+        engine.stop();
+        saved
+    };
+    {
+        let mut store = Persistence::open(&temporary.path()).expect("database opens");
+        store.save_tree(&saved.0, &saved.1).expect("it stores");
+    }
+
+    // --- session two: the same applications, new handles ---
+    let restored = Persistence::open(&temporary.path())
+        .expect("database reopens")
+        .load_trees()
+        .expect("arrangements are readable");
+    let engine = spawn_engine(vec![display()], tree_config());
+    let events = engine.events();
+    let reader = engine.state_reader();
+    let _ = events.send(Event::WindowsObserved {
+        windows: vec![
+            window(901, "alpha.exe", "AlphaClass"),
+            window(902, "beta.exe", "BetaClass"),
+        ],
+    });
+    settle(&reader, "the fresh arrangement", |state| {
+        (widths_by_application(state).len() == 2).then_some(())
+    });
+    let _ = events.send(Event::ContainerTreesLoaded(restored));
+
+    settle(&reader, "the resized weights to be adopted", |state| {
+        (widths_by_application(state)
+            == vec![("alpha.exe".to_owned(), 768), ("beta.exe".to_owned(), 1152)])
+        .then_some(())
+    });
+    engine.stop();
+}
+
 #[test]
 fn an_arrangement_whose_windows_are_gone_restores_nothing_rather_than_guessing() {
     let temporary = TempDatabase::new("absent");
@@ -235,10 +350,14 @@ fn an_arrangement_whose_windows_are_gone_restores_nothing_rather_than_guessing()
             ],
         });
         let stored = settle(&reader, "an arrangement to store", |state| {
-            state.persistence_intents.iter().rev().find_map(|intent| match intent {
-                PersistenceIntent::SaveContainerTree { tree, .. } => Some((**tree).clone()),
-                _ => None,
-            })
+            state
+                .persistence_intents
+                .iter()
+                .rev()
+                .find_map(|intent| match intent {
+                    PersistenceIntent::SaveContainerTree { tree, .. } => Some((**tree).clone()),
+                    _ => None,
+                })
         });
         engine.stop();
         stored

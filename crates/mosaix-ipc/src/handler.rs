@@ -4,6 +4,7 @@ use mosaix_config::{
     BindingEdit, BindingWrite, Command, ConfigLayer, KeyCombo, LayoutEdit, LayoutWrite,
     ResolvedConfig, SavedLayout,
 };
+use mosaix_domain::commands::TreeResizeResult;
 use mosaix_domain::undo::UndoResult;
 use mosaix_engine::{
     EligibilityReason, EngineState, Event, EventSender, StateReader, ZoneSnapDirection,
@@ -756,6 +757,20 @@ pub fn handle_request(
                 direction: mosaix_engine::CardinalDirection::Down,
             },
         ),
+        IpcRequest::ResizeLeft => {
+            resize_tree(events, state_reader, mosaix_engine::CardinalDirection::Left)
+        }
+        IpcRequest::ResizeRight => resize_tree(
+            events,
+            state_reader,
+            mosaix_engine::CardinalDirection::Right,
+        ),
+        IpcRequest::ResizeUp => {
+            resize_tree(events, state_reader, mosaix_engine::CardinalDirection::Up)
+        }
+        IpcRequest::ResizeDown => {
+            resize_tree(events, state_reader, mosaix_engine::CardinalDirection::Down)
+        }
         IpcRequest::GetPauseState => {
             let state = state_reader.snapshot();
             let value = serde_json::json!({ "paused": state.paused });
@@ -1025,6 +1040,33 @@ impl CaptureHold {
     }
 }
 
+/// Asks for a tree resize and answers with the typed outcome.
+///
+/// Preflighted the way undo is: the reducer reaches the same verdict
+/// against its own state, so the answer describes the plan rather than a
+/// completed movement, and a refusal comes back as data rather than as a
+/// string the caller would have to parse.
+fn resize_tree(
+    events: &EventSender,
+    state_reader: &StateReader,
+    direction: mosaix_engine::CardinalDirection,
+) -> IpcResponse {
+    let result = match mosaix_engine::plan_tree_resize(&state_reader.snapshot(), direction) {
+        Ok(plan) => {
+            if let other @ IpcResponse::Error { .. } =
+                send_event(events, Event::TreeResizeRequested { direction })
+            {
+                return other;
+            }
+            TreeResizeResult::Applied(plan.applied)
+        }
+        Err(refusal) => TreeResizeResult::Refused(refusal),
+    };
+    IpcResponse::Ok {
+        data: Some(serde_json::to_value(result).expect("tree results serialize")),
+    }
+}
+
 fn send_event(events: &EventSender, event: Event) -> IpcResponse {
     if events.send(event).is_err() {
         IpcResponse::Error {
@@ -1107,6 +1149,27 @@ mod tests {
         assert_eq!(data["refused"], "nothing_to_undo");
         let parsed: UndoResult =
             serde_json::from_value(data).expect("the CLI can read what the agent sent");
+        assert!(!parsed.is_applied());
+    }
+
+    #[test]
+    fn a_resize_outside_tree_mode_answers_with_a_typed_refusal_not_an_error() {
+        let engine = mosaix_engine::spawn_engine(Vec::new(), Default::default());
+        let response = handle_request(
+            &IpcRequest::ResizeLeft,
+            &engine.events(),
+            &engine.state_reader(),
+            &RecordingStore::wrote("config.toml", &[]),
+            &no_probe(),
+        );
+        engine.stop();
+
+        let IpcResponse::Ok { data: Some(data) } = response else {
+            panic!("a refusal is an answer, got {response:?}");
+        };
+        assert_eq!(data["refused"], "not_tree_mode");
+        let parsed: TreeResizeResult =
+            serde_json::from_value(data).expect("the payload is the typed result");
         assert!(!parsed.is_applied());
     }
 
@@ -1212,6 +1275,7 @@ mod tests {
             topology_fingerprint: String::new(),
             durable_revision: 3,
             members: Vec::new(),
+            prior_trees: Vec::new(),
         });
         state.persistence_health = PersistenceHealth::Degraded {
             last_durable_revision: 3,

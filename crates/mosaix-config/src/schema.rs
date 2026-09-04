@@ -60,6 +60,12 @@ pub enum Command {
     SwapRight,
     SwapUp,
     SwapDown,
+    /// Move the nearest container-tree divider facing that way by five
+    /// percentage points (CONTEXT.md "Tree resize").
+    ResizeLeft,
+    ResizeRight,
+    ResizeUp,
+    ResizeDown,
     TogglePause,
     /// Apply the saved layout called `name` to the focused window's
     /// display. Ordered last so every layout binding sorts after every
@@ -95,6 +101,10 @@ impl Command {
             Self::SwapRight => "swap-right",
             Self::SwapUp => "swap-up",
             Self::SwapDown => "swap-down",
+            Self::ResizeLeft => "resize-left",
+            Self::ResizeRight => "resize-right",
+            Self::ResizeUp => "resize-up",
+            Self::ResizeDown => "resize-down",
             Self::TogglePause => "toggle-pause",
             Self::ApplyLayout { .. } => APPLY_LAYOUT_VERB,
         }
@@ -106,7 +116,7 @@ impl Command {
     /// [`Command::verb`] rather than repeating them, so the spelling of a
     /// verb lives in exactly one place and the two directions cannot drift
     /// apart -- which is what the serde derive used to guarantee for free.
-    pub fn unit_verbs() -> [Self; 16] {
+    pub fn unit_verbs() -> [Self; 20] {
         [
             Self::SnapLeft,
             Self::SnapRight,
@@ -123,6 +133,10 @@ impl Command {
             Self::SwapRight,
             Self::SwapUp,
             Self::SwapDown,
+            Self::ResizeLeft,
+            Self::ResizeRight,
+            Self::ResizeUp,
+            Self::ResizeDown,
             Self::TogglePause,
         ]
     }
@@ -134,7 +148,7 @@ impl Command {
     /// layout name inside. Callers turn a `None` into the load-time
     /// "unknown command" rejection that names the file and line.
     ///
-    /// A linear scan of sixteen, run once per binding at config load.
+    /// A linear scan of twenty, run once per binding at config load.
     fn unit_from_verb(verb: &str) -> Option<Self> {
         Self::unit_verbs()
             .into_iter()

@@ -86,6 +86,18 @@ pub fn event_for_command(command: &Command, paused: bool) -> Event {
         Command::SwapDown => Event::DirectionalSwapRequested {
             direction: CardinalDirection::Down,
         },
+        Command::ResizeLeft => Event::TreeResizeRequested {
+            direction: CardinalDirection::Left,
+        },
+        Command::ResizeRight => Event::TreeResizeRequested {
+            direction: CardinalDirection::Right,
+        },
+        Command::ResizeUp => Event::TreeResizeRequested {
+            direction: CardinalDirection::Up,
+        },
+        Command::ResizeDown => Event::TreeResizeRequested {
+            direction: CardinalDirection::Down,
+        },
         Command::TogglePause => {
             if paused {
                 Event::ResumeRequested
@@ -325,7 +337,7 @@ mod tests {
         );
     }
 
-    fn every_command() -> [Command; 16] {
+    fn every_command() -> [Command; 20] {
         [
             Command::SnapLeft,
             Command::SnapRight,
@@ -342,6 +354,10 @@ mod tests {
             Command::SwapDown,
             Command::SwapUp,
             Command::SwapRight,
+            Command::ResizeLeft,
+            Command::ResizeRight,
+            Command::ResizeUp,
+            Command::ResizeDown,
             Command::TogglePause,
         ]
     }

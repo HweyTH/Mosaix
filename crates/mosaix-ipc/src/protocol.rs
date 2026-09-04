@@ -8,11 +8,12 @@ use serde::{Deserialize, Serialize};
 /// requests, to 4 for the hotkey-capture pair, to 5 when
 /// [`IpcRequest::SaveLayout`] gained its write-destination redirect, and
 /// to 6 for the binding-editing requests, and to 7 when
-/// [`IpcRequest::ProbeHotkey`] gained the command it is probing for. An
+/// [`IpcRequest::ProbeHotkey`] gained the command it is probing for, and
+/// to 10 for the four tree-resize requests. An
 /// older agent has no tag for a request this build added -- and no field
 /// for one an existing request grew -- so the version is what makes the
 /// mismatch reportable instead of surfacing as a deserialization failure.
-pub const PROTOCOL_VERSION: u32 = 9;
+pub const PROTOCOL_VERSION: u32 = 10;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct IpcEnvelope {
@@ -50,6 +51,15 @@ pub enum IpcRequest {
     SwapRight,
     SwapUp,
     SwapDown,
+    /// Move the nearest container-tree divider facing that way by five
+    /// percentage points (CONTEXT.md "Tree resize"). Answered with a typed
+    /// [`mosaix_domain::TreeResizeResult`] either way: a refusal is data
+    /// the caller can inspect, not a transport error. Hence
+    /// [`PROTOCOL_VERSION`] 10.
+    ResizeLeft,
+    ResizeRight,
+    ResizeUp,
+    ResizeDown,
     GetPauseState,
     /// Select a display for display-scoped commands, including an empty one.
     FocusDisplay {
@@ -270,6 +280,10 @@ mod tests {
             IpcRequest::SwapRight,
             IpcRequest::SwapUp,
             IpcRequest::SwapDown,
+            IpcRequest::ResizeLeft,
+            IpcRequest::ResizeRight,
+            IpcRequest::ResizeUp,
+            IpcRequest::ResizeDown,
             IpcRequest::GetPauseState,
             IpcRequest::FocusDisplay { display_id: 7 },
             IpcRequest::Undo,

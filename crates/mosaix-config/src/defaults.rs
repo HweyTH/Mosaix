@@ -52,6 +52,10 @@ pub fn default_base_config() -> BaseConfig {
     hotkeys.insert(Command::SwapDown, shifted_combo("J"));
     hotkeys.insert(Command::SwapUp, shifted_combo("K"));
     hotkeys.insert(Command::SwapRight, shifted_combo("L"));
+    hotkeys.insert(Command::ResizeLeft, shifted_combo("LEFT"));
+    hotkeys.insert(Command::ResizeRight, shifted_combo("RIGHT"));
+    hotkeys.insert(Command::ResizeUp, shifted_combo("UP"));
+    hotkeys.insert(Command::ResizeDown, shifted_combo("DOWN"));
     hotkeys.insert(Command::TogglePause, arrow_combo("P"));
 
     BaseConfig {

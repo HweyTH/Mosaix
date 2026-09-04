@@ -37,6 +37,18 @@ enum Command {
     SwapRight,
     SwapUp,
     SwapDown,
+    /// Move the nearest container-tree divider facing that way by five
+    /// percentage points, growing the focused window's side.
+    ///
+    /// Stops short of pushing any window below its minimum size, and does
+    /// nothing at the edge of the arrangement. Either way the outcome is
+    /// reported, not silently swallowed.
+    Resize {
+        #[command(subcommand)]
+        direction: ResizeDirection,
+        #[arg(long)]
+        json: bool,
+    },
     /// Work with saved layouts.
     Layout {
         #[command(subcommand)]
@@ -116,6 +128,14 @@ enum FocusDirection {
     Right,
 }
 
+#[derive(Debug, Subcommand, Clone, Copy)]
+enum ResizeDirection {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
 #[cfg(windows)]
 fn main() {
     use mosaix_ipc::{send_request, IpcRequest, IpcResponse};
@@ -143,6 +163,11 @@ fn main() {
         } else {
             run_undo(json);
         }
+        return;
+    }
+    // So does a tree resize.
+    if let Command::Resize { direction, json } = cli.command {
+        run_resize(direction, json);
         return;
     }
     let state_json = matches!(&cli.command, Command::State { json: true });
@@ -185,7 +210,10 @@ fn main() {
         } => IpcRequest::ApplyLayout { name },
         Command::State { .. } => IpcRequest::GetState,
         Command::Ping => IpcRequest::Ping,
-        Command::Persistence { .. } | Command::Undo { .. } | Command::Arrangement { .. } => {
+        Command::Persistence { .. }
+        | Command::Undo { .. }
+        | Command::Arrangement { .. }
+        | Command::Resize { .. } => {
             unreachable!("handled above")
         }
     };
@@ -302,7 +330,6 @@ fn report_arrangement(json: bool) {
     println!("{}", format_arrangement(&state));
 }
 
-
 /// Reports whether undo would work right now, and why not if it would not.
 ///
 /// Reads the agent's published state rather than asking undo to preflight,
@@ -353,6 +380,92 @@ fn report_undo_availability(json: bool) {
             println!("there is nothing to undo");
             std::process::exit(1);
         }
+    }
+}
+
+/// Renders a tree-resize outcome for a person.
+///
+/// A pure function of the result so the wording can be tested without an
+/// agent. The exit status is the caller's concern: a refusal is a normal
+/// answer to print, but still a failure to act on.
+fn format_resize(result: &mosaix_domain::TreeResizeResult) -> String {
+    use mosaix_domain::TreeResizeResult;
+    match result {
+        TreeResizeResult::Applied(applied) => {
+            let grew: Vec<String> = applied.grew.iter().map(|id| id.0.to_string()).collect();
+            let shrank: Vec<String> = applied.shrank.iter().map(|id| id.0.to_string()).collect();
+            let mut rendered = format!(
+                "{}: moved the divider {} percentage point{}",
+                applied.command,
+                applied.percentage_points,
+                if applied.percentage_points == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            );
+            if applied.percentage_points < mosaix_domain::TREE_RESIZE_STEP_PERCENT {
+                rendered.push_str(" (clamped at a minimum size)");
+            }
+            rendered.push_str(&format!(
+                "\n  grew: {}\n  shrank: {}",
+                grew.join(" "),
+                shrank.join(" ")
+            ));
+            rendered
+        }
+        TreeResizeResult::Refused(refusal) => format!("mosaix: {refusal}"),
+    }
+}
+
+#[cfg(windows)]
+fn run_resize(direction: ResizeDirection, json: bool) {
+    use mosaix_ipc::{send_request, IpcRequest, IpcResponse};
+
+    let request = match direction {
+        ResizeDirection::Left => IpcRequest::ResizeLeft,
+        ResizeDirection::Right => IpcRequest::ResizeRight,
+        ResizeDirection::Up => IpcRequest::ResizeUp,
+        ResizeDirection::Down => IpcRequest::ResizeDown,
+    };
+    let data = match send_request(request) {
+        Ok(IpcResponse::Ok { data: Some(data) }) => data,
+        Ok(IpcResponse::Ok { data: None }) => {
+            eprintln!("mosaix: the agent answered without a resize result");
+            std::process::exit(2);
+        }
+        Ok(IpcResponse::Error { message }) => {
+            eprintln!("mosaix: {message}");
+            std::process::exit(1);
+        }
+        Ok(IpcResponse::VersionMismatch { server_version }) => {
+            eprintln!("mosaix: protocol version mismatch (server: v{server_version})");
+            std::process::exit(1);
+        }
+        Err(error) => {
+            eprintln!("mosaix: {error}");
+            std::process::exit(2);
+        }
+    };
+    let result: mosaix_domain::TreeResizeResult = match serde_json::from_value(data.clone()) {
+        Ok(result) => result,
+        Err(error) => {
+            eprintln!("mosaix: could not read the agent's resize result: {error}");
+            std::process::exit(2);
+        }
+    };
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&data).expect("JSON value serializes")
+        );
+    } else if result.is_applied() {
+        println!("{}", format_resize(&result));
+    } else {
+        eprintln!("{}", format_resize(&result));
+    }
+    if !result.is_applied() {
+        std::process::exit(1);
     }
 }
 
@@ -452,10 +565,7 @@ fn run_undo(json: bool) {
                     ordinals,
                     ..
                 } => {
-                    eprintln!(
-                        "  targets {ordinals:?} all matched window {}",
-                        window_id.0
-                    );
+                    eprintln!("  targets {ordinals:?} all matched window {}", window_id.0);
                 }
                 UndoRefusal::PersistenceDegraded { reason, .. } => {
                     eprintln!("  reason: {reason}");
@@ -471,9 +581,7 @@ fn run_undo(json: bool) {
 /// The scored candidates a refusal has to show, whichever shape the
 /// outcome took.
 #[cfg(windows)]
-fn match_candidates(
-    outcome: &mosaix_domain::MatchOutcome,
-) -> &[mosaix_domain::ScoredCandidate] {
+fn match_candidates(outcome: &mosaix_domain::MatchOutcome) -> &[mosaix_domain::ScoredCandidate] {
     use mosaix_domain::MatchOutcome;
 
     match outcome {
@@ -651,6 +759,48 @@ mod tests {
         assert!(
             format_arrangement(&state).starts_with("arrangement: tree (suspended)"),
             "a suspended arrangement is still the configured one"
+        );
+    }
+
+    #[test]
+    fn a_resize_report_names_the_step_and_both_sides_of_the_divider() {
+        use mosaix_domain::{DisplayId, TreeResizeApplied, TreeResizeResult, WindowId};
+
+        let full = TreeResizeResult::Applied(TreeResizeApplied {
+            command: "resize-left".to_owned(),
+            display_id: DisplayId(1),
+            window_id: WindowId(3),
+            percentage_points: 5,
+            grew: vec![WindowId(2), WindowId(3)],
+            shrank: vec![WindowId(1)],
+            weights_before: vec![0.5, 0.5],
+            weights_after: vec![0.45, 0.55],
+        });
+        assert_eq!(
+            format_resize(&full),
+            "resize-left: moved the divider 5 percentage points\n  grew: 2 3\n  shrank: 1"
+        );
+
+        let clamped = TreeResizeResult::Applied(TreeResizeApplied {
+            percentage_points: 1,
+            ..match full {
+                TreeResizeResult::Applied(applied) => applied,
+                TreeResizeResult::Refused(_) => unreachable!(),
+            }
+        });
+        assert!(format_resize(&clamped).contains("1 percentage point (clamped at a minimum size)"));
+    }
+
+    #[test]
+    fn a_refused_resize_is_rendered_as_its_own_reason() {
+        use mosaix_domain::{TreeResizeRefusal, TreeResizeResult};
+
+        let refused = TreeResizeResult::Refused(TreeResizeRefusal::NoDivider {
+            command: "resize-up".to_owned(),
+        });
+        assert_eq!(
+            format_resize(&refused),
+            "mosaix: resize-up: the window is at the edge of the arrangement on that side"
         );
     }
 

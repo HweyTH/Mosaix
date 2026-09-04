@@ -126,6 +126,29 @@ impl<L> Node<L> {
 /// invisible window.
 pub const MIN_WEIGHT: f64 = 0.01;
 
+/// Which way along a container's axis a divider moves: toward the first
+/// child (left or up) or toward the last (right or down).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Toward {
+    Start,
+    End,
+}
+
+/// What [`Tree::resize_toward`] changed: the windows on each side of the
+/// divider it moved, and the container's weights before and after.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DividerChange<L> {
+    pub axis: SplitAxis,
+    pub toward: Toward,
+    /// Every window in the child that gained space.
+    pub grew: Vec<L>,
+    /// Every window in the child that gave space up.
+    pub shrank: Vec<L>,
+    pub weights_before: Vec<f64>,
+    pub weights_after: Vec<f64>,
+}
+
 /// One display's arrangement. An empty tree is a display with no tiled
 /// windows, which is an ordinary state rather than an error.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -396,6 +419,151 @@ impl<L: PartialEq> Tree<L> {
         swap_within(root, first, second);
         true
     }
+
+    /// Whether a divider on `axis` faces `toward` from `window`'s leaf.
+    ///
+    /// The divider is the one [`Tree::resize_toward`] would move: the
+    /// nearest ancestor container on `axis` in which the child holding
+    /// `window` has a sibling on the `toward` side. The immediate parent is
+    /// tried first, and only when it cannot satisfy the direction does the
+    /// search climb outward (spec user story 36). `false` at a boundary
+    /// of the arrangement, where no ancestor qualifies.
+    pub fn has_divider_toward(&self, window: &L, axis: SplitAxis, toward: Toward) -> bool {
+        let Some(root) = self.root.as_ref() else {
+            return false;
+        };
+        let Some(path) = path_to(root, window) else {
+            return false;
+        };
+        (0..path.len()).rev().any(|depth| {
+            let Node::Split {
+                axis: node_axis,
+                children,
+            } = node_at(root, &path[..depth])
+            else {
+                return false;
+            };
+            *node_axis == axis && sibling_toward(children.len(), path[depth], toward).is_some()
+        })
+    }
+
+    /// Moves the divider [`Tree::has_divider_toward`] describes by
+    /// `fraction` of its container's extent, growing `window`'s side and
+    /// shrinking the sibling's (CONTEXT.md "Tree resize").
+    ///
+    /// Only the two children on either side of the divider change share;
+    /// the container's other children keep theirs, and its weights are
+    /// renormalized to sum to one so that repeated resizes stay
+    /// deterministic rather than drifting. `None` when no divider faces
+    /// that way, or when the sibling would fall below [`MIN_WEIGHT`] --
+    /// the tree is untouched in either case. Whether the resulting
+    /// geometry respects every window's minimum size is the planner's
+    /// question, not this one's.
+    pub fn resize_toward(
+        &mut self,
+        window: &L,
+        axis: SplitAxis,
+        toward: Toward,
+        fraction: f64,
+    ) -> Option<DividerChange<L>>
+    where
+        L: Clone,
+    {
+        if !(fraction.is_finite() && fraction > 0.0) {
+            return None;
+        }
+        let root = self.root.as_mut()?;
+        let path = path_to(root, window)?;
+        for depth in (0..path.len()).rev() {
+            let Node::Split {
+                axis: node_axis,
+                children,
+            } = node_at_mut(root, &path[..depth])
+            else {
+                continue;
+            };
+            if *node_axis != axis {
+                continue;
+            }
+            let index = path[depth];
+            let Some(sibling) = sibling_toward(children.len(), index, toward) else {
+                continue;
+            };
+            let total: f64 = children.iter().map(|child| child.weight).sum();
+            let delta = fraction * total;
+            if children[sibling].weight - delta < MIN_WEIGHT * total {
+                return None;
+            }
+            let weights_before: Vec<f64> = children.iter().map(|child| child.weight).collect();
+            children[index].weight += delta;
+            children[sibling].weight -= delta;
+            let renormalized: f64 = children.iter().map(|child| child.weight).sum();
+            for child in children.iter_mut() {
+                child.weight /= renormalized;
+            }
+            return Some(DividerChange {
+                axis,
+                toward,
+                grew: children[index]
+                    .node
+                    .leaves()
+                    .into_iter()
+                    .map(|leaf| leaf.window.clone())
+                    .collect(),
+                shrank: children[sibling]
+                    .node
+                    .leaves()
+                    .into_iter()
+                    .map(|leaf| leaf.window.clone())
+                    .collect(),
+                weights_before,
+                weights_after: children.iter().map(|child| child.weight).collect(),
+            });
+        }
+        None
+    }
+}
+
+/// The index of the child on the `toward` side of `index`, if any.
+fn sibling_toward(len: usize, index: usize, toward: Toward) -> Option<usize> {
+    match toward {
+        Toward::Start => index.checked_sub(1),
+        Toward::End => (index + 1 < len).then_some(index + 1),
+    }
+}
+
+/// The child indices leading from `node` to the leaf holding `wanted`.
+fn path_to<L: PartialEq>(node: &Node<L>, wanted: &L) -> Option<Vec<usize>> {
+    match node {
+        Node::Leaf(leaf) => (leaf.window == *wanted).then(Vec::new),
+        Node::Split { children, .. } => children.iter().enumerate().find_map(|(index, child)| {
+            let mut path = path_to(&child.node, wanted)?;
+            path.insert(0, index);
+            Some(path)
+        }),
+    }
+}
+
+fn node_at<'a, L>(node: &'a Node<L>, path: &[usize]) -> &'a Node<L> {
+    let mut current = node;
+    for index in path {
+        let Node::Split { children, .. } = current else {
+            unreachable!("a path only descends through containers");
+        };
+        current = &children[*index].node;
+    }
+    current
+}
+
+fn node_at_mut<'a, L>(node: &'a mut Node<L>, path: &[usize]) -> &'a mut Node<L> {
+    let mut current = node;
+    for index in path {
+        let Node::Split { children, .. } = current else {
+            unreachable!("a path only descends through containers");
+        };
+        current = &mut children[*index].node;
+    }
+    current
 }
 
 fn find_leaf<'a, L: PartialEq>(node: &'a Node<L>, wanted: &L) -> Option<&'a Leaf<L>> {
@@ -815,6 +983,169 @@ mod tests {
         let mut tree = tree;
         tree.split_leaf(&leaf(3), SplitAxis::Vertical, leaf(9));
         assert_eq!(tree.insertion_of(&leaf(9)), Some(2));
+    }
+
+    /// H[ 1, V[ 2, 3 ] ]: window 3 sits under window 2 on the right.
+    fn nested_tree() -> ContainerTree {
+        let mut tree = ContainerTree::new();
+        tree.insert_first(leaf(1));
+        tree.split_leaf(&leaf(1), SplitAxis::Horizontal, leaf(2));
+        tree.split_leaf(&leaf(2), SplitAxis::Vertical, leaf(3));
+        tree
+    }
+
+    fn root_weights(tree: &ContainerTree) -> Vec<f64> {
+        match tree.root() {
+            Some(Node::Split { children, .. }) => children.iter().map(|c| c.weight).collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    #[test]
+    fn resizing_moves_the_nearest_divider_that_faces_the_direction() {
+        let mut tree = nested_tree();
+
+        // Up from window 3: its parent is vertical and window 2 is above
+        // it, so that divider moves and the root is untouched.
+        let change = tree
+            .resize_toward(&leaf(3), SplitAxis::Vertical, Toward::Start, 0.05)
+            .expect("a divider faces up");
+
+        assert_eq!(change.grew, vec![leaf(3)]);
+        assert_eq!(change.shrank, vec![leaf(2)]);
+        assert_eq!(change.weights_after, vec![0.45, 0.55]);
+        assert_eq!(
+            root_weights(&tree),
+            vec![1.0, 1.0],
+            "the outer split is untouched"
+        );
+    }
+
+    #[test]
+    fn resizing_climbs_outward_only_when_the_parent_cannot_face_that_way() {
+        let mut tree = nested_tree();
+
+        // Left from window 3: its parent is vertical, so the search climbs
+        // to the horizontal root, where window 1 is on the left.
+        let change = tree
+            .resize_toward(&leaf(3), SplitAxis::Horizontal, Toward::Start, 0.05)
+            .expect("the root divider faces left");
+
+        assert_eq!(
+            change.grew,
+            vec![leaf(2), leaf(3)],
+            "the whole subtree grows"
+        );
+        assert_eq!(change.shrank, vec![leaf(1)]);
+        assert_eq!(change.weights_before, vec![1.0, 1.0]);
+        assert_eq!(change.weights_after, vec![0.45, 0.55]);
+    }
+
+    #[test]
+    fn resizing_at_a_boundary_is_refused_without_touching_the_tree() {
+        let mut tree = nested_tree();
+        let before = tree.clone();
+
+        // Nothing is to the left of window 1, up from it, or down from it.
+        assert!(!tree.has_divider_toward(&leaf(1), SplitAxis::Horizontal, Toward::Start));
+        assert!(tree
+            .resize_toward(&leaf(1), SplitAxis::Horizontal, Toward::Start, 0.05)
+            .is_none());
+        assert!(tree
+            .resize_toward(&leaf(1), SplitAxis::Vertical, Toward::Start, 0.05)
+            .is_none());
+        assert!(tree
+            .resize_toward(&leaf(1), SplitAxis::Vertical, Toward::End, 0.05)
+            .is_none());
+        assert!(tree
+            .resize_toward(&leaf(99), SplitAxis::Horizontal, Toward::End, 0.05)
+            .is_none());
+
+        assert_eq!(tree, before);
+    }
+
+    #[test]
+    fn resizing_only_touches_the_two_children_beside_the_divider() {
+        let mut tree = Tree::from_root(Node::Split {
+            axis: SplitAxis::Horizontal,
+            children: vec![
+                Child {
+                    weight: 1.0,
+                    node: Node::window(leaf(1)),
+                },
+                Child {
+                    weight: 1.0,
+                    node: Node::window(leaf(2)),
+                },
+                Child {
+                    weight: 2.0,
+                    node: Node::window(leaf(3)),
+                },
+            ],
+        });
+
+        let change = tree
+            .resize_toward(&leaf(2), SplitAxis::Horizontal, Toward::End, 0.05)
+            .expect("window 3 is to the right");
+
+        assert_eq!(change.grew, vec![leaf(2)]);
+        assert_eq!(change.shrank, vec![leaf(3)]);
+        let weights = root_weights(&tree);
+        assert!(
+            (weights[0] - 0.25).abs() < 1e-9,
+            "window 1 keeps its quarter"
+        );
+        assert!((weights[1] - 0.30).abs() < 1e-9);
+        assert!((weights[2] - 0.45).abs() < 1e-9);
+        assert!(
+            (weights.iter().sum::<f64>() - 1.0).abs() < 1e-9,
+            "renormalized"
+        );
+    }
+
+    #[test]
+    fn resizing_refuses_to_squeeze_a_sibling_below_the_minimum_weight() {
+        let mut tree = Tree::from_root(Node::Split {
+            axis: SplitAxis::Horizontal,
+            children: vec![
+                Child {
+                    weight: 0.97,
+                    node: Node::window(leaf(1)),
+                },
+                Child {
+                    weight: 0.03,
+                    node: Node::window(leaf(2)),
+                },
+            ],
+        });
+        let before = tree.clone();
+
+        assert!(tree
+            .resize_toward(&leaf(1), SplitAxis::Horizontal, Toward::End, 0.05)
+            .is_none());
+        assert_eq!(tree, before);
+        assert!(
+            tree.resize_toward(&leaf(1), SplitAxis::Horizontal, Toward::End, 0.01)
+                .is_some(),
+            "a smaller step that leaves the sibling visible is fine"
+        );
+    }
+
+    #[test]
+    fn repeated_resizes_are_deterministic_and_reversible() {
+        let mut tree = nested_tree();
+        let before = tree.clone();
+        for _ in 0..3 {
+            tree.resize_toward(&leaf(1), SplitAxis::Horizontal, Toward::End, 0.05);
+        }
+        for _ in 0..3 {
+            tree.resize_toward(&leaf(2), SplitAxis::Horizontal, Toward::Start, 0.05);
+        }
+        let weights = root_weights(&tree);
+        let original = root_weights(&before);
+        // Both trees are renormalized forms of 1:1, so compare shares.
+        let share = |w: &Vec<f64>| w[0] / (w[0] + w[1]);
+        assert!((share(&weights) - share(&original)).abs() < 1e-9);
     }
 
     #[test]
