@@ -42,6 +42,11 @@ enum Command {
         #[command(subcommand)]
         action: LayoutAction,
     },
+    /// Inspect or recover the durable state database.
+    Persistence {
+        #[command(subcommand)]
+        action: PersistenceAction,
+    },
     State {
         #[arg(long)]
         json: bool,
@@ -51,13 +56,27 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum LayoutAction {
-    /// Apply a saved layout to the focused window's display. Fails with
-    /// the agent's own reason if no managed window is focused or no layout
-    /// carries that name.
+    /// Apply a saved layout to the focused display. Fails with the agent's
+    /// own reason if no display is targeted or no layout carries that name.
     Apply {
         /// The layout's name, as declared under `[layouts]` in config.
         name: String,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum PersistenceAction {
+    /// Report whether committed state is durable, and why not if it is not.
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Move an unusable state database aside and start a fresh one.
+    ///
+    /// Nothing is deleted: the old file is preserved next to it. Refused
+    /// while a running agent still holds a healthy database, since that
+    /// database is not the one needing recovery.
+    Reset,
 }
 
 #[derive(Debug, Subcommand)]
@@ -83,6 +102,14 @@ fn main() {
     use mosaix_ipc::{send_request, IpcRequest, IpcResponse};
 
     let cli = Cli::parse();
+    // The two persistence actions do not map onto a single request: status
+    // renders fields the agent already publishes, and reset deliberately
+    // works on the file itself, because every failure that calls for it is
+    // one where the agent never got the database open.
+    if let Command::Persistence { action } = cli.command {
+        run_persistence(action);
+        return;
+    }
     let state_json = matches!(&cli.command, Command::State { json: true });
     let request = match cli.command {
         Command::Snap {
@@ -123,6 +150,7 @@ fn main() {
         } => IpcRequest::ApplyLayout { name },
         Command::State { .. } => IpcRequest::GetState,
         Command::Ping => IpcRequest::Ping,
+        Command::Persistence { .. } => unreachable!("handled above"),
     };
     match send_request(request) {
         Ok(IpcResponse::Ok { data: Some(data) }) if state_json => {
@@ -144,6 +172,88 @@ fn main() {
         Err(error) => {
             eprintln!("mosaix: {error}");
             std::process::exit(2);
+        }
+    }
+}
+
+/// The agent's published view of durability, or `None` when no agent
+/// answered. "No agent" and "an agent that cannot reach its database" are
+/// different situations and only the first is safe to reset blindly.
+#[cfg(windows)]
+fn published_persistence() -> Option<serde_json::Value> {
+    use mosaix_ipc::{send_request, IpcRequest, IpcResponse};
+
+    match send_request(IpcRequest::GetState) {
+        Ok(IpcResponse::Ok { data: Some(data) }) => Some(data),
+        _ => None,
+    }
+}
+
+#[cfg(windows)]
+fn run_persistence(action: PersistenceAction) {
+    match action {
+        PersistenceAction::Status { json } => {
+            let Some(state) = published_persistence() else {
+                eprintln!("mosaix: no agent is running, so durability is not being tracked");
+                std::process::exit(1);
+            };
+            let status = state["persistence_status"].as_str().unwrap_or("unknown");
+            let revision = state["last_durable_revision"].as_u64().unwrap_or(0);
+            let reason = state["persistence_reason"].as_str();
+            if json {
+                let value = serde_json::json!({
+                    "persistence_status": status,
+                    "last_durable_revision": revision,
+                    "persistence_reason": reason,
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&value).expect("JSON value serializes")
+                );
+                return;
+            }
+            match reason {
+                None => println!("persistence: healthy (durable through revision {revision})"),
+                Some(reason) => {
+                    println!("persistence: degraded ({reason})");
+                    println!("last durable revision: {revision}");
+                    println!(
+                        "window management continues from memory; \
+                         run `mosaix persistence reset` to start a fresh database"
+                    );
+                }
+            }
+        }
+        PersistenceAction::Reset => {
+            if let Some(state) = published_persistence() {
+                if state["persistence_status"].as_str() == Some("healthy") {
+                    eprintln!(
+                        "mosaix: the running agent's state database is healthy; \
+                         stop the agent before resetting it"
+                    );
+                    std::process::exit(1);
+                }
+            }
+            let Some(path) = mosaix_persistence::default_database_path() else {
+                eprintln!("mosaix: this platform has no state database location");
+                std::process::exit(2);
+            };
+            match mosaix_persistence::Persistence::reset(&path) {
+                Ok(outcome) => {
+                    match outcome.preserved {
+                        Some(preserved) => {
+                            println!("previous database preserved at {}", preserved.display());
+                        }
+                        None => println!("no previous database was present"),
+                    }
+                    println!("fresh state database created at {}", path.display());
+                    println!("restart the agent to resume durable state");
+                }
+                Err(error) => {
+                    eprintln!("mosaix: {error}");
+                    std::process::exit(1);
+                }
+            }
         }
     }
 }

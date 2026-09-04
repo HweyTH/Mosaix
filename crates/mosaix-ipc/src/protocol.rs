@@ -55,8 +55,8 @@ pub enum IpcRequest {
     FocusDisplay {
         display_id: isize,
     },
-    /// Apply the saved layout called `name` to the focused window's
-    /// display (ADR 0020). The first request carrying a payload, hence
+    /// Apply the saved layout called `name` to the focused display. The
+    /// first request carrying a payload, hence
     /// [`PROTOCOL_VERSION`] 2.
     ApplyLayout {
         name: String,

@@ -709,7 +709,7 @@ pub fn plan_saved_layout(
                 .and_then(|window_id| state.inventory.get(&window_id))
                 .map(|managed| managed.window.display_id)
         })
-        .ok_or(SavedLayoutRejection::NoFocusedManagedWindow)?;
+        .ok_or(SavedLayoutRejection::NoFocusedDisplay)?;
     let Some(work_area) = work_area_of(&state.displays, display_id) else {
         return Err(SavedLayoutRejection::DisplayUnavailable { display_id });
     };
@@ -5322,7 +5322,7 @@ mod tests {
     }
 
     #[test]
-    fn applying_a_saved_layout_with_no_focused_managed_window_is_rejected_and_places_nothing() {
+    fn applying_a_saved_layout_with_no_focused_display_is_rejected_and_places_nothing() {
         let mut state = state_with_saved_layout("half", &[(0.0, 0.0, 0.5, 1.0)]);
         apply(
             &mut state,
@@ -5335,7 +5335,7 @@ mod tests {
 
         assert_eq!(
             plan_saved_layout(&state, "half"),
-            Err(SavedLayoutRejection::NoFocusedManagedWindow)
+            Err(SavedLayoutRejection::NoFocusedDisplay)
         );
 
         apply(
@@ -5353,7 +5353,7 @@ mod tests {
     }
 
     #[test]
-    fn focus_on_a_window_outside_the_managed_inventory_is_not_a_layout_target() {
+    fn unmanaged_focus_without_a_display_target_is_not_a_layout_target() {
         let mut state = state_with_saved_layout("half", &[(0.0, 0.0, 0.5, 1.0)]);
         apply(
             &mut state,
@@ -5367,7 +5367,7 @@ mod tests {
 
         assert_eq!(
             plan_saved_layout(&state, "half"),
-            Err(SavedLayoutRejection::NoFocusedManagedWindow)
+            Err(SavedLayoutRejection::NoFocusedDisplay)
         );
     }
 
@@ -6109,5 +6109,117 @@ mod tests {
             Event::DisplayTopologyChanged(vec![display(2, "primary", 0)]),
         );
         assert_eq!(state.focused_display, Some(DisplayId(2)));
+    }
+
+    #[test]
+    fn a_storage_failure_leaves_the_committed_arrangement_intact() {
+        // ADR 0025: durability is a promise about the database, not about
+        // the desktop. Losing the first must not disturb the second, and
+        // must not provoke compensating movement either.
+        let mut state = state_with_saved_layout("half", &[(0.0, 0.0, 0.5, 1.0)]);
+        apply(
+            &mut state,
+            Event::WindowsObserved {
+                windows: vec![window_at(1, 1, Rect::new(0, 0, 600, 600))],
+            },
+        );
+        apply(
+            &mut state,
+            Event::FocusDisplayRequested {
+                display_id: DisplayId(1),
+            },
+        );
+        apply(
+            &mut state,
+            Event::SavedLayoutApplyRequested {
+                name: "half".to_owned(),
+            },
+        );
+        assert!(
+            !placements(&state).is_empty(),
+            "the layout must have been applied for this test to mean anything"
+        );
+        let windows_before = state.windows.clone();
+        let inventory_before = state.inventory.clone();
+        state.effects.clear();
+
+        apply(
+            &mut state,
+            Event::PersistenceHealthChanged(PersistenceHealth::Degraded {
+                last_durable_revision: 3,
+                reason: mosaix_persistence::PersistenceFailure::WriteFailed,
+            }),
+        );
+
+        assert_eq!(
+            state.windows, windows_before,
+            "a storage failure must not move a window"
+        );
+        assert_eq!(
+            state.inventory, inventory_before,
+            "a storage failure must not forget a window"
+        );
+        assert!(
+            state.effects.is_empty(),
+            "a storage failure must emit no compensating effect"
+        );
+        assert_eq!(
+            state.persistence_health,
+            PersistenceHealth::Degraded {
+                last_durable_revision: 3,
+                reason: mosaix_persistence::PersistenceFailure::WriteFailed,
+            },
+            "the failure must still be reported honestly"
+        );
+    }
+
+    #[test]
+    fn saved_layout_uses_an_explicit_focused_display_without_a_focused_window() {
+        let mut state = state_with_saved_layout("half", &[(0.0, 0.0, 0.5, 1.0)]);
+        state.displays.push(display(2, "secondary", 1920));
+        apply(
+            &mut state,
+            Event::WindowsObserved {
+                windows: vec![window_at(2, 2, Rect::new(1920, 0, 600, 600))],
+            },
+        );
+        state.focused_window = None;
+        apply(
+            &mut state,
+            Event::FocusDisplayRequested {
+                display_id: DisplayId(2),
+            },
+        );
+        state.effects.clear();
+
+        apply(
+            &mut state,
+            Event::SavedLayoutApplyRequested {
+                name: "half".to_owned(),
+            },
+        );
+
+        assert_eq!(
+            placements(&state),
+            vec![(WindowId(2), DisplayId(2), Rect::new(1920, 0, 960, 1080))]
+        );
+    }
+
+    #[test]
+    fn saved_layout_without_any_display_target_is_rejected_with_a_typed_reason() {
+        let state = EngineState {
+            resolved_config: ResolvedConfig {
+                layouts: [("half".to_owned(), saved_layout(&[(0.0, 0.0, 0.5, 1.0)]))]
+                    .into_iter()
+                    .collect(),
+                ..ResolvedConfig::default()
+            },
+            ..EngineState::default()
+        };
+
+        assert_eq!(
+            plan_saved_layout(&state, "half"),
+            Err(SavedLayoutRejection::NoFocusedDisplay)
+        );
     }
 }

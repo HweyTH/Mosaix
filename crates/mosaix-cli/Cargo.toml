@@ -11,5 +11,6 @@ path = "src/main.rs"
 
 [dependencies]
 mosaix-ipc = { path = "../mosaix-ipc" }
+mosaix-persistence = { path = "../mosaix-persistence" }
 clap = { workspace = true }
 serde_json = { workspace = true }

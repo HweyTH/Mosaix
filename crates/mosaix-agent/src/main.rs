@@ -202,13 +202,15 @@ fn main() {
     // The worker owns the per-user bundled-SQLite connection. A failure is
     // deliberately reflected into reducer state instead of aborting live
     // window management.
-    let persistence_path = config_dir
-        .as_ref()
-        .map(|dir| dir.parent().unwrap_or(dir).join("state.db"));
+    let persistence_path = mosaix_persistence::default_database_path();
+    let persistence_start_failure = std::sync::Arc::new(std::sync::Mutex::new(None));
     let persistence_worker = persistence_path.as_ref().and_then(|path| {
         mosaix_persistence::PersistenceWorker::start(path)
             .map_err(|error| {
                 tracing::error!(%error, "persistence worker could not start");
+                *persistence_start_failure
+                    .lock()
+                    .expect("persistence failure mutex poisoned") = Some(error.failure());
                 error
             })
             .ok()
@@ -219,7 +221,11 @@ fn main() {
             .send(mosaix_engine::Event::PersistenceHealthChanged(
                 mosaix_persistence::PersistenceHealth::Degraded {
                     last_durable_revision: 0,
-                    reason: mosaix_persistence::PersistenceFailure::OpenFailed,
+                    reason: persistence_start_failure
+                        .lock()
+                        .expect("persistence failure mutex poisoned")
+                        .take()
+                        .unwrap_or(mosaix_persistence::PersistenceFailure::OpenFailed),
                 },
             ));
     }

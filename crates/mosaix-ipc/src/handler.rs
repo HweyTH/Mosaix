@@ -339,7 +339,7 @@ impl From<EngineState> for StateSnapshot {
                 } => (
                     "degraded".to_owned(),
                     last_durable_revision,
-                    Some(format!("{reason:?}").to_lowercase()),
+                    Some(reason.code().to_owned()),
                 ),
             };
         Self {
@@ -691,7 +691,7 @@ pub fn handle_request(
         IpcRequest::ApplyLayout { name } => {
             // The reducer would reach the same verdict, but only a log
             // would come of it. Asking first is what lets the caller be
-            // told *why* nothing happened (ADR 0020).
+            // told *why* nothing happened.
             match mosaix_engine::plan_saved_layout(&state_reader.snapshot(), name) {
                 Ok(plan) => match send_event(
                     events,
@@ -961,6 +961,23 @@ mod tests {
 
         assert_eq!(json["degraded_windows"][0]["window_id"], 41);
         assert_eq!(json["degraded_windows"][0]["reason"], "circuit_open");
+    }
+
+    #[test]
+    fn state_snapshot_exposes_focused_display_and_persistence_health() {
+        let mut state = EngineState::default();
+        state.focused_display = Some(DisplayId(-7));
+        state.persistence_health = PersistenceHealth::Degraded {
+            last_durable_revision: 41,
+            reason: mosaix_persistence::PersistenceFailure::MigrationFailed,
+        };
+
+        let json = serde_json::to_value(StateSnapshot::from(state)).unwrap();
+
+        assert_eq!(json["focused_display"], -7);
+        assert_eq!(json["persistence_status"], "degraded");
+        assert_eq!(json["last_durable_revision"], 41);
+        assert_eq!(json["persistence_reason"], "migration_failed");
     }
 
     #[test]
