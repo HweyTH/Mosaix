@@ -24,7 +24,7 @@ use mosaix_domain::identity::WindowEvidence;
 use mosaix_domain::recovery::{RecoveryDraft, RecoveryEntryId};
 use mosaix_domain::tree::PersistedTree;
 use mosaix_domain::undo::{
-    now_unix, UndoMember, UndoTransaction, UndoTransactionDraft, UndoTransactionId,
+    now_unix, UndoAssignment, UndoMember, UndoTransaction, UndoTransactionDraft, UndoTransactionId,
     UndoTreeSnapshot,
 };
 use mosaix_domain::workspace::{PersistedWorkspace, WorkspaceName, WorkspaceOrigin};
@@ -139,6 +139,22 @@ const MIGRATIONS: &[Migration] = &[
                          origin TEXT NOT NULL,
                          displayed_fingerprint TEXT,
                          tree TEXT
+                     );",
+    },
+    // The displayed workspace assignments a command changed, as they
+    // stood before it, so undoing a workspace switch puts the assignment
+    // back and not only the windows (CONTEXT.md "Workspace switch
+    // transaction"). Cascades with its transaction for the same reason
+    // members and trees do. `workspace` is nullable because a display
+    // that showed nothing is a state a switch can leave behind.
+    Migration {
+        version: 6,
+        statements: "CREATE TABLE undo_assignment (
+                         transaction_id INTEGER NOT NULL
+                             REFERENCES undo_transaction (id) ON DELETE CASCADE,
+                         display_fingerprint TEXT NOT NULL,
+                         workspace TEXT,
+                         PRIMARY KEY (transaction_id, display_fingerprint)
                      );",
     },
 ];
@@ -558,6 +574,14 @@ impl Persistence {
                     rusqlite::params![id.0, display_fingerprint, document],
                 )?;
             }
+            for assignment in &draft.prior_assignments {
+                transaction.execute(
+                    "INSERT INTO undo_assignment
+                         (transaction_id, display_fingerprint, workspace)
+                     VALUES (?1, ?2, ?3)",
+                    rusqlite::params![id.0, assignment.display_fingerprint, assignment.workspace,],
+                )?;
+            }
             // Pruning rides inside the insert's transaction, so history is
             // never observably over its bounds and a failed prune cannot
             // leave the new transaction stored without it.
@@ -612,7 +636,32 @@ impl Persistence {
             durable_revision,
             members: self.members_of(id)?,
             prior_trees: self.trees_of(id)?,
+            prior_assignments: self.assignments_of(id)?,
         }))
+    }
+
+    fn assignments_of(
+        &self,
+        id: UndoTransactionId,
+    ) -> Result<Vec<UndoAssignment>, PersistenceError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT display_fingerprint, workspace FROM undo_assignment
+                 WHERE transaction_id = ?1 ORDER BY display_fingerprint",
+            )
+            .map_err(PersistenceError::Read)?;
+        let rows = statement
+            .query_map([id.0], |row| {
+                Ok(UndoAssignment {
+                    display_fingerprint: row.get(0)?,
+                    workspace: row.get(1)?,
+                })
+            })
+            .map_err(PersistenceError::Read)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(PersistenceError::Read)?;
+        Ok(rows)
     }
 
     fn trees_of(&self, id: UndoTransactionId) -> Result<Vec<UndoTreeSnapshot>, PersistenceError> {

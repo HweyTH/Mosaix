@@ -198,6 +198,13 @@ enum WorkspaceAction {
         #[arg(long)]
         json: bool,
     },
+    /// Reconcile the windows a failed switch left unaccounted for. This
+    /// is the only way out of the workspace-switch-degraded condition,
+    /// and switching stays blocked until it succeeds.
+    RestoreSwitch {
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -674,6 +681,32 @@ fn format_workspace_result(result: &mosaix_domain::WorkspaceCommandResult) -> St
                 applied.name, applied.from_display_id.0, applied.to_display_id.0
             ),
         },
+        WorkspaceCommandResult::Focused(WorkspaceFocusApplied::SwitchStarted {
+            name,
+            display_id,
+            replaced,
+            parking,
+            restoring,
+        }) => match replaced {
+            Some(replaced) => format!(
+                "switching display {} from {replaced} to {name}: parking {parking} window(s),                  restoring {restoring}",
+                display_id.0
+            ),
+            None => format!(
+                "switching display {} to {name}: parking {parking} window(s), restoring {restoring}",
+                display_id.0
+            ),
+        },
+        WorkspaceCommandResult::SwitchFailed(failed) if failed.compensated => format!(
+            "mosaix: the switch to {} was cancelled and every moved window is back ({})",
+            failed.name, failed.reason
+        ),
+        WorkspaceCommandResult::SwitchFailed(failed) => format!(
+            "mosaix: the switch to {} failed and {} window(s) could not be put back ({});              workspace switching is blocked until `mosaix workspace restore-switch`",
+            failed.name,
+            failed.stranded_windows.len(),
+            failed.reason
+        ),
         WorkspaceCommandResult::Refused(refusal) => {
             format!("mosaix: {refusal} ({})", refusal.code())
         }
@@ -707,6 +740,37 @@ fn format_switching(state: &serde_json::Value) -> String {
     }
     if let Some(capability) = switching["parking_capability"].as_str() {
         lines.push(format!("  parking site: {capability}"));
+    }
+    // A degraded switch outranks everything above it: switching is
+    // blocked regardless of what the profile asks for, and the line that
+    // says so has to be impossible to miss.
+    let switch = &state["workspace_switch"];
+    if let Some(degraded) = switch["degraded"].as_object() {
+        let stranded = degraded["stranded_windows"]
+            .as_array()
+            .map(|windows| {
+                windows
+                    .iter()
+                    .map(|id| id.to_string())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .unwrap_or_default();
+        lines.insert(
+            0,
+            format!(
+                "workspace switching: blocked; a failed switch left window(s) {stranded}                  unaccounted for ({}) -- run `mosaix workspace restore-switch`",
+                degraded["reason"].as_str().unwrap_or("no reason")
+            ),
+        );
+    }
+    if let Some(in_flight) = switch["in_flight"].as_object() {
+        lines.push(format!(
+            "  switch in flight: display {} to {} ({})",
+            in_flight["display_id"],
+            in_flight["target"].as_str().unwrap_or("?"),
+            in_flight["phase"].as_str().unwrap_or("?")
+        ));
     }
     let recovery = &state["recovery"];
     if let Some(parked) = recovery["parked_windows"].as_array() {
@@ -831,6 +895,10 @@ fn run_workspace(action: WorkspaceAction) {
             run_restore_parked(json);
             return;
         }
+        WorkspaceAction::RestoreSwitch { json } => {
+            run_restore_switch(json);
+            return;
+        }
         WorkspaceAction::Create { name, json } => (IpcRequest::CreateWorkspace { name }, json),
         WorkspaceAction::Delete { name, json } => (IpcRequest::DeleteWorkspace { name }, json),
         WorkspaceAction::Focus { name, json } => (IpcRequest::FocusWorkspace { name }, json),
@@ -937,6 +1005,77 @@ fn run_park_window(window: isize, json: bool) {
 }
 
 #[cfg(windows)]
+/// Asks the agent to reconcile a degraded switch, and reports what it
+/// answered.
+///
+/// Exits non-zero when nothing was reconciled, so a script can tell "the
+/// condition is cleared" from "there was nothing to clear" without
+/// parsing prose.
+#[cfg(windows)]
+fn run_restore_switch(json: bool) {
+    use mosaix_ipc::{send_request, IpcRequest, IpcResponse};
+
+    let data = match send_request(IpcRequest::RestoreWorkspaceSwitch) {
+        Ok(IpcResponse::Ok { data: Some(data) }) => data,
+        Ok(IpcResponse::Ok { data: None }) => {
+            eprintln!("mosaix: the agent answered without a result");
+            std::process::exit(2);
+        }
+        Ok(IpcResponse::Error { message }) => {
+            eprintln!("mosaix: {message}");
+            std::process::exit(1);
+        }
+        Ok(IpcResponse::VersionMismatch { server_version }) => {
+            eprintln!("mosaix: protocol version mismatch (server: v{server_version})");
+            std::process::exit(1);
+        }
+        Err(error) => {
+            eprintln!("mosaix: {error}");
+            std::process::exit(2);
+        }
+    };
+    let result: mosaix_domain::WorkspaceSwitchRestoreResult =
+        match serde_json::from_value(data.clone()) {
+            Ok(result) => result,
+            Err(error) => {
+                eprintln!("mosaix: could not read the agent's restore result: {error}");
+                std::process::exit(2);
+            }
+        };
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&data).expect("JSON value serializes")
+        );
+    } else {
+        match &result {
+            mosaix_domain::WorkspaceSwitchRestoreResult::NotDegraded => {
+                eprintln!("mosaix: no degraded workspace switch to reconcile");
+            }
+            mosaix_domain::WorkspaceSwitchRestoreResult::Reconciled { .. } => {
+                println!("workspace switching is unblocked; nothing was left parked");
+            }
+            mosaix_domain::WorkspaceSwitchRestoreResult::Requested { windows } => {
+                println!(
+                    "restore requested for {} stranded window(s): {}",
+                    windows.len(),
+                    windows
+                        .iter()
+                        .map(|window| window.0.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+        }
+    }
+    if matches!(
+        result,
+        mosaix_domain::WorkspaceSwitchRestoreResult::NotDegraded
+    ) {
+        std::process::exit(1);
+    }
+}
+
 fn run_restore_parked(json: bool) {
     use mosaix_ipc::{send_request, IpcRequest, IpcResponse};
 
@@ -1203,6 +1342,10 @@ fn run_undo(json: bool) {
                 UndoRefusal::PersistenceDegraded { reason, .. } => {
                     eprintln!("  reason: {reason}");
                     eprintln!("  see `mosaix persistence status`");
+                }
+                UndoRefusal::WorkspaceSwitchRefused { reason, .. } => {
+                    eprintln!("  reason: {reason}");
+                    eprintln!("  see `mosaix workspace switching`");
                 }
                 UndoRefusal::NothingToUndo => {}
             }
@@ -1633,6 +1776,115 @@ mod tests {
         assert_eq!(
             format_workspaces(&state),
             "workspaces:\n  chat: hidden, from command, no windows, 2 dormant position(s)\n  dev: display 1, from configuration, windows 11 12\n  rule typo names unknown workspace \"dv\" for window 13"
+        );
+    }
+
+    #[test]
+    fn a_degraded_switch_leads_the_switching_report_and_names_the_way_out() {
+        // Whatever the profile asks for, switching is blocked while a
+        // failed compensation stands, so that is the first line.
+        let state = serde_json::json!({
+            "workspace_switching": {
+                "status": "experimental",
+                "reason": null,
+                "profile_file": null,
+                "displayed": {},
+                "parking_capability": "verified",
+            },
+            "workspace_switch": {
+                "in_flight": null,
+                "degraded": {
+                    "display_id": 1,
+                    "target": "chat",
+                    "outgoing": "dev",
+                    "stranded_windows": [41, 42],
+                    "reason": "the window would not come back",
+                },
+            },
+            "recovery": {},
+        });
+
+        let rendered = format_switching(&state);
+
+        assert!(
+            rendered.starts_with("workspace switching: blocked;"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("41 42"), "{rendered}");
+        assert!(
+            rendered.contains("mosaix workspace restore-switch"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn a_switch_in_flight_is_reported_with_the_phase_it_is_in() {
+        let state = serde_json::json!({
+            "workspace_switching": {
+                "status": "experimental",
+                "reason": null,
+                "profile_file": null,
+                "displayed": {},
+                "parking_capability": "verified",
+            },
+            "workspace_switch": {
+                "in_flight": {
+                    "display_id": 1,
+                    "target": "chat",
+                    "outgoing": "dev",
+                    "phase": "parking",
+                    "parked_windows": [],
+                    "restored_windows": [],
+                },
+                "degraded": null,
+            },
+            "recovery": {},
+        });
+
+        assert!(
+            format_switching(&state).contains("switch in flight: display 1 to chat (parking)"),
+            "{}",
+            format_switching(&state)
+        );
+    }
+
+    #[test]
+    fn a_switch_that_could_not_be_compensated_tells_the_user_what_to_run() {
+        let result = mosaix_domain::WorkspaceCommandResult::SwitchFailed(
+            mosaix_domain::WorkspaceSwitchFailed {
+                name: mosaix_domain::WorkspaceName::new("chat").unwrap(),
+                display_id: mosaix_domain::DisplayId(1),
+                reason: "the window would not come back".to_owned(),
+                compensated: false,
+                stranded_windows: vec![mosaix_domain::WindowId(41)],
+            },
+        );
+
+        let rendered = format_workspace_result(&result);
+
+        assert!(
+            rendered.contains("1 window(s) could not be put back"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("restore-switch"), "{rendered}");
+    }
+
+    #[test]
+    fn a_compensated_switch_says_every_window_is_back() {
+        let result = mosaix_domain::WorkspaceCommandResult::SwitchFailed(
+            mosaix_domain::WorkspaceSwitchFailed {
+                name: mosaix_domain::WorkspaceName::new("chat").unwrap(),
+                display_id: mosaix_domain::DisplayId(1),
+                reason: "the window refused to move".to_owned(),
+                compensated: true,
+                stranded_windows: Vec::new(),
+            },
+        );
+
+        assert_eq!(
+            format_workspace_result(&result),
+            "mosaix: the switch to chat was cancelled and every moved window is back \
+             (the window refused to move)"
         );
     }
 

@@ -12,13 +12,18 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use mosaix_config::{ResolvedConfig, ResolvedConfigSet, ResolvedProfile, TilingMode};
+use mosaix_config::{
+    ResolvedConfig, ResolvedConfigSet, ResolvedProfile, ResolvedWorkspaceSwitching, TilingMode,
+};
+use mosaix_domain::recovery::RecoveryEntryId;
+use mosaix_domain::workspace::ParkingCapability;
 use mosaix_domain::{
     topology_fingerprint, ApplicationId, Display, DisplayId, Rect, Rotation, Window,
     WindowCapabilities, WindowId, WindowLifecycle, WindowRole, WorkspaceName, WorkspaceOrigin,
 };
 use mosaix_engine::{
-    spawn_engine, CardinalDirection, EngineState, Event, PersistenceIntent, StateReader,
+    spawn_engine, CardinalDirection, EngineEffect, EngineState, Event, EventSender,
+    PersistenceIntent, StateReader,
 };
 use mosaix_persistence::Persistence;
 
@@ -61,11 +66,18 @@ fn display() -> Display {
     }
 }
 
-/// A profile that turns on tree-mode automatic tiling for this topology
-/// and declares one workspace, `dev`.
+/// A profile that turns on tree-mode automatic tiling for this topology,
+/// declares one workspace, `dev`, and requests experimental switching for
+/// it -- which is the only way a switch may move a window (ADR 0028).
 fn tree_config() -> ResolvedConfigSet {
     let config = ResolvedConfig {
         workspaces: vec![WorkspaceName::new("dev").unwrap()],
+        workspace_switching: Some(ResolvedWorkspaceSwitching {
+            experimental: true,
+            displayed: [("DISPLAY1".to_owned(), WorkspaceName::new("dev").unwrap())]
+                .into_iter()
+                .collect(),
+        }),
         automatic_tiling_enabled: true,
         tiling_mode: TilingMode::Tree,
         ..ResolvedConfig::default()
@@ -105,10 +117,73 @@ fn window(id: isize, application: &str, class: &str) -> Window {
     }
 }
 
-fn settle<T>(reader: &StateReader, what: &str, condition: impl Fn(&EngineState) -> Option<T>) -> T {
+/// As much of the agent's two answering loops as a switch needs: the
+/// persistence worker acknowledging each recovery entry durable, and the
+/// placement executor reporting each park and restore as landed.
+///
+/// Without these the engine is right to sit still: a window may not leave
+/// visible geometry until its way back is on disk (ADR 0023).
+struct Adapter {
+    intents: usize,
+    effects: usize,
+    next_entry: i64,
+}
+
+impl Adapter {
+    fn new() -> Self {
+        Self {
+            intents: 0,
+            effects: 0,
+            next_entry: 0,
+        }
+    }
+
+    fn pump(&mut self, events: &EventSender, state: &EngineState) {
+        for intent in state.persistence_intents.iter().skip(self.intents) {
+            if let PersistenceIntent::RecordRecovery { token, .. } = intent {
+                self.next_entry += 1;
+                let _ = events.send(Event::RecoveryEntryDurable {
+                    token: *token,
+                    entry_id: RecoveryEntryId(self.next_entry),
+                });
+            }
+        }
+        self.intents = state.persistence_intents.len();
+        for effect in state.effects.iter().skip(self.effects) {
+            match effect {
+                EngineEffect::ParkWindow {
+                    window_id,
+                    entry_id,
+                } => {
+                    let _ = events.send(Event::WindowParked {
+                        window_id: *window_id,
+                        entry_id: *entry_id,
+                    });
+                }
+                EngineEffect::RestoreWindow { window_id, .. } => {
+                    let _ = events.send(Event::WindowRestored {
+                        window_id: *window_id,
+                    });
+                }
+                _ => {}
+            }
+        }
+        self.effects = state.effects.len();
+    }
+}
+
+fn settle<T>(
+    events: &EventSender,
+    adapter: &mut Adapter,
+    reader: &StateReader,
+    what: &str,
+    condition: impl Fn(&EngineState) -> Option<T>,
+) -> T {
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
-        if let Some(value) = condition(&reader.snapshot()) {
+        let snapshot = reader.snapshot();
+        adapter.pump(events, &snapshot);
+        if let Some(value) = condition(&snapshot) {
             return value;
         }
         std::thread::sleep(Duration::from_millis(5));
@@ -146,11 +221,15 @@ fn ws(name: &str) -> WorkspaceName {
 fn the_pool_its_displays_and_a_hidden_workspaces_tree_come_back_after_a_restart() {
     let temporary = TempDatabase::new("pool");
 
-    // --- session one: shape dev, then hide it behind a new workspace ---
+    // --- session one: shape dev, switch away to a new workspace, back ---
     {
         let engine = spawn_engine(vec![display()], tree_config());
         let events = engine.events();
         let reader = engine.state_reader();
+        let mut adapter = Adapter::new();
+        let _ = events.send(Event::ParkingCapabilityReported(
+            ParkingCapability::Verified,
+        ));
 
         let _ = events.send(Event::WindowsObserved {
             windows: vec![
@@ -158,9 +237,13 @@ fn the_pool_its_displays_and_a_hidden_workspaces_tree_come_back_after_a_restart(
                 window(12, "beta.exe", "BetaClass"),
             ],
         });
-        settle(&reader, "the first arrangement", |state| {
-            (order_by_application(state).len() == 2).then_some(())
-        });
+        settle(
+            &events,
+            &mut adapter,
+            &reader,
+            "the first arrangement",
+            |state| (order_by_application(state).len() == 2).then_some(()),
+        );
         let _ = events.send(Event::WindowFocused {
             window_id: WindowId(11),
             display_id: DisplayId(1),
@@ -169,19 +252,37 @@ fn the_pool_its_displays_and_a_hidden_workspaces_tree_come_back_after_a_restart(
         let _ = events.send(Event::DirectionalSwapRequested {
             direction: CardinalDirection::Right,
         });
-        settle(&reader, "the swap", |state| {
+        settle(&events, &mut adapter, &reader, "the swap", |state| {
             (order_by_application(state) == vec!["beta.exe", "alpha.exe"]).then_some(())
         });
 
+        // Switching to chat is a transaction: alpha and beta leave the
+        // screen before chat is displayed, and only then does the
+        // assignment change (CONTEXT.md "Workspace switch transaction").
         let _ = events.send(Event::WorkspaceCreateRequested {
             name: "chat".to_owned(),
         });
         let _ = events.send(Event::WorkspaceFocusRequested {
             name: "chat".to_owned(),
         });
-        settle(&reader, "chat to be displayed", |state| {
-            (state.workspaces.display_of(&ws("chat")) == Some(DisplayId(1))).then_some(())
-        });
+        settle(
+            &events,
+            &mut adapter,
+            &reader,
+            "chat to be displayed",
+            |state| (state.workspaces.display_of(&ws("chat")) == Some(DisplayId(1))).then_some(()),
+        );
+        let parked = reader.snapshot();
+        assert_eq!(
+            parked.parked_windows.len(),
+            2,
+            "the outgoing workspace's windows left the screen through the ledger"
+        );
+        assert!(
+            parked.switch.is_none() && parked.switch_degraded.is_none(),
+            "the transaction closed cleanly"
+        );
+
         let _ = events.send(Event::WindowsObserved {
             windows: vec![
                 window(11, "alpha.exe", "AlphaClass"),
@@ -189,9 +290,36 @@ fn the_pool_its_displays_and_a_hidden_workspaces_tree_come_back_after_a_restart(
                 window(13, "gamma.exe", "GammaClass"),
             ],
         });
-        settle(&reader, "gamma to join chat", |state| {
-            (state.workspaces.workspace_of(WindowId(13)) == Some(&ws("chat"))).then_some(())
+        settle(
+            &events,
+            &mut adapter,
+            &reader,
+            "gamma to join chat",
+            |state| {
+                (state.workspaces.workspace_of(WindowId(13)) == Some(&ws("chat"))).then_some(())
+            },
+        );
+
+        // Back to dev: gamma parks, alpha and beta come off the parking
+        // site, and dev is displayed again with the shape it had.
+        let _ = events.send(Event::WorkspaceFocusRequested {
+            name: "dev".to_owned(),
         });
+        settle(
+            &events,
+            &mut adapter,
+            &reader,
+            "dev to be displayed again",
+            |state| (state.workspaces.display_of(&ws("dev")) == Some(DisplayId(1))).then_some(()),
+        );
+        let back = reader.snapshot();
+        let mut parked: Vec<WindowId> = back.parked_windows.keys().copied().collect();
+        parked.sort_by_key(|window_id| window_id.0);
+        assert_eq!(
+            parked,
+            vec![WindowId(13)],
+            "only the newly hidden workspace's window is parked"
+        );
 
         // Every workspace write the reducer asked for, applied in order to
         // a real database -- what the agent's persistence bridge does.
@@ -229,8 +357,13 @@ fn the_pool_its_displays_and_a_hidden_workspaces_tree_come_back_after_a_restart(
             })
             .collect::<Vec<_>>(),
         vec![
-            ("chat", WorkspaceOrigin::Command, Some("DISPLAY1"), Some(1)),
-            ("dev", WorkspaceOrigin::Configuration, None, Some(2)),
+            ("chat", WorkspaceOrigin::Command, None, Some(1)),
+            (
+                "dev",
+                WorkspaceOrigin::Configuration,
+                Some("DISPLAY1"),
+                Some(2)
+            ),
         ],
         "the pool, each workspace's display, and each tree were stored"
     );
@@ -238,70 +371,79 @@ fn the_pool_its_displays_and_a_hidden_workspaces_tree_come_back_after_a_restart(
     let engine = spawn_engine(vec![display()], tree_config());
     let events = engine.events();
     let reader = engine.state_reader();
+    let mut adapter = Adapter::new();
+    let _ = events.send(Event::ParkingCapabilityReported(
+        ParkingCapability::Verified,
+    ));
     let _ = events.send(Event::WorkspacesLoaded(restored));
-    settle(&reader, "the pool to be restored", |state| {
-        (state.workspaces.display_of(&ws("chat")) == Some(DisplayId(1))
-            && state.workspaces.contains(&ws("dev"))
-            && !state.workspaces.is_displayed(&ws("dev")))
-        .then_some(())
-    });
+    settle(
+        &events,
+        &mut adapter,
+        &reader,
+        "the pool to be restored",
+        |state| {
+            (state.workspaces.display_of(&ws("dev")) == Some(DisplayId(1))
+                && state.workspaces.contains(&ws("chat"))
+                && !state.workspaces.is_displayed(&ws("chat")))
+            .then_some(())
+        },
+    );
 
+    // Dev's stored tree reclaims alpha and beta by evidence, in the
+    // swapped order the user left them in -- none of which depends on a
+    // native handle, and all of the handles are new.
     let _ = events.send(Event::WindowsObserved {
         windows: vec![
             window(901, "alpha.exe", "AlphaClass"),
             window(902, "beta.exe", "BetaClass"),
-            window(903, "gamma.exe", "GammaClass"),
         ],
     });
-    settle(&reader, "the new windows to be assigned", |state| {
-        (state.inventory.len() == 3).then_some(())
-    });
+    settle(
+        &events,
+        &mut adapter,
+        &reader,
+        "dev's stored shape",
+        |state| (order_by_application(state) == vec!["beta.exe", "alpha.exe"]).then_some(()),
+    );
     let state = reader.snapshot();
-    // Every new window joined the displayed workspace: membership is a
-    // native-handle fact and does not survive a restart, so alpha and
-    // beta are chat's now and are arranged with gamma, while dev's stored
-    // tree keeps their positions dormant until they are matched back.
-    for id in [901, 902, 903] {
+    assert!(
+        state.trees[&DisplayId(1)].dormant_positions().is_empty(),
+        "both stored positions found their window again"
+    );
+    for id in [901, 902] {
         assert_eq!(
             state.workspaces.workspace_of(WindowId(id)),
-            Some(&ws("chat"))
+            Some(&ws("dev")),
+            "a window is a member of the workspace displayed where it appeared"
         );
     }
-    assert_eq!(
-        order_by_application(&state).len(),
-        3,
-        "chat is displayed, and every window is its member"
-    );
 
-    // Focusing dev brings its tree back, and the tree reclaims alpha and
-    // beta from evidence -- in the swapped order the user left them in.
+    // Switching to chat in the new session parks dev's windows and brings
+    // chat's stored tree back; gamma is gone, so its position is dormant.
     let _ = events.send(Event::WorkspaceFocusRequested {
-        name: "dev".to_owned(),
+        name: "chat".to_owned(),
     });
-    settle(&reader, "dev to be displayed", |state| {
-        (state.workspaces.display_of(&ws("dev")) == Some(DisplayId(1))).then_some(())
-    });
-    // Alpha and beta are chat's members, so dev's tree finds no live
-    // candidates yet: its two positions stay dormant, exactly as a tree
-    // whose windows are absent does (issue #51). Reassigning membership
-    // to a workspace is issue #60's switch transaction; here the
-    // persisted shape is what is under test.
-    let state = reader.snapshot();
-    let dev_tree = &state.trees[&DisplayId(1)];
-    assert_eq!(
-        dev_tree.dormant_positions().len(),
-        2,
-        "the stored tree came back with both positions kept for their windows"
+    settle(
+        &events,
+        &mut adapter,
+        &reader,
+        "chat to be displayed again",
+        |state| (state.workspaces.display_of(&ws("chat")) == Some(DisplayId(1))).then_some(()),
     );
-    let stored_order: Vec<String> = dev_tree
-        .dormant_positions()
-        .into_iter()
-        .map(|(_, dormant)| dormant.evidence.application_id.0.clone())
-        .collect();
+    let state = reader.snapshot();
     assert_eq!(
-        stored_order,
-        vec!["beta.exe", "alpha.exe"],
-        "the swap the user made is the shape that was stored"
+        state.parked_windows.len(),
+        2,
+        "dev's two windows left the screen for the switch"
+    );
+    assert_eq!(
+        state.trees[&DisplayId(1)]
+            .dormant_positions()
+            .into_iter()
+            .map(|(_, dormant)| dormant.evidence.application_id.0.clone())
+            .collect::<Vec<_>>(),
+        vec!["gamma.exe"],
+        "chat's stored tree came back, keeping the position of a window that is gone"
     );
     engine.stop();
 }

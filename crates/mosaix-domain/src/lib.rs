@@ -36,13 +36,15 @@ pub use tree::{
     PersistedTree, SplitAxis, Toward, Tree, DORMANT_RETENTION_SECONDS,
 };
 pub use undo::{
-    UndoApplied, UndoMember, UndoRefusal, UndoRestoredWindow, UndoResult, UndoTargetOutcome,
-    UndoTransaction, UndoTransactionDraft, UndoTransactionId, UndoTreeSnapshot,
+    UndoApplied, UndoAssignment, UndoMember, UndoRefusal, UndoRestoredWindow, UndoResult,
+    UndoTargetOutcome, UndoTransaction, UndoTransactionDraft, UndoTransactionId, UndoTreeSnapshot,
 };
 pub use window::{Window, WindowCapabilities, WindowLifecycle, WindowRole};
 pub use workspace::{
     ParkingCapability, PersistedWorkspace, SwitchingPending, Workspace, WorkspaceCommandResult,
     WorkspaceCreateApplied, WorkspaceDeleteApplied, WorkspaceFocusApplied, WorkspaceMoveApplied,
     WorkspaceName, WorkspaceNameError, WorkspaceOrigin, WorkspacePool, WorkspaceRefusal,
-    WorkspaceSwitchingStatus, WorkspaceSwitchingUnavailable, MAX_WORKSPACE_NAME_CHARS,
+    WorkspaceSwitchDegraded, WorkspaceSwitchFailed, WorkspaceSwitchPhase,
+    WorkspaceSwitchRestoreResult, WorkspaceSwitchingStatus, WorkspaceSwitchingUnavailable,
+    MAX_WORKSPACE_NAME_CHARS,
 };

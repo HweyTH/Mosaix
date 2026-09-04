@@ -107,7 +107,7 @@ A member of Mosaix's global pool of uniquely named managed-window groups, create
 _Avoid_: Virtual desktop, Space, saved workspace
 
 **Workspace focus**:
-Displaying a hidden logical workspace on the focused monitor, or focusing its last-focused live window when it is already displayed on another monitor. It never moves a displayed workspace between monitors.
+Displaying a hidden logical workspace on the focused monitor, or focusing its last-focused live window when it is already displayed on another monitor. It never moves a displayed workspace between monitors. Displaying one runs as a `Workspace switch transaction`, so it is refused whenever that transaction would be: with a window to move and switching not authorised, with a full-screen member, or while an earlier switch is in flight or left the display workspace-switch degraded.
 _Avoid_: Workspace move, display transfer, workspace switch (alone)
 
 **Workspace move**:
@@ -135,7 +135,7 @@ A small SQLite file beside the state database, written before any window is park
 _Avoid_: Undo history, session state, handle cache
 
 **Workspace switch transaction**:
-An all-or-nothing change of the logical workspace displayed on one monitor, durably recording recovery data before parking or restoring windows. Any placement failure cancels the switch and compensates completed moves; success creates one undo transaction covering both assignment and placements.
+An all-or-nothing change of the logical workspace displayed on one monitor, durably recording recovery data before parking or restoring windows. The outgoing workspace's windows all leave the screen before any of the target's come back, and the displayed assignment changes only once every move has landed. Any placement failure cancels the switch and compensates completed moves in the mirror order; success creates one undo transaction covering both assignment and placements. A switch that would move no window at all is pure bookkeeping: it needs no parking site and no authorised switching, because the desktop never sees it.
 _Avoid_: Placement transaction, partial workspace switch
 
 **Workspace switching status**:

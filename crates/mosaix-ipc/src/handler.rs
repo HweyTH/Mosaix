@@ -91,6 +91,42 @@ pub struct WorkspaceSwitchingSnapshot {
     pub parking_capability: String,
 }
 
+/// Experimental switching as it is actually behaving right now: what is
+/// in flight, and what an earlier failure left behind (CONTEXT.md
+/// "Workspace switch transaction", "Workspace-switch degraded").
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceSwitchSnapshot {
+    /// The switch in flight, if any.
+    #[serde(default)]
+    pub in_flight: Option<WorkspaceSwitchInFlightSnapshot>,
+    /// The windows an earlier compensation could not put back. Present
+    /// only while the degraded condition stands, and switching is blocked
+    /// for as long as it is.
+    #[serde(default)]
+    pub degraded: Option<WorkspaceSwitchDegradedSnapshot>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceSwitchInFlightSnapshot {
+    pub display_id: isize,
+    pub target: String,
+    pub outgoing: Option<String>,
+    /// `recording`, `parking`, `restoring`, `compensating_park`, or
+    /// `compensating_restore`.
+    pub phase: String,
+    pub parked_windows: Vec<isize>,
+    pub restored_windows: Vec<isize>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceSwitchDegradedSnapshot {
+    pub display_id: isize,
+    pub target: String,
+    pub outgoing: Option<String>,
+    pub stranded_windows: Vec<isize>,
+    pub reason: String,
+}
+
 /// The recovery ledger as published state describes it (ADR 0023).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct RecoverySnapshot {
@@ -179,6 +215,10 @@ pub struct StateSnapshot {
     /// startup recovery found.
     #[serde(default)]
     pub recovery: Option<RecoverySnapshot>,
+    /// A switch in flight, and any condition a failed one left behind.
+    /// `None` when neither is true, which is the normal case.
+    #[serde(default)]
+    pub workspace_switch: Option<WorkspaceSwitchSnapshot>,
     pub paused: bool,
     pub automatic_tiling_active: bool,
     pub automatic_tiling_suspended: bool,
@@ -563,6 +603,40 @@ impl From<EngineState> for StateSnapshot {
                 })
                 .collect(),
         });
+        let workspace_switch =
+            (state.switch.is_some() || state.switch_degraded.is_some()).then(|| {
+                WorkspaceSwitchSnapshot {
+                    in_flight: state.switch.as_ref().map(|switch| {
+                        WorkspaceSwitchInFlightSnapshot {
+                            display_id: switch.display_id.0,
+                            target: switch.target.as_str().to_owned(),
+                            outgoing: switch
+                                .outgoing
+                                .as_ref()
+                                .map(|name| name.as_str().to_owned()),
+                            phase: switch.phase.code().to_owned(),
+                            parked_windows: switch.parked.iter().map(|id| id.0).collect(),
+                            restored_windows: switch.restored.iter().map(|id| id.0).collect(),
+                        }
+                    }),
+                    degraded: state.switch_degraded.as_ref().map(|degraded| {
+                        WorkspaceSwitchDegradedSnapshot {
+                            display_id: degraded.display_id.0,
+                            target: degraded.target.as_str().to_owned(),
+                            outgoing: degraded
+                                .outgoing
+                                .as_ref()
+                                .map(|name| name.as_str().to_owned()),
+                            stranded_windows: degraded
+                                .stranded_windows
+                                .iter()
+                                .map(|id| id.0)
+                                .collect(),
+                            reason: degraded.reason.clone(),
+                        }
+                    }),
+                }
+            });
         let switching_status = state.workspace_switching_status();
         let workspace_switching = Some(WorkspaceSwitchingSnapshot {
             status: switching_status.code().to_owned(),
@@ -687,6 +761,7 @@ impl From<EngineState> for StateSnapshot {
             rule_workspace_refusals,
             workspace_switching,
             recovery,
+            workspace_switch,
             paused: state.paused,
             automatic_tiling_active: state.automatic_tiling_active,
             automatic_tiling_suspended: state.automatic_tiling_suspended,
@@ -1132,6 +1207,25 @@ pub fn handle_request(
             };
             IpcResponse::Ok {
                 data: Some(serde_json::to_value(result).expect("park results serialize")),
+            }
+        }
+        IpcRequest::RestoreWorkspaceSwitch => {
+            // Preflighted here so the answer names the windows the
+            // reducer will actually ask for, and refuses to claim a
+            // reconciliation that is not happening.
+            let result = mosaix_engine::plan_workspace_switch_restore(&state_reader.snapshot());
+            if !matches!(
+                result,
+                mosaix_domain::WorkspaceSwitchRestoreResult::NotDegraded
+            ) {
+                if let other @ IpcResponse::Error { .. } =
+                    send_event(events, Event::WorkspaceSwitchRestoreRequested)
+                {
+                    return other;
+                }
+            }
+            IpcResponse::Ok {
+                data: Some(serde_json::to_value(result).expect("switch restore results serialize")),
             }
         }
         IpcRequest::RestoreParkedWindows => {
@@ -1774,6 +1868,7 @@ mod tests {
             durable_revision: 3,
             members: Vec::new(),
             prior_trees: Vec::new(),
+            prior_assignments: Vec::new(),
         });
         state.persistence_health = PersistenceHealth::Degraded {
             last_durable_revision: 3,
@@ -3128,6 +3223,67 @@ mod tests {
             StateSnapshot::from(engine.snapshot()).workspaces.len(),
             1,
             "a refused name creates nothing"
+        );
+    }
+
+    #[test]
+    fn a_state_snapshot_carries_no_switch_section_when_nothing_is_switching() {
+        let engine = tiling_engine_with_workspaces(&["dev"]);
+
+        let snapshot = StateSnapshot::from(engine.snapshot());
+
+        assert_eq!(
+            snapshot.workspace_switch, None,
+            "the normal case says nothing rather than saying nothing is wrong"
+        );
+    }
+
+    #[test]
+    fn a_degraded_switch_is_published_with_the_windows_it_left_behind() {
+        let mut state = EngineState::default();
+        state.switch_degraded = Some(mosaix_domain::WorkspaceSwitchDegraded {
+            display_id: mosaix_domain::DisplayId(1),
+            target: mosaix_domain::WorkspaceName::new("chat").unwrap(),
+            outgoing: Some(mosaix_domain::WorkspaceName::new("dev").unwrap()),
+            stranded_windows: vec![mosaix_domain::WindowId(41)],
+            reason: "the window would not come back".to_owned(),
+        });
+
+        let json = serde_json::to_value(StateSnapshot::from(state)).unwrap();
+
+        assert_eq!(json["workspace_switch"]["degraded"]["display_id"], 1);
+        assert_eq!(json["workspace_switch"]["degraded"]["target"], "chat");
+        assert_eq!(json["workspace_switch"]["degraded"]["outgoing"], "dev");
+        assert_eq!(
+            json["workspace_switch"]["degraded"]["stranded_windows"],
+            serde_json::json!([41])
+        );
+        assert_eq!(
+            json["workspace_switch"]["in_flight"],
+            serde_json::Value::Null
+        );
+    }
+
+    #[test]
+    fn reconciling_a_switch_that_is_not_degraded_answers_with_a_typed_result_not_an_error() {
+        let engine = tiling_engine_with_workspaces(&["dev"]);
+
+        let response = handle_request(
+            &IpcRequest::RestoreWorkspaceSwitch,
+            &engine.events(),
+            &engine.state_reader(),
+            &no_store(),
+            &no_probe(),
+        );
+
+        let IpcResponse::Ok { data: Some(data) } = response else {
+            panic!("nothing to reconcile is data, not an error: {response:?}");
+        };
+        let result: mosaix_domain::WorkspaceSwitchRestoreResult =
+            serde_json::from_value(data).unwrap();
+        assert_eq!(
+            result,
+            mosaix_domain::WorkspaceSwitchRestoreResult::NotDegraded
         );
     }
 

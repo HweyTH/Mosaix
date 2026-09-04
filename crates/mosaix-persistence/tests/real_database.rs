@@ -277,6 +277,7 @@ fn draft(command: &str, applications: &[&str]) -> mosaix_domain::UndoTransaction
             })
             .collect(),
         prior_trees: Vec::new(),
+        prior_assignments: Vec::new(),
     }
 }
 
@@ -1284,4 +1285,36 @@ fn the_ledger_stores_no_window_titles() {
     }
     let bytes = fs::read(ledger_path(&temporary)).unwrap();
     assert!(!String::from_utf8_lossy(&bytes).contains("title"));
+}
+
+#[test]
+fn a_switch_keeps_the_displayed_assignment_it_changed_across_a_restart() {
+    // Undoing a workspace switch means switching back, which is only
+    // possible if the assignment the command changed is stored with it
+    // (CONTEXT.md "Workspace switch transaction").
+    let temporary = TempDatabase::new("undo-assignment");
+    let mut store = mosaix_persistence::Persistence::open(&temporary.path()).expect("it opens");
+    let mut draft = draft("workspace-focus chat", &["alpha.exe"]);
+    draft.prior_assignments = vec![
+        mosaix_domain::UndoAssignment {
+            display_fingerprint: "DISPLAY1".to_owned(),
+            workspace: Some("dev".to_owned()),
+        },
+        mosaix_domain::UndoAssignment {
+            display_fingerprint: "DISPLAY2".to_owned(),
+            workspace: None,
+        },
+    ];
+
+    store.record_transaction(&draft).expect("it stores");
+    drop(store);
+
+    let reopened = mosaix_persistence::Persistence::open(&temporary.path()).expect("it reopens");
+    let stored = reopened
+        .newest_transaction()
+        .expect("it reads")
+        .expect("a transaction is stored");
+
+    assert!(stored.changes_workspace_assignment());
+    assert_eq!(stored.prior_assignments, draft.prior_assignments);
 }
