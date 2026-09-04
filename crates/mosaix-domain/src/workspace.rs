@@ -324,6 +324,121 @@ impl WorkspaceCommandResult {
     }
 }
 
+/// Whether the platform adapter has verified a recoverable parking site
+/// for the current topology (ADR 0023). Parking is never authorised on
+/// `Unverified`, and a `Refused` site is never worked around by another
+/// hiding mechanism.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum ParkingCapability {
+    #[default]
+    Unverified,
+    Verified,
+    Refused {
+        reason: String,
+    },
+}
+
+/// Why a requested experimental switching mapping is not in effect.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WorkspaceSwitchingUnavailable {
+    /// The profile maps a display that is not connected.
+    DisplayNotConnected { display_fingerprint: String },
+    /// A connected display has no mapping.
+    MappingIncomplete { display_fingerprint: String },
+    /// The mapping names a workspace the pool does not hold.
+    UnknownWorkspace { name: String },
+    /// The adapter found no recoverable parking site.
+    ParkingRefused { reason: String },
+}
+
+impl WorkspaceSwitchingUnavailable {
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::DisplayNotConnected { .. } => "display_not_connected",
+            Self::MappingIncomplete { .. } => "mapping_incomplete",
+            Self::UnknownWorkspace { .. } => "unknown_workspace",
+            Self::ParkingRefused { .. } => "parking_refused",
+        }
+    }
+}
+
+impl std::fmt::Display for WorkspaceSwitchingUnavailable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DisplayNotConnected {
+                display_fingerprint,
+            } => write!(
+                formatter,
+                "the profile maps display {display_fingerprint:?}, which is not connected"
+            ),
+            Self::MappingIncomplete {
+                display_fingerprint,
+            } => write!(
+                formatter,
+                "display {display_fingerprint:?} has no workspace mapped to it"
+            ),
+            Self::UnknownWorkspace { name } => {
+                write!(
+                    formatter,
+                    "the profile maps workspace {name:?}, which does not exist"
+                )
+            }
+            Self::ParkingRefused { reason } => {
+                write!(formatter, "no recoverable parking site: {reason}")
+            }
+        }
+    }
+}
+
+/// What still stands between a requested mapping and experimental
+/// switching being active.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SwitchingPending {
+    /// No adapter has verified a recoverable parking site yet.
+    ParkingCapabilityUnverified,
+    /// Recovery data would not be durable (CONTEXT.md
+    /// "Persistence-degraded"), so no window may be parked.
+    PersistenceDegraded,
+}
+
+impl SwitchingPending {
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::ParkingCapabilityUnverified => "parking_capability_unverified",
+            Self::PersistenceDegraded => "persistence_degraded",
+        }
+    }
+}
+
+/// The state of experimental workspace switching for the current
+/// topology (ADR 0023, ADR 0028).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WorkspaceSwitchingStatus {
+    /// No matched profile asks for it. Base config cannot.
+    Disabled,
+    /// The matched profile asks for it and its mapping is in effect, but
+    /// switching itself cannot activate until `pending` clears.
+    Requested { pending: SwitchingPending },
+    /// The matched profile asks for it, but its mapping could not be
+    /// applied; the previous displayed assignment stands.
+    Unavailable {
+        reason: WorkspaceSwitchingUnavailable,
+    },
+    /// The mapping is in effect and parking is authorised.
+    Experimental,
+}
+
+impl WorkspaceSwitchingStatus {
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Requested { .. } => "requested",
+            Self::Unavailable { .. } => "unavailable",
+            Self::Experimental => "experimental",
+        }
+    }
+}
+
 /// The global pool (ADR 0028).
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct WorkspacePool {

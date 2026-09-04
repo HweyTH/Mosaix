@@ -322,6 +322,7 @@ pub fn save_profile_settings(
         automatic_tiling: None,
         focus_border: FocusBorderOverride::default(),
         layouts: Default::default(),
+        workspace_switching: None,
     });
     // The settings surface toggles activation, not the arrangement, so the
     // profile's existing mode is carried through. Defaulting it here would

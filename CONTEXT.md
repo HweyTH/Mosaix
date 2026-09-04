@@ -130,6 +130,10 @@ _Avoid_: Hide, cloak, minimize
 An all-or-nothing change of the logical workspace displayed on one monitor, durably recording recovery data before parking or restoring windows. Any placement failure cancels the switch and compensates completed moves; success creates one undo transaction covering both assignment and placements.
 _Avoid_: Placement transaction, partial workspace switch
 
+**Workspace switching status**:
+One of four states published for the current topology: disabled (no matched profile requests switching; base config cannot), requested (the matched profile's complete workspace-to-display mapping is in effect, but switching waits on a verified parking site or on persistence recovering), unavailable (the profile requests it but its mapping could not be applied, so the previous displayed assignment stands), or experimental (mapping in effect and parking authorised). A profile mapping applies to every display atomically or not at all, and the engine invents no workspace name to complete one.
+_Avoid_: Enabled (which does not say whether parking is authorised), workspace mode
+
 **Workspace-switch degraded**:
 A health condition in which compensation for a failed workspace switch could not restore every moved window. Further switching remains blocked until the explicit restore action reconciles the affected windows.
 _Avoid_: Persistence-degraded, degraded tiling

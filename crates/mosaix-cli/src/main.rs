@@ -127,6 +127,13 @@ enum WorkspaceAction {
         #[arg(long)]
         json: bool,
     },
+    /// Report experimental workspace switching for the current topology:
+    /// disabled, requested, unavailable, or experimental, with the
+    /// reason and the mapping the matched profile declares.
+    Switching {
+        #[arg(long)]
+        json: bool,
+    },
     /// Create a hidden, empty workspace. Refuses a name that already
     /// exists under any casing.
     Create {
@@ -636,6 +643,37 @@ fn format_workspace_result(result: &mosaix_domain::WorkspaceCommandResult) -> St
     }
 }
 
+/// Renders the switching section of published state.
+fn format_switching(state: &serde_json::Value) -> String {
+    let switching = &state["workspace_switching"];
+    let status = switching["status"].as_str().unwrap_or("unknown");
+    let mut lines = vec![match (status, switching["reason"].as_str()) {
+        ("disabled", _) => "workspace switching: disabled (no matched profile requests it; base config cannot)".to_owned(),
+        ("requested", Some(reason)) => format!(
+            "workspace switching: requested by the matched profile; not yet active ({reason})"
+        ),
+        ("unavailable", Some(reason)) => format!(
+            "workspace switching: unavailable; the previous displayed assignment stands ({reason})"
+        ),
+        ("experimental", _) => {
+            "workspace switching: experimental (parking via public APIs; not native virtual desktops)".to_owned()
+        }
+        (status, reason) => format!("workspace switching: {status} ({})", reason.unwrap_or("no reason")),
+    }];
+    if let Some(file) = switching["profile_file"].as_str() {
+        lines.push(format!("  requested by: {file}"));
+    }
+    if let Some(displayed) = switching["displayed"].as_object() {
+        for (display, name) in displayed {
+            lines.push(format!("  {display} -> {}", name.as_str().unwrap_or("?")));
+        }
+    }
+    if let Some(capability) = switching["parking_capability"].as_str() {
+        lines.push(format!("  parking site: {capability}"));
+    }
+    lines.join("\n")
+}
+
 /// Renders the workspace section of published state.
 fn format_workspaces(state: &serde_json::Value) -> String {
     let Some(workspaces) = state["workspaces"].as_array() else {
@@ -692,6 +730,22 @@ fn run_workspace(action: WorkspaceAction) {
     use mosaix_ipc::{send_request, IpcRequest, IpcResponse};
 
     let (request, json) = match action {
+        WorkspaceAction::Switching { json } => {
+            let Some(state) = published_persistence() else {
+                eprintln!("mosaix: no agent is running");
+                std::process::exit(1);
+            };
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&state["workspace_switching"])
+                        .expect("JSON value serializes")
+                );
+            } else {
+                println!("{}", format_switching(&state));
+            }
+            return;
+        }
         WorkspaceAction::List { json } => {
             let Some(state) = published_persistence() else {
                 eprintln!("mosaix: no agent is running");
@@ -1344,5 +1398,38 @@ mod tests {
             format_workspace_result(&result),
             "workspace chat is now displayed on display 1 (replacing dev, now hidden)"
         );
+    }
+
+    #[test]
+    fn switching_status_names_the_reason_the_profile_and_the_mapping() {
+        let state = serde_json::json!({
+            "workspace_switching": {
+                "status": "requested",
+                "reason": "parking_capability_unverified",
+                "profile_file": "office.toml",
+                "displayed": { "MON-A": "dev", "MON-B": "chat" },
+                "parking_capability": "unverified",
+            }
+        });
+
+        assert_eq!(
+            format_switching(&state),
+            "workspace switching: requested by the matched profile; not yet active (parking_capability_unverified)\n  requested by: office.toml\n  MON-A -> dev\n  MON-B -> chat\n  parking site: unverified"
+        );
+    }
+
+    #[test]
+    fn switching_status_disabled_says_why_base_config_cannot_enable_it() {
+        let state = serde_json::json!({
+            "workspace_switching": {
+                "status": "disabled",
+                "reason": null,
+                "profile_file": null,
+                "displayed": {},
+                "parking_capability": "unverified",
+            }
+        });
+
+        assert!(format_switching(&state).starts_with("workspace switching: disabled"));
     }
 }

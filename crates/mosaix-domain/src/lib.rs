@@ -18,7 +18,7 @@ pub use commands::{
     TreeResizeResult, TREE_RESIZE_STEP_PERCENT,
 };
 pub use coordinates::{allocate_edges, LogicalRect, NormalizedRect};
-pub use display::{topology_fingerprint, Display, Rotation};
+pub use display::{display_fingerprints, topology_fingerprint, Display, Rotation};
 pub use geometry::{Gaps, Rect, Size};
 pub use id::{ApplicationId, DisplayId, WindowId};
 pub use identity::{
@@ -35,7 +35,8 @@ pub use undo::{
 };
 pub use window::{Window, WindowCapabilities, WindowLifecycle, WindowRole};
 pub use workspace::{
-    PersistedWorkspace, Workspace, WorkspaceCommandResult, WorkspaceCreateApplied,
-    WorkspaceDeleteApplied, WorkspaceFocusApplied, WorkspaceMoveApplied, WorkspaceName,
-    WorkspaceNameError, WorkspaceOrigin, WorkspacePool, WorkspaceRefusal, MAX_WORKSPACE_NAME_CHARS,
+    ParkingCapability, PersistedWorkspace, SwitchingPending, Workspace, WorkspaceCommandResult,
+    WorkspaceCreateApplied, WorkspaceDeleteApplied, WorkspaceFocusApplied, WorkspaceMoveApplied,
+    WorkspaceName, WorkspaceNameError, WorkspaceOrigin, WorkspacePool, WorkspaceRefusal,
+    WorkspaceSwitchingStatus, WorkspaceSwitchingUnavailable, MAX_WORKSPACE_NAME_CHARS,
 };

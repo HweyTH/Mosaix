@@ -71,6 +71,7 @@ pub fn default_base_config() -> BaseConfig {
         // No layouts ship as defaults: a saved layout describes a shape one
         // user chose, so Mosaix has nothing to guess at (ADR 0018).
         layouts: BTreeMap::new(),
+        workspace_switching: None,
     }
 }
 

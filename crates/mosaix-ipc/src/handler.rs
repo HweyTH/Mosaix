@@ -6,7 +6,7 @@ use mosaix_config::{
 };
 use mosaix_domain::commands::{DirectionalSwapResult, RemovePositionResult, TreeResizeResult};
 use mosaix_domain::undo::UndoResult;
-use mosaix_domain::workspace::WorkspaceCommandResult;
+use mosaix_domain::workspace::{WorkspaceCommandResult, WorkspaceSwitchingStatus};
 use mosaix_domain::DisplayId;
 use mosaix_engine::{
     EligibilityReason, EngineState, Event, EventSender, StateReader, ZoneSnapDirection,
@@ -71,6 +71,26 @@ pub struct WorkspaceSnapshot {
     pub dormant_positions: usize,
 }
 
+/// Experimental workspace switching as published state describes it
+/// (ADR 0023, ADR 0028): one of `disabled`, `requested`, `unavailable`,
+/// or `experimental`, with the machine-readable reason a client can act
+/// on, and the mapping the matched profile declares.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceSwitchingSnapshot {
+    pub status: String,
+    /// Why `requested` has not become `experimental`, or why
+    /// `unavailable`; `None` for `disabled` and `experimental`.
+    pub reason: Option<String>,
+    /// The profile file making the request, when one does.
+    pub profile_file: Option<String>,
+    /// The mapping the profile declares, display fingerprint to workspace
+    /// name, whether or not it is currently in effect.
+    pub displayed: BTreeMap<String, String>,
+    /// Whether the adapter has verified a recoverable parking site:
+    /// `unverified`, `verified`, or `refused`.
+    pub parking_capability: String,
+}
+
 /// A rule that named a workspace the pool does not hold, so the window
 /// stayed in the workspace of the display it appeared on (ADR 0028).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -113,6 +133,9 @@ pub struct StateSnapshot {
     /// Rules whose workspace target named nothing in the pool.
     #[serde(default)]
     pub rule_workspace_refusals: Vec<RuleWorkspaceRefusalSnapshot>,
+    /// Experimental switching for the current topology.
+    #[serde(default)]
+    pub workspace_switching: Option<WorkspaceSwitchingSnapshot>,
     pub paused: bool,
     pub automatic_tiling_active: bool,
     pub automatic_tiling_suspended: bool,
@@ -462,6 +485,39 @@ impl From<EngineState> for StateSnapshot {
                 workspace: refusal.workspace.clone(),
             })
             .collect();
+        let switching_status = state.workspace_switching_status();
+        let workspace_switching = Some(WorkspaceSwitchingSnapshot {
+            status: switching_status.code().to_owned(),
+            reason: match &switching_status {
+                WorkspaceSwitchingStatus::Requested { pending } => Some(pending.code().to_owned()),
+                WorkspaceSwitchingStatus::Unavailable { reason } => Some(reason.code().to_owned()),
+                WorkspaceSwitchingStatus::Disabled | WorkspaceSwitchingStatus::Experimental => None,
+            },
+            profile_file: state
+                .resolved_config
+                .workspace_switching
+                .as_ref()
+                .filter(|switching| switching.experimental)
+                .and(state.resolved_config.profile_file.clone()),
+            displayed: state
+                .resolved_config
+                .workspace_switching
+                .as_ref()
+                .map(|switching| {
+                    switching
+                        .displayed
+                        .iter()
+                        .map(|(display, name)| (display.clone(), name.as_str().to_owned()))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            parking_capability: match &state.parking_capability {
+                mosaix_domain::ParkingCapability::Unverified => "unverified",
+                mosaix_domain::ParkingCapability::Verified => "verified",
+                mosaix_domain::ParkingCapability::Refused { .. } => "refused",
+            }
+            .to_owned(),
+        });
         let last_applied_layouts = state
             .last_applied_layouts
             .iter()
@@ -551,6 +607,7 @@ impl From<EngineState> for StateSnapshot {
             container_trees,
             workspaces,
             rule_workspace_refusals,
+            workspace_switching,
             paused: state.paused,
             automatic_tiling_active: state.automatic_tiling_active,
             automatic_tiling_suspended: state.automatic_tiling_suspended,
@@ -3041,5 +3098,66 @@ mod tests {
         );
         let json = serde_json::to_string(&snapshot).unwrap();
         assert!(!json.contains("non-sensitive-test-title"));
+    }
+
+    #[test]
+    fn state_snapshot_reports_switching_as_disabled_without_a_requesting_profile() {
+        let json = serde_json::to_value(StateSnapshot::from(EngineState::default())).unwrap();
+
+        assert_eq!(json["workspace_switching"]["status"], "disabled");
+        assert_eq!(
+            json["workspace_switching"]["reason"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            json["workspace_switching"]["parking_capability"],
+            "unverified"
+        );
+    }
+
+    #[test]
+    fn state_snapshot_reports_a_requested_mapping_with_what_it_waits_for() {
+        let display = mosaix_domain::Display {
+            id: DisplayId(1),
+            stable_fingerprint: "MON-A".to_owned(),
+            full_bounds: Rect::new(0, 0, 1920, 1080),
+            work_area: Rect::new(0, 0, 1920, 1080),
+            scale_factor: 1.0,
+            rotation: mosaix_domain::Rotation::Landscape,
+            is_primary: true,
+        };
+        let name = mosaix_domain::WorkspaceName::new("dev").unwrap();
+        let config = mosaix_config::ResolvedConfig {
+            workspaces: vec![name.clone()],
+            workspace_switching: Some(mosaix_config::ResolvedWorkspaceSwitching {
+                experimental: true,
+                displayed: [("MON-A".to_owned(), name)].into_iter().collect(),
+            }),
+            profile_file: Some("office.toml".to_owned()),
+            ..mosaix_config::ResolvedConfig::default()
+        };
+        let engine = mosaix_engine::spawn_engine(
+            vec![display.clone()],
+            mosaix_config::ResolvedConfigSet {
+                base: mosaix_config::ResolvedConfig {
+                    workspaces: config.workspaces.clone(),
+                    ..mosaix_config::ResolvedConfig::default()
+                },
+                profiles: vec![mosaix_config::ResolvedProfile {
+                    fingerprint: mosaix_domain::topology_fingerprint(&[display]),
+                    config,
+                }],
+            },
+        );
+
+        let json = serde_json::to_value(StateSnapshot::from(engine.snapshot())).unwrap();
+
+        assert_eq!(json["workspace_switching"]["status"], "requested");
+        assert_eq!(
+            json["workspace_switching"]["reason"],
+            "parking_capability_unverified"
+        );
+        assert_eq!(json["workspace_switching"]["profile_file"], "office.toml");
+        assert_eq!(json["workspace_switching"]["displayed"]["MON-A"], "dev");
     }
 }

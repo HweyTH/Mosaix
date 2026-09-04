@@ -54,9 +54,10 @@ use mosaix_domain::undo::{
     UndoTargetOutcome, UndoTransaction, UndoTransactionDraft, UndoTransactionId, UndoTreeSnapshot,
 };
 use mosaix_domain::workspace::{
-    PersistedWorkspace, WorkspaceCommandResult, WorkspaceCreateApplied, WorkspaceDeleteApplied,
-    WorkspaceFocusApplied, WorkspaceMoveApplied, WorkspaceName, WorkspaceOrigin, WorkspacePool,
-    WorkspaceRefusal,
+    ParkingCapability, PersistedWorkspace, SwitchingPending, WorkspaceCommandResult,
+    WorkspaceCreateApplied, WorkspaceDeleteApplied, WorkspaceFocusApplied, WorkspaceMoveApplied,
+    WorkspaceName, WorkspaceOrigin, WorkspacePool, WorkspaceRefusal, WorkspaceSwitchingStatus,
+    WorkspaceSwitchingUnavailable,
 };
 use mosaix_domain::{
     topology_fingerprint, Display, DisplayId, Rect, Window, WindowId, WindowLifecycle,
@@ -285,6 +286,15 @@ pub struct EngineState {
     /// Rules that named a workspace the pool does not hold, one entry per
     /// affected window. Cleared for a window when it leaves management.
     pub rule_workspace_refusals: Vec<RuleWorkspaceRefusal>,
+    /// Why the matched profile's switching mapping is not in effect, when
+    /// it asked for one and it could not be applied. `None` when it is in
+    /// effect, or when nothing asked. Read through
+    /// [`EngineState::workspace_switching_status`].
+    switching_unavailable: Option<WorkspaceSwitchingUnavailable>,
+    /// What the platform adapter last said about a recoverable parking
+    /// site for this topology (ADR 0023). Parking is authorised only on
+    /// `Verified`; nothing in the reducer verifies it.
+    pub parking_capability: ParkingCapability,
     pub displays: Vec<Display>,
     /// Where each tracked window currently sits, keyed by window. Entries
     /// are created (and their `previous_placement` remembered) by
@@ -389,6 +399,43 @@ pub struct EngineState {
 }
 
 impl EngineState {
+    /// The state of experimental workspace switching for the current
+    /// topology, derived rather than stored so it can never disagree
+    /// with the facts it summarises: whether the matched profile asks,
+    /// whether its mapping applied, whether recovery data would be
+    /// durable, and whether a parking site is verified.
+    pub fn workspace_switching_status(&self) -> WorkspaceSwitchingStatus {
+        let requested = self
+            .resolved_config
+            .workspace_switching
+            .as_ref()
+            .is_some_and(|switching| switching.experimental);
+        if !requested {
+            return WorkspaceSwitchingStatus::Disabled;
+        }
+        if let Some(reason) = &self.switching_unavailable {
+            return WorkspaceSwitchingStatus::Unavailable {
+                reason: reason.clone(),
+            };
+        }
+        if matches!(self.persistence_health, PersistenceHealth::Degraded { .. }) {
+            return WorkspaceSwitchingStatus::Requested {
+                pending: SwitchingPending::PersistenceDegraded,
+            };
+        }
+        match &self.parking_capability {
+            ParkingCapability::Verified => WorkspaceSwitchingStatus::Experimental,
+            ParkingCapability::Unverified => WorkspaceSwitchingStatus::Requested {
+                pending: SwitchingPending::ParkingCapabilityUnverified,
+            },
+            ParkingCapability::Refused { reason } => WorkspaceSwitchingStatus::Unavailable {
+                reason: WorkspaceSwitchingUnavailable::ParkingRefused {
+                    reason: reason.clone(),
+                },
+            },
+        }
+    }
+
     /// The number of windows whose circuit breaker is currently open
     /// (Feature 31).  Useful for diagnostics via `mosaix state --json`.
     pub fn circuit_breaker_count(&self) -> usize {
@@ -1181,6 +1228,9 @@ fn apply(state: &mut EngineState, event: Event) {
                 state.pending_displayed.remove(&name);
             }
             fill_empty_displays(state);
+            // A resolved topology-profile preference outranks what was
+            // remembered (ADR 0028).
+            apply_switching_mapping(state);
             assign_unassigned_windows(state);
             reconcile_arrangements(state);
             persist_workspaces(state);
@@ -1429,6 +1479,7 @@ fn apply(state: &mut EngineState, event: Event) {
                 sync_workspaces_from_config(state);
             }
             fill_empty_displays(state);
+            apply_switching_mapping(state);
             assign_unassigned_windows(state);
             reconcile_arrangements(state);
             persist_workspaces(state);
@@ -1740,6 +1791,7 @@ fn apply(state: &mut EngineState, event: Event) {
             state.config_set = *config_set;
             sync_workspaces_from_config(state);
             fill_empty_displays(state);
+            apply_switching_mapping(state);
             assign_unassigned_windows(state);
             reconcile_arrangements(state);
             persist_workspaces(state);
@@ -1999,6 +2051,7 @@ fn apply(state: &mut EngineState, event: Event) {
                 state.automatic_tiling_active = state.resolved_config.automatic_tiling_enabled;
                 sync_workspaces_from_config(state);
                 fill_empty_displays(state);
+                apply_switching_mapping(state);
             }
             if let Some(windows) = windows {
                 state.observed_windows = windows
@@ -2608,6 +2661,71 @@ fn fill_empty_displays(state: &mut EngineState) {
         state.pending_displayed.remove(&name);
         state.workspaces.display(&name, display_id);
         adopt_workspace_tree(state, &name, display_id);
+    }
+}
+
+/// Applies the matched profile's switching mapping as one transition, or
+/// leaves the displayed assignment exactly as it was (ADR 0028).
+///
+/// Every display and every name is resolved before anything changes, so
+/// a mapping that cannot be completed changes nothing and is reported as
+/// unavailable with the first reason found; the engine never invents a
+/// workspace to finish it. When the mapping already holds, nothing is
+/// stashed or adopted, so an unrelated config reload does not disturb
+/// the trees.
+fn apply_switching_mapping(state: &mut EngineState) {
+    state.switching_unavailable = None;
+    let Some(switching) = state.resolved_config.workspace_switching.clone() else {
+        return;
+    };
+    if !switching.experimental {
+        return;
+    }
+    let mut target: Vec<(DisplayId, WorkspaceName)> = Vec::new();
+    for (fingerprint, name) in &switching.displayed {
+        let Some(display_id) = display_id_of(state, fingerprint) else {
+            state.switching_unavailable =
+                Some(WorkspaceSwitchingUnavailable::DisplayNotConnected {
+                    display_fingerprint: fingerprint.clone(),
+                });
+            return;
+        };
+        let Some(name) = state.workspaces.resolve(name.as_str()) else {
+            state.switching_unavailable = Some(WorkspaceSwitchingUnavailable::UnknownWorkspace {
+                name: name.as_str().to_owned(),
+            });
+            return;
+        };
+        target.push((display_id, name));
+    }
+    for display in &state.displays {
+        if !target
+            .iter()
+            .any(|(display_id, _)| *display_id == display.id)
+        {
+            state.switching_unavailable = Some(WorkspaceSwitchingUnavailable::MappingIncomplete {
+                display_fingerprint: display.stable_fingerprint.clone(),
+            });
+            return;
+        }
+    }
+    target.sort_by_key(|(display_id, _)| display_id.0);
+    if state.workspaces.displayed() == target {
+        return;
+    }
+    tracing::info!("applying the profile's workspace mapping to every display");
+    // Every display gives up what it shows before any takes what it is
+    // mapped to, so two workspaces exchanging displays each carry their
+    // own tree rather than inheriting the other's.
+    for (display_id, _) in &target {
+        if state.workspaces.displayed_on(*display_id).is_some() {
+            stash_display_tree(state, *display_id);
+            state.workspaces.hide_display(*display_id);
+        }
+    }
+    for (display_id, name) in &target {
+        state.workspaces.display(name, *display_id);
+        adopt_workspace_tree(state, name, *display_id);
     }
 }
 
@@ -4167,6 +4285,8 @@ pub fn spawn_engine_with_capacity(
         saved_workspaces: HashMap::new(),
         last_workspace_result: None,
         rule_workspace_refusals: Vec::new(),
+        switching_unavailable: None,
+        parking_capability: ParkingCapability::Unverified,
         displays: initial_displays,
         windows: HashMap::new(),
         inventory: HashMap::new(),
@@ -4196,6 +4316,7 @@ pub fn spawn_engine_with_capacity(
     // observed, so the first observation already has somewhere to belong.
     sync_workspaces_from_config(&mut initial_state);
     fill_empty_displays(&mut initial_state);
+    apply_switching_mapping(&mut initial_state);
     let state = Arc::new(Mutex::new(initial_state.clone()));
 
     let published_state = Arc::clone(&state);
@@ -11615,6 +11736,294 @@ mod tests {
         assert_eq!(
             state.workspaces.get(&ws("media")).unwrap().origin,
             WorkspaceOrigin::Configuration
+        );
+    }
+
+    // ---- Experimental switching mappings (ADR 0028) --------------------
+
+    fn switching_set(
+        displays: &[Display],
+        workspaces: &[&str],
+        experimental: bool,
+        mapping: &[(&str, &str)],
+    ) -> ResolvedConfigSet {
+        let config = ResolvedConfig {
+            workspaces: workspaces.iter().map(|name| ws(name)).collect(),
+            workspace_switching: Some(mosaix_config::ResolvedWorkspaceSwitching {
+                experimental,
+                displayed: mapping
+                    .iter()
+                    .map(|(display, name)| ((*display).to_owned(), ws(name)))
+                    .collect(),
+            }),
+            automatic_tiling_enabled: true,
+            tiling_mode: TilingMode::Tree,
+            ..ResolvedConfig::default()
+        };
+        ResolvedConfigSet {
+            base: ResolvedConfig {
+                workspaces: config.workspaces.clone(),
+                ..ResolvedConfig::default()
+            },
+            profiles: vec![ResolvedProfile {
+                fingerprint: topology_fingerprint(displays),
+                config,
+            }],
+        }
+    }
+
+    #[test]
+    fn base_config_cannot_request_switching_so_it_stays_disabled() {
+        let state = workspace_state(&[1], &["dev"]);
+        assert_eq!(
+            state.workspace_switching_status(),
+            WorkspaceSwitchingStatus::Disabled
+        );
+    }
+
+    #[test]
+    fn a_valid_profile_mapping_applies_to_every_display_at_once_and_is_requested() {
+        let mut state = workspace_state(&[1, 2], &["dev", "chat", "media"]);
+        observe(
+            &mut state,
+            vec![
+                app_window_at(1, "a.exe", 1, Rect::new(0, 0, 400, 300)),
+                app_window_at(2, "b.exe", 2, Rect::new(1920, 0, 400, 300)),
+            ],
+        );
+        assert_eq!(
+            state.workspaces.displayed(),
+            vec![(DisplayId(1), ws("dev")), (DisplayId(2), ws("chat"))]
+        );
+        let set = switching_set(
+            &state.displays,
+            &["dev", "chat", "media"],
+            true,
+            &[("DISPLAY1", "media"), ("DISPLAY2", "dev")],
+        );
+
+        apply(&mut state, Event::ConfigChanged(Box::new(set)));
+
+        assert_eq!(
+            state.workspaces.displayed(),
+            vec![(DisplayId(1), ws("media")), (DisplayId(2), ws("dev"))],
+            "the whole mapping applied as one transition"
+        );
+        assert!(
+            state
+                .workspaces
+                .get(&ws("chat"))
+                .unwrap()
+                .stashed_tree
+                .as_ref()
+                .unwrap()
+                .contains(&WindowId(2)),
+            "the displaced workspace kept its tree"
+        );
+        assert_eq!(
+            state.trees[&DisplayId(2)].windows(),
+            vec![&WindowId(1)],
+            "dev carried its tree to its new display"
+        );
+        assert_eq!(
+            state.workspace_switching_status(),
+            WorkspaceSwitchingStatus::Requested {
+                pending: SwitchingPending::ParkingCapabilityUnverified
+            },
+            "the mapping is in effect; switching itself waits for a verified parking site"
+        );
+    }
+
+    #[test]
+    fn an_inert_mapping_changes_nothing_and_reports_disabled() {
+        let mut state = workspace_state(&[1, 2], &["dev", "chat"]);
+        let set = switching_set(
+            &state.displays,
+            &["dev", "chat"],
+            false,
+            &[("DISPLAY1", "chat"), ("DISPLAY2", "dev")],
+        );
+
+        apply(&mut state, Event::ConfigChanged(Box::new(set)));
+
+        assert_eq!(
+            state.workspaces.displayed(),
+            vec![(DisplayId(1), ws("dev")), (DisplayId(2), ws("chat"))]
+        );
+        assert_eq!(
+            state.workspace_switching_status(),
+            WorkspaceSwitchingStatus::Disabled
+        );
+    }
+
+    #[test]
+    fn a_mapping_that_cannot_be_completed_changes_nothing_and_is_unavailable() {
+        let mut state = workspace_state(&[1, 2], &["dev", "chat"]);
+        let before = state.workspaces.displayed();
+
+        // Validation would refuse these; the reducer still must not apply
+        // half of one if they ever arrive.
+        let unknown = switching_set(
+            &state.displays,
+            &["dev", "chat"],
+            true,
+            &[("DISPLAY1", "chat"), ("DISPLAY2", "media")],
+        );
+        apply(&mut state, Event::ConfigChanged(Box::new(unknown)));
+        assert_eq!(state.workspaces.displayed(), before);
+        assert_eq!(
+            state.workspace_switching_status(),
+            WorkspaceSwitchingStatus::Unavailable {
+                reason: WorkspaceSwitchingUnavailable::UnknownWorkspace {
+                    name: "media".to_owned()
+                }
+            }
+        );
+        assert_eq!(
+            state.workspaces.names(),
+            vec![ws("chat"), ws("dev")],
+            "no name was invented"
+        );
+
+        let incomplete = switching_set(
+            &state.displays,
+            &["dev", "chat"],
+            true,
+            &[("DISPLAY1", "chat")],
+        );
+        apply(&mut state, Event::ConfigChanged(Box::new(incomplete)));
+        assert_eq!(state.workspaces.displayed(), before);
+        assert_eq!(
+            state.workspace_switching_status(),
+            WorkspaceSwitchingStatus::Unavailable {
+                reason: WorkspaceSwitchingUnavailable::MappingIncomplete {
+                    display_fingerprint: "DISPLAY2".to_owned()
+                }
+            }
+        );
+
+        let stray = switching_set(
+            &state.displays,
+            &["dev", "chat"],
+            true,
+            &[
+                ("DISPLAY1", "chat"),
+                ("DISPLAY2", "dev"),
+                ("DISPLAY9", "dev"),
+            ],
+        );
+        apply(&mut state, Event::ConfigChanged(Box::new(stray)));
+        assert_eq!(state.workspaces.displayed(), before);
+        assert_eq!(
+            state.workspace_switching_status(),
+            WorkspaceSwitchingStatus::Unavailable {
+                reason: WorkspaceSwitchingUnavailable::DisplayNotConnected {
+                    display_fingerprint: "DISPLAY9".to_owned()
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn a_mapping_already_in_effect_leaves_the_trees_alone_on_reload() {
+        let mut state = workspace_state(&[1], &["dev"]);
+        observe(
+            &mut state,
+            vec![
+                app_window_at(1, "a.exe", 1, Rect::new(0, 0, 400, 300)),
+                app_window_at(2, "b.exe", 1, Rect::new(500, 0, 400, 300)),
+            ],
+        );
+        let set = switching_set(&state.displays, &["dev"], true, &[("DISPLAY1", "dev")]);
+        apply(&mut state, Event::ConfigChanged(Box::new(set.clone())));
+        let tree = state.trees[&DisplayId(1)].clone();
+        let mut again = set;
+        again.base.gaps = mosaix_domain::Gaps::new(4, 4);
+
+        apply(&mut state, Event::ConfigChanged(Box::new(again)));
+
+        assert_eq!(state.trees[&DisplayId(1)], tree);
+        assert!(state
+            .workspaces
+            .get(&ws("dev"))
+            .unwrap()
+            .stashed_tree
+            .is_none());
+    }
+
+    #[test]
+    fn switching_status_follows_persistence_health_and_parking_capability() {
+        let mut state = workspace_state(&[1], &["dev"]);
+        let set = switching_set(&state.displays, &["dev"], true, &[("DISPLAY1", "dev")]);
+        apply(&mut state, Event::ConfigChanged(Box::new(set)));
+
+        apply(
+            &mut state,
+            Event::PersistenceHealthChanged(PersistenceHealth::Degraded {
+                last_durable_revision: 1,
+                reason: mosaix_persistence::PersistenceFailure::WriteFailed,
+            }),
+        );
+        assert_eq!(
+            state.workspace_switching_status(),
+            WorkspaceSwitchingStatus::Requested {
+                pending: SwitchingPending::PersistenceDegraded
+            }
+        );
+
+        apply(
+            &mut state,
+            Event::PersistenceHealthChanged(PersistenceHealth::Healthy {
+                last_durable_revision: 2,
+            }),
+        );
+        state.parking_capability = ParkingCapability::Verified;
+        assert_eq!(
+            state.workspace_switching_status(),
+            WorkspaceSwitchingStatus::Experimental
+        );
+
+        state.parking_capability = ParkingCapability::Refused {
+            reason: "no off-screen edge".to_owned(),
+        };
+        assert_eq!(
+            state.workspace_switching_status(),
+            WorkspaceSwitchingStatus::Unavailable {
+                reason: WorkspaceSwitchingUnavailable::ParkingRefused {
+                    reason: "no off-screen edge".to_owned()
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn a_profile_mapping_outranks_a_remembered_assignment_at_restart() {
+        let mut state = workspace_state(&[1], &["dev", "chat"]);
+        let set = switching_set(
+            &state.displays,
+            &["dev", "chat"],
+            true,
+            &[("DISPLAY1", "chat")],
+        );
+        apply(&mut state, Event::ConfigChanged(Box::new(set)));
+        assert_eq!(
+            state.workspaces.displayed(),
+            vec![(DisplayId(1), ws("chat"))]
+        );
+
+        apply(
+            &mut state,
+            Event::WorkspacesLoaded(vec![PersistedWorkspace {
+                name: ws("dev"),
+                origin: WorkspaceOrigin::Configuration,
+                displayed_fingerprint: Some("DISPLAY1".to_owned()),
+                tree: None,
+            }]),
+        );
+
+        assert_eq!(
+            state.workspaces.displayed(),
+            vec![(DisplayId(1), ws("chat"))]
         );
     }
 }

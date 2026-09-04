@@ -463,6 +463,44 @@ pub struct AutomaticTilingSection {
     pub mode: TilingMode,
 }
 
+/// A profile's request for experimental workspace switching (ADR 0023,
+/// ADR 0028). Only a topology profile may carry it: base config applies
+/// to every unmatched topology, and parking must never activate merely
+/// because a user docked.
+///
+/// ```toml
+/// [workspace_switching]
+/// experimental = true
+///
+/// [workspace_switching.displayed]
+/// "\\.\DISPLAY1|1920x1080|scale=1" = "dev"
+/// "\\.\DISPLAY2|2560x1440|scale=1" = "chat"
+/// ```
+///
+/// `displayed` maps every display of the profile's topology, by the
+/// stable fingerprint `mosaix state` reports, to a distinct declared
+/// workspace. A mapping that misses a display, repeats a workspace,
+/// names an unknown one, or names a display the topology lacks rejects
+/// the whole directory; the engine never invents a name to complete it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceSwitchingSection {
+    /// Whether switching is requested. `false` keeps the mapping
+    /// validated but inert.
+    #[serde(default)]
+    pub experimental: bool,
+    #[serde(default)]
+    pub displayed: BTreeMap<String, String>,
+}
+
+/// A profile's switching request as merged into a resolved config: the
+/// same shape with every workspace name validated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedWorkspaceSwitching {
+    pub experimental: bool,
+    pub displayed: BTreeMap<String, WorkspaceName>,
+}
+
 /// How automatic tiling arranges a display's windows (ADR 0023).
 ///
 /// The first tree release deliberately offers one tree policy. Stack,
@@ -584,6 +622,11 @@ pub struct BaseConfig {
     /// scalar fields of the table containing it.
     #[serde(default)]
     pub layouts: BTreeMap<String, SavedLayout>,
+    /// Present only so a switching request written into base config is
+    /// refused with a reason that says where it belongs, rather than as
+    /// an unknown field. Never written.
+    #[serde(default, skip_serializing)]
+    pub workspace_switching: Option<WorkspaceSwitchingSection>,
 }
 
 /// A sparse `outer`/`inner` override, letting a profile override just one
@@ -634,6 +677,11 @@ pub struct ProfileConfig {
     /// the settings application rewrites it.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub layouts: BTreeMap<String, SavedLayout>,
+    /// The experimental switching request for this topology, if any.
+    /// Serialized after `layouts`, and skipped when absent, for the same
+    /// TOML ordering reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_switching: Option<WorkspaceSwitchingSection>,
 }
 
 /// What `workspaces` means when a base config does not mention it.
@@ -695,6 +743,9 @@ pub struct ResolvedConfig {
     /// Every workspace configuration declares for this topology, base
     /// config's first and then the profile's additions, each name once.
     pub workspaces: Vec<WorkspaceName>,
+    /// The matched profile's switching request. `None` for base config,
+    /// which cannot make one, and for a profile that makes none.
+    pub workspace_switching: Option<ResolvedWorkspaceSwitching>,
     pub hotkeys: BTreeMap<Command, KeyCombo>,
     /// Which layer supplied each binding in `hotkeys`, keyed identically.
     ///
@@ -1098,6 +1149,7 @@ mod tests {
             behavior: BehaviorSection::default(),
             focus_border: FocusBorderSection::default(),
             layouts: BTreeMap::new(),
+            workspace_switching: None,
         };
         base.hotkeys
             .insert(Command::SnapLeft, KeyCombo::parse("ctrl+alt+left").unwrap());
@@ -1140,5 +1192,51 @@ mod tests {
         assert_eq!(command.to_string(), "focus-workspace.deep.work");
         assert_eq!(command.verb(), "focus-workspace");
         assert_eq!(Command::parse("focus-workspace"), None);
+    }
+
+    #[test]
+    fn a_profiles_switching_request_round_trips_through_toml() {
+        let mut displayed = BTreeMap::new();
+        displayed.insert(
+            r"\\.\DISPLAY1|1920x1080|scale=1".to_owned(),
+            "dev".to_owned(),
+        );
+        let profile = ProfileConfig {
+            fingerprint: "MON".to_owned(),
+            workspaces: vec!["dev".to_owned()],
+            hotkeys: BTreeMap::new(),
+            gaps: GapsOverride::default(),
+            behavior: BehaviorSection::default(),
+            automatic_tiling: None,
+            focus_border: FocusBorderOverride::default(),
+            layouts: BTreeMap::new(),
+            workspace_switching: Some(WorkspaceSwitchingSection {
+                experimental: true,
+                displayed,
+            }),
+        };
+
+        let rendered = toml::to_string_pretty(&profile).unwrap();
+        assert!(
+            rendered.contains("[workspace_switching]\nexperimental = true"),
+            "got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("[workspace_switching.displayed]"),
+            "got:\n{rendered}"
+        );
+        let reparsed: ProfileConfig = toml::from_str(&rendered).unwrap();
+        assert_eq!(reparsed, profile);
+
+        let without = ProfileConfig {
+            workspace_switching: None,
+            ..profile
+        };
+        assert!(
+            !toml::to_string_pretty(&without)
+                .unwrap()
+                .contains("workspace_switching"),
+            "a profile that makes no request writes no section"
+        );
     }
 }

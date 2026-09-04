@@ -34,7 +34,8 @@ pub use io::{
 pub use schema::{
     default_workspaces, layout_names_collide, AutomaticTilingSection, BaseConfig, BehaviorSection,
     Command, ConfigLayer, FocusBorderOverride, FocusBorderSection, GapsOverride, KeyCombo,
-    ProfileConfig, ResolvedConfig, ResolvedConfigSet, ResolvedProfile, RgbaColor, SavedLayout,
-    TilingMode, BASE_CONFIG_FILE_NAME, CURRENT_VERSION, DEFAULT_WORKSPACE_NAME,
+    ProfileConfig, ResolvedConfig, ResolvedConfigSet, ResolvedProfile, ResolvedWorkspaceSwitching,
+    RgbaColor, SavedLayout, TilingMode, WorkspaceSwitchingSection, BASE_CONFIG_FILE_NAME,
+    CURRENT_VERSION, DEFAULT_WORKSPACE_NAME,
 };
 pub use validate::{merge, validate, CandidateConfig, CandidateProfile, ValidationError};
