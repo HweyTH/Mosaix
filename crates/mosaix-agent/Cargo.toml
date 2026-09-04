@@ -13,6 +13,7 @@ path = "src/main.rs"
 mosaix-engine = { path = "../mosaix-engine" }
 mosaix-config = { path = "../mosaix-config" }
 mosaix-ipc = { path = "../mosaix-ipc" }
+mosaix-persistence = { path = "../mosaix-persistence" }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
