@@ -12,7 +12,8 @@ pub mod window;
 
 // Re-export commonly used types at the crate root for convenience.
 pub use commands::{
-    TreeResizeApplied, TreeResizeRefusal, TreeResizeResult, TREE_RESIZE_STEP_PERCENT,
+    RemovePositionApplied, RemovePositionRefusal, RemovePositionResult, TreeResizeApplied,
+    TreeResizeRefusal, TreeResizeResult, TREE_RESIZE_STEP_PERCENT,
 };
 pub use coordinates::{allocate_edges, LogicalRect, NormalizedRect};
 pub use display::{topology_fingerprint, Display, Rotation};
@@ -23,7 +24,8 @@ pub use identity::{
     ScoredCandidate, WindowEvidence,
 };
 pub use tree::{
-    Child, ContainerTree, DividerChange, Leaf, Node, PersistedTree, SplitAxis, Toward, Tree,
+    Child, ContainerTree, DividerChange, DormantPosition, Leaf, LeafFate, Node, Occupant,
+    PersistedTree, SplitAxis, Toward, Tree, DORMANT_RETENTION_SECONDS,
 };
 pub use undo::{
     UndoApplied, UndoMember, UndoRefusal, UndoRestoredWindow, UndoResult, UndoTargetOutcome,

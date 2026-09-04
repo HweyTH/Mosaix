@@ -41,9 +41,14 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 use mosaix_config::{Command, ResolvedConfig, ResolvedConfigSet, TilingMode};
-use mosaix_domain::commands::{TreeResizeApplied, TreeResizeRefusal, TREE_RESIZE_STEP_PERCENT};
+use mosaix_domain::commands::{
+    RemovePositionApplied, RemovePositionRefusal, TreeResizeApplied, TreeResizeRefusal,
+    TREE_RESIZE_STEP_PERCENT,
+};
 use mosaix_domain::identity::{match_window_with_order, WindowEvidence};
-use mosaix_domain::tree::{ContainerTree, PersistedTree, SplitAxis, Toward};
+use mosaix_domain::tree::{
+    ContainerTree, DormantPosition, LeafFate, Occupant, PersistedTree, SplitAxis, Toward,
+};
 use mosaix_domain::undo::{
     now_unix, UndoApplied, UndoMember, UndoRefusal, UndoRestoredWindow, UndoResult,
     UndoTargetOutcome, UndoTransaction, UndoTransactionDraft, UndoTransactionId, UndoTreeSnapshot,
@@ -223,6 +228,10 @@ pub struct EngineState {
     /// reflow -- a directional swap does exactly that -- and such a change
     /// would otherwise look like no change at all.
     saved_trees: HashMap<DisplayId, ContainerTree>,
+    /// What would recognise each tiled window if it closed: evidence
+    /// captured at the last reflow, so a leaf can go dormant with it after
+    /// the window -- and its inventory entry -- are gone.
+    leaf_evidence: HashMap<WindowId, WindowEvidence>,
     /// The windows each display's tree could not fit at their minimum
     /// size, newest insertion first (CONTEXT.md "Constraint-overflow
     /// window"). They keep their leaves and stay managed; they are simply
@@ -651,6 +660,15 @@ pub enum Event {
         direction: CardinalDirection,
     },
 
+    /// Delete the dormant slot numbered `position` from `display_id`'s
+    /// tree, closing the space its ancestors held for it (CONTEXT.md
+    /// "Dormant tree leaf"). Refusals are typed, reached by
+    /// [`plan_remove_position`], and mutate nothing.
+    TreePositionRemoveRequested {
+        display_id: DisplayId,
+        position: u64,
+    },
+
     InteractivePlacementStarted {
         window_id: WindowId,
     },
@@ -1019,7 +1037,7 @@ fn apply(state: &mut EngineState, event: Event) {
                         continue;
                     };
                     let active = active_tiled_windows_on(state, display_id);
-                    let restored = restore_tree(state, &snapshot.tree, &active);
+                    let restored = restore_tree(state, &snapshot.tree, &active, now_unix());
                     state.trees.insert(display_id, restored);
                     restored_structure = true;
                 }
@@ -1523,6 +1541,24 @@ fn apply(state: &mut EngineState, event: Event) {
                 if let Some(tree) = state.trees.get_mut(&display_id) {
                     tree.swap_leaves(&focused, &neighbor);
                 }
+            }
+            reconcile_arrangements(state);
+            state.revision += 1;
+            close_undo_scope(state);
+        }
+
+        Event::TreePositionRemoveRequested {
+            display_id,
+            position,
+        } => {
+            if let Err(refusal) = plan_remove_position(state, display_id, position) {
+                tracing::info!(%refusal, "remove-position refused; nothing changed");
+                return;
+            }
+            open_undo_scope(state, "remove-position");
+            capture_tree_for_undo(state, display_id);
+            if let Some(tree) = state.trees.get_mut(&display_id) {
+                tree.remove_position(position);
             }
             reconcile_arrangements(state);
             state.revision += 1;
@@ -2213,16 +2249,21 @@ fn reconcile_container_trees(state: &mut EngineState) {
         //
         // `pending_trees` is a startup payload and is consumed here, so
         // this happens once and the reducer is the authority afterwards.
+        let now = now_unix();
         if let Some(stored) = fingerprint
             .as_ref()
             .and_then(|fingerprint| state.pending_trees.remove(fingerprint))
         {
-            tree = restore_tree(state, &stored, &active);
+            tree = restore_tree(state, &stored, &active, now);
         }
 
-        // Windows that are no longer tiled here give their space back.
-        // Dormant leaves, which would hold that space open for a later
-        // match, are deferred: see issue #9.
+        // A window that is no longer tiled here -- closed, minimized,
+        // floated, or moved away -- leaves its slot dormant rather than
+        // giving it up, so a confident return can reclaim it (spec user
+        // stories 38 and 39). The evidence was captured at the last
+        // reflow, because a closed window is already gone from the
+        // inventory by now. A leaf nothing could ever recognise is
+        // removed instead of holding space open forever.
         let departed: Vec<WindowId> = tree
             .windows()
             .into_iter()
@@ -2230,17 +2271,69 @@ fn reconcile_container_trees(state: &mut EngineState) {
             .copied()
             .collect();
         for window_id in departed {
-            tree.remove(&window_id);
+            match state.leaf_evidence.remove(&window_id) {
+                Some(evidence) => {
+                    tree.make_dormant(
+                        &window_id,
+                        DormantPosition {
+                            evidence,
+                            since_unix: now,
+                        },
+                    );
+                }
+                None => {
+                    tree.remove(&window_id);
+                }
+            }
+        }
+        tree.prune_dormant(now);
+
+        // A returning window takes its old slot back only on a confident
+        // match; anything less inserts it fresh and leaves the slot for a
+        // better candidate (spec user story 39). Slots are offered in
+        // visual order and each window is claimed at most once, so the
+        // outcome does not depend on enumeration order.
+        let mut unplaced: Vec<WindowId> = active
+            .iter()
+            .filter(|window_id| !tree.contains(window_id))
+            .copied()
+            .collect();
+        for (position, dormant) in tree
+            .dormant_positions()
+            .into_iter()
+            .map(|(position, dormant)| (position, dormant.clone()))
+            .collect::<Vec<_>>()
+        {
+            let candidates: Vec<&Window> = unplaced
+                .iter()
+                .filter_map(|window_id| state.inventory.get(window_id))
+                .map(|managed| &managed.window)
+                .collect();
+            let Some(window_id) = match_window_with_order(
+                &dormant.evidence,
+                candidates.iter().copied(),
+                |window| display_fingerprint_of(state, window.display_id),
+                |window| Some(launch_order_of(state, window.id)),
+            )
+            .confident_window() else {
+                continue;
+            };
+            if tree.reclaim(position, window_id) {
+                unplaced.retain(|id| *id != window_id);
+            }
         }
 
         // New windows arrive in visual order, so the arrangement a set of
         // windows produces does not depend on which order they were
-        // observed in.
-        for window_id in &active {
-            if tree.contains(window_id) {
+        // observed in. A tree of only dormant slots has no window to
+        // split, so the newcomer goes beside the whole arrangement and
+        // has the display to itself until a slot is reclaimed.
+        for window_id in &unplaced {
+            if tree.insert_first(*window_id) {
                 continue;
             }
-            if tree.insert_first(*window_id) {
+            if !tree.has_windows() {
+                tree.split_root(longer_axis_of(work_area), *window_id);
                 continue;
             }
             let placements = plan_tree_raw(&tree, work_area);
@@ -2248,6 +2341,14 @@ fn reconcile_container_trees(state: &mut EngineState) {
                 continue;
             };
             tree.split_leaf(&insertion.target, insertion.axis, *window_id);
+        }
+
+        // Refresh what would recognise each window, now that it is where
+        // the tree put it. This is what a later dormancy is built from.
+        for window_id in tree.windows() {
+            if let Some(evidence) = evidence_for(state, *window_id) {
+                state.leaf_evidence.insert(*window_id, evidence);
+            }
         }
 
         // Only a structural change is worth a write. A reflow that moved
@@ -2302,14 +2403,19 @@ fn reconcile_container_trees(state: &mut EngineState) {
 /// that display. A leaf that cannot be identified confidently is dropped
 /// rather than guessed at, and no live window is claimed by two leaves --
 /// the same refusal-first rule undo follows, applied to structure.
-fn restore_tree(state: &EngineState, stored: &PersistedTree, active: &[WindowId]) -> ContainerTree {
+fn restore_tree(
+    state: &EngineState,
+    stored: &PersistedTree,
+    active: &[WindowId],
+    now_unix: i64,
+) -> ContainerTree {
     let candidates: Vec<&Window> = active
         .iter()
         .filter_map(|window_id| state.inventory.get(window_id))
         .map(|managed| &managed.window)
         .collect();
     let mut claimed: HashSet<WindowId> = HashSet::new();
-    stored.filter_map_windows(&mut |evidence| {
+    let mut identify = |evidence: &WindowEvidence| {
         match_window_with_order(
             evidence,
             candidates.iter().copied(),
@@ -2318,23 +2424,58 @@ fn restore_tree(state: &EngineState, stored: &PersistedTree, active: &[WindowId]
         )
         .confident_window()
         .filter(|window_id| claimed.insert(*window_id))
-    })
+    };
+    // A stored slot whose window is not here becomes dormant from now:
+    // the structure is kept for a later confident return rather than
+    // dropped. A slot that was already dormant keeps the time it went
+    // dormant, so retention counts from the right moment, and is pruned
+    // here if that moment is far enough back (spec user story 40).
+    let mut restored = stored.convert_leaves(&mut |leaf| match &leaf.occupant {
+        Occupant::Live(evidence) => match identify(evidence) {
+            Some(window_id) => LeafFate::Live(window_id),
+            None => LeafFate::Dormant(DormantPosition {
+                evidence: evidence.clone(),
+                since_unix: now_unix,
+            }),
+        },
+        Occupant::Dormant(position) => match identify(&position.evidence) {
+            Some(window_id) => LeafFate::Live(window_id),
+            None => LeafFate::Dormant(position.clone()),
+        },
+    });
+    restored.prune_dormant(now_unix);
+    restored
+}
+
+/// What would recognise `window_id` in a later session, if the inventory
+/// can describe it.
+fn evidence_for(state: &EngineState, window_id: WindowId) -> Option<WindowEvidence> {
+    let managed = state.inventory.get(&window_id)?;
+    let fingerprint = display_fingerprint_of(state, managed.window.display_id)?;
+    Some(WindowEvidence::capture(
+        &managed.window,
+        launch_order_of(state, window_id),
+        &fingerprint,
+    ))
 }
 
 /// The durable form of a live tree: the same structure with each window
-/// replaced by evidence that can find it again. A window the inventory
-/// cannot describe is dropped, because a leaf nothing could ever match
-/// would only hold space open forever.
+/// replaced by evidence that can find it again, and each dormant slot
+/// kept as it is. A window the inventory cannot describe is dropped,
+/// because a leaf nothing could ever match would only hold space open
+/// forever.
 fn durable_tree(state: &EngineState, tree: &ContainerTree) -> PersistedTree {
-    tree.filter_map_windows(&mut |window_id| {
-        let managed = state.inventory.get(window_id)?;
-        let fingerprint = display_fingerprint_of(state, managed.window.display_id)?;
-        Some(WindowEvidence::capture(
-            &managed.window,
-            launch_order_of(state, *window_id),
-            &fingerprint,
-        ))
-    })
+    tree.filter_map_windows(&mut |window_id| evidence_for(state, *window_id))
+}
+
+/// Splitting "on the longer axis" of a work area: side by side when it is
+/// wide, stacked when it is tall.
+const fn longer_axis_of(area: Rect) -> SplitAxis {
+    if area.width >= area.height {
+        SplitAxis::Horizontal
+    } else {
+        SplitAxis::Vertical
+    }
 }
 
 /// The resolved config that should be active for `displays`' current
@@ -2514,6 +2655,42 @@ pub fn plan_tree_resize(
         }
     }
     Err(TreeResizeRefusal::MinimumSizeReached { command })
+}
+
+/// What removing dormant slot `position` from `display_id`'s tree would
+/// do against `state` right now, or the typed reason it would do nothing.
+pub fn plan_remove_position(
+    state: &EngineState,
+    display_id: DisplayId,
+    position: u64,
+) -> Result<RemovePositionApplied, RemovePositionRefusal> {
+    if state.paused {
+        return Err(RemovePositionRefusal::Paused);
+    }
+    if state.resolved_config.tiling_mode != TilingMode::Tree || !state.automatic_tiling_active {
+        return Err(RemovePositionRefusal::NotTreeMode);
+    }
+    if work_area_of(&state.displays, display_id).is_none() {
+        return Err(RemovePositionRefusal::DisplayUnavailable { display_id });
+    }
+    let dormant = state
+        .trees
+        .get(&display_id)
+        .and_then(|tree| {
+            tree.dormant_positions()
+                .into_iter()
+                .find(|(number, _)| *number == position)
+                .map(|(_, dormant)| dormant.clone())
+        })
+        .ok_or(RemovePositionRefusal::UnknownPosition {
+            display_id,
+            position,
+        })?;
+    Ok(RemovePositionApplied {
+        display_id,
+        position,
+        application: dormant.evidence.application_id.0,
+    })
 }
 
 pub fn plan_undo(state: &EngineState) -> UndoResult {
@@ -3131,6 +3308,7 @@ pub fn spawn_engine_with_capacity(
         trees: HashMap::new(),
         pending_trees: HashMap::new(),
         saved_trees: HashMap::new(),
+        leaf_evidence: HashMap::new(),
         constraint_overflow: HashMap::new(),
         displays: initial_displays,
         windows: HashMap::new(),
@@ -8235,6 +8413,365 @@ mod tests {
             "both swapped windows are reversible together, found {:?}",
             drafts[0].members.len()
         );
+    }
+
+    // ---- Dormant positions (issue #53) ---------------------------------
+
+    /// [`app_window_at`] with the class and executable path a real window
+    /// carries, which is what lets the matcher recognise it again: a
+    /// signal absent on both sides scores nothing.
+    fn known_window_at(id: isize, application: &str, display_id: isize, bounds: Rect) -> Window {
+        let mut window = app_window_at(id, application, display_id, bounds);
+        window.native_class = Some(format!("{application}-class"));
+        window.executable_path = Some(std::path::PathBuf::from(format!("C:/apps/{application}")));
+        window
+    }
+
+    /// Two distinguishable applications side by side, alpha on the left.
+    fn two_apps_state() -> EngineState {
+        let mut state = tree_state();
+        observe(
+            &mut state,
+            vec![
+                known_window_at(1, "alpha.exe", 1, Rect::new(0, 0, 400, 300)),
+                known_window_at(2, "beta.exe", 1, Rect::new(500, 0, 400, 300)),
+            ],
+        );
+        assert_eq!(
+            arrangement(&state),
+            vec![
+                (1, Rect::new(0, 0, 960, 1080)),
+                (2, Rect::new(960, 0, 960, 1080)),
+            ]
+        );
+        state.effects.clear();
+        state.persistence_intents.clear();
+        state
+    }
+
+    fn dormant_positions(state: &EngineState) -> Vec<(u64, String, i64)> {
+        state.trees[&DisplayId(1)]
+            .dormant_positions()
+            .into_iter()
+            .map(|(position, dormant)| {
+                (
+                    position,
+                    dormant.evidence.application_id.0.clone(),
+                    dormant.since_unix,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_closed_window_leaves_a_dormant_slot_that_reserves_no_space() {
+        let mut state = two_apps_state();
+
+        // beta closes.
+        observe(
+            &mut state,
+            vec![known_window_at(
+                1,
+                "alpha.exe",
+                1,
+                Rect::new(0, 0, 960, 1080),
+            )],
+        );
+
+        assert_eq!(
+            arrangement(&state),
+            vec![(1, Rect::new(0, 0, 1920, 1080))],
+            "alpha uses the whole display; the slot holds no space open"
+        );
+        let dormant = dormant_positions(&state);
+        assert_eq!(dormant.len(), 1);
+        assert_eq!(dormant[0].0, 1, "the slot keeps its insertion number");
+        assert_eq!(
+            dormant[0].1, "beta.exe",
+            "and privacy-safe evidence of who held it"
+        );
+        assert!(
+            recorded_drafts(&state).is_empty(),
+            "a passive close is not an undo transaction"
+        );
+        assert!(
+            state
+                .persistence_intents
+                .iter()
+                .any(|intent| matches!(intent, PersistenceIntent::SaveContainerTree { .. })),
+            "the dormant slot is durable"
+        );
+    }
+
+    #[test]
+    fn a_returning_window_reclaims_its_slot_on_a_confident_match() {
+        let mut state = two_apps_state();
+        let tree_before = state.trees[&DisplayId(1)].clone();
+        observe(
+            &mut state,
+            vec![known_window_at(
+                1,
+                "alpha.exe",
+                1,
+                Rect::new(0, 0, 960, 1080),
+            )],
+        );
+        assert_eq!(dormant_positions(&state).len(), 1);
+
+        // beta reopens with a new native handle, and alpha now has focus
+        // -- so plain insertion would have split alpha, not restored the
+        // right-hand slot.
+        focus(&mut state, 1, Rect::new(0, 0, 1920, 1080));
+        observe(
+            &mut state,
+            vec![
+                known_window_at(1, "alpha.exe", 1, Rect::new(0, 0, 1920, 1080)),
+                known_window_at(77, "beta.exe", 1, Rect::new(300, 300, 400, 300)),
+            ],
+        );
+
+        assert_eq!(
+            arrangement(&state),
+            vec![
+                (1, Rect::new(0, 0, 960, 1080)),
+                (77, Rect::new(960, 0, 960, 1080)),
+            ],
+            "beta is back on the right, where its slot was"
+        );
+        assert!(dormant_positions(&state).is_empty());
+        assert_eq!(
+            state.trees[&DisplayId(1)].insertion_of(&WindowId(77)),
+            tree_before.insertion_of(&WindowId(2)),
+            "the reclaimed slot is the original slot, metadata and all"
+        );
+    }
+
+    #[test]
+    fn an_ambiguous_return_inserts_fresh_and_leaves_the_slot_alone() {
+        let mut state = two_apps_state();
+        observe(
+            &mut state,
+            vec![known_window_at(
+                1,
+                "alpha.exe",
+                1,
+                Rect::new(0, 0, 960, 1080),
+            )],
+        );
+
+        // Two identical beta windows appear at once: neither can be told
+        // from the other, so neither takes the slot.
+        observe(
+            &mut state,
+            vec![
+                known_window_at(1, "alpha.exe", 1, Rect::new(0, 0, 1920, 1080)),
+                known_window_at(77, "beta.exe", 1, Rect::new(300, 300, 400, 300)),
+                known_window_at(78, "beta.exe", 1, Rect::new(300, 300, 400, 300)),
+            ],
+        );
+
+        assert_eq!(
+            dormant_positions(&state).len(),
+            1,
+            "an ambiguous match must not mutate the tree"
+        );
+        assert_eq!(
+            state.trees[&DisplayId(1)].len(),
+            3,
+            "both were inserted fresh"
+        );
+    }
+
+    #[test]
+    fn dormant_slots_expire_after_seven_days_on_the_next_reflow() {
+        let mut state = two_apps_state();
+        observe(
+            &mut state,
+            vec![known_window_at(
+                1,
+                "alpha.exe",
+                1,
+                Rect::new(0, 0, 960, 1080),
+            )],
+        );
+        // Age the slot past retention.
+        let mut aged = state.trees[&DisplayId(1)].clone();
+        let evidence = aged.dormant_positions()[0].1.evidence.clone();
+        aged.reclaim(1, WindowId(2));
+        aged.make_dormant(
+            &WindowId(2),
+            mosaix_domain::DormantPosition {
+                evidence,
+                since_unix: now_unix() - mosaix_domain::DORMANT_RETENTION_SECONDS - 1,
+            },
+        );
+        state.trees.insert(DisplayId(1), aged);
+
+        // Any observation that changes the inventory provokes a reflow;
+        // here alpha reports slightly different bounds.
+        observe(
+            &mut state,
+            vec![known_window_at(
+                1,
+                "alpha.exe",
+                1,
+                Rect::new(2, 2, 1916, 1076),
+            )],
+        );
+
+        assert!(
+            dormant_positions(&state).is_empty(),
+            "the aged slot is pruned"
+        );
+        assert!(
+            matches!(
+                state.trees[&DisplayId(1)].root(),
+                Some(mosaix_domain::Node::Leaf(_))
+            ),
+            "and the container that located it is gone"
+        );
+    }
+
+    #[test]
+    fn removing_a_dormant_position_is_explicit_typed_and_undoable() {
+        let mut state = two_apps_state();
+        observe(
+            &mut state,
+            vec![known_window_at(
+                1,
+                "alpha.exe",
+                1,
+                Rect::new(0, 0, 960, 1080),
+            )],
+        );
+        let tree_before = state.trees[&DisplayId(1)].clone();
+        state.persistence_intents.clear();
+
+        assert_eq!(
+            plan_remove_position(&state, DisplayId(1), 5),
+            Err(RemovePositionRefusal::UnknownPosition {
+                display_id: DisplayId(1),
+                position: 5
+            })
+        );
+        assert_eq!(
+            plan_remove_position(&state, DisplayId(1), 0),
+            Err(RemovePositionRefusal::UnknownPosition {
+                display_id: DisplayId(1),
+                position: 0
+            }),
+            "a live slot is not removable this way"
+        );
+        assert_eq!(
+            plan_remove_position(&state, DisplayId(9), 1),
+            Err(RemovePositionRefusal::DisplayUnavailable {
+                display_id: DisplayId(9)
+            })
+        );
+        let applied = plan_remove_position(&state, DisplayId(1), 1).expect("the slot exists");
+        assert_eq!(applied.application, "beta.exe");
+
+        apply(
+            &mut state,
+            Event::TreePositionRemoveRequested {
+                display_id: DisplayId(1),
+                position: 1,
+            },
+        );
+
+        assert!(dormant_positions(&state).is_empty());
+        let drafts = recorded_drafts(&state);
+        assert_eq!(
+            drafts.len(),
+            1,
+            "a structural change with no placements is still a transaction"
+        );
+        assert_eq!(drafts[0].command, "remove-position");
+        assert_eq!(drafts[0].prior_trees.len(), 1);
+
+        let stored = stored(drafts[0], 1);
+        apply(&mut state, Event::UndoHistoryLoaded(Some(Box::new(stored))));
+        apply(&mut state, Event::UndoRequested);
+
+        assert!(matches!(
+            state.last_undo_result,
+            Some(UndoResult::Applied(_))
+        ));
+        assert_eq!(
+            dormant_positions(&state),
+            dormant_positions(&EngineState {
+                trees: [(DisplayId(1), tree_before)].into_iter().collect(),
+                ..EngineState::default()
+            }),
+            "undo puts the dormant slot back"
+        );
+    }
+
+    #[test]
+    fn a_stored_arrangement_whose_window_is_missing_keeps_its_slot_dormant() {
+        // Restart: the stored tree has alpha and beta, but only alpha is
+        // open. Beta's slot waits; when beta opens later it goes home.
+        let mut first = two_apps_state();
+        let stored = first
+            .persistence_intents
+            .iter()
+            .rev()
+            .find_map(|intent| match intent {
+                PersistenceIntent::SaveContainerTree { tree, .. } => Some((**tree).clone()),
+                _ => None,
+            })
+            .or_else(|| {
+                // The fixture cleared intents; rebuild the durable form.
+                Some(durable_tree(&first, &first.trees[&DisplayId(1)]))
+            })
+            .expect("a durable tree");
+        first.trees.clear();
+
+        let mut state = tree_state();
+        observe(
+            &mut state,
+            vec![known_window_at(
+                501,
+                "alpha.exe",
+                1,
+                Rect::new(0, 0, 400, 300),
+            )],
+        );
+        apply(
+            &mut state,
+            Event::ContainerTreesLoaded([("DISPLAY1".to_owned(), stored)].into_iter().collect()),
+        );
+        observe(
+            &mut state,
+            vec![known_window_at(
+                501,
+                "alpha.exe",
+                1,
+                Rect::new(0, 0, 1920, 1080),
+            )],
+        );
+        assert_eq!(
+            arrangement(&state),
+            vec![(501, Rect::new(0, 0, 1920, 1080))]
+        );
+        assert_eq!(dormant_positions(&state).len(), 1, "beta is remembered");
+
+        observe(
+            &mut state,
+            vec![
+                known_window_at(501, "alpha.exe", 1, Rect::new(0, 0, 1920, 1080)),
+                known_window_at(502, "beta.exe", 1, Rect::new(10, 10, 400, 300)),
+            ],
+        );
+        assert_eq!(
+            arrangement(&state),
+            vec![
+                (501, Rect::new(0, 0, 960, 1080)),
+                (502, Rect::new(960, 0, 960, 1080)),
+            ],
+            "beta reclaims the right-hand slot across the restart"
+        );
+        assert!(dormant_positions(&state).is_empty());
     }
 
     // ---- Tree resize (issue #52) ---------------------------------------

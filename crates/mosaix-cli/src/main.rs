@@ -49,6 +49,20 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Forget a dormant tree position: a slot kept for a window that has
+    /// closed, listed by `mosaix arrangement`.
+    ///
+    /// Undoable. A slot for an open window cannot be removed this way;
+    /// close the window instead.
+    RemovePosition {
+        /// The display whose tree holds the slot.
+        #[arg(long)]
+        display: isize,
+        /// The position number `mosaix arrangement` reports.
+        position: u64,
+        #[arg(long)]
+        json: bool,
+    },
     /// Work with saved layouts.
     Layout {
         #[command(subcommand)]
@@ -165,9 +179,18 @@ fn main() {
         }
         return;
     }
-    // So does a tree resize.
+    // So does a tree resize, and removing a dormant position.
     if let Command::Resize { direction, json } = cli.command {
         run_resize(direction, json);
+        return;
+    }
+    if let Command::RemovePosition {
+        display,
+        position,
+        json,
+    } = cli.command
+    {
+        run_remove_position(display, position, json);
         return;
     }
     let state_json = matches!(&cli.command, Command::State { json: true });
@@ -213,7 +236,8 @@ fn main() {
         Command::Persistence { .. }
         | Command::Undo { .. }
         | Command::Arrangement { .. }
-        | Command::Resize { .. } => {
+        | Command::Resize { .. }
+        | Command::RemovePosition { .. } => {
             unreachable!("handled above")
         }
     };
@@ -296,6 +320,16 @@ fn format_arrangement(state: &serde_json::Value) -> String {
                         "\n    cannot fit at minimum size, left floating: {}",
                         overflow.join(" ")
                     ));
+                }
+                if let Some(dormant) = tree["dormant_positions"].as_array() {
+                    for slot in dormant {
+                        rendered.push_str(&format!(
+                            "\n    dormant position {} kept for {} (expires {})",
+                            slot["position"].as_u64().unwrap_or(0),
+                            slot["application"].as_str().unwrap_or("?"),
+                            slot["expires_unix"].as_i64().unwrap_or(0),
+                        ));
+                    }
                 }
             }
         }
@@ -415,6 +449,66 @@ fn format_resize(result: &mosaix_domain::TreeResizeResult) -> String {
             rendered
         }
         TreeResizeResult::Refused(refusal) => format!("mosaix: {refusal}"),
+    }
+}
+
+/// Renders a remove-position outcome for a person.
+fn format_remove_position(result: &mosaix_domain::RemovePositionResult) -> String {
+    use mosaix_domain::RemovePositionResult;
+    match result {
+        RemovePositionResult::Applied(applied) => format!(
+            "removed dormant position {} on display {} (was kept for {})",
+            applied.position, applied.display_id.0, applied.application
+        ),
+        RemovePositionResult::Refused(refusal) => format!("mosaix: {refusal}"),
+    }
+}
+
+#[cfg(windows)]
+fn run_remove_position(display: isize, position: u64, json: bool) {
+    use mosaix_ipc::{send_request, IpcRequest, IpcResponse};
+
+    let data = match send_request(IpcRequest::RemoveTreePosition {
+        display_id: display,
+        position,
+    }) {
+        Ok(IpcResponse::Ok { data: Some(data) }) => data,
+        Ok(IpcResponse::Ok { data: None }) => {
+            eprintln!("mosaix: the agent answered without a result");
+            std::process::exit(2);
+        }
+        Ok(IpcResponse::Error { message }) => {
+            eprintln!("mosaix: {message}");
+            std::process::exit(1);
+        }
+        Ok(IpcResponse::VersionMismatch { server_version }) => {
+            eprintln!("mosaix: protocol version mismatch (server: v{server_version})");
+            std::process::exit(1);
+        }
+        Err(error) => {
+            eprintln!("mosaix: {error}");
+            std::process::exit(2);
+        }
+    };
+    let result: mosaix_domain::RemovePositionResult = match serde_json::from_value(data.clone()) {
+        Ok(result) => result,
+        Err(error) => {
+            eprintln!("mosaix: could not read the agent's result: {error}");
+            std::process::exit(2);
+        }
+    };
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&data).expect("JSON value serializes")
+        );
+    } else if result.is_applied() {
+        println!("{}", format_remove_position(&result));
+    } else {
+        eprintln!("{}", format_remove_position(&result));
+    }
+    if !result.is_applied() {
+        std::process::exit(1);
     }
 }
 
@@ -729,6 +823,55 @@ mod tests {
         assert_eq!(
             format_arrangement(&state),
             "arrangement: tree (active)\n  display 1: 11 12 13\n    cannot fit at minimum size, left floating: 13"
+        );
+    }
+
+    #[test]
+    fn tree_mode_lists_dormant_positions_by_number_and_application() {
+        let state = serde_json::json!({
+            "tiling_mode": "tree",
+            "automatic_tiling_active": true,
+            "automatic_tiling_suspended": false,
+            "container_trees": [
+                {
+                    "display_id": 1,
+                    "windows": [11],
+                    "constraint_overflow": [],
+                    "dormant_positions": [
+                        { "position": 1, "application": "Code.exe", "expires_unix": 1756604800 },
+                    ],
+                },
+            ],
+        });
+
+        assert_eq!(
+            format_arrangement(&state),
+            "arrangement: tree (active)\n  display 1: 11\n    dormant position 1 kept for Code.exe (expires 1756604800)"
+        );
+    }
+
+    #[test]
+    fn a_remove_position_report_names_the_slot_and_who_it_was_for() {
+        use mosaix_domain::{
+            DisplayId, RemovePositionApplied, RemovePositionRefusal, RemovePositionResult,
+        };
+
+        assert_eq!(
+            format_remove_position(&RemovePositionResult::Applied(RemovePositionApplied {
+                display_id: DisplayId(1),
+                position: 4,
+                application: "Code.exe".to_owned(),
+            })),
+            "removed dormant position 4 on display 1 (was kept for Code.exe)"
+        );
+        assert_eq!(
+            format_remove_position(&RemovePositionResult::Refused(
+                RemovePositionRefusal::UnknownPosition {
+                    display_id: DisplayId(1),
+                    position: 4,
+                }
+            )),
+            "mosaix: display 1 has no dormant position 4"
         );
     }
 

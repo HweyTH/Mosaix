@@ -4,7 +4,7 @@ use mosaix_config::{
     BindingEdit, BindingWrite, Command, ConfigLayer, KeyCombo, LayoutEdit, LayoutWrite,
     ResolvedConfig, SavedLayout,
 };
-use mosaix_domain::commands::TreeResizeResult;
+use mosaix_domain::commands::{RemovePositionResult, TreeResizeResult};
 use mosaix_domain::undo::UndoResult;
 use mosaix_engine::{
     EligibilityReason, EngineState, Event, EventSender, StateReader, ZoneSnapDirection,
@@ -27,6 +27,24 @@ pub struct ContainerTreeSnapshot {
     /// appear in `windows` too, because they keep their leaves.
     #[serde(default)]
     pub constraint_overflow: Vec<isize>,
+    /// Slots kept for windows that have gone, in visual order (CONTEXT.md
+    /// "Dormant tree leaf"). What the remove-position command names.
+    #[serde(default)]
+    pub dormant_positions: Vec<DormantPositionSnapshot>,
+}
+
+/// One dormant slot, described by the same privacy-safe evidence that
+/// would recognise its window: never a title.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct DormantPositionSnapshot {
+    /// The number the remove-position command takes.
+    pub position: u64,
+    pub application: String,
+    pub native_class: Option<String>,
+    pub role: String,
+    pub dormant_since_unix: i64,
+    /// When retention will prune the slot on its own.
+    pub expires_unix: i64,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -408,6 +426,18 @@ impl From<EngineState> for StateSnapshot {
                     .get(display_id)
                     .map(|overflow| overflow.iter().map(|id| id.0).collect())
                     .unwrap_or_default(),
+                dormant_positions: tree
+                    .dormant_positions()
+                    .into_iter()
+                    .map(|(position, dormant)| DormantPositionSnapshot {
+                        position,
+                        application: dormant.evidence.application_id.0.clone(),
+                        native_class: dormant.evidence.native_class.clone(),
+                        role: dormant.evidence.role.code().to_owned(),
+                        dormant_since_unix: dormant.since_unix,
+                        expires_unix: dormant.expires_unix(),
+                    })
+                    .collect(),
             })
             .collect();
         container_trees.sort_by_key(|snapshot| snapshot.display_id);
@@ -770,6 +800,34 @@ pub fn handle_request(
         }
         IpcRequest::ResizeDown => {
             resize_tree(events, state_reader, mosaix_engine::CardinalDirection::Down)
+        }
+        IpcRequest::RemoveTreePosition {
+            display_id,
+            position,
+        } => {
+            let display_id = mosaix_domain::DisplayId(*display_id);
+            let result = match mosaix_engine::plan_remove_position(
+                &state_reader.snapshot(),
+                display_id,
+                *position,
+            ) {
+                Ok(applied) => {
+                    if let other @ IpcResponse::Error { .. } = send_event(
+                        events,
+                        Event::TreePositionRemoveRequested {
+                            display_id,
+                            position: *position,
+                        },
+                    ) {
+                        return other;
+                    }
+                    RemovePositionResult::Applied(applied)
+                }
+                Err(refusal) => RemovePositionResult::Refused(refusal),
+            };
+            IpcResponse::Ok {
+                data: Some(serde_json::to_value(result).expect("tree results serialize")),
+            }
         }
         IpcRequest::GetPauseState => {
             let state = state_reader.snapshot();
@@ -1174,6 +1232,71 @@ mod tests {
     }
 
     #[test]
+    fn removing_a_position_outside_tree_mode_answers_with_a_typed_refusal() {
+        let engine = mosaix_engine::spawn_engine(Vec::new(), Default::default());
+        let response = handle_request(
+            &IpcRequest::RemoveTreePosition {
+                display_id: 1,
+                position: 3,
+            },
+            &engine.events(),
+            &engine.state_reader(),
+            &RecordingStore::wrote("config.toml", &[]),
+            &no_probe(),
+        );
+        engine.stop();
+
+        let IpcResponse::Ok { data: Some(data) } = response else {
+            panic!("a refusal is an answer, got {response:?}");
+        };
+        assert_eq!(data["refused"], "not_tree_mode");
+    }
+
+    #[test]
+    fn state_snapshot_lists_dormant_positions_without_titles() {
+        use mosaix_domain::identity::WindowEvidence;
+        use mosaix_domain::tree::{ContainerTree, DormantPosition, SplitAxis};
+
+        let mut state = EngineState::default();
+        state.resolved_config.tiling_mode = mosaix_config::TilingMode::Tree;
+        let mut tree = ContainerTree::new();
+        tree.insert_first(WindowId(11));
+        tree.split_leaf(&WindowId(11), SplitAxis::Horizontal, WindowId(12));
+        tree.make_dormant(
+            &WindowId(12),
+            DormantPosition {
+                evidence: WindowEvidence {
+                    application_id: ApplicationId("Code.exe".to_owned()),
+                    executable_path: Some("C:/apps/Code.exe".to_owned()),
+                    native_class: Some("Chrome_WidgetWin_1".to_owned()),
+                    role: WindowRole::Normal,
+                    launch_order: 0,
+                    last_placement: Rect::new(960, 0, 960, 1080),
+                    display_fingerprint: "DISPLAY1".to_owned(),
+                },
+                since_unix: 1_756_000_000,
+            },
+        );
+        state.trees.insert(DisplayId(1), tree);
+
+        let json = serde_json::to_value(StateSnapshot::from(state)).unwrap();
+
+        let tree = &json["container_trees"][0];
+        assert_eq!(tree["windows"], serde_json::json!([11]));
+        assert_eq!(tree["dormant_positions"][0]["position"], 1);
+        assert_eq!(tree["dormant_positions"][0]["application"], "Code.exe");
+        assert_eq!(
+            tree["dormant_positions"][0]["expires_unix"],
+            1_756_000_000 + mosaix_domain::DORMANT_RETENTION_SECONDS
+        );
+        let rendered = json.to_string();
+        assert!(
+            !rendered.contains("title"),
+            "a dormant slot is described by evidence, never a title: {rendered}"
+        );
+    }
+
+    #[test]
     fn state_snapshot_reports_the_balanced_grid_and_no_trees_by_default() {
         let json = serde_json::to_value(StateSnapshot::from(EngineState::default())).unwrap();
 
@@ -1201,7 +1324,12 @@ mod tests {
         assert_eq!(json["tiling_mode"], "tree");
         assert_eq!(
             json["container_trees"],
-            serde_json::json!([{ "display_id": 2, "windows": [11, 12], "constraint_overflow": [] }])
+            serde_json::json!([{
+                "display_id": 2,
+                "windows": [11, 12],
+                "constraint_overflow": [],
+                "dormant_positions": [],
+            }])
         );
     }
 

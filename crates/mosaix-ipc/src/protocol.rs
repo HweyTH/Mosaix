@@ -9,11 +9,12 @@ use serde::{Deserialize, Serialize};
 /// [`IpcRequest::SaveLayout`] gained its write-destination redirect, and
 /// to 6 for the binding-editing requests, and to 7 when
 /// [`IpcRequest::ProbeHotkey`] gained the command it is probing for, and
-/// to 10 for the four tree-resize requests. An
+/// to 10 for the four tree-resize requests, and to 11 for
+/// [`IpcRequest::RemoveTreePosition`]. An
 /// older agent has no tag for a request this build added -- and no field
 /// for one an existing request grew -- so the version is what makes the
 /// mismatch reportable instead of surfacing as a deserialization failure.
-pub const PROTOCOL_VERSION: u32 = 10;
+pub const PROTOCOL_VERSION: u32 = 11;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct IpcEnvelope {
@@ -60,6 +61,15 @@ pub enum IpcRequest {
     ResizeRight,
     ResizeUp,
     ResizeDown,
+    /// Delete the dormant slot numbered `position` from `display_id`'s
+    /// container tree (CONTEXT.md "Dormant tree leaf"). Positions are the
+    /// numbers the state snapshot reports for each tree. Answered with a
+    /// typed [`mosaix_domain::RemovePositionResult`] either way, hence
+    /// [`PROTOCOL_VERSION`] 11.
+    RemoveTreePosition {
+        display_id: isize,
+        position: u64,
+    },
     GetPauseState,
     /// Select a display for display-scoped commands, including an empty one.
     FocusDisplay {
@@ -284,6 +294,10 @@ mod tests {
             IpcRequest::ResizeRight,
             IpcRequest::ResizeUp,
             IpcRequest::ResizeDown,
+            IpcRequest::RemoveTreePosition {
+                display_id: 1,
+                position: 4,
+            },
             IpcRequest::GetPauseState,
             IpcRequest::FocusDisplay { display_id: 7 },
             IpcRequest::Undo,

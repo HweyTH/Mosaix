@@ -118,6 +118,82 @@ impl TreeResizeResult {
     }
 }
 
+/// Why removing a dormant position did nothing (CONTEXT.md "Dormant tree
+/// leaf").
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemovePositionRefusal {
+    /// Window management is paused, as it is for every other placement.
+    Paused,
+    /// Automatic tiling is not currently producing a container tree.
+    NotTreeMode,
+    /// No connected display has that id.
+    DisplayUnavailable { display_id: DisplayId },
+    /// That display's tree holds no dormant slot with that number. A live
+    /// slot is never removed this way; close its window instead.
+    UnknownPosition {
+        display_id: DisplayId,
+        position: u64,
+    },
+}
+
+impl RemovePositionRefusal {
+    /// A stable machine-readable reason code.
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::Paused => "paused",
+            Self::NotTreeMode => "not_tree_mode",
+            Self::DisplayUnavailable { .. } => "display_unavailable",
+            Self::UnknownPosition { .. } => "unknown_position",
+        }
+    }
+}
+
+impl std::fmt::Display for RemovePositionRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Paused => formatter.write_str("window management is paused"),
+            Self::NotTreeMode => {
+                formatter.write_str("automatic tiling is not arranging a container tree")
+            }
+            Self::DisplayUnavailable { display_id } => {
+                write!(formatter, "display {} is not connected", display_id.0)
+            }
+            Self::UnknownPosition {
+                display_id,
+                position,
+            } => write!(
+                formatter,
+                "display {} has no dormant position {position}",
+                display_id.0
+            ),
+        }
+    }
+}
+
+/// What removing a dormant position changed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemovePositionApplied {
+    pub display_id: DisplayId,
+    pub position: u64,
+    /// The application the removed slot was waiting for. Never a title.
+    pub application: String,
+}
+
+/// The result of asking to remove a dormant position.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemovePositionResult {
+    Applied(RemovePositionApplied),
+    Refused(RemovePositionRefusal),
+}
+
+impl RemovePositionResult {
+    pub const fn is_applied(&self) -> bool {
+        matches!(self, Self::Applied(_))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -337,6 +337,98 @@ fn resized_divider_weights_come_back_after_a_restart() {
 }
 
 #[test]
+fn a_window_missing_at_restart_keeps_a_dormant_slot_it_reclaims_when_it_reopens() {
+    let temporary = TempDatabase::new("dormant");
+    let saved = {
+        let engine = spawn_engine(vec![display()], tree_config());
+        let events = engine.events();
+        let reader = engine.state_reader();
+        let _ = events.send(Event::WindowsObserved {
+            windows: vec![
+                window(11, "alpha.exe", "AlphaClass"),
+                window(12, "beta.exe", "BetaClass"),
+            ],
+        });
+        // Swap so the stored shape is beta | alpha, which fresh insertion
+        // of alpha alone followed by beta would not reproduce.
+        settle(&reader, "the first arrangement", |state| {
+            (order_by_application(state).len() == 2).then_some(())
+        });
+        let _ = events.send(Event::WindowFocused {
+            window_id: WindowId(11),
+            display_id: mosaix_domain::DisplayId(1),
+            bounds: Rect::new(0, 0, 960, 1080),
+        });
+        let _ = events.send(Event::DirectionalSwapRequested {
+            direction: CardinalDirection::Right,
+        });
+        settle(&reader, "the swap", |state| {
+            (order_by_application(state) == vec!["beta.exe", "alpha.exe"]).then_some(())
+        });
+        let saved = settle(&reader, "the arrangement to be stored", |state| {
+            state
+                .persistence_intents
+                .iter()
+                .rev()
+                .find_map(|intent| match intent {
+                    PersistenceIntent::SaveContainerTree {
+                        display_fingerprint,
+                        tree,
+                    } => Some((display_fingerprint.clone(), (**tree).clone())),
+                    _ => None,
+                })
+        });
+        engine.stop();
+        saved
+    };
+    {
+        let mut store = Persistence::open(&temporary.path()).expect("database opens");
+        store.save_tree(&saved.0, &saved.1).expect("it stores");
+    }
+
+    // --- session two: only alpha is open at first ---
+    let restored = Persistence::open(&temporary.path())
+        .expect("database reopens")
+        .load_trees()
+        .expect("arrangements are readable");
+    let engine = spawn_engine(vec![display()], tree_config());
+    let events = engine.events();
+    let reader = engine.state_reader();
+    let _ = events.send(Event::WindowsObserved {
+        windows: vec![window(901, "alpha.exe", "AlphaClass")],
+    });
+    settle(&reader, "alpha alone", |state| {
+        (order_by_application(state).len() == 1).then_some(())
+    });
+    let _ = events.send(Event::ContainerTreesLoaded(restored));
+    settle(&reader, "beta's slot to be kept dormant", |state| {
+        let tree = state.trees.get(&mosaix_domain::DisplayId(1))?;
+        (tree.dormant_positions().len() == 1).then_some(())
+    });
+    let alpha_alone = reader.snapshot().windows[&WindowId(901)].bounds;
+    assert_eq!(
+        alpha_alone,
+        Rect::new(0, 0, 1920, 1080),
+        "a dormant slot reserves no space"
+    );
+
+    // beta opens: it goes back to the left, where the stored shape had it.
+    let _ = events.send(Event::WindowsObserved {
+        windows: vec![
+            window(901, "alpha.exe", "AlphaClass"),
+            window(902, "beta.exe", "BetaClass"),
+        ],
+    });
+    settle(&reader, "beta to reclaim its slot", |state| {
+        (order_by_application(state) == vec!["beta.exe", "alpha.exe"]).then_some(())
+    });
+    assert!(reader.snapshot().trees[&mosaix_domain::DisplayId(1)]
+        .dormant_positions()
+        .is_empty());
+    engine.stop();
+}
+
+#[test]
 fn an_arrangement_whose_windows_are_gone_restores_nothing_rather_than_guessing() {
     let temporary = TempDatabase::new("absent");
     let stored = {

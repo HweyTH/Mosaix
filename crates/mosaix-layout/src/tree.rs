@@ -67,7 +67,9 @@ pub fn plan_tree_constrained(
     gaps: Gaps,
     minimum_size: impl Fn(WindowId) -> Option<Size>,
 ) -> TreePlan {
-    let mut arranged = tree.clone();
+    // Dormant slots take no space: the planner works on the projection
+    // in which their siblings have absorbed them (spec user story 42).
+    let mut arranged = tree.live_projection();
     let mut overflow = Vec::new();
     loop {
         let raw = plan_tree_raw(&arranged, work_area);
@@ -96,7 +98,7 @@ pub fn plan_tree_constrained(
             .into_iter()
             .enumerate()
             .max_by_key(|(index, leaf)| (leaf.inserted, *index))
-            .map(|(_, leaf)| leaf.window)
+            .and_then(|(_, leaf)| leaf.window().copied())
         else {
             return TreePlan {
                 placements: Vec::new(),
@@ -119,7 +121,8 @@ pub fn plan_tree_raw(tree: &ContainerTree, work_area: Rect) -> Vec<(WindowId, Re
     if work_area.width <= 0 || work_area.height <= 0 {
         return placements;
     }
-    if let Some(root) = tree.root() {
+    let projection = tree.live_projection();
+    if let Some(root) = projection.root() {
         tile(root, work_area, &mut placements);
     }
     placements
@@ -151,7 +154,13 @@ fn usable_gaps(
 
 fn tile(node: &Node<WindowId>, area: Rect, placements: &mut Vec<(WindowId, Rect)>) {
     match node {
-        Node::Leaf(leaf) => placements.push((leaf.window, area)),
+        // The projection holds no dormant leaves, but the planner is
+        // total over any tree, so one is simply given no placement.
+        Node::Leaf(leaf) => {
+            if let Some(window) = leaf.window() {
+                placements.push((*window, area));
+            }
+        }
         Node::Split { axis, children } => {
             let weights: Vec<f64> = children.iter().map(|child| child.weight).collect();
             if weights.is_empty() {
@@ -579,6 +588,39 @@ mod tests {
                 .find(|(id, _, _)| *id == window_id.0)
                 .map(|(_, width, height)| Size::new(*width, *height))
         }
+    }
+
+    #[test]
+    fn a_dormant_slot_takes_no_space_and_its_siblings_use_the_arrangement() {
+        use mosaix_domain::identity::WindowEvidence;
+        use mosaix_domain::tree::DormantPosition;
+
+        let mut tree = tree_of(&[1, 2, 3]);
+        tree.make_dormant(
+            &WindowId(3),
+            DormantPosition {
+                evidence: WindowEvidence {
+                    application_id: mosaix_domain::ApplicationId("x.exe".to_owned()),
+                    executable_path: None,
+                    native_class: None,
+                    role: mosaix_domain::WindowRole::Normal,
+                    launch_order: 0,
+                    last_placement: Rect::new(0, 540, 960, 540),
+                    display_fingerprint: "D".to_owned(),
+                },
+                since_unix: 0,
+            },
+        );
+
+        assert_eq!(
+            plan_tree(&tree, WORK_AREA, Gaps::new(0, 0)),
+            vec![
+                (WindowId(1), Rect::new(0, 0, 960, 1080)),
+                (WindowId(2), Rect::new(960, 0, 960, 1080)),
+            ],
+            "window 1 takes back the half it shared with the dormant slot"
+        );
+        assert_eq!(tree.dormant_positions().len(), 1, "the slot is still there");
     }
 
     #[test]
