@@ -118,6 +118,89 @@ impl TreeResizeResult {
     }
 }
 
+/// Why a directional swap did nothing (CONTEXT.md "Directional swap",
+/// ADR 0026). Every variant leaves the arrangement untouched.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DirectionalSwapRefusal {
+    /// Window management is paused, as it is for every other placement.
+    Paused,
+    /// Nothing is focused, or focus is on a window Mosaix does not manage.
+    NoFocusedWindow,
+    /// The focused window is not an arranged endpoint: it floats, or the
+    /// display cannot fit it and it is in constraint overflow.
+    NotArranged { window_id: WindowId },
+    /// The focused window's display is no longer connected.
+    DisplayUnavailable { display_id: DisplayId },
+    /// No arranged window lies that way on the same display. Swap does
+    /// not wrap and does not cross displays; display transfer is the
+    /// explicit command for that.
+    NoNeighbor { command: String },
+}
+
+impl DirectionalSwapRefusal {
+    /// A stable machine-readable reason code.
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::Paused => "paused",
+            Self::NoFocusedWindow => "no_focused_window",
+            Self::NotArranged { .. } => "not_arranged",
+            Self::DisplayUnavailable { .. } => "display_unavailable",
+            Self::NoNeighbor { .. } => "no_neighbor",
+        }
+    }
+}
+
+impl std::fmt::Display for DirectionalSwapRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Paused => formatter.write_str("window management is paused"),
+            Self::NoFocusedWindow => formatter.write_str("no managed window is focused"),
+            Self::NotArranged { window_id } => write!(
+                formatter,
+                "window {} is floating or cannot be fitted, so it has no place to swap from",
+                window_id.0
+            ),
+            Self::DisplayUnavailable { display_id } => write!(
+                formatter,
+                "the focused window's display {} is no longer connected",
+                display_id.0
+            ),
+            Self::NoNeighbor { command } => write!(
+                formatter,
+                "{command}: no arranged window lies that way on this display"
+            ),
+        }
+    }
+}
+
+/// What a directional swap exchanged.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirectionalSwapApplied {
+    pub command: String,
+    pub display_id: DisplayId,
+    /// The focused window, which keeps focus and moves to the neighbor's
+    /// former place.
+    pub window_id: WindowId,
+    /// The neighbor directional focus would have selected, which moves
+    /// to the focused window's former place.
+    pub neighbor_id: WindowId,
+}
+
+/// The result of asking for a directional swap.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DirectionalSwapResult {
+    Applied(DirectionalSwapApplied),
+    Refused(DirectionalSwapRefusal),
+}
+
+impl DirectionalSwapResult {
+    pub const fn is_applied(&self) -> bool {
+        matches!(self, Self::Applied(_))
+    }
+}
+
 /// Why removing a dormant position did nothing (CONTEXT.md "Dormant tree
 /// leaf").
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -4,7 +4,7 @@ use mosaix_config::{
     BindingEdit, BindingWrite, Command, ConfigLayer, KeyCombo, LayoutEdit, LayoutWrite,
     ResolvedConfig, SavedLayout,
 };
-use mosaix_domain::commands::{RemovePositionResult, TreeResizeResult};
+use mosaix_domain::commands::{DirectionalSwapResult, RemovePositionResult, TreeResizeResult};
 use mosaix_domain::undo::UndoResult;
 use mosaix_engine::{
     EligibilityReason, EngineState, Event, EventSender, StateReader, ZoneSnapDirection,
@@ -763,30 +763,14 @@ pub fn handle_request(
                 direction: mosaix_engine::CardinalDirection::Down,
             },
         ),
-        IpcRequest::SwapLeft => send_event(
+        IpcRequest::SwapLeft => swap(events, state_reader, mosaix_engine::CardinalDirection::Left),
+        IpcRequest::SwapRight => swap(
             events,
-            Event::DirectionalSwapRequested {
-                direction: mosaix_engine::CardinalDirection::Left,
-            },
+            state_reader,
+            mosaix_engine::CardinalDirection::Right,
         ),
-        IpcRequest::SwapRight => send_event(
-            events,
-            Event::DirectionalSwapRequested {
-                direction: mosaix_engine::CardinalDirection::Right,
-            },
-        ),
-        IpcRequest::SwapUp => send_event(
-            events,
-            Event::DirectionalSwapRequested {
-                direction: mosaix_engine::CardinalDirection::Up,
-            },
-        ),
-        IpcRequest::SwapDown => send_event(
-            events,
-            Event::DirectionalSwapRequested {
-                direction: mosaix_engine::CardinalDirection::Down,
-            },
-        ),
+        IpcRequest::SwapUp => swap(events, state_reader, mosaix_engine::CardinalDirection::Up),
+        IpcRequest::SwapDown => swap(events, state_reader, mosaix_engine::CardinalDirection::Down),
         IpcRequest::ResizeLeft => {
             resize_tree(events, state_reader, mosaix_engine::CardinalDirection::Left)
         }
@@ -1098,6 +1082,30 @@ impl CaptureHold {
     }
 }
 
+/// Asks for a directional swap and answers with the typed outcome: the
+/// neighbor it will exchange with, or the structured no-target result
+/// ADR 0026 calls for. Preflighted the way undo is.
+fn swap(
+    events: &EventSender,
+    state_reader: &StateReader,
+    direction: mosaix_engine::CardinalDirection,
+) -> IpcResponse {
+    let result = match mosaix_engine::plan_directional_swap(&state_reader.snapshot(), direction) {
+        Ok(applied) => {
+            if let other @ IpcResponse::Error { .. } =
+                send_event(events, Event::DirectionalSwapRequested { direction })
+            {
+                return other;
+            }
+            DirectionalSwapResult::Applied(applied)
+        }
+        Err(refusal) => DirectionalSwapResult::Refused(refusal),
+    };
+    IpcResponse::Ok {
+        data: Some(serde_json::to_value(result).expect("tree results serialize")),
+    }
+}
+
 /// Asks for a tree resize and answers with the typed outcome.
 ///
 /// Preflighted the way undo is: the reducer reaches the same verdict
@@ -1228,6 +1236,26 @@ mod tests {
         assert_eq!(data["refused"], "not_tree_mode");
         let parsed: TreeResizeResult =
             serde_json::from_value(data).expect("the payload is the typed result");
+        assert!(!parsed.is_applied());
+    }
+
+    #[test]
+    fn a_swap_with_nothing_focused_answers_with_a_typed_no_target_result() {
+        let engine = mosaix_engine::spawn_engine(Vec::new(), Default::default());
+        let response = handle_request(
+            &IpcRequest::SwapLeft,
+            &engine.events(),
+            &engine.state_reader(),
+            &RecordingStore::wrote("config.toml", &[]),
+            &no_probe(),
+        );
+        engine.stop();
+
+        let IpcResponse::Ok { data: Some(data) } = response else {
+            panic!("a no-target result is an answer, got {response:?}");
+        };
+        assert_eq!(data["refused"], "no_focused_window");
+        let parsed: DirectionalSwapResult = serde_json::from_value(data).unwrap();
         assert!(!parsed.is_applied());
     }
 

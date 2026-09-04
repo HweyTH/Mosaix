@@ -42,8 +42,8 @@ use std::thread::{self, JoinHandle};
 
 use mosaix_config::{Command, ResolvedConfig, ResolvedConfigSet, TilingMode};
 use mosaix_domain::commands::{
-    RemovePositionApplied, RemovePositionRefusal, TreeResizeApplied, TreeResizeRefusal,
-    TREE_RESIZE_STEP_PERCENT,
+    DirectionalSwapApplied, DirectionalSwapRefusal, RemovePositionApplied, RemovePositionRefusal,
+    TreeResizeApplied, TreeResizeRefusal, TREE_RESIZE_STEP_PERCENT,
 };
 use mosaix_domain::identity::{match_window_with_order, WindowEvidence};
 use mosaix_domain::tree::{
@@ -1504,19 +1504,15 @@ fn apply(state: &mut EngineState, event: Event) {
         }
 
         Event::DirectionalSwapRequested { direction } => {
-            let Some(focused) = state.focused_window else {
-                return;
+            let plan = match plan_directional_swap(state, direction) {
+                Ok(plan) => plan,
+                Err(refusal) => {
+                    tracing::info!(%refusal, "directional swap refused; nothing changed");
+                    return;
+                }
             };
-            let Some(neighbor) = directional_neighbor(state, direction) else {
-                return;
-            };
-            let Some(display_id) = state
-                .inventory
-                .get(&focused)
-                .map(|managed| managed.window.display_id)
-            else {
-                return;
-            };
+            let (focused, neighbor, display_id) =
+                (plan.window_id, plan.neighbor_id, plan.display_id);
             let Some(order) = state.visual_window_order.get_mut(&display_id) else {
                 return;
             };
@@ -2655,6 +2651,48 @@ pub fn plan_tree_resize(
         }
     }
     Err(TreeResizeRefusal::MinimumSizeReached { command })
+}
+
+/// What swapping the focused window in `direction` would do against
+/// `state` right now, or the typed reason it would do nothing (CONTEXT.md
+/// "Directional swap", ADR 0026).
+///
+/// The neighbor is exactly the one [`Event::DirectionalFocusRequested`]
+/// would focus, because both go through [`directional_neighbor`]: a
+/// direction has one spatial meaning. Pure over `state`, so the IPC
+/// handler and the reducer reach the same verdict from the same state.
+pub fn plan_directional_swap(
+    state: &EngineState,
+    direction: CardinalDirection,
+) -> Result<DirectionalSwapApplied, DirectionalSwapRefusal> {
+    let command = swap_command(direction).to_owned();
+    if state.paused {
+        return Err(DirectionalSwapRefusal::Paused);
+    }
+    let window_id = state
+        .focused_window
+        .ok_or(DirectionalSwapRefusal::NoFocusedWindow)?;
+    let display_id = state
+        .inventory
+        .get(&window_id)
+        .map(|managed| managed.window.display_id)
+        .ok_or(DirectionalSwapRefusal::NoFocusedWindow)?;
+    if work_area_of(&state.displays, display_id).is_none() {
+        return Err(DirectionalSwapRefusal::DisplayUnavailable { display_id });
+    }
+    if !directional_endpoint(state, display_id, window_id) {
+        return Err(DirectionalSwapRefusal::NotArranged { window_id });
+    }
+    let neighbor_id =
+        directional_neighbor(state, direction).ok_or(DirectionalSwapRefusal::NoNeighbor {
+            command: command.clone(),
+        })?;
+    Ok(DirectionalSwapApplied {
+        command,
+        display_id,
+        window_id,
+        neighbor_id,
+    })
 }
 
 /// What removing dormant slot `position` from `display_id`'s tree would
@@ -8408,11 +8446,249 @@ mod tests {
             1,
             "the command and the BSP reflow it caused are one transaction"
         );
-        assert!(
-            drafts[0].members.len() >= 2,
-            "both swapped windows are reversible together, found {:?}",
-            drafts[0].members.len()
+        assert_eq!(
+            drafts[0].members.len(),
+            2,
+            "exactly the two swapped windows are reversible together"
         );
+    }
+
+    // ---- Directional swap in tree mode (issue #55) ---------------------
+
+    /// H[ 1, V[ 2, dormant, 3 ] ] with the root divider resized, so the
+    /// tree carries every kind of state a swap must leave alone.
+    fn rich_tree_state() -> EngineState {
+        let mut state = tree_state();
+        observe(
+            &mut state,
+            vec![known_window_at(
+                1,
+                "alpha.exe",
+                1,
+                Rect::new(0, 0, 400, 300),
+            )],
+        );
+        observe(
+            &mut state,
+            vec![
+                known_window_at(1, "alpha.exe", 1, Rect::new(0, 0, 1920, 1080)),
+                known_window_at(2, "beta.exe", 1, Rect::new(0, 0, 400, 300)),
+            ],
+        );
+        focus(&mut state, 2, Rect::new(960, 0, 960, 1080));
+        observe(
+            &mut state,
+            vec![
+                known_window_at(1, "alpha.exe", 1, Rect::new(0, 0, 960, 1080)),
+                known_window_at(2, "beta.exe", 1, Rect::new(960, 0, 960, 1080)),
+                known_window_at(4, "delta.exe", 1, Rect::new(0, 0, 400, 300)),
+            ],
+        );
+        focus(&mut state, 4, Rect::new(960, 540, 960, 540));
+        observe(
+            &mut state,
+            vec![
+                known_window_at(1, "alpha.exe", 1, Rect::new(0, 0, 960, 1080)),
+                known_window_at(2, "beta.exe", 1, Rect::new(960, 0, 960, 540)),
+                known_window_at(4, "delta.exe", 1, Rect::new(960, 540, 960, 540)),
+                known_window_at(3, "gamma.exe", 1, Rect::new(0, 0, 400, 300)),
+            ],
+        );
+        // delta closes: its slot between beta and gamma goes dormant.
+        observe(
+            &mut state,
+            vec![
+                known_window_at(1, "alpha.exe", 1, Rect::new(0, 0, 960, 1080)),
+                known_window_at(2, "beta.exe", 1, Rect::new(960, 0, 960, 360)),
+                known_window_at(3, "gamma.exe", 1, Rect::new(960, 720, 960, 360)),
+            ],
+        );
+        assert_eq!(state.trees[&DisplayId(1)].dormant_positions().len(), 1);
+        focus(&mut state, 2, Rect::new(960, 0, 960, 540));
+        resize(&mut state, CardinalDirection::Left);
+        assert_eq!(
+            arrangement(&state),
+            vec![
+                (1, Rect::new(0, 0, 864, 1080)),
+                (2, Rect::new(864, 0, 1056, 540)),
+                (3, Rect::new(864, 540, 1056, 540)),
+            ]
+        );
+        state.effects.clear();
+        state.persistence_intents.clear();
+        state
+    }
+
+    #[test]
+    fn swap_selects_exactly_the_neighbor_directional_focus_selects() {
+        let mut state = rich_tree_state();
+        for id in [1, 2, 3] {
+            let bounds = state.windows[&WindowId(id)].bounds;
+            focus(&mut state, id, bounds);
+            for direction in [
+                CardinalDirection::Left,
+                CardinalDirection::Right,
+                CardinalDirection::Up,
+                CardinalDirection::Down,
+            ] {
+                let focus_target = directional_neighbor(&state, direction);
+                let swap_target = plan_directional_swap(&state, direction)
+                    .ok()
+                    .map(|plan| plan.neighbor_id);
+                assert_eq!(
+                    focus_target, swap_target,
+                    "from {id} going {direction:?}: focus and swap must name one neighbor"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn swap_exchanges_only_two_bindings_and_leaves_every_other_slot_alone() {
+        let mut state = rich_tree_state();
+        let tree_before = state.trees[&DisplayId(1)].clone();
+        // Right from window 1 is window 2, the top of the right column.
+        focus(&mut state, 1, Rect::new(0, 0, 864, 1080));
+
+        apply(
+            &mut state,
+            Event::DirectionalSwapRequested {
+                direction: CardinalDirection::Right,
+            },
+        );
+
+        let tree_after = &state.trees[&DisplayId(1)];
+        // Mapping the two windows back reproduces the prior tree exactly:
+        // containers, axes, weights, dormant slot, and insertion numbers.
+        let mut unswapped = tree_after.clone();
+        assert!(unswapped.swap_leaves(&WindowId(2), &WindowId(1)));
+        assert_eq!(unswapped, tree_before);
+        assert_eq!(
+            tree_after.dormant_positions().len(),
+            1,
+            "the dormant slot in the right column is untouched"
+        );
+        assert_eq!(
+            placements(&state)
+                .iter()
+                .map(|(id, _, _)| id.0)
+                .collect::<std::collections::BTreeSet<_>>(),
+            [1, 2].into_iter().collect(),
+            "only the two swapped windows are placed; window 3 does not move"
+        );
+        assert_eq!(
+            state.windows[&WindowId(3)].bounds,
+            Rect::new(864, 540, 1056, 540)
+        );
+    }
+
+    #[test]
+    fn focus_stays_on_the_same_window_which_now_sits_where_its_neighbor_was() {
+        let mut state = rich_tree_state();
+        focus(&mut state, 1, Rect::new(0, 0, 864, 1080));
+        let neighbor_was = state.windows[&WindowId(2)].bounds;
+
+        apply(
+            &mut state,
+            Event::DirectionalSwapRequested {
+                direction: CardinalDirection::Right,
+            },
+        );
+
+        assert_eq!(state.focused_window, Some(WindowId(1)));
+        assert_eq!(state.windows[&WindowId(1)].bounds, neighbor_was);
+        assert!(
+            !state
+                .effects
+                .iter()
+                .any(|effect| matches!(effect, EngineEffect::FocusWindow { .. })),
+            "no focus effect is needed: the same window keeps focus"
+        );
+        let drafts = recorded_drafts(&state);
+        assert_eq!(drafts.len(), 1);
+        assert_eq!(drafts[0].command, "swap-right");
+        assert_eq!(drafts[0].members.len(), 2);
+    }
+
+    #[test]
+    fn swap_refuses_typed_at_boundaries_and_for_ineligible_endpoints() {
+        let mut state = rich_tree_state();
+
+        // Boundary: nothing lies left of window 1, and it does not wrap.
+        focus(&mut state, 1, Rect::new(0, 0, 864, 1080));
+        assert_eq!(
+            plan_directional_swap(&state, CardinalDirection::Left),
+            Err(DirectionalSwapRefusal::NoNeighbor {
+                command: "swap-left".to_owned()
+            })
+        );
+        let tree_before = state.trees[&DisplayId(1)].clone();
+        apply(
+            &mut state,
+            Event::DirectionalSwapRequested {
+                direction: CardinalDirection::Left,
+            },
+        );
+        assert_eq!(state.trees[&DisplayId(1)], tree_before);
+        assert!(recorded_drafts(&state).is_empty());
+
+        // A floating window is not an endpoint, from either side.
+        focus(&mut state, 3, Rect::new(864, 540, 1056, 540));
+        apply(&mut state, Event::ToggleFloatingRequested);
+        assert_eq!(
+            plan_directional_swap(&state, CardinalDirection::Up),
+            Err(DirectionalSwapRefusal::NotArranged {
+                window_id: WindowId(3)
+            })
+        );
+        focus(&mut state, 2, Rect::new(864, 0, 1056, 1080));
+        assert!(matches!(
+            plan_directional_swap(&state, CardinalDirection::Down),
+            Err(DirectionalSwapRefusal::NoNeighbor { .. })
+        ));
+
+        state.paused = true;
+        assert_eq!(
+            plan_directional_swap(&state, CardinalDirection::Left),
+            Err(DirectionalSwapRefusal::Paused)
+        );
+        state.focused_window = None;
+        state.paused = false;
+        assert_eq!(
+            plan_directional_swap(&state, CardinalDirection::Left),
+            Err(DirectionalSwapRefusal::NoFocusedWindow)
+        );
+    }
+
+    #[test]
+    fn swap_never_crosses_a_display_where_display_transfer_would() {
+        let mut state = tree_state();
+        state.displays = vec![display(1, "DISPLAY1", 0), display(2, "DISPLAY2", 1920)];
+        observe(
+            &mut state,
+            vec![
+                known_window_at(1, "alpha.exe", 1, Rect::new(0, 0, 400, 300)),
+                known_window_at(2, "beta.exe", 2, Rect::new(1920, 0, 400, 300)),
+            ],
+        );
+        focus(&mut state, 1, Rect::new(0, 0, 1920, 1080));
+
+        assert_eq!(
+            plan_directional_swap(&state, CardinalDirection::Right),
+            Err(DirectionalSwapRefusal::NoNeighbor {
+                command: "swap-right".to_owned()
+            }),
+            "the window on the next display is not a neighbor"
+        );
+        // The explicit command for that is a throw, which does move it.
+        apply(
+            &mut state,
+            Event::WindowThrowToDisplayRequested {
+                window_id: WindowId(1),
+                direction: DisplayDirection::Next,
+            },
+        );
+        assert_eq!(state.windows[&WindowId(1)].display_id, DisplayId(2));
     }
 
     // ---- Dormant positions (issue #53) ---------------------------------

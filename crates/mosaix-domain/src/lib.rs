@@ -12,8 +12,9 @@ pub mod window;
 
 // Re-export commonly used types at the crate root for convenience.
 pub use commands::{
-    RemovePositionApplied, RemovePositionRefusal, RemovePositionResult, TreeResizeApplied,
-    TreeResizeRefusal, TreeResizeResult, TREE_RESIZE_STEP_PERCENT,
+    DirectionalSwapApplied, DirectionalSwapRefusal, DirectionalSwapResult, RemovePositionApplied,
+    RemovePositionRefusal, RemovePositionResult, TreeResizeApplied, TreeResizeRefusal,
+    TreeResizeResult, TREE_RESIZE_STEP_PERCENT,
 };
 pub use coordinates::{allocate_edges, LogicalRect, NormalizedRect};
 pub use display::{topology_fingerprint, Display, Rotation};

@@ -184,6 +184,16 @@ fn main() {
         run_resize(direction, json);
         return;
     }
+    if let Some(request) = match cli.command {
+        Command::SwapLeft => Some(IpcRequest::SwapLeft),
+        Command::SwapRight => Some(IpcRequest::SwapRight),
+        Command::SwapUp => Some(IpcRequest::SwapUp),
+        Command::SwapDown => Some(IpcRequest::SwapDown),
+        _ => None,
+    } {
+        run_swap(request);
+        return;
+    }
     if let Command::RemovePosition {
         display,
         position,
@@ -449,6 +459,56 @@ fn format_resize(result: &mosaix_domain::TreeResizeResult) -> String {
             rendered
         }
         TreeResizeResult::Refused(refusal) => format!("mosaix: {refusal}"),
+    }
+}
+
+/// Renders a directional-swap outcome for a person.
+fn format_swap(result: &mosaix_domain::DirectionalSwapResult) -> String {
+    use mosaix_domain::DirectionalSwapResult;
+    match result {
+        DirectionalSwapResult::Applied(applied) => format!(
+            "{}: swapped window {} with window {}",
+            applied.command, applied.window_id.0, applied.neighbor_id.0
+        ),
+        DirectionalSwapResult::Refused(refusal) => format!("mosaix: {refusal}"),
+    }
+}
+
+#[cfg(windows)]
+fn run_swap(request: mosaix_ipc::IpcRequest) {
+    use mosaix_ipc::{send_request, IpcResponse};
+
+    let data = match send_request(request) {
+        Ok(IpcResponse::Ok { data: Some(data) }) => data,
+        Ok(IpcResponse::Ok { data: None }) => {
+            println!("Ok");
+            return;
+        }
+        Ok(IpcResponse::Error { message }) => {
+            eprintln!("mosaix: {message}");
+            std::process::exit(1);
+        }
+        Ok(IpcResponse::VersionMismatch { server_version }) => {
+            eprintln!("mosaix: protocol version mismatch (server: v{server_version})");
+            std::process::exit(1);
+        }
+        Err(error) => {
+            eprintln!("mosaix: {error}");
+            std::process::exit(2);
+        }
+    };
+    let result: mosaix_domain::DirectionalSwapResult = match serde_json::from_value(data) {
+        Ok(result) => result,
+        Err(error) => {
+            eprintln!("mosaix: could not read the agent's swap result: {error}");
+            std::process::exit(2);
+        }
+    };
+    if result.is_applied() {
+        println!("{}", format_swap(&result));
+    } else {
+        eprintln!("{}", format_swap(&result));
+        std::process::exit(1);
     }
 }
 
@@ -847,6 +907,32 @@ mod tests {
         assert_eq!(
             format_arrangement(&state),
             "arrangement: tree (active)\n  display 1: 11\n    dormant position 1 kept for Code.exe (expires 1756604800)"
+        );
+    }
+
+    #[test]
+    fn a_swap_report_names_both_windows_or_the_reason_nothing_moved() {
+        use mosaix_domain::{
+            DirectionalSwapApplied, DirectionalSwapRefusal, DirectionalSwapResult, DisplayId,
+            WindowId,
+        };
+
+        assert_eq!(
+            format_swap(&DirectionalSwapResult::Applied(DirectionalSwapApplied {
+                command: "swap-down".to_owned(),
+                display_id: DisplayId(1),
+                window_id: WindowId(2),
+                neighbor_id: WindowId(3),
+            })),
+            "swap-down: swapped window 2 with window 3"
+        );
+        assert_eq!(
+            format_swap(&DirectionalSwapResult::Refused(
+                DirectionalSwapRefusal::NoNeighbor {
+                    command: "swap-left".to_owned()
+                }
+            )),
+            "mosaix: swap-left: no arranged window lies that way on this display"
         );
     }
 
