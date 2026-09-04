@@ -41,19 +41,32 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 use mosaix_config::{Command, ResolvedConfig, ResolvedConfigSet, TilingMode};
+use mosaix_domain::commands::{
+    DirectionalSwapApplied, DirectionalSwapRefusal, RemovePositionApplied, RemovePositionRefusal,
+    TreeResizeApplied, TreeResizeRefusal, TREE_RESIZE_STEP_PERCENT,
+};
+use mosaix_domain::identity::{match_window_with_order, MatchOutcome, WindowEvidence};
+use mosaix_domain::recovery::{ParkingRefusal, RecoveryDraft, RecoveryEntryId, RecoveryOutcome};
+use mosaix_domain::tree::{
+    ContainerTree, DormantPosition, LeafFate, Occupant, PersistedTree, SplitAxis, Toward,
+};
+use mosaix_domain::undo::{
+    now_unix, UndoApplied, UndoMember, UndoRefusal, UndoRestoredWindow, UndoResult,
+    UndoTargetOutcome, UndoTransaction, UndoTransactionDraft, UndoTransactionId, UndoTreeSnapshot,
+};
+use mosaix_domain::workspace::{
+    ParkingCapability, PersistedWorkspace, SwitchingPending, WorkspaceCommandResult,
+    WorkspaceCreateApplied, WorkspaceDeleteApplied, WorkspaceFocusApplied, WorkspaceMoveApplied,
+    WorkspaceName, WorkspaceOrigin, WorkspacePool, WorkspaceRefusal, WorkspaceSwitchingStatus,
+    WorkspaceSwitchingUnavailable,
+};
 use mosaix_domain::{
     topology_fingerprint, Display, DisplayId, Rect, Window, WindowId, WindowLifecycle,
 };
 use mosaix_layout::{
-    apply_gaps, choose_insertion, cycle_display, plan_balanced_grid, plan_tree, plan_tree_raw,
-    resolve_saved_layout, resolve_zone_cycle, snap_to_half, throw_preserving_ratio, CycleStep,
-    DisplayDirection, HalfZone, HorizontalDirection,
-};
-use mosaix_domain::identity::{match_window_with_order, WindowEvidence};
-use mosaix_domain::tree::{ContainerTree, PersistedTree};
-use mosaix_domain::undo::{
-    now_unix, UndoApplied, UndoMember, UndoRefusal, UndoRestoredWindow, UndoResult,
-    UndoTargetOutcome, UndoTransaction, UndoTransactionDraft, UndoTransactionId,
+    apply_gaps, choose_insertion, cycle_display, plan_balanced_grid, plan_tree_constrained,
+    plan_tree_raw, resolve_saved_layout, resolve_zone_cycle, snap_to_half, throw_preserving_ratio,
+    CycleStep, DisplayDirection, HalfZone, HorizontalDirection,
 };
 use mosaix_persistence::PersistenceHealth;
 use mosaix_rules::{builtin_rules, ManageAction, Rule, RuleEvaluator};
@@ -86,6 +99,15 @@ pub enum EngineEffect {
     },
     /// Requests a fresh native display/window observation before recovery.
     ReconcileWindows,
+    /// Move `window_id` out of visible geometry. Emitted only once the
+    /// recovery ledger has acknowledged entry `entry_id` as durable
+    /// (ADR 0023), so a crash between this effect and its completion
+    /// still leaves enough on disk to put the window back. The adapter
+    /// answers with [`Event::WindowParked`] when the move landed.
+    ParkWindow {
+        window_id: WindowId,
+        entry_id: RecoveryEntryId,
+    },
 }
 
 /// A durable write the reducer has committed to but does not perform.
@@ -111,6 +133,42 @@ pub enum PersistenceIntent {
         display_fingerprint: String,
         tree: Box<PersistedTree>,
     },
+    /// Store one logical workspace: its origin, the display it is shown
+    /// on, and the tree it owns (ADR 0028). Written whenever any of those
+    /// change, so a restart finds the pool as it was.
+    SaveWorkspace(Box<PersistedWorkspace>),
+    /// Forget a workspace the user deleted.
+    DeleteWorkspace(WorkspaceName),
+    /// Record recovery data for a window about to be parked. Acknowledged
+    /// back through [`Event::RecoveryEntryDurable`] with the same token;
+    /// until then the window is pending and no parking effect exists.
+    RecordRecovery {
+        token: u64,
+        draft: Box<RecoveryDraft>,
+    },
+    /// The parking effect for this entry was carried out.
+    MarkParked(RecoveryEntryId),
+    /// The window this entry describes is back in visible geometry.
+    MarkRestored(RecoveryEntryId),
+}
+
+/// A window waiting for its recovery entry to become durable before it
+/// may be parked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingParking {
+    pub token: u64,
+    pub window_id: WindowId,
+}
+
+/// A rule named a workspace the pool does not hold. The window stays in
+/// the workspace displayed where it appeared, and this records why, so a
+/// typo in a rule is visible rather than silently creating a workspace
+/// (ADR 0028).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuleWorkspaceRefusal {
+    pub window_id: WindowId,
+    pub rule_id: Option<String>,
+    pub workspace: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -163,11 +221,15 @@ pub struct InteractivePlacementSession {
 /// as an automatic reflow does -- does not overwrite that, because undo
 /// restores where the window was before the *command*, not before its last
 /// internal step.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 struct UndoScope {
     command: String,
     members: Vec<UndoMember>,
     claimed: HashSet<WindowId>,
+    /// Each container tree the command is about to reshape, as it stood
+    /// when the command started. Captured once per display; the first
+    /// capture wins for the same reason the first placement does.
+    prior_trees: Vec<(DisplayId, ContainerTree)>,
 }
 
 /// State the reducer owns and is the only writer of.
@@ -218,6 +280,65 @@ pub struct EngineState {
     /// reflow -- a directional swap does exactly that -- and such a change
     /// would otherwise look like no change at all.
     saved_trees: HashMap<DisplayId, ContainerTree>,
+    /// What would recognise each tiled window if it closed: evidence
+    /// captured at the last reflow, so a leaf can go dormant with it after
+    /// the window -- and its inventory entry -- are gone.
+    leaf_evidence: HashMap<WindowId, WindowEvidence>,
+    /// The windows each display's tree could not fit at their minimum
+    /// size, newest insertion first (CONTEXT.md "Constraint-overflow
+    /// window"). They keep their leaves and stay managed; they are simply
+    /// not placed until the tree can satisfy them again. Distinct from
+    /// session-floating, which is the user's choice and outlives a reflow.
+    pub constraint_overflow: HashMap<DisplayId, Vec<WindowId>>,
+    /// The global pool of logical workspaces (CONTEXT.md "Logical
+    /// workspace", ADR 0028): which is displayed where, which window
+    /// belongs to which, and each one's stashed tree while hidden. A
+    /// displayed workspace's tree is the entry in `trees` for its
+    /// display; the two are exchanged whenever a display changes
+    /// workspace, so the tree follows the workspace.
+    pub workspaces: WorkspacePool,
+    /// Stored workspace trees the agent read at startup, waiting for
+    /// their workspace to be displayed and reflowed, exactly as
+    /// `pending_trees` waits for a display.
+    pub pending_workspace_trees: HashMap<WorkspaceName, PersistedTree>,
+    /// Where each stored workspace was displayed when last written, by
+    /// display fingerprint. Consumed when a display with no workspace is
+    /// filled: a workspace goes back where it was if that display is
+    /// here, and stays hidden otherwise (ADR 0028).
+    pending_displayed: HashMap<WorkspaceName, String>,
+    /// Each workspace as it was last written out, so a reflow that
+    /// changed nothing about it writes nothing.
+    saved_workspaces: HashMap<WorkspaceName, PersistedWorkspace>,
+    /// What the last workspace lifecycle command concluded, kept so IPC
+    /// and the CLI can report a refusal that happened between requests.
+    pub last_workspace_result: Option<WorkspaceCommandResult>,
+    /// Rules that named a workspace the pool does not hold, one entry per
+    /// affected window. Cleared for a window when it leaves management.
+    pub rule_workspace_refusals: Vec<RuleWorkspaceRefusal>,
+    /// Why the matched profile's switching mapping is not in effect, when
+    /// it asked for one and it could not be applied. `None` when it is in
+    /// effect, or when nothing asked. Read through
+    /// [`EngineState::workspace_switching_status`].
+    switching_unavailable: Option<WorkspaceSwitchingUnavailable>,
+    /// What the platform adapter last said about a recoverable parking
+    /// site for this topology (ADR 0023). Parking is authorised only on
+    /// `Verified`; nothing in the reducer verifies it.
+    pub parking_capability: ParkingCapability,
+    /// This agent session's identity in the recovery ledger, so a later
+    /// session can tell its own entries from a previous session's.
+    pub session_id: String,
+    /// Windows whose recovery entry has been requested but not yet
+    /// acknowledged durable. No parking effect exists for any of them.
+    pub pending_parking: Vec<PendingParking>,
+    next_parking_token: u64,
+    /// Every window this session has parked, with the ledger entry that
+    /// authorised it. Restoration consumes the entry.
+    pub parked_windows: HashMap<WindowId, RecoveryEntryId>,
+    /// What the last parking authorisation request concluded.
+    pub last_parking_refusal: Option<ParkingRefusal>,
+    /// What startup recovery did with the previous session's ledger:
+    /// each open entry's verdict and whether its window was put back.
+    pub recovery_outcomes: Vec<RecoveryOutcome>,
     pub displays: Vec<Display>,
     /// Where each tracked window currently sits, keyed by window. Entries
     /// are created (and their `previous_placement` remembered) by
@@ -322,6 +443,43 @@ pub struct EngineState {
 }
 
 impl EngineState {
+    /// The state of experimental workspace switching for the current
+    /// topology, derived rather than stored so it can never disagree
+    /// with the facts it summarises: whether the matched profile asks,
+    /// whether its mapping applied, whether recovery data would be
+    /// durable, and whether a parking site is verified.
+    pub fn workspace_switching_status(&self) -> WorkspaceSwitchingStatus {
+        let requested = self
+            .resolved_config
+            .workspace_switching
+            .as_ref()
+            .is_some_and(|switching| switching.experimental);
+        if !requested {
+            return WorkspaceSwitchingStatus::Disabled;
+        }
+        if let Some(reason) = &self.switching_unavailable {
+            return WorkspaceSwitchingStatus::Unavailable {
+                reason: reason.clone(),
+            };
+        }
+        if matches!(self.persistence_health, PersistenceHealth::Degraded { .. }) {
+            return WorkspaceSwitchingStatus::Requested {
+                pending: SwitchingPending::PersistenceDegraded,
+            };
+        }
+        match &self.parking_capability {
+            ParkingCapability::Verified => WorkspaceSwitchingStatus::Experimental,
+            ParkingCapability::Unverified => WorkspaceSwitchingStatus::Requested {
+                pending: SwitchingPending::ParkingCapabilityUnverified,
+            },
+            ParkingCapability::Refused { reason } => WorkspaceSwitchingStatus::Unavailable {
+                reason: WorkspaceSwitchingUnavailable::ParkingRefused {
+                    reason: reason.clone(),
+                },
+            },
+        }
+    }
+
     /// The number of windows whose circuit breaker is currently open
     /// (Feature 31).  Useful for diagnostics via `mosaix state --json`.
     pub fn circuit_breaker_count(&self) -> usize {
@@ -424,6 +582,26 @@ const fn swap_command(direction: CardinalDirection) -> &'static str {
     }
 }
 
+/// The stored command name for a tree resize.
+const fn resize_command(direction: CardinalDirection) -> &'static str {
+    match direction {
+        CardinalDirection::Left => "resize-left",
+        CardinalDirection::Right => "resize-right",
+        CardinalDirection::Up => "resize-up",
+        CardinalDirection::Down => "resize-down",
+    }
+}
+
+/// The container axis a cardinal direction moves along, and which way.
+const fn divider_for(direction: CardinalDirection) -> (SplitAxis, Toward) {
+    match direction {
+        CardinalDirection::Left => (SplitAxis::Horizontal, Toward::Start),
+        CardinalDirection::Right => (SplitAxis::Horizontal, Toward::End),
+        CardinalDirection::Up => (SplitAxis::Vertical, Toward::Start),
+        CardinalDirection::Down => (SplitAxis::Vertical, Toward::End),
+    }
+}
+
 /// The stored command name for a throw to an adjacent display.
 const fn throw_command(direction: DisplayDirection) -> &'static str {
     match direction {
@@ -470,6 +648,81 @@ pub enum Event {
     /// The container trees the state database holds, keyed by display
     /// fingerprint. Published once at startup.
     ContainerTreesLoaded(HashMap<String, PersistedTree>),
+
+    /// The logical workspaces the state database holds. Published once at
+    /// startup. Command-created workspaces rejoin the pool; every
+    /// workspace's tree waits for it to be displayed; and one that was
+    /// displayed on a display that is here again goes back to it.
+    WorkspacesLoaded(Vec<PersistedWorkspace>),
+
+    /// Create a hidden, empty workspace called `name` (ADR 0028). Every
+    /// way this changes nothing is a typed [`WorkspaceRefusal`], reached
+    /// by [`plan_workspace_create`].
+    WorkspaceCreateRequested {
+        name: String,
+    },
+
+    /// Delete the workspace called `name`, which must be hidden, empty of
+    /// live and dormant members, and not declared by configuration.
+    WorkspaceDeleteRequested {
+        name: String,
+    },
+
+    /// Display the hidden workspace `name` on the focused display, or, if
+    /// it is already displayed somewhere, focus its last-focused live
+    /// window there (CONTEXT.md "Workspace focus"). A focus never moves a
+    /// displayed workspace between monitors.
+    WorkspaceFocusRequested {
+        name: String,
+    },
+
+    /// Move the displayed workspace `name` to `display_id`, exchanging it
+    /// with whatever that display showed. Identity and tree travel with
+    /// it (ADR 0028).
+    WorkspaceMoveRequested {
+        name: String,
+        display_id: DisplayId,
+    },
+
+    /// What the platform adapter concluded about a recoverable parking
+    /// site for the current topology (ADR 0023).
+    ParkingCapabilityReported(ParkingCapability),
+
+    /// Ask to park `window_id`. Every refusal is typed and reached by
+    /// [`plan_parking_authorization`] before any write; on success the
+    /// reducer records a recovery intent and waits, emitting no parking
+    /// effect until [`Event::RecoveryEntryDurable`] answers.
+    ParkingAuthorizationRequested {
+        window_id: WindowId,
+    },
+
+    /// The ledger made the entry for `token` durable. This, and only
+    /// this, authorises the parking effect.
+    RecoveryEntryDurable {
+        token: u64,
+        entry_id: RecoveryEntryId,
+    },
+
+    /// The ledger could not write the entry for `token`. The window
+    /// stays visible.
+    RecoveryEntryRefused {
+        token: u64,
+    },
+
+    /// The adapter carried out the parking effect for `entry_id`.
+    WindowParked {
+        window_id: WindowId,
+        entry_id: RecoveryEntryId,
+    },
+
+    /// The window `entry_id` described is back in visible geometry.
+    WindowRestored {
+        window_id: WindowId,
+    },
+
+    /// What startup recovery did with the previous session's ledger,
+    /// published so state and clients can report it.
+    RecoveryReported(Vec<RecoveryOutcome>),
 
     /// A window was snapped or otherwise placed at `bounds` on
     /// `display_id`. Producers (a zone-snap command that resolved bounds
@@ -608,6 +861,25 @@ pub enum Event {
     /// neighbor, then recomputes the affected Balanced grid.
     DirectionalSwapRequested {
         direction: CardinalDirection,
+    },
+
+    /// Move the nearest container-tree divider facing `direction` by
+    /// [`TREE_RESIZE_STEP_PERCENT`] points, growing the focused window's
+    /// side (CONTEXT.md "Tree resize"). Every way it can change nothing is
+    /// a typed [`TreeResizeRefusal`], reached by [`plan_tree_resize`] so a
+    /// synchronous caller can report it; the reducer reaches the same
+    /// verdict and, on a refusal, mutates nothing.
+    TreeResizeRequested {
+        direction: CardinalDirection,
+    },
+
+    /// Delete the dormant slot numbered `position` from `display_id`'s
+    /// tree, closing the space its ancestors held for it (CONTEXT.md
+    /// "Dormant tree leaf"). Refusals are typed, reached by
+    /// [`plan_remove_position`], and mutate nothing.
+    TreePositionRemoveRequested {
+        display_id: DisplayId,
+        position: u64,
     },
 
     InteractivePlacementStarted {
@@ -950,6 +1222,325 @@ fn apply(state: &mut EngineState, event: Event) {
             state.revision += 1;
         }
 
+        Event::WorkspacesLoaded(stored) => {
+            if stored.is_empty() {
+                return;
+            }
+            for persisted in stored {
+                let declared = state
+                    .resolved_config
+                    .workspaces
+                    .iter()
+                    .any(|name| name.collides_with(&persisted.name));
+                match state.workspaces.resolve(persisted.name.as_str()) {
+                    // Configuration already declared it this session; the
+                    // database only adds what the file cannot know.
+                    Some(_) => {}
+                    None => {
+                        // A workspace that configuration declared last
+                        // session and no longer does is not deleted --
+                        // deletion is never implicit -- but it is no
+                        // longer configuration's, so a command may delete
+                        // it (ADR 0028).
+                        let origin = if declared {
+                            WorkspaceOrigin::Configuration
+                        } else {
+                            WorkspaceOrigin::Command
+                        };
+                        if state
+                            .workspaces
+                            .create(persisted.name.clone(), origin)
+                            .is_err()
+                        {
+                            continue;
+                        }
+                    }
+                }
+                let name = state
+                    .workspaces
+                    .resolve(persisted.name.as_str())
+                    .expect("just created or found");
+                if let Some(tree) = persisted.tree {
+                    state.pending_workspace_trees.insert(name.clone(), tree);
+                }
+                if let Some(fingerprint) = persisted.displayed_fingerprint {
+                    state.pending_displayed.insert(name.clone(), fingerprint);
+                }
+                // What the database holds is what was last written, so
+                // nothing needs rewriting until something changes.
+                state.saved_workspaces.insert(
+                    name.clone(),
+                    PersistedWorkspace {
+                        name,
+                        origin: persisted.origin,
+                        displayed_fingerprint: None,
+                        tree: None,
+                    },
+                );
+            }
+            // A workspace goes back to the display it was on. The startup
+            // fill may already have put a configuration workspace there;
+            // one that has no window yet gives way, because nothing is
+            // revealed or lost by exchanging two empty workspaces, and
+            // the remembered assignment is the one the user last had. A
+            // workspace that already has windows is kept: the database
+            // answered after the user started working, and what they
+            // can see wins over what was stored.
+            let remembered: Vec<(WorkspaceName, String)> = state
+                .pending_displayed
+                .iter()
+                .map(|(name, fingerprint)| (name.clone(), fingerprint.clone()))
+                .collect();
+            for (name, fingerprint) in remembered {
+                let Some(display_id) = display_id_of(state, &fingerprint) else {
+                    continue;
+                };
+                if state.workspaces.is_displayed(&name) {
+                    state.pending_displayed.remove(&name);
+                    continue;
+                }
+                let current_is_empty = state
+                    .workspaces
+                    .displayed_on(display_id)
+                    .is_none_or(|current| state.workspaces.members_of(current).is_empty());
+                if !current_is_empty {
+                    continue;
+                }
+                stash_display_tree(state, display_id);
+                state.workspaces.display(&name, display_id);
+                adopt_workspace_tree(state, &name, display_id);
+                state.pending_displayed.remove(&name);
+            }
+            fill_empty_displays(state);
+            // A resolved topology-profile preference outranks what was
+            // remembered (ADR 0028).
+            apply_switching_mapping(state);
+            assign_unassigned_windows(state);
+            reconcile_arrangements(state);
+            persist_workspaces(state);
+            state.revision += 1;
+        }
+
+        Event::WorkspaceCreateRequested { name } => {
+            let result = match plan_workspace_create(state, &name) {
+                Ok(_) => {
+                    let name = WorkspaceName::new(&name).expect("planned");
+                    let applied = state
+                        .workspaces
+                        .create(name, WorkspaceOrigin::Command)
+                        .expect("planned");
+                    persist_workspaces(state);
+                    WorkspaceCommandResult::Created(applied)
+                }
+                Err(refusal) => {
+                    tracing::info!(%refusal, "workspace create refused; nothing changed");
+                    WorkspaceCommandResult::Refused(refusal)
+                }
+            };
+            state.last_workspace_result = Some(result);
+            state.revision += 1;
+        }
+
+        Event::WorkspaceDeleteRequested { name } => {
+            let result = match plan_workspace_delete(state, &name) {
+                Ok(_) => {
+                    let applied = state.workspaces.delete(&name).expect("planned");
+                    state.saved_workspaces.remove(&applied.name);
+                    state.pending_workspace_trees.remove(&applied.name);
+                    state.pending_displayed.remove(&applied.name);
+                    state
+                        .persistence_intents
+                        .push(PersistenceIntent::DeleteWorkspace(applied.name.clone()));
+                    WorkspaceCommandResult::Deleted(applied)
+                }
+                Err(refusal) => {
+                    tracing::info!(%refusal, "workspace delete refused; nothing changed");
+                    WorkspaceCommandResult::Refused(refusal)
+                }
+            };
+            state.last_workspace_result = Some(result);
+            state.revision += 1;
+        }
+
+        Event::WorkspaceFocusRequested { name } => {
+            let result = match plan_workspace_focus(state, &name) {
+                Ok(WorkspaceFocusApplied::Displayed {
+                    name,
+                    display_id,
+                    replaced,
+                }) => {
+                    // The displaced workspace takes its tree with it, and
+                    // the shown one brings its own back. No undo scope is
+                    // opened: reversing a display change as one operation
+                    // arrives with the workspace switch transaction, and
+                    // recording only the placements here would let undo
+                    // restore windows into a tree the display no longer
+                    // shows.
+                    if replaced.is_some() {
+                        stash_display_tree(state, display_id);
+                    }
+                    state.workspaces.display(&name, display_id);
+                    adopt_workspace_tree(state, &name, display_id);
+                    state.focused_display = Some(display_id);
+                    reconcile_arrangements(state);
+                    persist_workspaces(state);
+                    WorkspaceCommandResult::Focused(WorkspaceFocusApplied::Displayed {
+                        name,
+                        display_id,
+                        replaced,
+                    })
+                }
+                Ok(WorkspaceFocusApplied::FocusedExisting {
+                    name,
+                    display_id,
+                    focused_window,
+                }) => {
+                    state.focused_display = Some(display_id);
+                    if let Some(window_id) = focused_window {
+                        state.effects.push(EngineEffect::FocusWindow { window_id });
+                    }
+                    WorkspaceCommandResult::Focused(WorkspaceFocusApplied::FocusedExisting {
+                        name,
+                        display_id,
+                        focused_window,
+                    })
+                }
+                Err(refusal) => {
+                    tracing::info!(%refusal, "workspace focus refused; nothing changed");
+                    WorkspaceCommandResult::Refused(refusal)
+                }
+            };
+            state.last_workspace_result = Some(result);
+            state.revision += 1;
+        }
+
+        Event::WorkspaceMoveRequested { name, display_id } => {
+            let result = match plan_workspace_move(state, &name, display_id) {
+                Ok(applied) => {
+                    // Both displays give up their trees and take the
+                    // other's, so neither workspace loses structure and
+                    // nothing becomes hidden.
+                    let moving = state.trees.remove(&applied.from_display_id);
+                    let displaced = state.trees.remove(&applied.to_display_id);
+                    for display in [applied.from_display_id, applied.to_display_id] {
+                        state.saved_trees.remove(&display);
+                        state.constraint_overflow.remove(&display);
+                        state.visual_window_order.remove(&display);
+                    }
+                    if let Some(tree) = moving {
+                        state.trees.insert(applied.to_display_id, tree);
+                    }
+                    if let Some(tree) = displaced {
+                        state.trees.insert(applied.from_display_id, tree);
+                    }
+                    state
+                        .workspaces
+                        .swap_displays(applied.from_display_id, applied.to_display_id);
+                    state.focused_display = Some(applied.to_display_id);
+                    reconcile_arrangements(state);
+                    persist_workspaces(state);
+                    WorkspaceCommandResult::Moved(applied)
+                }
+                Err(refusal) => {
+                    tracing::info!(%refusal, "workspace move refused; nothing changed");
+                    WorkspaceCommandResult::Refused(refusal)
+                }
+            };
+            state.last_workspace_result = Some(result);
+            state.revision += 1;
+        }
+
+        Event::ParkingCapabilityReported(capability) => {
+            if state.parking_capability != capability {
+                state.parking_capability = capability;
+                state.revision += 1;
+            }
+        }
+
+        Event::ParkingAuthorizationRequested { window_id } => {
+            match plan_parking_authorization(state, window_id) {
+                Ok(draft) => {
+                    state.next_parking_token += 1;
+                    let token = state.next_parking_token;
+                    state
+                        .pending_parking
+                        .push(PendingParking { token, window_id });
+                    state
+                        .persistence_intents
+                        .push(PersistenceIntent::RecordRecovery {
+                            token,
+                            draft: Box::new(draft),
+                        });
+                    state.last_parking_refusal = None;
+                }
+                Err(refusal) => {
+                    tracing::info!(%refusal, "parking refused; the window stays visible");
+                    state.last_parking_refusal = Some(refusal);
+                }
+            }
+            state.revision += 1;
+        }
+
+        Event::RecoveryEntryDurable { token, entry_id } => {
+            let Some(index) = state
+                .pending_parking
+                .iter()
+                .position(|pending| pending.token == token)
+            else {
+                return;
+            };
+            let pending = state.pending_parking.remove(index);
+            // Recovery data is durable; the window may leave visible
+            // geometry now, and not before (ADR 0023). A window that has
+            // since left management is not parked at all.
+            if state.inventory.contains_key(&pending.window_id) {
+                state.effects.push(EngineEffect::ParkWindow {
+                    window_id: pending.window_id,
+                    entry_id,
+                });
+            }
+            state.revision += 1;
+        }
+
+        Event::RecoveryEntryRefused { token } => {
+            let before = state.pending_parking.len();
+            state
+                .pending_parking
+                .retain(|pending| pending.token != token);
+            if state.pending_parking.len() != before {
+                tracing::warn!(
+                    token,
+                    "recovery data was not durable; the window stays visible"
+                );
+                state.revision += 1;
+            }
+        }
+
+        Event::WindowParked {
+            window_id,
+            entry_id,
+        } => {
+            state.parked_windows.insert(window_id, entry_id);
+            state
+                .persistence_intents
+                .push(PersistenceIntent::MarkParked(entry_id));
+            state.revision += 1;
+        }
+
+        Event::WindowRestored { window_id } => {
+            if let Some(entry_id) = state.parked_windows.remove(&window_id) {
+                state
+                    .persistence_intents
+                    .push(PersistenceIntent::MarkRestored(entry_id));
+                state.revision += 1;
+            }
+        }
+
+        Event::RecoveryReported(outcomes) => {
+            state.recovery_outcomes = outcomes;
+            state.revision += 1;
+        }
+
         Event::UndoRequested => {
             if state.paused {
                 tracing::debug!("undo requested while paused; ignoring");
@@ -960,6 +1551,28 @@ fn apply(state: &mut EngineState, event: Event) {
                 // No scope is opened here: undo is not itself undoable.
                 // Persistent redo is deferred to issue #44, and recording
                 // one would make a second undo reverse the first.
+                //
+                // Structure first, then windows. The trees the command
+                // reshaped go back to what they were, through the same
+                // confident matching a stored arrangement uses, so the
+                // next reflow agrees with the restored placements rather
+                // than quietly redoing the command.
+                let prior_trees = state
+                    .newest_undo
+                    .as_ref()
+                    .map(|transaction| transaction.prior_trees.clone())
+                    .unwrap_or_default();
+                let mut restored_structure = false;
+                for snapshot in &prior_trees {
+                    let Some(display_id) = display_id_of(state, &snapshot.display_fingerprint)
+                    else {
+                        continue;
+                    };
+                    let active = active_tiled_windows_on(state, display_id);
+                    let restored = restore_tree(state, &snapshot.tree, &active, now_unix());
+                    state.trees.insert(display_id, restored);
+                    restored_structure = true;
+                }
                 for restored in &applied.restored {
                     place_window(
                         state,
@@ -968,6 +1581,13 @@ fn apply(state: &mut EngineState, event: Event) {
                         restored.placement,
                         None,
                     );
+                }
+                if restored_structure {
+                    // Passive: no scope is open, so whatever this moves is
+                    // part of the undo rather than a new transaction. With
+                    // consistent snapshots it moves nothing, and stores
+                    // the restored tree.
+                    reconcile_arrangements(state);
                 }
                 state
                     .persistence_intents
@@ -1004,6 +1624,12 @@ fn apply(state: &mut EngineState, event: Event) {
             state.deferred_reflow_displays.clear();
             migrate_orphaned_windows(state, &displays);
             migrate_focused_display(state, &displays);
+            // A vanished display's workspace becomes hidden with its tree
+            // intact, and no surviving display's workspace is displaced
+            // to make room for it (ADR 0028). Its windows have already
+            // migrated physically, above; they simply are not arranged
+            // until the workspace is displayed again.
+            hide_workspaces_on_vanished_displays(state, &displays);
             state.displays = displays;
             // A display that is gone has no arrangement to report. Keeping
             // its entry would leave published state naming a layout as
@@ -1025,8 +1651,13 @@ fn apply(state: &mut EngineState, event: Event) {
                 state.resolved_config = select_resolved_config(&state.config_set, &state.displays);
                 state.automatic_tiling_suspended = false;
                 state.automatic_tiling_active = state.resolved_config.automatic_tiling_enabled;
+                sync_workspaces_from_config(state);
             }
+            fill_empty_displays(state);
+            apply_switching_mapping(state);
+            assign_unassigned_windows(state);
             reconcile_arrangements(state);
+            persist_workspaces(state);
             state.revision += 1;
         }
 
@@ -1172,6 +1803,7 @@ fn apply(state: &mut EngineState, event: Event) {
                 rejection_count: 0,
             });
             state.focused_window = Some(window_id);
+            state.workspaces.note_focus(window_id);
             if state
                 .displays
                 .iter()
@@ -1332,7 +1964,12 @@ fn apply(state: &mut EngineState, event: Event) {
             state.automatic_tiling_active =
                 state.resolved_config.automatic_tiling_enabled && !state.automatic_tiling_suspended;
             state.config_set = *config_set;
+            sync_workspaces_from_config(state);
+            fill_empty_displays(state);
+            apply_switching_mapping(state);
+            assign_unassigned_windows(state);
             reconcile_arrangements(state);
+            persist_workspaces(state);
             state.revision += 1;
         }
 
@@ -1416,19 +2053,15 @@ fn apply(state: &mut EngineState, event: Event) {
         }
 
         Event::DirectionalSwapRequested { direction } => {
-            let Some(focused) = state.focused_window else {
-                return;
+            let plan = match plan_directional_swap(state, direction) {
+                Ok(plan) => plan,
+                Err(refusal) => {
+                    tracing::info!(%refusal, "directional swap refused; nothing changed");
+                    return;
+                }
             };
-            let Some(neighbor) = directional_neighbor(state, direction) else {
-                return;
-            };
-            let Some(display_id) = state
-                .inventory
-                .get(&focused)
-                .map(|managed| managed.window.display_id)
-            else {
-                return;
-            };
+            let (focused, neighbor, display_id) =
+                (plan.window_id, plan.neighbor_id, plan.display_id);
             let Some(order) = state.visual_window_order.get_mut(&display_id) else {
                 return;
             };
@@ -1439,6 +2072,9 @@ fn apply(state: &mut EngineState, event: Event) {
                 return;
             };
             order.swap(focused_index, neighbor_index);
+            // The scope opens before the tree changes, so the transaction
+            // can carry the structure as it was and not only the windows.
+            open_undo_scope(state, swap_command(direction));
             // In tree mode the arrangement comes from the tree, not from
             // visual order, so the exchange has to happen there too. It is
             // an exchange of the two leaves' occupants and nothing else:
@@ -1446,11 +2082,46 @@ fn apply(state: &mut EngineState, event: Event) {
             // were (ADR 0026). Focus is deliberately not moved, so the user
             // keeps controlling the window they just moved.
             if state.resolved_config.tiling_mode == TilingMode::Tree {
+                capture_tree_for_undo(state, display_id);
                 if let Some(tree) = state.trees.get_mut(&display_id) {
                     tree.swap_leaves(&focused, &neighbor);
                 }
             }
-            open_undo_scope(state, swap_command(direction));
+            reconcile_arrangements(state);
+            state.revision += 1;
+            close_undo_scope(state);
+        }
+
+        Event::TreePositionRemoveRequested {
+            display_id,
+            position,
+        } => {
+            if let Err(refusal) = plan_remove_position(state, display_id, position) {
+                tracing::info!(%refusal, "remove-position refused; nothing changed");
+                return;
+            }
+            open_undo_scope(state, "remove-position");
+            capture_tree_for_undo(state, display_id);
+            if let Some(tree) = state.trees.get_mut(&display_id) {
+                tree.remove_position(position);
+            }
+            reconcile_arrangements(state);
+            state.revision += 1;
+            close_undo_scope(state);
+        }
+
+        Event::TreeResizeRequested { direction } => {
+            let plan = match plan_tree_resize(state, direction) {
+                Ok(plan) => plan,
+                Err(refusal) => {
+                    tracing::info!(%refusal, "tree resize refused; nothing changed");
+                    return;
+                }
+            };
+            let display_id = plan.applied.display_id;
+            open_undo_scope(state, resize_command(direction));
+            capture_tree_for_undo(state, display_id);
+            state.trees.insert(display_id, plan.tree);
             reconcile_arrangements(state);
             state.revision += 1;
             close_undo_scope(state);
@@ -1548,10 +2219,14 @@ fn apply(state: &mut EngineState, event: Event) {
                 tracing::warn!("empty wake display observation; retaining last usable topology");
             } else if topology_fingerprint(&displays) != topology_fingerprint(&state.displays) {
                 migrate_orphaned_windows(state, &displays);
+                hide_workspaces_on_vanished_displays(state, &displays);
                 state.displays = displays;
                 state.resolved_config = select_resolved_config(&state.config_set, &state.displays);
                 state.automatic_tiling_suspended = false;
                 state.automatic_tiling_active = state.resolved_config.automatic_tiling_enabled;
+                sync_workspaces_from_config(state);
+                fill_empty_displays(state);
+                apply_switching_mapping(state);
             }
             if let Some(windows) = windows {
                 state.observed_windows = windows
@@ -1810,10 +2485,39 @@ fn eligibility_for(window: &Window, action: ManageAction, circuit_open: bool) ->
     }
 }
 
+/// Whether `window_id` currently occupies a live, actively arranged leaf
+/// of `display_id`'s container tree: in it, and not in constraint
+/// overflow. Under the balanced grid every eligible window is arranged,
+/// so this is only asked in tree mode.
+fn arranged_in_tree(state: &EngineState, display_id: DisplayId, window_id: WindowId) -> bool {
+    state
+        .trees
+        .get(&display_id)
+        .is_some_and(|tree| tree.contains(&window_id))
+        && !state
+            .constraint_overflow
+            .get(&display_id)
+            .is_some_and(|overflow| overflow.contains(&window_id))
+}
+
+/// Whether `window_id` can be an endpoint of a directional command on
+/// `display_id`: eligible for tiling and, in tree mode, actually arranged
+/// (CONTEXT.md "Directional focus", "Directional swap").
+fn directional_endpoint(state: &EngineState, display_id: DisplayId, window_id: WindowId) -> bool {
+    let eligible = state.inventory.get(&window_id).is_some_and(|managed| {
+        managed.eligibility == EligibilityReason::Eligible
+            && managed.window.display_id == display_id
+    });
+    eligible
+        && (state.resolved_config.tiling_mode != TilingMode::Tree
+            || !state.automatic_tiling_active
+            || arranged_in_tree(state, display_id, window_id))
+}
+
 fn directional_neighbor(state: &EngineState, direction: CardinalDirection) -> Option<WindowId> {
     let focused = state.focused_window?;
     let source = state.inventory.get(&focused)?;
-    if source.eligibility != EligibilityReason::Eligible {
+    if !directional_endpoint(state, source.window.display_id, focused) {
         return None;
     }
     let source_bounds = state.windows.get(&focused)?.bounds;
@@ -1831,10 +2535,7 @@ fn directional_neighbor(state: &EngineState, direction: CardinalDirection) -> Op
             if *candidate_id == focused {
                 return None;
             }
-            let managed = state.inventory.get(candidate_id)?;
-            if managed.eligibility != EligibilityReason::Eligible
-                || managed.window.display_id != source.window.display_id
-            {
+            if !directional_endpoint(state, source.window.display_id, *candidate_id) {
                 return None;
             }
             let bounds = state.windows.get(candidate_id)?.bounds;
@@ -1893,10 +2594,21 @@ fn replace_inventory_from_observations(state: &mut EngineState, observed: Vec<Wi
     let evaluator =
         RuleEvaluator::new(state.rules.iter().cloned().chain(builtin_rules()).collect());
     let mut next = HashMap::new();
+    let mut rule_targets: Vec<(WindowId, Option<String>, String)> = Vec::new();
     for window in observed {
-        let action = evaluator.evaluate(&window).actions.manage;
+        let evaluation = evaluator.evaluate(&window);
+        let action = evaluation.actions.manage;
         if action == ManageAction::Exclude {
             continue;
+        }
+        // A rule's workspace target is applied once, when the window is
+        // first managed; membership is a fact about the window from then
+        // on, and re-evaluating it on every observation would fight a
+        // workspace move the user makes later.
+        if let Some(target) = evaluation.actions.workspace {
+            if !state.inventory.contains_key(&window.id) {
+                rule_targets.push((window.id, evaluation.matching_rule_id, target));
+            }
         }
         let circuit_open = state
             .windows
@@ -1938,8 +2650,529 @@ fn replace_inventory_from_observations(state: &mut EngineState, observed: Vec<Wi
     {
         state.focused_window = None;
     }
+    // A member of a hidden workspace that closed while hidden goes
+    // dormant in that workspace's stashed tree now, while the evidence
+    // captured at its last reflow is still here. The displayed trees do
+    // this for themselves on their next reflow.
+    let departed: Vec<WindowId> = state
+        .inventory
+        .keys()
+        .filter(|id| !managed_ids.contains(id))
+        .copied()
+        .collect();
+    let now = now_unix();
+    for window_id in departed {
+        let Some(name) = state.workspaces.workspace_of(window_id).cloned() else {
+            continue;
+        };
+        if state.workspaces.is_displayed(&name) {
+            continue;
+        }
+        let evidence = state.leaf_evidence.remove(&window_id);
+        if let Some(workspace) = state.workspaces.get_mut(&name) {
+            if let Some(tree) = workspace.stashed_tree.as_mut() {
+                match evidence {
+                    Some(evidence) => {
+                        tree.make_dormant(
+                            &window_id,
+                            DormantPosition {
+                                evidence,
+                                since_unix: now,
+                            },
+                        );
+                    }
+                    None => {
+                        tree.remove(&window_id);
+                    }
+                }
+            }
+        }
+    }
+    state
+        .workspaces
+        .retain_members(|id| managed_ids.contains(&id));
+    state
+        .rule_workspace_refusals
+        .retain(|refusal| managed_ids.contains(&refusal.window_id));
     state.inventory = next;
+    // Rule targets first, so a window a rule sends elsewhere is never
+    // first placed in the workspace of the display it appeared on.
+    for (window_id, rule_id, target) in rule_targets {
+        match state.workspaces.resolve(&target) {
+            Some(name) => {
+                state.workspaces.assign(window_id, &name);
+            }
+            None => {
+                tracing::warn!(
+                    ?window_id,
+                    workspace = %target,
+                    "a rule names a workspace that does not exist; the window keeps its display's workspace"
+                );
+                state.rule_workspace_refusals.push(RuleWorkspaceRefusal {
+                    window_id,
+                    rule_id,
+                    workspace: target,
+                });
+            }
+        }
+    }
+    assign_unassigned_windows(state);
     inventory_changed || placements_changed
+}
+
+/// The display `window_id` should be arranged on: where its workspace is
+/// displayed, or nowhere while that workspace is hidden. A window that
+/// belongs to no workspace -- one on a display the pool has no workspace
+/// left to fill -- is arranged where it physically is, exactly as before
+/// workspaces existed.
+fn arrangement_display_of(state: &EngineState, window_id: WindowId) -> Option<DisplayId> {
+    match state.workspaces.workspace_of(window_id) {
+        Some(name) => state.workspaces.display_of(name),
+        None => state
+            .inventory
+            .get(&window_id)
+            .map(|managed| managed.window.display_id),
+    }
+}
+
+/// Gives every managed window that belongs to no workspace the workspace
+/// displayed where it sits, if that display has one. Every tiled and
+/// floating managed window belongs to exactly one workspace whenever the
+/// pool can provide one (ADR 0028); the engine never creates one to make
+/// that true.
+fn assign_unassigned_windows(state: &mut EngineState) {
+    let unassigned: Vec<(WindowId, DisplayId)> = state
+        .inventory
+        .values()
+        .filter(|managed| state.workspaces.workspace_of(managed.window.id).is_none())
+        .map(|managed| (managed.window.id, managed.window.display_id))
+        .collect();
+    for (window_id, display_id) in unassigned {
+        if let Some(name) = state.workspaces.displayed_on(display_id).cloned() {
+            state.workspaces.assign(window_id, &name);
+        }
+    }
+}
+
+/// Brings the pool up to date with what configuration declares: every
+/// declared name exists, owned by configuration; a name configuration
+/// stopped declaring stays -- deletion is never implicit -- but becomes
+/// deletable by command (ADR 0028).
+fn sync_workspaces_from_config(state: &mut EngineState) {
+    let declared: Vec<WorkspaceName> = state.resolved_config.workspaces.clone();
+    for name in &declared {
+        match state.workspaces.resolve(name.as_str()) {
+            Some(existing) => {
+                if let Some(workspace) = state.workspaces.get_mut(&existing) {
+                    workspace.origin = WorkspaceOrigin::Configuration;
+                }
+            }
+            None => {
+                let _ = state
+                    .workspaces
+                    .create(name.clone(), WorkspaceOrigin::Configuration);
+            }
+        }
+    }
+    for name in state.workspaces.names() {
+        if !declared
+            .iter()
+            .any(|declared| declared.collides_with(&name))
+        {
+            if let Some(workspace) = state.workspaces.get_mut(&name) {
+                workspace.origin = WorkspaceOrigin::Command;
+            }
+        }
+    }
+}
+
+/// Gives every display with no displayed workspace one, if the pool has
+/// one to give: first the workspace that was displayed on that display
+/// when last written, then any hidden workspace that owns no live window,
+/// in name order. A hidden workspace with windows is never revealed by a
+/// display appearing (ADR 0028). A display the pool cannot fill stays
+/// without a workspace, and arranges its windows as it did before
+/// workspaces existed.
+fn fill_empty_displays(state: &mut EngineState) {
+    let mut displays: Vec<&Display> = state.displays.iter().collect();
+    displays.sort_by_key(|display| (!display.is_primary, display.id.0));
+    let displays: Vec<(DisplayId, String)> = displays
+        .into_iter()
+        .map(|display| (display.id, display.stable_fingerprint.clone()))
+        .collect();
+    for (display_id, fingerprint) in displays {
+        if state.workspaces.displayed_on(display_id).is_some() {
+            continue;
+        }
+        let remembered = state
+            .pending_displayed
+            .iter()
+            .filter(|(name, stored)| {
+                **stored == fingerprint && !state.workspaces.is_displayed(name)
+            })
+            .map(|(name, _)| name.clone())
+            .min();
+        // Configuration's own order first, so `workspaces = ["dev",
+        // "chat"]` puts dev on the primary display; then anything else
+        // the pool holds, by name.
+        let chosen = remembered.or_else(|| {
+            let hidden_and_empty = state.workspaces.hidden_and_empty();
+            state
+                .resolved_config
+                .workspaces
+                .iter()
+                .filter_map(|declared| {
+                    hidden_and_empty
+                        .iter()
+                        .find(|name| name.collides_with(declared))
+                        .cloned()
+                })
+                .chain(hidden_and_empty.iter().cloned())
+                .next()
+        });
+        let Some(name) = chosen else {
+            continue;
+        };
+        state.pending_displayed.remove(&name);
+        state.workspaces.display(&name, display_id);
+        adopt_workspace_tree(state, &name, display_id);
+    }
+}
+
+/// Applies the matched profile's switching mapping as one transition, or
+/// leaves the displayed assignment exactly as it was (ADR 0028).
+///
+/// Every display and every name is resolved before anything changes, so
+/// a mapping that cannot be completed changes nothing and is reported as
+/// unavailable with the first reason found; the engine never invents a
+/// workspace to finish it. When the mapping already holds, nothing is
+/// stashed or adopted, so an unrelated config reload does not disturb
+/// the trees.
+fn apply_switching_mapping(state: &mut EngineState) {
+    state.switching_unavailable = None;
+    let Some(switching) = state.resolved_config.workspace_switching.clone() else {
+        return;
+    };
+    if !switching.experimental {
+        return;
+    }
+    let mut target: Vec<(DisplayId, WorkspaceName)> = Vec::new();
+    for (fingerprint, name) in &switching.displayed {
+        let Some(display_id) = display_id_of(state, fingerprint) else {
+            state.switching_unavailable =
+                Some(WorkspaceSwitchingUnavailable::DisplayNotConnected {
+                    display_fingerprint: fingerprint.clone(),
+                });
+            return;
+        };
+        let Some(name) = state.workspaces.resolve(name.as_str()) else {
+            state.switching_unavailable = Some(WorkspaceSwitchingUnavailable::UnknownWorkspace {
+                name: name.as_str().to_owned(),
+            });
+            return;
+        };
+        target.push((display_id, name));
+    }
+    for display in &state.displays {
+        if !target
+            .iter()
+            .any(|(display_id, _)| *display_id == display.id)
+        {
+            state.switching_unavailable = Some(WorkspaceSwitchingUnavailable::MappingIncomplete {
+                display_fingerprint: display.stable_fingerprint.clone(),
+            });
+            return;
+        }
+    }
+    target.sort_by_key(|(display_id, _)| display_id.0);
+    if state.workspaces.displayed() == target {
+        return;
+    }
+    tracing::info!("applying the profile's workspace mapping to every display");
+    // Every display gives up what it shows before any takes what it is
+    // mapped to, so two workspaces exchanging displays each carry their
+    // own tree rather than inheriting the other's.
+    for (display_id, _) in &target {
+        if state.workspaces.displayed_on(*display_id).is_some() {
+            stash_display_tree(state, *display_id);
+            state.workspaces.hide_display(*display_id);
+        }
+    }
+    for (display_id, name) in &target {
+        state.workspaces.display(name, *display_id);
+        adopt_workspace_tree(state, name, *display_id);
+    }
+}
+
+/// Moves `display_id`'s live tree into the workspace displayed there, so
+/// the workspace keeps its structure while hidden. The display's
+/// per-display bookkeeping goes with it.
+fn stash_display_tree(state: &mut EngineState, display_id: DisplayId) {
+    let tree = state.trees.remove(&display_id);
+    state.saved_trees.remove(&display_id);
+    state.constraint_overflow.remove(&display_id);
+    state.visual_window_order.remove(&display_id);
+    let Some(name) = state.workspaces.displayed_on(display_id).cloned() else {
+        return;
+    };
+    if let Some(workspace) = state.workspaces.get_mut(&name) {
+        workspace.stashed_tree = tree;
+    }
+}
+
+/// Takes `name`'s stashed tree out and makes it `display_id`'s live tree.
+/// A workspace with nothing stashed leaves the display to build one, or
+/// to adopt the stored tree waiting in `pending_workspace_trees`.
+fn adopt_workspace_tree(state: &mut EngineState, name: &WorkspaceName, display_id: DisplayId) {
+    let stashed = state
+        .workspaces
+        .get_mut(name)
+        .and_then(|workspace| workspace.stashed_tree.take());
+    state.saved_trees.remove(&display_id);
+    state.constraint_overflow.remove(&display_id);
+    match stashed {
+        Some(tree) => {
+            state.trees.insert(display_id, tree);
+        }
+        None => {
+            state.trees.remove(&display_id);
+        }
+    }
+}
+
+/// Hides the workspace of every display absent from `new_displays`,
+/// stashing its tree first so the retain below does not drop it.
+fn hide_workspaces_on_vanished_displays(state: &mut EngineState, new_displays: &[Display]) {
+    let vanished: Vec<DisplayId> = state
+        .displays
+        .iter()
+        .filter(|display| {
+            !new_displays
+                .iter()
+                .any(|survivor| survivor.id == display.id)
+        })
+        .map(|display| display.id)
+        .collect();
+    for display_id in vanished {
+        stash_display_tree(state, display_id);
+    }
+    let hidden = state
+        .workspaces
+        .retain_displays(|display_id| new_displays.iter().any(|display| display.id == display_id));
+    if !hidden.is_empty() {
+        tracing::info!(
+            count = hidden.len(),
+            "workspaces on vanished displays are now hidden"
+        );
+    }
+}
+
+/// The durable form of one workspace as it stands now.
+fn persisted_workspace(state: &EngineState, name: &WorkspaceName) -> Option<PersistedWorkspace> {
+    let workspace = state.workspaces.get(name)?;
+    let display_id = state.workspaces.display_of(name);
+    let tree = match display_id {
+        Some(display_id) => state
+            .trees
+            .get(&display_id)
+            .map(|tree| durable_tree(state, tree)),
+        None => workspace
+            .stashed_tree
+            .as_ref()
+            .map(|tree| durable_tree(state, tree)),
+    };
+    Some(PersistedWorkspace {
+        name: name.clone(),
+        origin: workspace.origin,
+        displayed_fingerprint: display_id
+            .and_then(|display_id| display_fingerprint_of(state, display_id)),
+        tree: tree.filter(|tree| !tree.is_empty()),
+    })
+}
+
+/// Writes every workspace whose durable form changed since it was last
+/// written. A workspace whose tree is still waiting in
+/// `pending_workspace_trees` is left alone: writing its empty live tree
+/// now would overwrite the stored one before it was ever adopted.
+fn persist_workspaces(state: &mut EngineState) {
+    for name in state.workspaces.names() {
+        if state.pending_workspace_trees.contains_key(&name) {
+            continue;
+        }
+        let Some(persisted) = persisted_workspace(state, &name) else {
+            continue;
+        };
+        if state.saved_workspaces.get(&name) == Some(&persisted) {
+            continue;
+        }
+        state
+            .persistence_intents
+            .push(PersistenceIntent::SaveWorkspace(Box::new(
+                persisted.clone(),
+            )));
+        state.saved_workspaces.insert(name, persisted);
+    }
+}
+
+/// Decides whether `window_id` may be parked, and with what recovery
+/// data, without recording anything (ADR 0023).
+///
+/// Every refusal comes before the draft exists: a degraded state
+/// database, an unverified or refused parking site, a full-screen
+/// window, or a window the topology cannot place. The draft's process
+/// creation time is left for the agent, which has platform access, to
+/// fill in before the entry is written.
+pub fn plan_parking_authorization(
+    state: &EngineState,
+    window_id: WindowId,
+) -> Result<RecoveryDraft, ParkingRefusal> {
+    let managed = state
+        .inventory
+        .get(&window_id)
+        .ok_or(ParkingRefusal::NotManaged { window_id })?;
+    if matches!(state.persistence_health, PersistenceHealth::Degraded { .. }) {
+        return Err(ParkingRefusal::PersistenceDegraded);
+    }
+    match &state.parking_capability {
+        ParkingCapability::Verified => {}
+        ParkingCapability::Unverified => return Err(ParkingRefusal::ParkingCapabilityUnverified),
+        ParkingCapability::Refused { reason } => {
+            return Err(ParkingRefusal::ParkingRefused {
+                reason: reason.clone(),
+            })
+        }
+    }
+    if managed.window.lifecycle == WindowLifecycle::Fullscreen {
+        return Err(ParkingRefusal::Fullscreen { window_id });
+    }
+    if state
+        .pending_parking
+        .iter()
+        .any(|pending| pending.window_id == window_id)
+    {
+        return Err(ParkingRefusal::AlreadyPending { window_id });
+    }
+    let fingerprint = display_fingerprint_of(state, managed.window.display_id)
+        .ok_or(ParkingRefusal::UnknownDisplay { window_id })?;
+    // The normal bounds are the placement the reducer intends when the
+    // window is not maximised; a maximised window's `bounds` is its
+    // maximised extent, so the last intended placement stands in.
+    let normal_bounds = state
+        .windows
+        .get(&window_id)
+        .map(|placement| placement.bounds)
+        .unwrap_or(managed.window.bounds);
+    Ok(RecoveryDraft::capture(
+        &managed.window,
+        &state.session_id,
+        &fingerprint,
+        normal_bounds,
+        now_unix(),
+    ))
+}
+
+/// Decides what creating a workspace would do, without doing it.
+pub fn plan_workspace_create(
+    state: &EngineState,
+    name: &str,
+) -> Result<WorkspaceCreateApplied, WorkspaceRefusal> {
+    let name =
+        WorkspaceName::new(name).map_err(|reason| WorkspaceRefusal::InvalidName { reason })?;
+    if let Some(existing) = state.workspaces.resolve(name.as_str()) {
+        return Err(WorkspaceRefusal::AlreadyExists { name: existing });
+    }
+    Ok(WorkspaceCreateApplied { name })
+}
+
+/// Decides what deleting a workspace would do, without doing it.
+pub fn plan_workspace_delete(
+    state: &EngineState,
+    name: &str,
+) -> Result<WorkspaceDeleteApplied, WorkspaceRefusal> {
+    state
+        .workspaces
+        .check_delete(name)
+        .map(|name| WorkspaceDeleteApplied { name })
+}
+
+/// Decides what focusing a workspace would do, without doing it
+/// (CONTEXT.md "Workspace focus"). The same function answers the IPC
+/// preflight and drives the reducer, so a caller is never told something
+/// different from what happens.
+pub fn plan_workspace_focus(
+    state: &EngineState,
+    name: &str,
+) -> Result<WorkspaceFocusApplied, WorkspaceRefusal> {
+    let name = state.workspaces.require(name)?;
+    if let Some(display_id) = state.workspaces.display_of(&name) {
+        let last_focused = state
+            .workspaces
+            .get(&name)
+            .and_then(|workspace| workspace.last_focused)
+            .filter(|window_id| state.inventory.contains_key(window_id));
+        let focused_window = last_focused.or_else(|| {
+            state
+                .workspaces
+                .members_of(&name)
+                .into_iter()
+                .find(|window_id| state.inventory.contains_key(window_id))
+        });
+        return Ok(WorkspaceFocusApplied::FocusedExisting {
+            name,
+            display_id,
+            focused_window,
+        });
+    }
+    if state.paused {
+        return Err(WorkspaceRefusal::Paused);
+    }
+    let display_id = state
+        .focused_display
+        .filter(|display_id| {
+            state
+                .displays
+                .iter()
+                .any(|display| display.id == *display_id)
+        })
+        .ok_or(WorkspaceRefusal::NoFocusedDisplay)?;
+    Ok(WorkspaceFocusApplied::Displayed {
+        name,
+        display_id,
+        replaced: state.workspaces.displayed_on(display_id).cloned(),
+    })
+}
+
+/// Decides what moving a displayed workspace to `display_id` would do,
+/// without doing it.
+pub fn plan_workspace_move(
+    state: &EngineState,
+    name: &str,
+    display_id: DisplayId,
+) -> Result<WorkspaceMoveApplied, WorkspaceRefusal> {
+    let name = state.workspaces.require(name)?;
+    if state.paused {
+        return Err(WorkspaceRefusal::Paused);
+    }
+    let from_display_id = state
+        .workspaces
+        .display_of(&name)
+        .ok_or_else(|| WorkspaceRefusal::NotDisplayed { name: name.clone() })?;
+    if !state
+        .displays
+        .iter()
+        .any(|display| display.id == display_id)
+    {
+        return Err(WorkspaceRefusal::UnknownDisplay { display_id });
+    }
+    if from_display_id == display_id {
+        return Err(WorkspaceRefusal::AlreadyDisplayedThere { name, display_id });
+    }
+    Ok(WorkspaceMoveApplied {
+        name,
+        from_display_id,
+        to_display_id: display_id,
+        swapped_with: state.workspaces.displayed_on(display_id).cloned(),
+    })
 }
 
 /// Updates visual order and emits one final Balanced-grid plan per affected
@@ -1964,11 +3197,19 @@ fn reconcile_arrangements(state: &mut EngineState) {
 /// Shared by both planners so a window can never be tiled under one
 /// arrangement and forgotten under the other.
 fn refresh_tiling_sets(state: &mut EngineState) -> Vec<(DisplayId, Rect, Vec<WindowId>)> {
+    // A window is arranged where its workspace is displayed, which is its
+    // physical display except while a workspace focus is carrying it to
+    // the focused display, and nowhere while its workspace is hidden.
+    let arrangement: HashMap<WindowId, Option<DisplayId>> = state
+        .inventory
+        .keys()
+        .map(|id| (*id, arrangement_display_of(state, *id)))
+        .collect();
     for (display_id, order) in &mut state.visual_window_order {
         order.retain(|id| {
             state.inventory.get(id).is_some_and(|managed| {
                 (managed.action == ManageAction::Tile || state.session_tiled.contains(id))
-                    && managed.window.display_id == *display_id
+                    && arrangement.get(id).copied().flatten() == Some(*display_id)
             })
         });
     }
@@ -1978,12 +3219,9 @@ fn refresh_tiling_sets(state: &mut EngineState) -> Vec<(DisplayId, Rect, Vec<Win
         .filter(|managed| {
             managed.action == ManageAction::Tile || state.session_tiled.contains(&managed.window.id)
         })
-        .map(|managed| {
-            (
-                managed.window.display_id,
-                managed.window.id,
-                managed.window.bounds,
-            )
+        .filter_map(|managed| {
+            let display_id = arrangement.get(&managed.window.id).copied().flatten()?;
+            Some((display_id, managed.window.id, managed.window.bounds))
         })
         .collect();
     candidates.sort_by_key(|(display, id, bounds)| (display.0, bounds.y, bounds.x, id.0));
@@ -2007,7 +3245,7 @@ fn refresh_tiling_sets(state: &mut EngineState) -> Vec<(DisplayId, Rect, Vec<Win
                 .into_iter()
                 .filter(|id| {
                     state.inventory.get(id).is_some_and(|managed| {
-                        managed.window.display_id == display.id
+                        arrangement.get(id).copied().flatten() == Some(display.id)
                             && (managed.action == ManageAction::Tile
                                 || state.session_tiled.contains(id))
                             && managed.eligibility == EligibilityReason::Eligible
@@ -2035,6 +3273,7 @@ fn reconcile_balanced_grids(state: &mut EngineState) {
     if !state.automatic_tiling_active || state.paused {
         return;
     }
+    state.constraint_overflow.clear();
 
     for (display_id, work_area, active) in refresh_tiling_sets(state) {
         if defer_reflow(state, display_id) {
@@ -2066,8 +3305,14 @@ fn reconcile_container_trees(state: &mut EngineState) {
         return;
     }
 
-    let live_displays: HashSet<DisplayId> = state.displays.iter().map(|display| display.id).collect();
-    state.trees.retain(|display_id, _| live_displays.contains(display_id));
+    let live_displays: HashSet<DisplayId> =
+        state.displays.iter().map(|display| display.id).collect();
+    state
+        .trees
+        .retain(|display_id, _| live_displays.contains(display_id));
+    state
+        .constraint_overflow
+        .retain(|display_id, _| live_displays.contains(display_id));
 
     for (display_id, work_area, active) in refresh_tiling_sets(state) {
         if defer_reflow(state, display_id) {
@@ -2090,34 +3335,104 @@ fn reconcile_container_trees(state: &mut EngineState) {
         //
         // `pending_trees` is a startup payload and is consumed here, so
         // this happens once and the reducer is the authority afterwards.
-        if let Some(stored) = fingerprint
+        let now = now_unix();
+        let workspace = state.workspaces.displayed_on(display_id).cloned();
+        // A displayed workspace's own stored tree comes first. Failing
+        // that, the display-anchored tree written before workspaces
+        // existed is adopted by the workspace now displayed there, so an
+        // upgrade keeps the arrangement the user had.
+        let stored = workspace
             .as_ref()
-            .and_then(|fingerprint| state.pending_trees.remove(fingerprint))
-        {
-            tree = restore_tree(state, &stored, &active);
+            .and_then(|name| state.pending_workspace_trees.remove(name))
+            .or_else(|| {
+                fingerprint
+                    .as_ref()
+                    .and_then(|fingerprint| state.pending_trees.remove(fingerprint))
+            });
+        if let Some(stored) = stored {
+            tree = restore_tree(state, &stored, &active, now);
         }
 
-        // Windows that are no longer tiled here give their space back.
-        // Dormant leaves, which would hold that space open for a later
-        // match, are deferred: see issue #9.
+        // A window that has closed leaves its slot dormant rather than
+        // giving it up, so a confident return can reclaim it (spec user
+        // stories 38 and 39). The evidence was captured at the last
+        // reflow, because a closed window is already gone from the
+        // inventory by now. A window that is still open but no longer
+        // tiled here -- floated, minimized, or moved to another display
+        // -- simply leaves the tree: it is not lost, and a slot kept for
+        // a window the user can see would be a ghost. A leaf nothing could
+        // ever recognise is removed instead of holding space open forever.
         let departed: Vec<WindowId> = tree
-            .leaves()
+            .windows()
             .into_iter()
             .filter(|window_id| !active.contains(window_id))
             .copied()
             .collect();
         for window_id in departed {
-            tree.remove(&window_id);
+            let evidence = state.leaf_evidence.remove(&window_id);
+            match evidence {
+                Some(evidence) if !state.inventory.contains_key(&window_id) => {
+                    tree.make_dormant(
+                        &window_id,
+                        DormantPosition {
+                            evidence,
+                            since_unix: now,
+                        },
+                    );
+                }
+                _ => {
+                    tree.remove(&window_id);
+                }
+            }
+        }
+        tree.prune_dormant(now);
+
+        // A returning window takes its old slot back only on a confident
+        // match; anything less inserts it fresh and leaves the slot for a
+        // better candidate (spec user story 39). Slots are offered in
+        // visual order and each window is claimed at most once, so the
+        // outcome does not depend on enumeration order.
+        let mut unplaced: Vec<WindowId> = active
+            .iter()
+            .filter(|window_id| !tree.contains(window_id))
+            .copied()
+            .collect();
+        for (position, dormant) in tree
+            .dormant_positions()
+            .into_iter()
+            .map(|(position, dormant)| (position, dormant.clone()))
+            .collect::<Vec<_>>()
+        {
+            let candidates: Vec<&Window> = unplaced
+                .iter()
+                .filter_map(|window_id| state.inventory.get(window_id))
+                .map(|managed| &managed.window)
+                .collect();
+            let Some(window_id) = match_window_with_order(
+                &dormant.evidence,
+                candidates.iter().copied(),
+                |window| display_fingerprint_of(state, window.display_id),
+                |window| Some(launch_order_of(state, window.id)),
+            )
+            .confident_window() else {
+                continue;
+            };
+            if tree.reclaim(position, window_id) {
+                unplaced.retain(|id| *id != window_id);
+            }
         }
 
         // New windows arrive in visual order, so the arrangement a set of
         // windows produces does not depend on which order they were
-        // observed in.
-        for window_id in &active {
-            if tree.contains(window_id) {
+        // observed in. A tree of only dormant slots has no window to
+        // split, so the newcomer goes beside the whole arrangement and
+        // has the display to itself until a slot is reclaimed.
+        for window_id in &unplaced {
+            if tree.insert_first(*window_id) {
                 continue;
             }
-            if tree.insert_first(*window_id) {
+            if !tree.has_windows() {
+                tree.split_root(longer_axis_of(work_area), *window_id);
                 continue;
             }
             let placements = plan_tree_raw(&tree, work_area);
@@ -2127,25 +3442,56 @@ fn reconcile_container_trees(state: &mut EngineState) {
             tree.split_leaf(&insertion.target, insertion.axis, *window_id);
         }
 
+        // Refresh what would recognise each window, now that it is where
+        // the tree put it. This is what a later dormancy is built from.
+        for window_id in tree.windows() {
+            if let Some(evidence) = evidence_for(state, *window_id) {
+                state.leaf_evidence.insert(*window_id, evidence);
+            }
+        }
+
         // Only a structural change is worth a write. A reflow that moved
         // windows without reshaping the tree -- a display resizing, say --
         // has nothing new to store.
         if state.saved_trees.get(&display_id) != Some(&tree) {
-            if let Some(fingerprint) = fingerprint {
-                let durable = durable_tree(state, &tree);
-                state
-                    .persistence_intents
-                    .push(PersistenceIntent::SaveContainerTree {
-                        display_fingerprint: fingerprint,
-                        tree: Box::new(durable),
-                    });
-                state.saved_trees.insert(display_id, tree.clone());
+            // A display with a workspace stores its tree under the
+            // workspace, written by `persist_workspaces` once the tree is
+            // in place below; only a display the pool could not fill
+            // keeps the display-anchored row.
+            if workspace.is_none() {
+                if let Some(fingerprint) = fingerprint {
+                    let durable = durable_tree(state, &tree);
+                    state
+                        .persistence_intents
+                        .push(PersistenceIntent::SaveContainerTree {
+                            display_fingerprint: fingerprint,
+                            tree: Box::new(durable),
+                        });
+                }
             }
+            state.saved_trees.insert(display_id, tree.clone());
         }
 
-        let planned = plan_tree(&tree, work_area, state.resolved_config.gaps);
+        // A window the display cannot fit at its minimum size is left
+        // where it is rather than squeezed: it keeps its leaf and its
+        // management, and comes back the moment the tree can hold it
+        // (spec user stories 45 and 46). Nothing here floats it by choice,
+        // so the overflow set is recomputed from scratch every reflow.
+        let planned = plan_tree_constrained(&tree, work_area, state.resolved_config.gaps, |id| {
+            state
+                .inventory
+                .get(&id)
+                .and_then(|managed| managed.window.minimum_size)
+        });
         state.trees.insert(display_id, tree);
-        for (window_id, bounds) in planned {
+        if planned.overflow.is_empty() {
+            state.constraint_overflow.remove(&display_id);
+        } else {
+            state
+                .constraint_overflow
+                .insert(display_id, planned.overflow);
+        }
+        for (window_id, bounds) in planned.placements {
             let unchanged = state.windows.get(&window_id).is_some_and(|placement| {
                 placement.display_id == display_id && placement.bounds == bounds
             });
@@ -2154,6 +3500,13 @@ fn reconcile_container_trees(state: &mut EngineState) {
             }
         }
     }
+    // Evidence is only ever needed for a window that could still close
+    // out of a tree; anything the inventory no longer holds has already
+    // gone dormant or been dropped above.
+    state
+        .leaf_evidence
+        .retain(|window_id, _| state.inventory.contains_key(window_id));
+    persist_workspaces(state);
 }
 
 /// Turns a stored arrangement back into a live one.
@@ -2166,6 +3519,7 @@ fn restore_tree(
     state: &EngineState,
     stored: &PersistedTree,
     active: &[WindowId],
+    now_unix: i64,
 ) -> ContainerTree {
     let candidates: Vec<&Window> = active
         .iter()
@@ -2173,7 +3527,7 @@ fn restore_tree(
         .map(|managed| &managed.window)
         .collect();
     let mut claimed: HashSet<WindowId> = HashSet::new();
-    stored.filter_map_leaves(&mut |evidence| {
+    let mut identify = |evidence: &WindowEvidence| {
         match_window_with_order(
             evidence,
             candidates.iter().copied(),
@@ -2182,23 +3536,58 @@ fn restore_tree(
         )
         .confident_window()
         .filter(|window_id| claimed.insert(*window_id))
-    })
+    };
+    // A stored slot whose window is not here becomes dormant from now:
+    // the structure is kept for a later confident return rather than
+    // dropped. A slot that was already dormant keeps the time it went
+    // dormant, so retention counts from the right moment, and is pruned
+    // here if that moment is far enough back (spec user story 40).
+    let mut restored = stored.convert_leaves(&mut |leaf| match &leaf.occupant {
+        Occupant::Live(evidence) => match identify(evidence) {
+            Some(window_id) => LeafFate::Live(window_id),
+            None => LeafFate::Dormant(DormantPosition {
+                evidence: evidence.clone(),
+                since_unix: now_unix,
+            }),
+        },
+        Occupant::Dormant(position) => match identify(&position.evidence) {
+            Some(window_id) => LeafFate::Live(window_id),
+            None => LeafFate::Dormant(position.clone()),
+        },
+    });
+    restored.prune_dormant(now_unix);
+    restored
+}
+
+/// What would recognise `window_id` in a later session, if the inventory
+/// can describe it.
+fn evidence_for(state: &EngineState, window_id: WindowId) -> Option<WindowEvidence> {
+    let managed = state.inventory.get(&window_id)?;
+    let fingerprint = display_fingerprint_of(state, managed.window.display_id)?;
+    Some(WindowEvidence::capture(
+        &managed.window,
+        launch_order_of(state, window_id),
+        &fingerprint,
+    ))
 }
 
 /// The durable form of a live tree: the same structure with each window
-/// replaced by evidence that can find it again. A window the inventory
-/// cannot describe is dropped, because a leaf nothing could ever match
-/// would only hold space open forever.
+/// replaced by evidence that can find it again, and each dormant slot
+/// kept as it is. A window the inventory cannot describe is dropped,
+/// because a leaf nothing could ever match would only hold space open
+/// forever.
 fn durable_tree(state: &EngineState, tree: &ContainerTree) -> PersistedTree {
-    tree.filter_map_leaves(&mut |window_id| {
-        let managed = state.inventory.get(window_id)?;
-        let fingerprint = display_fingerprint_of(state, managed.window.display_id)?;
-        Some(WindowEvidence::capture(
-            &managed.window,
-            launch_order_of(state, *window_id),
-            &fingerprint,
-        ))
-    })
+    tree.filter_map_windows(&mut |window_id| evidence_for(state, *window_id))
+}
+
+/// Splitting "on the longer axis" of a work area: side by side when it is
+/// wide, stacked when it is tall.
+const fn longer_axis_of(area: Rect) -> SplitAxis {
+    if area.width >= area.height {
+        SplitAxis::Horizontal
+    } else {
+        SplitAxis::Vertical
+    }
 }
 
 /// The resolved config that should be active for `displays`' current
@@ -2267,6 +3656,203 @@ pub fn diff_placements(
 /// some members have moved and a later one turns out to be unresolvable.
 /// The same function answers the IPC preflight and drives the reducer, so a
 /// caller is never told something different from what happens.
+/// Whether automatic tiling is currently producing container trees, which
+/// is what every tree command requires.
+fn tree_mode_active(state: &EngineState) -> bool {
+    state.resolved_config.tiling_mode == TilingMode::Tree && state.automatic_tiling_active
+}
+
+/// The windows currently eligible to occupy leaves of `display_id`'s tree:
+/// tiled, on that display, and not temporarily ineligible.
+fn active_tiled_windows_on(state: &EngineState, display_id: DisplayId) -> Vec<WindowId> {
+    let mut active: Vec<WindowId> = state
+        .inventory
+        .values()
+        .filter(|managed| {
+            managed.window.display_id == display_id
+                && (managed.action == ManageAction::Tile
+                    || state.session_tiled.contains(&managed.window.id))
+                && managed.eligibility == EligibilityReason::Eligible
+        })
+        .map(|managed| managed.window.id)
+        .collect();
+    active.sort_unstable_by_key(|id| id.0);
+    active
+}
+
+/// A resize the reducer would apply: the typed outcome to report, and the
+/// reshaped tree to adopt.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TreeResizePlan {
+    pub applied: TreeResizeApplied,
+    pub tree: ContainerTree,
+}
+
+/// What resizing the focused window's tree in `direction` would do
+/// against `state` right now, or the typed reason it would do nothing.
+///
+/// Pure over `state`, so the IPC handler and the reducer reach the same
+/// verdict from the same state. The full five-point step is taken when
+/// every arranged window stays at or above its minimum size with the
+/// gaps it has; otherwise the largest smaller whole step that does is
+/// taken, and if not even one point is legal the command is refused
+/// without touching the tree (spec user stories 33, 34, and 37).
+/// "Legal" means the resize neither overflows a window that was arranged
+/// nor costs any decoration: a resize is a request about weights, and
+/// it must not be answered by degrading the arrangement.
+pub fn plan_tree_resize(
+    state: &EngineState,
+    direction: CardinalDirection,
+) -> Result<TreeResizePlan, TreeResizeRefusal> {
+    let command = resize_command(direction).to_owned();
+    if state.paused {
+        return Err(TreeResizeRefusal::Paused);
+    }
+    if !tree_mode_active(state) {
+        return Err(TreeResizeRefusal::NotTreeMode);
+    }
+    let window_id = state
+        .focused_window
+        .ok_or(TreeResizeRefusal::NoFocusedWindow)?;
+    let display_id = state
+        .inventory
+        .get(&window_id)
+        .map(|managed| managed.window.display_id)
+        .ok_or(TreeResizeRefusal::NoFocusedWindow)?;
+    let work_area = work_area_of(&state.displays, display_id)
+        .ok_or(TreeResizeRefusal::DisplayUnavailable { display_id })?;
+    if !arranged_in_tree(state, display_id, window_id) {
+        return Err(TreeResizeRefusal::NotArranged { window_id });
+    }
+    let tree = state
+        .trees
+        .get(&display_id)
+        .ok_or(TreeResizeRefusal::NotArranged { window_id })?;
+    let (axis, toward) = divider_for(direction);
+    if !tree.has_divider_toward(&window_id, axis, toward) {
+        return Err(TreeResizeRefusal::NoDivider { command });
+    }
+
+    let minimum_size = |id: WindowId| {
+        state
+            .inventory
+            .get(&id)
+            .and_then(|managed| managed.window.minimum_size)
+    };
+    let gaps = state.resolved_config.gaps;
+    let current = plan_tree_constrained(tree, work_area, gaps, minimum_size);
+
+    for points in (1..=TREE_RESIZE_STEP_PERCENT).rev() {
+        let mut candidate = tree.clone();
+        let Some(change) =
+            candidate.resize_toward(&window_id, axis, toward, f64::from(points) / 100.0)
+        else {
+            continue;
+        };
+        let planned = plan_tree_constrained(&candidate, work_area, gaps, minimum_size);
+        let no_new_overflow = planned
+            .overflow
+            .iter()
+            .all(|id| current.overflow.contains(id));
+        let no_lost_decoration =
+            planned.gaps.outer >= current.gaps.outer && planned.gaps.inner >= current.gaps.inner;
+        if no_new_overflow && no_lost_decoration {
+            return Ok(TreeResizePlan {
+                applied: TreeResizeApplied {
+                    command,
+                    display_id,
+                    window_id,
+                    percentage_points: points,
+                    grew: change.grew,
+                    shrank: change.shrank,
+                    weights_before: change.weights_before,
+                    weights_after: change.weights_after,
+                },
+                tree: candidate,
+            });
+        }
+    }
+    Err(TreeResizeRefusal::MinimumSizeReached { command })
+}
+
+/// What swapping the focused window in `direction` would do against
+/// `state` right now, or the typed reason it would do nothing (CONTEXT.md
+/// "Directional swap", ADR 0026).
+///
+/// The neighbor is exactly the one [`Event::DirectionalFocusRequested`]
+/// would focus, because both go through [`directional_neighbor`]: a
+/// direction has one spatial meaning. Pure over `state`, so the IPC
+/// handler and the reducer reach the same verdict from the same state.
+pub fn plan_directional_swap(
+    state: &EngineState,
+    direction: CardinalDirection,
+) -> Result<DirectionalSwapApplied, DirectionalSwapRefusal> {
+    let command = swap_command(direction).to_owned();
+    if state.paused {
+        return Err(DirectionalSwapRefusal::Paused);
+    }
+    let window_id = state
+        .focused_window
+        .ok_or(DirectionalSwapRefusal::NoFocusedWindow)?;
+    let display_id = state
+        .inventory
+        .get(&window_id)
+        .map(|managed| managed.window.display_id)
+        .ok_or(DirectionalSwapRefusal::NoFocusedWindow)?;
+    if work_area_of(&state.displays, display_id).is_none() {
+        return Err(DirectionalSwapRefusal::DisplayUnavailable { display_id });
+    }
+    if !directional_endpoint(state, display_id, window_id) {
+        return Err(DirectionalSwapRefusal::NotArranged { window_id });
+    }
+    let neighbor_id =
+        directional_neighbor(state, direction).ok_or(DirectionalSwapRefusal::NoNeighbor {
+            command: command.clone(),
+        })?;
+    Ok(DirectionalSwapApplied {
+        command,
+        display_id,
+        window_id,
+        neighbor_id,
+    })
+}
+
+/// What removing dormant slot `position` from `display_id`'s tree would
+/// do against `state` right now, or the typed reason it would do nothing.
+pub fn plan_remove_position(
+    state: &EngineState,
+    display_id: DisplayId,
+    position: u64,
+) -> Result<RemovePositionApplied, RemovePositionRefusal> {
+    if state.paused {
+        return Err(RemovePositionRefusal::Paused);
+    }
+    if !tree_mode_active(state) {
+        return Err(RemovePositionRefusal::NotTreeMode);
+    }
+    if work_area_of(&state.displays, display_id).is_none() {
+        return Err(RemovePositionRefusal::DisplayUnavailable { display_id });
+    }
+    let dormant = state
+        .trees
+        .get(&display_id)
+        .and_then(|tree| {
+            tree.dormant_positions()
+                .into_iter()
+                .find(|(number, _)| *number == position)
+                .map(|(_, dormant)| dormant.clone())
+        })
+        .ok_or(RemovePositionRefusal::UnknownPosition {
+            display_id,
+            position,
+        })?;
+    Ok(RemovePositionApplied {
+        display_id,
+        position,
+        application: dormant.evidence.application_id.0,
+    })
+}
+
 pub fn plan_undo(state: &EngineState) -> UndoResult {
     let Some(transaction) = state.newest_undo.as_ref() else {
         return UndoResult::Refused(UndoRefusal::NothingToUndo);
@@ -2315,6 +3901,47 @@ pub fn plan_undo(state: &EngineState) -> UndoResult {
         return UndoResult::Refused(UndoRefusal::TargetsUnresolved {
             transaction_id: transaction.id,
             targets,
+        });
+    }
+
+    // The structure the undo puts back is preflighted too. A leaf whose
+    // window is gone is fine -- it comes back dormant, which is exactly
+    // what its slot would be by now -- but a leaf that could be either of
+    // two windows is refused, because restoring it would guess (ADR
+    // 0024). The same matcher decides here and at apply time.
+    let mut structure: Vec<UndoTargetOutcome> = Vec::new();
+    for snapshot in &transaction.prior_trees {
+        let Some(display_id) = display_id_of(state, &snapshot.display_fingerprint) else {
+            continue;
+        };
+        let active = active_tiled_windows_on(state, display_id);
+        let on_display: Vec<&Window> = active
+            .iter()
+            .filter_map(|window_id| state.inventory.get(window_id))
+            .map(|managed| &managed.window)
+            .collect();
+        for evidence in snapshot.tree.windows() {
+            structure.push(UndoTargetOutcome {
+                ordinal: (targets.len() + structure.len()) as u32,
+                application: evidence.application_id.0.clone(),
+                outcome: match_window_with_order(
+                    evidence,
+                    on_display.iter().copied(),
+                    |window| display_fingerprint_of(state, window.display_id),
+                    |window| Some(launch_order_of(state, window.id)),
+                ),
+            });
+        }
+    }
+    if structure
+        .iter()
+        .any(|target| matches!(target.outcome, MatchOutcome::Ambiguous { .. }))
+    {
+        let mut all = targets;
+        all.extend(structure);
+        return UndoResult::Refused(UndoRefusal::TargetsUnresolved {
+            transaction_id: transaction.id,
+            targets: all,
         });
     }
 
@@ -2403,10 +4030,7 @@ fn launch_order_of(state: &EngineState, window_id: WindowId) -> u32 {
         .map(|other| other.window.id)
         .collect();
     siblings.sort_unstable_by_key(|id| id.0);
-    siblings
-        .iter()
-        .position(|id| *id == window_id)
-        .unwrap_or(0) as u32
+    siblings.iter().position(|id| *id == window_id).unwrap_or(0) as u32
 }
 
 /// Opens an undo scope for `command`.
@@ -2419,19 +4043,46 @@ fn open_undo_scope(state: &mut EngineState, command: &str) {
         command: command.to_owned(),
         members: Vec::new(),
         claimed: HashSet::new(),
+        prior_trees: Vec::new(),
     });
 }
 
-/// Closes the open scope, recording a transaction if it moved anything.
+/// Records `display_id`'s container tree in the open scope, as it stands
+/// now, before the command reshapes it. Call it before the mutation; a
+/// second call for the same display is ignored.
+fn capture_tree_for_undo(state: &mut EngineState, display_id: DisplayId) {
+    let tree = state.trees.get(&display_id).cloned().unwrap_or_default();
+    if let Some(scope) = state.undo_scope.as_mut() {
+        if !scope.prior_trees.iter().any(|(id, _)| *id == display_id) {
+            scope.prior_trees.push((display_id, tree));
+        }
+    }
+}
+
+/// Closes the open scope, recording a transaction if it changed anything.
 ///
-/// A command that moved nothing -- refused, suppressed by a circuit
-/// breaker, or a no-op -- records nothing, so undo never offers to reverse
-/// something the user never saw happen.
+/// A command that moved nothing and reshaped nothing -- refused,
+/// suppressed by a circuit breaker, or a no-op -- records nothing, so undo
+/// never offers to reverse something the user never saw happen. A tree
+/// captured but left as it was is not a change either.
 fn close_undo_scope(state: &mut EngineState) {
     let Some(scope) = state.undo_scope.take() else {
         return;
     };
-    if scope.members.is_empty() {
+    let prior_trees: Vec<UndoTreeSnapshot> = scope
+        .prior_trees
+        .iter()
+        .filter(|(display_id, prior)| {
+            state.trees.get(display_id).unwrap_or(&ContainerTree::new()) != prior
+        })
+        .filter_map(|(display_id, prior)| {
+            Some(UndoTreeSnapshot {
+                display_fingerprint: display_fingerprint_of(state, *display_id)?,
+                tree: durable_tree(state, prior),
+            })
+        })
+        .collect();
+    if scope.members.is_empty() && prior_trees.is_empty() {
         return;
     }
     state
@@ -2443,6 +4094,7 @@ fn close_undo_scope(state: &mut EngineState) {
                 topology_fingerprint: mosaix_domain::topology_fingerprint(&state.displays),
                 durable_revision: state.revision,
                 members: scope.members,
+                prior_trees,
             },
         ));
 }
@@ -2857,6 +4509,25 @@ pub fn spawn_engine_with_capacity(
         trees: HashMap::new(),
         pending_trees: HashMap::new(),
         saved_trees: HashMap::new(),
+        leaf_evidence: HashMap::new(),
+        constraint_overflow: HashMap::new(),
+        workspaces: WorkspacePool::new(),
+        pending_workspace_trees: HashMap::new(),
+        pending_displayed: HashMap::new(),
+        saved_workspaces: HashMap::new(),
+        last_workspace_result: None,
+        rule_workspace_refusals: Vec::new(),
+        switching_unavailable: None,
+        parking_capability: ParkingCapability::Unverified,
+        // One identity per process start: a restarted agent has a new
+        // one, so a previous session's ledger entries are never mistaken
+        // for this session's own.
+        session_id: format!("{}-{}", std::process::id(), now_unix()),
+        pending_parking: Vec::new(),
+        next_parking_token: 0,
+        parked_windows: HashMap::new(),
+        last_parking_refusal: None,
+        recovery_outcomes: Vec::new(),
         displays: initial_displays,
         windows: HashMap::new(),
         inventory: HashMap::new(),
@@ -2880,6 +4551,13 @@ pub fn spawn_engine_with_capacity(
         capture_holds: 0,
         unregistered_bindings: Vec::new(),
     };
+    let mut initial_state = initial_state;
+    // The pool starts from what configuration declares, and every display
+    // that can be given a workspace gets one before the first window is
+    // observed, so the first observation already has somewhere to belong.
+    sync_workspaces_from_config(&mut initial_state);
+    fill_empty_displays(&mut initial_state);
+    apply_switching_mapping(&mut initial_state);
     let state = Arc::new(Mutex::new(initial_state.clone()));
 
     let published_state = Arc::clone(&state);
@@ -4305,6 +5983,7 @@ mod tests {
             },
             elevated: false,
             lifecycle,
+            minimum_size: None,
         }
     }
 
@@ -6824,7 +8503,12 @@ mod tests {
             .filter_map(|intent| match intent {
                 PersistenceIntent::RecordUndoTransaction(draft) => Some(draft),
                 PersistenceIntent::ConsumeUndoTransaction(_)
-                | PersistenceIntent::SaveContainerTree { .. } => None,
+                | PersistenceIntent::SaveContainerTree { .. }
+                | PersistenceIntent::SaveWorkspace(_)
+                | PersistenceIntent::DeleteWorkspace(_)
+                | PersistenceIntent::RecordRecovery { .. }
+                | PersistenceIntent::MarkParked(_)
+                | PersistenceIntent::MarkRestored(_) => None,
             })
             .collect()
     }
@@ -6839,6 +8523,7 @@ mod tests {
             topology_fingerprint: draft.topology_fingerprint.clone(),
             durable_revision: draft.durable_revision,
             members: draft.members.clone(),
+            prior_trees: draft.prior_trees.clone(),
         }
     }
 
@@ -6954,7 +8639,10 @@ mod tests {
             "a successful undo consumes its transaction"
         );
         assert!(state.newest_undo.is_none());
-        assert!(matches!(state.last_undo_result, Some(UndoResult::Applied(_))));
+        assert!(matches!(
+            state.last_undo_result,
+            Some(UndoResult::Applied(_))
+        ));
     }
 
     #[test]
@@ -7091,7 +8779,10 @@ mod tests {
         let Some(UndoResult::Refused(UndoRefusal::TargetsUnresolved { targets, .. })) =
             &state.last_undo_result
         else {
-            panic!("expected an unresolved refusal, got {:?}", state.last_undo_result);
+            panic!(
+                "expected an unresolved refusal, got {:?}",
+                state.last_undo_result
+            );
         };
         assert_eq!(targets.len(), 1);
         assert_eq!(
@@ -7325,9 +9016,16 @@ mod tests {
         let Some(UndoResult::Refused(UndoRefusal::TargetsUnresolved { targets, .. })) =
             &state.last_undo_result
         else {
-            panic!("expected an unresolved refusal, got {:?}", state.last_undo_result);
+            panic!(
+                "expected an unresolved refusal, got {:?}",
+                state.last_undo_result
+            );
         };
-        assert_eq!(targets.len(), 2, "both members are reported, not only the failing one");
+        assert_eq!(
+            targets.len(),
+            2,
+            "both members are reported, not only the failing one"
+        );
         assert_eq!(
             targets.iter().filter(|target| target.is_resolved()).count(),
             1,
@@ -7393,7 +9091,12 @@ mod tests {
         apply(
             &mut state,
             Event::WindowsObserved {
-                windows: vec![app_window_at(12, "beta.exe", 1, Rect::new(960, 0, 960, 1080))],
+                windows: vec![app_window_at(
+                    12,
+                    "beta.exe",
+                    1,
+                    Rect::new(960, 0, 960, 1080),
+                )],
             },
         );
         state.effects.clear();
@@ -7411,7 +9114,10 @@ mod tests {
             "the newest transaction stays newest; it is not discarded to reach the older one"
         );
         assert_eq!(
-            state.last_undo_result.as_ref().map(|result| result.is_applied()),
+            state
+                .last_undo_result
+                .as_ref()
+                .map(|result| result.is_applied()),
             Some(false)
         );
         assert_ne!(
@@ -7451,7 +9157,11 @@ mod tests {
         );
 
         let drafts = recorded_drafts(&state);
-        assert_eq!(drafts.len(), 1, "the reflow is part of the command, not a second one");
+        assert_eq!(
+            drafts.len(),
+            1,
+            "the reflow is part of the command, not a second one"
+        );
         let moved: HashSet<WindowId> = placements(&state)
             .into_iter()
             .map(|(window_id, _, _)| window_id)
@@ -7847,7 +9557,10 @@ mod tests {
             ],
         );
 
-        observe(&mut state, vec![window_at(1, 1, Rect::new(0, 0, 960, 1080))]);
+        observe(
+            &mut state,
+            vec![window_at(1, 1, Rect::new(0, 0, 960, 1080))],
+        );
 
         assert_eq!(arrangement(&state), vec![(1, Rect::new(0, 0, 1920, 1080))]);
         assert_eq!(state.trees[&DisplayId(1)].len(), 1);
@@ -7858,7 +9571,10 @@ mod tests {
         // Three windows arriving one at a time, versus the same three
         // arriving together, must settle into the same tree.
         let mut incremental = tree_state();
-        observe(&mut incremental, vec![window_at(1, 1, Rect::new(0, 0, 400, 300))]);
+        observe(
+            &mut incremental,
+            vec![window_at(1, 1, Rect::new(0, 0, 400, 300))],
+        );
         observe(
             &mut incremental,
             vec![
@@ -7922,11 +9638,1333 @@ mod tests {
             1,
             "the command and the BSP reflow it caused are one transaction"
         );
-        assert!(
-            drafts[0].members.len() >= 2,
-            "both swapped windows are reversible together, found {:?}",
-            drafts[0].members.len()
+        assert_eq!(
+            drafts[0].members.len(),
+            2,
+            "exactly the two swapped windows are reversible together"
         );
+    }
+
+    // ---- Directional swap in tree mode (issue #55) ---------------------
+
+    /// H[ 1, V[ 2, dormant, 3 ] ] with the root divider resized, so the
+    /// tree carries every kind of state a swap must leave alone.
+    fn rich_tree_state() -> EngineState {
+        let mut state = tree_state();
+        observe(
+            &mut state,
+            vec![known_window_at(
+                1,
+                "alpha.exe",
+                1,
+                Rect::new(0, 0, 400, 300),
+            )],
+        );
+        observe(
+            &mut state,
+            vec![
+                known_window_at(1, "alpha.exe", 1, Rect::new(0, 0, 1920, 1080)),
+                known_window_at(2, "beta.exe", 1, Rect::new(0, 0, 400, 300)),
+            ],
+        );
+        focus(&mut state, 2, Rect::new(960, 0, 960, 1080));
+        observe(
+            &mut state,
+            vec![
+                known_window_at(1, "alpha.exe", 1, Rect::new(0, 0, 960, 1080)),
+                known_window_at(2, "beta.exe", 1, Rect::new(960, 0, 960, 1080)),
+                known_window_at(4, "delta.exe", 1, Rect::new(0, 0, 400, 300)),
+            ],
+        );
+        focus(&mut state, 4, Rect::new(960, 540, 960, 540));
+        observe(
+            &mut state,
+            vec![
+                known_window_at(1, "alpha.exe", 1, Rect::new(0, 0, 960, 1080)),
+                known_window_at(2, "beta.exe", 1, Rect::new(960, 0, 960, 540)),
+                known_window_at(4, "delta.exe", 1, Rect::new(960, 540, 960, 540)),
+                known_window_at(3, "gamma.exe", 1, Rect::new(0, 0, 400, 300)),
+            ],
+        );
+        // delta closes: its slot between beta and gamma goes dormant.
+        observe(
+            &mut state,
+            vec![
+                known_window_at(1, "alpha.exe", 1, Rect::new(0, 0, 960, 1080)),
+                known_window_at(2, "beta.exe", 1, Rect::new(960, 0, 960, 360)),
+                known_window_at(3, "gamma.exe", 1, Rect::new(960, 720, 960, 360)),
+            ],
+        );
+        assert_eq!(state.trees[&DisplayId(1)].dormant_positions().len(), 1);
+        focus(&mut state, 2, Rect::new(960, 0, 960, 540));
+        resize(&mut state, CardinalDirection::Left);
+        assert_eq!(
+            arrangement(&state),
+            vec![
+                (1, Rect::new(0, 0, 864, 1080)),
+                (2, Rect::new(864, 0, 1056, 540)),
+                (3, Rect::new(864, 540, 1056, 540)),
+            ]
+        );
+        state.effects.clear();
+        state.persistence_intents.clear();
+        state
+    }
+
+    #[test]
+    fn swap_selects_exactly_the_neighbor_directional_focus_selects() {
+        let mut state = rich_tree_state();
+        for id in [1, 2, 3] {
+            let bounds = state.windows[&WindowId(id)].bounds;
+            focus(&mut state, id, bounds);
+            for direction in [
+                CardinalDirection::Left,
+                CardinalDirection::Right,
+                CardinalDirection::Up,
+                CardinalDirection::Down,
+            ] {
+                let focus_target = directional_neighbor(&state, direction);
+                let swap_target = plan_directional_swap(&state, direction)
+                    .ok()
+                    .map(|plan| plan.neighbor_id);
+                assert_eq!(
+                    focus_target, swap_target,
+                    "from {id} going {direction:?}: focus and swap must name one neighbor"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn swap_exchanges_only_two_bindings_and_leaves_every_other_slot_alone() {
+        let mut state = rich_tree_state();
+        let tree_before = state.trees[&DisplayId(1)].clone();
+        // Right from window 1 is window 2, the top of the right column.
+        focus(&mut state, 1, Rect::new(0, 0, 864, 1080));
+
+        apply(
+            &mut state,
+            Event::DirectionalSwapRequested {
+                direction: CardinalDirection::Right,
+            },
+        );
+
+        let tree_after = &state.trees[&DisplayId(1)];
+        // Mapping the two windows back reproduces the prior tree exactly:
+        // containers, axes, weights, dormant slot, and insertion numbers.
+        let mut unswapped = tree_after.clone();
+        assert!(unswapped.swap_leaves(&WindowId(2), &WindowId(1)));
+        assert_eq!(unswapped, tree_before);
+        assert_eq!(
+            tree_after.dormant_positions().len(),
+            1,
+            "the dormant slot in the right column is untouched"
+        );
+        assert_eq!(
+            placements(&state)
+                .iter()
+                .map(|(id, _, _)| id.0)
+                .collect::<std::collections::BTreeSet<_>>(),
+            [1, 2].into_iter().collect(),
+            "only the two swapped windows are placed; window 3 does not move"
+        );
+        assert_eq!(
+            state.windows[&WindowId(3)].bounds,
+            Rect::new(864, 540, 1056, 540)
+        );
+    }
+
+    #[test]
+    fn focus_stays_on_the_same_window_which_now_sits_where_its_neighbor_was() {
+        let mut state = rich_tree_state();
+        focus(&mut state, 1, Rect::new(0, 0, 864, 1080));
+        let neighbor_was = state.windows[&WindowId(2)].bounds;
+
+        apply(
+            &mut state,
+            Event::DirectionalSwapRequested {
+                direction: CardinalDirection::Right,
+            },
+        );
+
+        assert_eq!(state.focused_window, Some(WindowId(1)));
+        assert_eq!(state.windows[&WindowId(1)].bounds, neighbor_was);
+        assert!(
+            !state
+                .effects
+                .iter()
+                .any(|effect| matches!(effect, EngineEffect::FocusWindow { .. })),
+            "no focus effect is needed: the same window keeps focus"
+        );
+        let drafts = recorded_drafts(&state);
+        assert_eq!(drafts.len(), 1);
+        assert_eq!(drafts[0].command, "swap-right");
+        assert_eq!(drafts[0].members.len(), 2);
+    }
+
+    #[test]
+    fn swap_refuses_typed_at_boundaries_and_for_ineligible_endpoints() {
+        let mut state = rich_tree_state();
+
+        // Boundary: nothing lies left of window 1, and it does not wrap.
+        focus(&mut state, 1, Rect::new(0, 0, 864, 1080));
+        assert_eq!(
+            plan_directional_swap(&state, CardinalDirection::Left),
+            Err(DirectionalSwapRefusal::NoNeighbor {
+                command: "swap-left".to_owned()
+            })
+        );
+        let tree_before = state.trees[&DisplayId(1)].clone();
+        apply(
+            &mut state,
+            Event::DirectionalSwapRequested {
+                direction: CardinalDirection::Left,
+            },
+        );
+        assert_eq!(state.trees[&DisplayId(1)], tree_before);
+        assert!(recorded_drafts(&state).is_empty());
+
+        // A floating window is not an endpoint, from either side.
+        focus(&mut state, 3, Rect::new(864, 540, 1056, 540));
+        apply(&mut state, Event::ToggleFloatingRequested);
+        assert_eq!(
+            plan_directional_swap(&state, CardinalDirection::Up),
+            Err(DirectionalSwapRefusal::NotArranged {
+                window_id: WindowId(3)
+            })
+        );
+        focus(&mut state, 2, Rect::new(864, 0, 1056, 1080));
+        assert!(matches!(
+            plan_directional_swap(&state, CardinalDirection::Down),
+            Err(DirectionalSwapRefusal::NoNeighbor { .. })
+        ));
+
+        state.paused = true;
+        assert_eq!(
+            plan_directional_swap(&state, CardinalDirection::Left),
+            Err(DirectionalSwapRefusal::Paused)
+        );
+        state.focused_window = None;
+        state.paused = false;
+        assert_eq!(
+            plan_directional_swap(&state, CardinalDirection::Left),
+            Err(DirectionalSwapRefusal::NoFocusedWindow)
+        );
+    }
+
+    #[test]
+    fn swap_never_crosses_a_display_where_display_transfer_would() {
+        let mut state = tree_state();
+        state.displays = vec![display(1, "DISPLAY1", 0), display(2, "DISPLAY2", 1920)];
+        observe(
+            &mut state,
+            vec![
+                known_window_at(1, "alpha.exe", 1, Rect::new(0, 0, 400, 300)),
+                known_window_at(2, "beta.exe", 2, Rect::new(1920, 0, 400, 300)),
+            ],
+        );
+        focus(&mut state, 1, Rect::new(0, 0, 1920, 1080));
+
+        assert_eq!(
+            plan_directional_swap(&state, CardinalDirection::Right),
+            Err(DirectionalSwapRefusal::NoNeighbor {
+                command: "swap-right".to_owned()
+            }),
+            "the window on the next display is not a neighbor"
+        );
+        // The explicit command for that is a throw, which does move it.
+        apply(
+            &mut state,
+            Event::WindowThrowToDisplayRequested {
+                window_id: WindowId(1),
+                direction: DisplayDirection::Next,
+            },
+        );
+        assert_eq!(state.windows[&WindowId(1)].display_id, DisplayId(2));
+    }
+
+    // ---- Dormant positions (issue #53) ---------------------------------
+
+    /// [`app_window_at`] with the class and executable path a real window
+    /// carries, which is what lets the matcher recognise it again: a
+    /// signal absent on both sides scores nothing.
+    fn known_window_at(id: isize, application: &str, display_id: isize, bounds: Rect) -> Window {
+        let mut window = app_window_at(id, application, display_id, bounds);
+        window.native_class = Some(format!("{application}-class"));
+        window.executable_path = Some(std::path::PathBuf::from(format!("C:/apps/{application}")));
+        window
+    }
+
+    /// Two distinguishable applications side by side, alpha on the left.
+    fn two_apps_state() -> EngineState {
+        let mut state = tree_state();
+        observe(
+            &mut state,
+            vec![
+                known_window_at(1, "alpha.exe", 1, Rect::new(0, 0, 400, 300)),
+                known_window_at(2, "beta.exe", 1, Rect::new(500, 0, 400, 300)),
+            ],
+        );
+        assert_eq!(
+            arrangement(&state),
+            vec![
+                (1, Rect::new(0, 0, 960, 1080)),
+                (2, Rect::new(960, 0, 960, 1080)),
+            ]
+        );
+        state.effects.clear();
+        state.persistence_intents.clear();
+        state
+    }
+
+    fn dormant_positions(state: &EngineState) -> Vec<(u64, String, i64)> {
+        state.trees[&DisplayId(1)]
+            .dormant_positions()
+            .into_iter()
+            .map(|(position, dormant)| {
+                (
+                    position,
+                    dormant.evidence.application_id.0.clone(),
+                    dormant.since_unix,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_closed_window_leaves_a_dormant_slot_that_reserves_no_space() {
+        let mut state = two_apps_state();
+
+        // beta closes.
+        observe(
+            &mut state,
+            vec![known_window_at(
+                1,
+                "alpha.exe",
+                1,
+                Rect::new(0, 0, 960, 1080),
+            )],
+        );
+
+        assert_eq!(
+            arrangement(&state),
+            vec![(1, Rect::new(0, 0, 1920, 1080))],
+            "alpha uses the whole display; the slot holds no space open"
+        );
+        let dormant = dormant_positions(&state);
+        assert_eq!(dormant.len(), 1);
+        assert_eq!(dormant[0].0, 1, "the slot keeps its insertion number");
+        assert_eq!(
+            dormant[0].1, "beta.exe",
+            "and privacy-safe evidence of who held it"
+        );
+        assert!(
+            recorded_drafts(&state).is_empty(),
+            "a passive close is not an undo transaction"
+        );
+        assert!(
+            state
+                .persistence_intents
+                .iter()
+                .any(|intent| matches!(intent, PersistenceIntent::SaveContainerTree { .. })),
+            "the dormant slot is durable"
+        );
+    }
+
+    #[test]
+    fn a_returning_window_reclaims_its_slot_on_a_confident_match() {
+        let mut state = two_apps_state();
+        let tree_before = state.trees[&DisplayId(1)].clone();
+        observe(
+            &mut state,
+            vec![known_window_at(
+                1,
+                "alpha.exe",
+                1,
+                Rect::new(0, 0, 960, 1080),
+            )],
+        );
+        assert_eq!(dormant_positions(&state).len(), 1);
+
+        // beta reopens with a new native handle, and alpha now has focus
+        // -- so plain insertion would have split alpha, not restored the
+        // right-hand slot.
+        focus(&mut state, 1, Rect::new(0, 0, 1920, 1080));
+        observe(
+            &mut state,
+            vec![
+                known_window_at(1, "alpha.exe", 1, Rect::new(0, 0, 1920, 1080)),
+                known_window_at(77, "beta.exe", 1, Rect::new(300, 300, 400, 300)),
+            ],
+        );
+
+        assert_eq!(
+            arrangement(&state),
+            vec![
+                (1, Rect::new(0, 0, 960, 1080)),
+                (77, Rect::new(960, 0, 960, 1080)),
+            ],
+            "beta is back on the right, where its slot was"
+        );
+        assert!(dormant_positions(&state).is_empty());
+        assert_eq!(
+            state.trees[&DisplayId(1)].insertion_of(&WindowId(77)),
+            tree_before.insertion_of(&WindowId(2)),
+            "the reclaimed slot is the original slot, metadata and all"
+        );
+    }
+
+    #[test]
+    fn an_ambiguous_return_inserts_fresh_and_leaves_the_slot_alone() {
+        let mut state = two_apps_state();
+        observe(
+            &mut state,
+            vec![known_window_at(
+                1,
+                "alpha.exe",
+                1,
+                Rect::new(0, 0, 960, 1080),
+            )],
+        );
+
+        // Two identical beta windows appear at once: neither can be told
+        // from the other, so neither takes the slot.
+        observe(
+            &mut state,
+            vec![
+                known_window_at(1, "alpha.exe", 1, Rect::new(0, 0, 1920, 1080)),
+                known_window_at(77, "beta.exe", 1, Rect::new(300, 300, 400, 300)),
+                known_window_at(78, "beta.exe", 1, Rect::new(300, 300, 400, 300)),
+            ],
+        );
+
+        assert_eq!(
+            dormant_positions(&state).len(),
+            1,
+            "an ambiguous match must not mutate the tree"
+        );
+        assert_eq!(
+            state.trees[&DisplayId(1)].len(),
+            3,
+            "both were inserted fresh"
+        );
+    }
+
+    #[test]
+    fn dormant_slots_expire_after_seven_days_on_the_next_reflow() {
+        let mut state = two_apps_state();
+        observe(
+            &mut state,
+            vec![known_window_at(
+                1,
+                "alpha.exe",
+                1,
+                Rect::new(0, 0, 960, 1080),
+            )],
+        );
+        // Age the slot past retention.
+        let mut aged = state.trees[&DisplayId(1)].clone();
+        let evidence = aged.dormant_positions()[0].1.evidence.clone();
+        aged.reclaim(1, WindowId(2));
+        aged.make_dormant(
+            &WindowId(2),
+            mosaix_domain::DormantPosition {
+                evidence,
+                since_unix: now_unix() - mosaix_domain::DORMANT_RETENTION_SECONDS - 1,
+            },
+        );
+        state.trees.insert(DisplayId(1), aged);
+
+        // Any observation that changes the inventory provokes a reflow;
+        // here alpha reports slightly different bounds.
+        observe(
+            &mut state,
+            vec![known_window_at(
+                1,
+                "alpha.exe",
+                1,
+                Rect::new(2, 2, 1916, 1076),
+            )],
+        );
+
+        assert!(
+            dormant_positions(&state).is_empty(),
+            "the aged slot is pruned"
+        );
+        assert!(
+            matches!(
+                state.trees[&DisplayId(1)].root(),
+                Some(mosaix_domain::Node::Leaf(_))
+            ),
+            "and the container that located it is gone"
+        );
+    }
+
+    #[test]
+    fn removing_a_dormant_position_is_explicit_typed_and_undoable() {
+        let mut state = two_apps_state();
+        observe(
+            &mut state,
+            vec![known_window_at(
+                1,
+                "alpha.exe",
+                1,
+                Rect::new(0, 0, 960, 1080),
+            )],
+        );
+        let tree_before = state.trees[&DisplayId(1)].clone();
+        state.persistence_intents.clear();
+
+        assert_eq!(
+            plan_remove_position(&state, DisplayId(1), 5),
+            Err(RemovePositionRefusal::UnknownPosition {
+                display_id: DisplayId(1),
+                position: 5
+            })
+        );
+        assert_eq!(
+            plan_remove_position(&state, DisplayId(1), 0),
+            Err(RemovePositionRefusal::UnknownPosition {
+                display_id: DisplayId(1),
+                position: 0
+            }),
+            "a live slot is not removable this way"
+        );
+        assert_eq!(
+            plan_remove_position(&state, DisplayId(9), 1),
+            Err(RemovePositionRefusal::DisplayUnavailable {
+                display_id: DisplayId(9)
+            })
+        );
+        let applied = plan_remove_position(&state, DisplayId(1), 1).expect("the slot exists");
+        assert_eq!(applied.application, "beta.exe");
+
+        apply(
+            &mut state,
+            Event::TreePositionRemoveRequested {
+                display_id: DisplayId(1),
+                position: 1,
+            },
+        );
+
+        assert!(dormant_positions(&state).is_empty());
+        let drafts = recorded_drafts(&state);
+        assert_eq!(
+            drafts.len(),
+            1,
+            "a structural change with no placements is still a transaction"
+        );
+        assert_eq!(drafts[0].command, "remove-position");
+        assert_eq!(drafts[0].prior_trees.len(), 1);
+
+        let stored = stored(drafts[0], 1);
+        apply(&mut state, Event::UndoHistoryLoaded(Some(Box::new(stored))));
+        apply(&mut state, Event::UndoRequested);
+
+        assert!(matches!(
+            state.last_undo_result,
+            Some(UndoResult::Applied(_))
+        ));
+        assert_eq!(
+            dormant_positions(&state),
+            dormant_positions(&EngineState {
+                trees: [(DisplayId(1), tree_before)].into_iter().collect(),
+                ..EngineState::default()
+            }),
+            "undo puts the dormant slot back"
+        );
+    }
+
+    #[test]
+    fn a_stored_arrangement_whose_window_is_missing_keeps_its_slot_dormant() {
+        // Restart: the stored tree has alpha and beta, but only alpha is
+        // open. Beta's slot waits; when beta opens later it goes home.
+        let mut first = two_apps_state();
+        let stored = first
+            .persistence_intents
+            .iter()
+            .rev()
+            .find_map(|intent| match intent {
+                PersistenceIntent::SaveContainerTree { tree, .. } => Some((**tree).clone()),
+                _ => None,
+            })
+            .or_else(|| {
+                // The fixture cleared intents; rebuild the durable form.
+                Some(durable_tree(&first, &first.trees[&DisplayId(1)]))
+            })
+            .expect("a durable tree");
+        first.trees.clear();
+
+        let mut state = tree_state();
+        observe(
+            &mut state,
+            vec![known_window_at(
+                501,
+                "alpha.exe",
+                1,
+                Rect::new(0, 0, 400, 300),
+            )],
+        );
+        apply(
+            &mut state,
+            Event::ContainerTreesLoaded([("DISPLAY1".to_owned(), stored)].into_iter().collect()),
+        );
+        observe(
+            &mut state,
+            vec![known_window_at(
+                501,
+                "alpha.exe",
+                1,
+                Rect::new(0, 0, 1920, 1080),
+            )],
+        );
+        assert_eq!(
+            arrangement(&state),
+            vec![(501, Rect::new(0, 0, 1920, 1080))]
+        );
+        assert_eq!(dormant_positions(&state).len(), 1, "beta is remembered");
+
+        observe(
+            &mut state,
+            vec![
+                known_window_at(501, "alpha.exe", 1, Rect::new(0, 0, 1920, 1080)),
+                known_window_at(502, "beta.exe", 1, Rect::new(10, 10, 400, 300)),
+            ],
+        );
+        assert_eq!(
+            arrangement(&state),
+            vec![
+                (501, Rect::new(0, 0, 960, 1080)),
+                (502, Rect::new(960, 0, 960, 1080)),
+            ],
+            "beta reclaims the right-hand slot across the restart"
+        );
+        assert!(dormant_positions(&state).is_empty());
+    }
+
+    // ---- Tree resize (issue #52) ---------------------------------------
+
+    /// H[ 1, V[ 2, 3 ] ] on a 1920x1080 display: window 1 takes the left
+    /// half, windows 2 and 3 stack on the right.
+    fn nested_tree_state() -> EngineState {
+        let mut state = tree_state();
+        observe(&mut state, vec![window_at(1, 1, Rect::new(0, 0, 400, 300))]);
+        observe(
+            &mut state,
+            vec![
+                window_at(1, 1, Rect::new(0, 0, 1920, 1080)),
+                window_at(2, 1, Rect::new(0, 0, 400, 300)),
+            ],
+        );
+        focus(&mut state, 2, Rect::new(960, 0, 960, 1080));
+        observe(
+            &mut state,
+            vec![
+                window_at(1, 1, Rect::new(0, 0, 960, 1080)),
+                window_at(2, 1, Rect::new(960, 0, 960, 1080)),
+                window_at(3, 1, Rect::new(0, 0, 400, 300)),
+            ],
+        );
+        assert_eq!(
+            arrangement(&state),
+            vec![
+                (1, Rect::new(0, 0, 960, 1080)),
+                (2, Rect::new(960, 0, 960, 540)),
+                (3, Rect::new(960, 540, 960, 540)),
+            ]
+        );
+        state.effects.clear();
+        state.persistence_intents.clear();
+        state
+    }
+
+    fn focus(state: &mut EngineState, id: isize, bounds: Rect) {
+        apply(
+            state,
+            Event::WindowFocused {
+                window_id: WindowId(id),
+                display_id: DisplayId(1),
+                bounds,
+            },
+        );
+    }
+
+    fn resize(state: &mut EngineState, direction: CardinalDirection) {
+        apply(state, Event::TreeResizeRequested { direction });
+    }
+
+    #[test]
+    fn resizing_moves_the_nearest_divider_by_five_points_and_reflows() {
+        let mut state = nested_tree_state();
+        focus(&mut state, 3, Rect::new(960, 540, 960, 540));
+
+        // Up from window 3 moves the divider between 2 and 3: 3 grows to
+        // 55% of the right column's 1080px, 2 shrinks to 45%.
+        resize(&mut state, CardinalDirection::Up);
+
+        assert_eq!(
+            arrangement(&state),
+            vec![
+                (1, Rect::new(0, 0, 960, 1080)),
+                (2, Rect::new(960, 0, 960, 486)),
+                (3, Rect::new(960, 486, 960, 594)),
+            ],
+            "the focused window grew upward and its sibling gave the space; nothing else moved"
+        );
+    }
+
+    #[test]
+    fn resizing_climbs_to_the_outer_divider_when_the_parent_cannot_face_that_way() {
+        let mut state = nested_tree_state();
+        focus(&mut state, 3, Rect::new(960, 540, 960, 540));
+
+        // Left from window 3: its parent is vertical, so the horizontal
+        // root divider moves and the whole right column grows.
+        resize(&mut state, CardinalDirection::Left);
+
+        assert_eq!(
+            arrangement(&state),
+            vec![
+                (1, Rect::new(0, 0, 864, 1080)),
+                (2, Rect::new(864, 0, 1056, 540)),
+                (3, Rect::new(864, 540, 1056, 540)),
+            ]
+        );
+    }
+
+    #[test]
+    fn resizing_at_the_arrangement_edge_is_a_typed_no_op() {
+        let mut state = nested_tree_state();
+        focus(&mut state, 1, Rect::new(0, 0, 960, 1080));
+        let before = state.trees[&DisplayId(1)].clone();
+
+        assert_eq!(
+            plan_tree_resize(&state, CardinalDirection::Left),
+            Err(TreeResizeRefusal::NoDivider {
+                command: "resize-left".to_owned()
+            })
+        );
+        assert!(matches!(
+            plan_tree_resize(&state, CardinalDirection::Up),
+            Err(TreeResizeRefusal::NoDivider { .. })
+        ));
+        resize(&mut state, CardinalDirection::Left);
+
+        assert_eq!(
+            state.trees[&DisplayId(1)],
+            before,
+            "no unrelated axis was touched"
+        );
+        assert!(placements(&state).is_empty());
+        assert!(
+            recorded_drafts(&state).is_empty(),
+            "a refused resize records no transaction"
+        );
+    }
+
+    #[test]
+    fn resizing_is_refused_for_windows_the_tree_does_not_arrange() {
+        let mut state = nested_tree_state();
+        assert_eq!(
+            plan_tree_resize(&EngineState::default(), CardinalDirection::Left),
+            Err(TreeResizeRefusal::NotTreeMode)
+        );
+        state.focused_window = None;
+        assert_eq!(
+            plan_tree_resize(&state, CardinalDirection::Left),
+            Err(TreeResizeRefusal::NoFocusedWindow)
+        );
+
+        // A session-floating window has no leaf.
+        focus(&mut state, 2, Rect::new(960, 0, 960, 540));
+        apply(&mut state, Event::ToggleFloatingRequested);
+        assert_eq!(
+            plan_tree_resize(&state, CardinalDirection::Left),
+            Err(TreeResizeRefusal::NotArranged {
+                window_id: WindowId(2)
+            })
+        );
+
+        state.paused = true;
+        assert_eq!(
+            plan_tree_resize(&state, CardinalDirection::Left),
+            Err(TreeResizeRefusal::Paused)
+        );
+    }
+
+    #[test]
+    fn resizing_clamps_to_the_largest_step_that_respects_minimum_sizes() {
+        // Two windows side by side on 1920px. Window 1 needs 940px; it
+        // holds 960, so the divider can move 20px toward it: 1% of 1920
+        // is 19.2px, 2% is 38.4px. Only the one-point step is legal.
+        let mut state = tree_state();
+        observe(
+            &mut state,
+            vec![
+                window_needing(1, 1, Rect::new(0, 0, 400, 300), (940, 100)),
+                window_at(2, 1, Rect::new(500, 0, 400, 300)),
+            ],
+        );
+        focus(&mut state, 2, Rect::new(960, 0, 960, 1080));
+        state.persistence_intents.clear();
+
+        let plan = plan_tree_resize(&state, CardinalDirection::Left).expect("one point fits");
+        assert_eq!(plan.applied.percentage_points, 1);
+        resize(&mut state, CardinalDirection::Left);
+        assert_eq!(state.windows[&WindowId(1)].bounds.width, 941);
+        assert!(
+            state.constraint_overflow.is_empty(),
+            "the clamp never overflows a window"
+        );
+
+        // Now window 1 is at 941px: not even one more point is legal.
+        assert_eq!(
+            plan_tree_resize(&state, CardinalDirection::Left),
+            Err(TreeResizeRefusal::MinimumSizeReached {
+                command: "resize-left".to_owned()
+            })
+        );
+        let before = state.trees[&DisplayId(1)].clone();
+        resize(&mut state, CardinalDirection::Left);
+        assert_eq!(state.trees[&DisplayId(1)], before);
+    }
+
+    #[test]
+    fn resizing_never_pays_for_itself_with_gaps() {
+        // With 20px gaps, window 1 at 960px raw is 946px placed and needs
+        // 940. A one-point move (19px) would put it below 940 -- and the
+        // planner could rescue that by shrinking the gaps, which a resize
+        // must not do.
+        let mut state = tree_state();
+        state.resolved_config.gaps = mosaix_domain::Gaps::new(20, 12);
+        observe(
+            &mut state,
+            vec![
+                window_needing(1, 1, Rect::new(0, 0, 400, 300), (940, 100)),
+                window_at(2, 1, Rect::new(500, 0, 400, 300)),
+            ],
+        );
+        focus(&mut state, 2, Rect::new(960, 0, 960, 1080));
+
+        assert!(matches!(
+            plan_tree_resize(&state, CardinalDirection::Left),
+            Err(TreeResizeRefusal::MinimumSizeReached { .. })
+        ));
+    }
+
+    #[test]
+    fn a_resize_and_its_placements_are_one_undo_transaction_that_restores_the_tree() {
+        let mut state = nested_tree_state();
+        focus(&mut state, 3, Rect::new(960, 540, 960, 540));
+        let tree_before = state.trees[&DisplayId(1)].clone();
+        let arrangement_before = arrangement(&state);
+
+        resize(&mut state, CardinalDirection::Up);
+
+        let drafts = recorded_drafts(&state);
+        assert_eq!(drafts.len(), 1, "one command, one transaction");
+        assert_eq!(drafts[0].command, "resize-up");
+        assert_eq!(drafts[0].members.len(), 2, "both moved windows are members");
+        assert_eq!(
+            drafts[0].prior_trees.len(),
+            1,
+            "and the tree as it was rides along"
+        );
+        assert_eq!(drafts[0].prior_trees[0].display_fingerprint, "DISPLAY1");
+
+        // Publish it back as stored history and undo it.
+        let stored = stored(drafts[0], 1);
+        apply(&mut state, Event::UndoHistoryLoaded(Some(Box::new(stored))));
+        state.effects.clear();
+        apply(&mut state, Event::UndoRequested);
+
+        assert!(matches!(
+            state.last_undo_result,
+            Some(UndoResult::Applied(_))
+        ));
+        assert_eq!(
+            arrangement(&state),
+            arrangement_before,
+            "the windows are back"
+        );
+        assert_eq!(
+            state.trees[&DisplayId(1)],
+            tree_before,
+            "and so are the weights, so the next reflow does not redo the resize"
+        );
+
+        // A later passive reflow moves nothing.
+        state.effects.clear();
+        observe(
+            &mut state,
+            vec![
+                window_at(1, 1, Rect::new(0, 0, 960, 1080)),
+                window_at(2, 1, Rect::new(960, 0, 960, 540)),
+                window_at(3, 1, Rect::new(960, 540, 960, 540)),
+            ],
+        );
+        assert!(placements(&state).is_empty());
+    }
+
+    #[test]
+    fn undoing_a_swap_restores_the_tree_as_well_as_the_windows() {
+        let mut state = nested_tree_state();
+        focus(&mut state, 1, Rect::new(0, 0, 960, 1080));
+        let tree_before = state.trees[&DisplayId(1)].clone();
+
+        apply(
+            &mut state,
+            Event::DirectionalSwapRequested {
+                direction: CardinalDirection::Right,
+            },
+        );
+        assert_ne!(state.trees[&DisplayId(1)], tree_before);
+        let drafts = recorded_drafts(&state);
+        assert_eq!(drafts.len(), 1);
+        assert_eq!(drafts[0].prior_trees.len(), 1);
+        let stored = stored(drafts[0], 1);
+        apply(&mut state, Event::UndoHistoryLoaded(Some(Box::new(stored))));
+
+        apply(&mut state, Event::UndoRequested);
+
+        assert_eq!(state.trees[&DisplayId(1)], tree_before);
+    }
+
+    #[test]
+    fn resize_survives_deep_unbalanced_odd_and_negative_origin_arrangements() {
+        // A five-window tree on an oddly sized display left of the primary,
+        // resized repeatedly in every direction: every plan must keep
+        // tiling exactly, and every resize must be reversible by the
+        // opposite resize on the sibling.
+        // Two displays at different scales: an odd, negative-origin one at
+        // 125% on the left and the primary at 100%.
+        let mut state = tree_state();
+        state.displays[0].full_bounds = Rect::new(-1367, -13, 1367, 769);
+        state.displays[0].work_area = Rect::new(-1367, -13, 1367, 741);
+        state.displays[0].scale_factor = 1.25;
+        state.displays.push(display(2, "DISPLAY2", 0));
+        let mut windows = Vec::new();
+        for id in 1..=5 {
+            windows.push(window_at(
+                id,
+                1,
+                Rect::new(-1300 + id as i32 * 10, 0, 300, 200),
+            ));
+            observe(&mut state, windows.clone());
+            let bounds = state.windows[&WindowId(id)].bounds;
+            focus(&mut state, id, bounds);
+        }
+        for id in 6..=8 {
+            windows.push(window_at(id, 2, Rect::new(id as i32 * 10, 0, 300, 200)));
+            observe(&mut state, windows.clone());
+            let bounds = state.windows[&WindowId(id)].bounds;
+            focus(&mut state, id, bounds);
+        }
+        let work_area_of_display =
+            |state: &EngineState, id: isize| state.displays[usize::from(id != 1)].work_area;
+        for (id, direction) in [
+            (5, CardinalDirection::Left),
+            (5, CardinalDirection::Up),
+            (3, CardinalDirection::Down),
+            (2, CardinalDirection::Right),
+            (4, CardinalDirection::Left),
+            (7, CardinalDirection::Left),
+            (8, CardinalDirection::Up),
+            (6, CardinalDirection::Right),
+        ] {
+            let bounds = state.windows[&WindowId(id)].bounds;
+            focus(&mut state, id, bounds);
+            resize(&mut state, direction);
+            for display_id in [1, 2] {
+                let work_area = work_area_of_display(&state, display_id);
+                let placed: Vec<Rect> = state
+                    .windows
+                    .values()
+                    .filter(|placement| placement.display_id == DisplayId(display_id))
+                    .map(|placement| placement.bounds)
+                    .collect();
+                let covered: i64 = placed
+                    .iter()
+                    .map(|rect| (rect.width as i64) * (rect.height as i64))
+                    .sum();
+                assert_eq!(
+                    covered,
+                    (work_area.width as i64) * (work_area.height as i64),
+                    "after {direction:?} on {id}: display {display_id} must still be tiled exactly"
+                );
+                for rect in &placed {
+                    assert!(work_area.contains(rect), "{rect:?} escaped {work_area:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_overflowed_window_returns_when_the_display_grows() {
+        let mut state = narrow_tree_state(1000);
+        // The topology change re-selects config, so the set has to keep
+        // tree mode on for the new fingerprint too.
+        state.config_set = ResolvedConfigSet {
+            base: state.resolved_config.clone(),
+            profiles: Vec::new(),
+        };
+        observe(
+            &mut state,
+            vec![
+                window_needing(1, 1, Rect::new(0, 0, 400, 300), (600, 100)),
+                window_needing(2, 1, Rect::new(500, 0, 400, 300), (600, 100)),
+            ],
+        );
+        assert_eq!(
+            state.constraint_overflow.get(&DisplayId(1)),
+            Some(&vec![WindowId(2)])
+        );
+        let tree_before = state.trees[&DisplayId(1)].clone();
+
+        let mut wider = display(1, "DISPLAY1", 0);
+        wider.full_bounds = Rect::new(0, 0, 1400, 600);
+        wider.work_area = Rect::new(0, 0, 1400, 600);
+        apply(&mut state, Event::DisplayTopologyChanged(vec![wider]));
+
+        assert!(state.constraint_overflow.is_empty());
+        assert_eq!(state.trees[&DisplayId(1)], tree_before, "the leaf was kept");
+        assert_eq!(
+            state.windows[&WindowId(2)].bounds,
+            Rect::new(700, 0, 700, 600)
+        );
+    }
+
+    #[test]
+    fn a_floated_or_transferred_window_leaves_the_tree_without_a_dormant_slot() {
+        let mut state = two_apps_state();
+        state.displays.push(display(2, "DISPLAY2", 1920));
+
+        focus(&mut state, 2, Rect::new(960, 0, 960, 1080));
+        apply(&mut state, Event::ToggleFloatingRequested);
+        assert!(
+            dormant_positions(&state).is_empty(),
+            "a window the user floated is visible; a slot kept for it would be a ghost"
+        );
+        apply(&mut state, Event::ToggleFloatingRequested);
+
+        apply(
+            &mut state,
+            Event::WindowThrowToDisplayRequested {
+                window_id: WindowId(2),
+                direction: DisplayDirection::Next,
+            },
+        );
+        assert!(
+            dormant_positions(&state).is_empty(),
+            "display transfer is explicit; the source keeps no slot"
+        );
+    }
+
+    #[test]
+    fn a_stored_dormant_slot_past_retention_is_pruned_on_load() {
+        let mut first = two_apps_state();
+        let durable = durable_tree(&first, &first.trees[&DisplayId(1)]);
+        first.trees.clear();
+        let aged = durable.convert_leaves(&mut |leaf| match &leaf.occupant {
+            mosaix_domain::Occupant::Live(evidence) if evidence.application_id.0 == "beta.exe" => {
+                mosaix_domain::LeafFate::Dormant(mosaix_domain::DormantPosition {
+                    evidence: evidence.clone(),
+                    since_unix: now_unix() - mosaix_domain::DORMANT_RETENTION_SECONDS - 1,
+                })
+            }
+            mosaix_domain::Occupant::Live(evidence) => {
+                mosaix_domain::LeafFate::Live(evidence.clone())
+            }
+            mosaix_domain::Occupant::Dormant(position) => {
+                mosaix_domain::LeafFate::Dormant(position.clone())
+            }
+        });
+
+        let mut state = tree_state();
+        observe(
+            &mut state,
+            vec![known_window_at(
+                501,
+                "alpha.exe",
+                1,
+                Rect::new(0, 0, 400, 300),
+            )],
+        );
+        apply(
+            &mut state,
+            Event::ContainerTreesLoaded([("DISPLAY1".to_owned(), aged)].into_iter().collect()),
+        );
+        observe(
+            &mut state,
+            vec![known_window_at(
+                501,
+                "alpha.exe",
+                1,
+                Rect::new(0, 0, 1920, 1080),
+            )],
+        );
+
+        assert!(
+            dormant_positions(&state).is_empty(),
+            "retention counts from when it went dormant"
+        );
+        assert_eq!(state.trees[&DisplayId(1)].len(), 1);
+    }
+
+    #[test]
+    fn undo_refuses_when_a_leaf_of_the_prior_tree_is_ambiguous() {
+        // alpha | beta, swapped. Then gamma opens twice, identically. The
+        // transaction's members (alpha, beta) still resolve, but the prior
+        // tree is edited to carry a gamma leaf whose evidence fits either
+        // gamma window equally -- restoring it would guess.
+        let mut state = two_apps_state();
+        focus(&mut state, 1, Rect::new(0, 0, 960, 1080));
+        apply(
+            &mut state,
+            Event::DirectionalSwapRequested {
+                direction: CardinalDirection::Right,
+            },
+        );
+        let mut draft = recorded_drafts(&state)[0].clone();
+        observe(
+            &mut state,
+            vec![
+                known_window_at(1, "alpha.exe", 1, Rect::new(960, 0, 960, 1080)),
+                known_window_at(2, "beta.exe", 1, Rect::new(0, 0, 960, 1080)),
+                known_window_at(8, "gamma.exe", 1, Rect::new(10, 10, 300, 200)),
+                known_window_at(9, "gamma.exe", 1, Rect::new(10, 10, 300, 200)),
+            ],
+        );
+        let gamma = mosaix_domain::WindowEvidence {
+            application_id: mosaix_domain::ApplicationId("gamma.exe".to_owned()),
+            executable_path: Some("C:/apps/gamma.exe".to_owned()),
+            native_class: Some("gamma.exe-class".to_owned()),
+            role: mosaix_domain::WindowRole::Normal,
+            launch_order: 5,
+            last_placement: Rect::new(5000, 5000, 10, 10),
+            display_fingerprint: "DISPLAY1".to_owned(),
+        };
+        let mut with_gamma = draft.prior_trees[0].tree.clone();
+        let first_leaf = with_gamma.windows()[0].clone();
+        with_gamma.split_leaf(&first_leaf, SplitAxis::Vertical, gamma);
+        draft.prior_trees[0].tree = with_gamma;
+        let stored = stored(&draft, 1);
+        apply(&mut state, Event::UndoHistoryLoaded(Some(Box::new(stored))));
+        state.effects.clear();
+        let tree_before = state.trees[&DisplayId(1)].clone();
+
+        let planned = plan_undo(&state);
+        let UndoResult::Refused(UndoRefusal::TargetsUnresolved { targets, .. }) = &planned else {
+            panic!("an ambiguous leaf must refuse, got {planned:?}");
+        };
+        assert!(targets.iter().any(|target| {
+            target.application == "gamma.exe"
+                && matches!(target.outcome, MatchOutcome::Ambiguous { .. })
+        }));
+        apply(&mut state, Event::UndoRequested);
+        assert!(placements(&state).is_empty(), "nothing moved");
+        assert_eq!(state.trees[&DisplayId(1)], tree_before, "nothing reshaped");
+        assert!(
+            state.newest_undo.is_some(),
+            "the transaction is kept for retry"
+        );
+    }
+
+    // ---- Constraint overflow (issue #54) ------------------------------
+
+    /// [`window_at`] with a known minimum size.
+    fn window_needing(id: isize, display_id: isize, bounds: Rect, minimum: (i32, i32)) -> Window {
+        let mut window = window_at(id, display_id, bounds);
+        window.minimum_size = Some(mosaix_domain::Size::new(minimum.0, minimum.1));
+        window
+    }
+
+    /// A tree-mode display too narrow for three windows of the given
+    /// minimum width side by side.
+    fn narrow_tree_state(width: i32) -> EngineState {
+        let mut state = tree_state();
+        state.displays[0].full_bounds = Rect::new(0, 0, width, 600);
+        state.displays[0].work_area = Rect::new(0, 0, width, 600);
+        state
+    }
+
+    #[test]
+    fn a_window_the_tree_cannot_fit_overflows_and_keeps_its_leaf() {
+        // 1000x600; each window needs 400x400. Two fit side by side at
+        // 500x600; a third would stack under the first at 500x300, which
+        // is too short. The newest inserted gives way; the others stay.
+        let mut state = narrow_tree_state(1000);
+        observe(
+            &mut state,
+            vec![
+                window_needing(1, 1, Rect::new(0, 0, 400, 300), (400, 400)),
+                window_needing(2, 1, Rect::new(500, 0, 400, 300), (400, 400)),
+            ],
+        );
+        observe(
+            &mut state,
+            vec![
+                window_needing(1, 1, Rect::new(0, 0, 500, 600), (400, 400)),
+                window_needing(2, 1, Rect::new(500, 0, 500, 600), (400, 400)),
+                window_needing(3, 1, Rect::new(10, 10, 400, 300), (400, 400)),
+            ],
+        );
+
+        assert_eq!(
+            state.constraint_overflow.get(&DisplayId(1)),
+            Some(&vec![WindowId(3)]),
+            "the newest window is the one that overflowed"
+        );
+        assert!(
+            state.trees[&DisplayId(1)].contains(&WindowId(3)),
+            "an overflowed window keeps its tree leaf"
+        );
+        assert_eq!(
+            state.windows[&WindowId(3)].bounds,
+            Rect::new(10, 10, 400, 300),
+            "an overflowed window is left where it is, not squeezed"
+        );
+        assert_eq!(
+            state.inventory[&WindowId(3)].eligibility,
+            EligibilityReason::Eligible,
+            "overflow is a planner outcome, not an eligibility change"
+        );
+        assert!(
+            !state.session_floating.contains(&WindowId(3)),
+            "overflow is distinct from a session-floating choice"
+        );
+        // The two established windows share the display between them.
+        assert_eq!(
+            state.windows[&WindowId(1)].bounds,
+            Rect::new(0, 0, 500, 600)
+        );
+        assert_eq!(
+            state.windows[&WindowId(2)].bounds,
+            Rect::new(500, 0, 500, 600)
+        );
+    }
+
+    #[test]
+    fn an_overflowed_window_returns_to_its_leaf_when_the_tree_can_hold_it() {
+        // 1000px wide; each window needs 600px, so only one fits at a
+        // time and the newer overflows.
+        let mut state = narrow_tree_state(1000);
+        observe(
+            &mut state,
+            vec![
+                window_needing(1, 1, Rect::new(0, 0, 400, 300), (600, 100)),
+                window_needing(2, 1, Rect::new(500, 0, 400, 300), (600, 100)),
+            ],
+        );
+        assert_eq!(
+            state.constraint_overflow.get(&DisplayId(1)),
+            Some(&vec![WindowId(2)]),
+            "the fixture must overflow the newer window to mean anything"
+        );
+        state.effects.clear();
+        state.persistence_intents.clear();
+
+        // The first window closes: the tree can now hold the second.
+        observe(
+            &mut state,
+            vec![window_needing(
+                2,
+                1,
+                Rect::new(500, 0, 400, 300),
+                (600, 100),
+            )],
+        );
+
+        assert!(
+            state.constraint_overflow.is_empty(),
+            "nothing overflows once the constraints can be met"
+        );
+        assert_eq!(
+            placements(&state),
+            vec![(WindowId(2), DisplayId(1), Rect::new(0, 0, 1000, 600))],
+            "the returning window is placed by the reflow, in the leaf it kept"
+        );
+        assert!(
+            recorded_drafts(&state).is_empty(),
+            "overflow and re-entry are passive; neither is an undo transaction"
+        );
+    }
+
+    #[test]
+    fn overflow_windows_are_not_directional_endpoints_in_tree_mode() {
+        let mut state = narrow_tree_state(1000);
+        observe(
+            &mut state,
+            vec![
+                window_needing(1, 1, Rect::new(0, 0, 400, 300), (400, 400)),
+                window_needing(2, 1, Rect::new(500, 0, 400, 300), (400, 400)),
+                window_needing(3, 1, Rect::new(600, 10, 400, 300), (400, 400)),
+            ],
+        );
+        assert_eq!(
+            state.constraint_overflow.get(&DisplayId(1)),
+            Some(&vec![WindowId(3)])
+        );
+
+        // Focus the overflowed window: it can neither be moved nor be
+        // found from a neighbour.
+        apply(
+            &mut state,
+            Event::WindowFocused {
+                window_id: WindowId(3),
+                display_id: DisplayId(1),
+                bounds: Rect::new(600, 10, 400, 300),
+            },
+        );
+        let tree_before = state.trees[&DisplayId(1)].clone();
+        state.effects.clear();
+        apply(
+            &mut state,
+            Event::DirectionalSwapRequested {
+                direction: CardinalDirection::Left,
+            },
+        );
+        assert_eq!(state.trees[&DisplayId(1)], tree_before);
+        assert!(placements(&state).is_empty());
+
+        apply(
+            &mut state,
+            Event::WindowFocused {
+                window_id: WindowId(2),
+                display_id: DisplayId(1),
+                bounds: Rect::new(500, 0, 500, 600),
+            },
+        );
+        state.effects.clear();
+        apply(
+            &mut state,
+            Event::DirectionalFocusRequested {
+                direction: CardinalDirection::Right,
+            },
+        );
+        assert!(
+            state.effects.is_empty(),
+            "the overflowed window to the right is not a focus target"
+        );
+    }
+
+    #[test]
+    fn overflow_reduces_gaps_before_it_removes_a_window() {
+        // Two 490px-minimum windows on a 1000px display with 20px gaps:
+        // undecorated they fit exactly.
+        let mut state = narrow_tree_state(1000);
+        state.resolved_config.gaps = mosaix_domain::Gaps::new(20, 12);
+        observe(
+            &mut state,
+            vec![
+                window_needing(1, 1, Rect::new(0, 0, 400, 300), (490, 100)),
+                window_needing(2, 1, Rect::new(500, 0, 400, 300), (490, 100)),
+            ],
+        );
+
+        assert!(state.constraint_overflow.is_empty());
+        assert!(state.windows[&WindowId(1)].bounds.width >= 490);
+        assert!(state.windows[&WindowId(2)].bounds.width >= 490);
     }
 
     #[test]
@@ -8083,5 +11121,1421 @@ mod tests {
             plan_saved_layout(&state, "half"),
             Err(SavedLayoutRejection::NoFocusedDisplay)
         );
+    }
+
+    // ---- Logical workspaces (ADR 0028) --------------------------------
+
+    fn ws(name: &str) -> WorkspaceName {
+        WorkspaceName::new(name).unwrap()
+    }
+
+    /// Tree mode over `display_ids`, with configuration declaring
+    /// `workspaces`. Every display that can be given a workspace has one
+    /// before any window is observed, exactly as `spawn_engine` does.
+    fn workspace_state(display_ids: &[isize], workspaces: &[&str]) -> EngineState {
+        let mut state = tree_state();
+        state.displays = display_ids
+            .iter()
+            .map(|id| display(*id, &format!("DISPLAY{id}"), (*id as i32 - 1) * 1920))
+            .collect();
+        state.focused_display = Some(DisplayId(display_ids[0]));
+        state.resolved_config.workspaces = workspaces.iter().map(|name| ws(name)).collect();
+        // A topology change re-selects from the config set, so it has to
+        // agree with the resolved config or tiling would switch off.
+        state.config_set.base = state.resolved_config.clone();
+        sync_workspaces_from_config(&mut state);
+        fill_empty_displays(&mut state);
+        state
+    }
+
+    fn create(state: &mut EngineState, name: &str) -> WorkspaceCommandResult {
+        apply(
+            state,
+            Event::WorkspaceCreateRequested {
+                name: name.to_owned(),
+            },
+        );
+        state.last_workspace_result.clone().unwrap()
+    }
+
+    fn focus_workspace(state: &mut EngineState, name: &str) -> WorkspaceCommandResult {
+        apply(
+            state,
+            Event::WorkspaceFocusRequested {
+                name: name.to_owned(),
+            },
+        );
+        state.last_workspace_result.clone().unwrap()
+    }
+
+    fn saved_workspaces(state: &EngineState) -> Vec<&PersistedWorkspace> {
+        state
+            .persistence_intents
+            .iter()
+            .filter_map(|intent| match intent {
+                PersistenceIntent::SaveWorkspace(workspace) => Some(workspace.as_ref()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn configuration_declares_the_pool_and_fills_displays_primary_first() {
+        let state = workspace_state(&[2, 1], &["dev", "chat", "media"]);
+
+        assert_eq!(
+            state.workspaces.names(),
+            vec![ws("chat"), ws("dev"), ws("media")]
+        );
+        assert_eq!(
+            state.workspaces.displayed(),
+            vec![(DisplayId(1), ws("dev")), (DisplayId(2), ws("chat"))],
+            "the primary display is filled first, in the order configuration declares"
+        );
+        assert!(!state.workspaces.is_displayed(&ws("media")));
+        for name in state.workspaces.names() {
+            assert_eq!(
+                state.workspaces.get(&name).unwrap().origin,
+                WorkspaceOrigin::Configuration
+            );
+        }
+    }
+
+    #[test]
+    fn a_display_the_pool_cannot_fill_arranges_its_windows_as_before() {
+        let mut state = workspace_state(&[1, 2], &["main"]);
+        observe(
+            &mut state,
+            vec![
+                app_window_at(1, "a.exe", 1, Rect::new(0, 0, 400, 300)),
+                app_window_at(2, "b.exe", 2, Rect::new(1920, 0, 400, 300)),
+            ],
+        );
+
+        assert_eq!(
+            state.workspaces.workspace_of(WindowId(1)),
+            Some(&ws("main"))
+        );
+        assert_eq!(
+            state.workspaces.workspace_of(WindowId(2)),
+            None,
+            "the engine never invents a workspace for the second display"
+        );
+        assert_eq!(
+            arrangement(&state),
+            vec![
+                (1, Rect::new(0, 0, 1920, 1080)),
+                (2, Rect::new(1920, 0, 1920, 1080))
+            ],
+            "the unfilled display still tiles what is on it"
+        );
+    }
+
+    #[test]
+    fn every_new_managed_window_joins_the_workspace_displayed_where_it_appears() {
+        let mut state = workspace_state(&[1, 2], &["dev", "chat"]);
+        observe(
+            &mut state,
+            vec![
+                app_window_at(1, "a.exe", 1, Rect::new(0, 0, 400, 300)),
+                app_window_at(2, "b.exe", 2, Rect::new(1920, 0, 400, 300)),
+            ],
+        );
+
+        assert_eq!(state.workspaces.workspace_of(WindowId(1)), Some(&ws("dev")));
+        assert_eq!(
+            state.workspaces.workspace_of(WindowId(2)),
+            Some(&ws("chat"))
+        );
+    }
+
+    #[test]
+    fn floating_windows_belong_to_a_workspace_and_excluded_windows_to_none() {
+        let mut state = workspace_state(&[1], &["dev"]);
+        let mut popup = app_window_at(2, "b.exe", 1, Rect::new(0, 0, 400, 300));
+        popup.role = mosaix_domain::WindowRole::Popup;
+        observe(
+            &mut state,
+            vec![
+                app_window_at(1, "a.exe", 1, Rect::new(0, 0, 400, 300)),
+                popup,
+            ],
+        );
+        apply(&mut state, Event::ToggleFloatingRequested);
+        focus(&mut state, 1, Rect::new(0, 0, 400, 300));
+        apply(&mut state, Event::ToggleFloatingRequested);
+
+        assert_eq!(
+            state.inventory[&WindowId(1)].eligibility,
+            EligibilityReason::SessionFloating
+        );
+        assert_eq!(state.workspaces.workspace_of(WindowId(1)), Some(&ws("dev")));
+        assert!(
+            !state.inventory.contains_key(&WindowId(2)),
+            "the built-in rules exclude popups"
+        );
+        assert_eq!(state.workspaces.workspace_of(WindowId(2)), None);
+    }
+
+    #[test]
+    fn create_is_explicit_and_refuses_duplicates_and_invalid_names() {
+        let mut state = workspace_state(&[1], &["dev"]);
+
+        assert_eq!(
+            create(&mut state, "  scratch "),
+            WorkspaceCommandResult::Created(WorkspaceCreateApplied {
+                name: ws("scratch")
+            })
+        );
+        assert_eq!(
+            state.workspaces.get(&ws("scratch")).unwrap().origin,
+            WorkspaceOrigin::Command
+        );
+        assert!(!state.workspaces.is_displayed(&ws("scratch")));
+        assert_eq!(
+            create(&mut state, "DEV"),
+            WorkspaceCommandResult::Refused(WorkspaceRefusal::AlreadyExists { name: ws("dev") })
+        );
+        assert_eq!(
+            create(&mut state, ""),
+            WorkspaceCommandResult::Refused(WorkspaceRefusal::InvalidName {
+                reason: mosaix_domain::WorkspaceNameError::Empty
+            })
+        );
+        assert_eq!(state.workspaces.len(), 2);
+    }
+
+    #[test]
+    fn unknown_focus_move_and_delete_targets_are_typed_refusals_that_create_nothing() {
+        let mut state = workspace_state(&[1], &["dev"]);
+
+        assert_eq!(
+            focus_workspace(&mut state, "typo"),
+            WorkspaceCommandResult::Refused(WorkspaceRefusal::UnknownWorkspace {
+                name: "typo".to_owned()
+            })
+        );
+        apply(
+            &mut state,
+            Event::WorkspaceMoveRequested {
+                name: "typo".to_owned(),
+                display_id: DisplayId(1),
+            },
+        );
+        assert_eq!(
+            state.last_workspace_result,
+            Some(WorkspaceCommandResult::Refused(
+                WorkspaceRefusal::UnknownWorkspace {
+                    name: "typo".to_owned()
+                }
+            ))
+        );
+        apply(
+            &mut state,
+            Event::WorkspaceDeleteRequested {
+                name: "typo".to_owned(),
+            },
+        );
+        assert_eq!(
+            state.last_workspace_result,
+            Some(WorkspaceCommandResult::Refused(
+                WorkspaceRefusal::UnknownWorkspace {
+                    name: "typo".to_owned()
+                }
+            ))
+        );
+        assert_eq!(state.workspaces.names(), vec![ws("dev")]);
+        assert!(saved_workspaces(&state)
+            .iter()
+            .all(|w| w.name != ws("typo")));
+    }
+
+    #[test]
+    fn a_rule_target_assigns_membership_and_an_unknown_target_is_recorded_not_created() {
+        let mut state = workspace_state(&[1], &["dev", "chat"]);
+        let rule = |id: &str, application: &str, workspace: &str| Rule {
+            id: id.to_owned(),
+            priority: 10,
+            enabled: true,
+            matcher: mosaix_rules::WindowMatcher {
+                application_id: Some(application.to_owned()),
+                application_regex: None,
+                title_regex: None,
+                native_class: None,
+                class_regex: None,
+                exe_path_regex: None,
+                exe_path: None,
+                role: None,
+            },
+            actions: mosaix_rules::RuleActions {
+                manage: ManageAction::Tile,
+                workspace: Some(workspace.to_owned()),
+            },
+        };
+        apply(
+            &mut state,
+            Event::RulesChanged {
+                rules: vec![
+                    rule("chat-app", "slack.exe", "chat"),
+                    rule("typo", "code.exe", "dv"),
+                ],
+            },
+        );
+
+        observe(
+            &mut state,
+            vec![
+                app_window_at(1, "slack.exe", 1, Rect::new(0, 0, 400, 300)),
+                app_window_at(2, "code.exe", 1, Rect::new(0, 0, 400, 300)),
+            ],
+        );
+
+        assert_eq!(
+            state.workspaces.workspace_of(WindowId(1)),
+            Some(&ws("chat")),
+            "the rule sent the window to the hidden workspace"
+        );
+        assert_eq!(
+            state.workspaces.workspace_of(WindowId(2)),
+            Some(&ws("dev")),
+            "an unknown target leaves the window in the workspace displayed where it appeared"
+        );
+        assert_eq!(
+            state.rule_workspace_refusals,
+            vec![RuleWorkspaceRefusal {
+                window_id: WindowId(2),
+                rule_id: Some("typo".to_owned()),
+                workspace: "dv".to_owned(),
+            }]
+        );
+        assert_eq!(state.workspaces.names(), vec![ws("chat"), ws("dev")]);
+        assert_eq!(
+            arrangement(&state),
+            vec![
+                (1, Rect::new(0, 0, 400, 300)),
+                (2, Rect::new(0, 0, 1920, 1080))
+            ],
+            "a hidden workspace's window is not arranged; the displayed one's fills the display"
+        );
+    }
+
+    #[test]
+    fn focusing_a_hidden_workspace_displays_it_on_the_focused_display_and_arranges_its_windows() {
+        let mut state = workspace_state(&[1], &["dev"]);
+        observe(
+            &mut state,
+            vec![
+                app_window_at(1, "a.exe", 1, Rect::new(0, 0, 400, 300)),
+                app_window_at(2, "b.exe", 1, Rect::new(500, 0, 400, 300)),
+            ],
+        );
+        create(&mut state, "chat");
+
+        assert_eq!(
+            focus_workspace(&mut state, "chat"),
+            WorkspaceCommandResult::Focused(WorkspaceFocusApplied::Displayed {
+                name: ws("chat"),
+                display_id: DisplayId(1),
+                replaced: Some(ws("dev")),
+            })
+        );
+        assert_eq!(
+            state.workspaces.displayed(),
+            vec![(DisplayId(1), ws("chat"))]
+        );
+        assert!(
+            state
+                .workspaces
+                .get(&ws("dev"))
+                .unwrap()
+                .stashed_tree
+                .as_ref()
+                .unwrap()
+                .contains(&WindowId(1)),
+            "the hidden workspace keeps its tree"
+        );
+        assert!(state
+            .trees
+            .get(&DisplayId(1))
+            .is_none_or(|tree| tree.is_empty()));
+
+        // A new window joins the displayed workspace and gets the whole
+        // display; dev's windows stay where they were, unarranged.
+        observe(
+            &mut state,
+            vec![
+                app_window_at(1, "a.exe", 1, Rect::new(0, 0, 960, 1080)),
+                app_window_at(2, "b.exe", 1, Rect::new(960, 0, 960, 1080)),
+                app_window_at(3, "c.exe", 1, Rect::new(10, 10, 400, 300)),
+            ],
+        );
+        assert_eq!(
+            state.workspaces.workspace_of(WindowId(3)),
+            Some(&ws("chat"))
+        );
+        assert_eq!(
+            arrangement(&state),
+            vec![
+                (1, Rect::new(0, 0, 960, 1080)),
+                (2, Rect::new(960, 0, 960, 1080)),
+                (3, Rect::new(0, 0, 1920, 1080)),
+            ]
+        );
+
+        // Returning to dev brings its tree back exactly.
+        assert_eq!(
+            focus_workspace(&mut state, "dev"),
+            WorkspaceCommandResult::Focused(WorkspaceFocusApplied::Displayed {
+                name: ws("dev"),
+                display_id: DisplayId(1),
+                replaced: Some(ws("chat")),
+            })
+        );
+        assert_eq!(
+            state.trees[&DisplayId(1)].windows(),
+            vec![&WindowId(1), &WindowId(2)]
+        );
+        assert!(state
+            .workspaces
+            .get(&ws("chat"))
+            .unwrap()
+            .stashed_tree
+            .as_ref()
+            .unwrap()
+            .contains(&WindowId(3)));
+    }
+
+    #[test]
+    fn focusing_a_workspace_displayed_elsewhere_focuses_its_last_window_and_does_not_move_it() {
+        let mut state = workspace_state(&[1, 2], &["dev", "chat"]);
+        observe(
+            &mut state,
+            vec![
+                app_window_at(1, "a.exe", 2, Rect::new(1920, 0, 400, 300)),
+                app_window_at(2, "b.exe", 2, Rect::new(2400, 0, 400, 300)),
+            ],
+        );
+        apply(
+            &mut state,
+            Event::WindowFocused {
+                window_id: WindowId(2),
+                display_id: DisplayId(2),
+                bounds: Rect::new(2400, 0, 400, 300),
+            },
+        );
+        apply(
+            &mut state,
+            Event::FocusDisplayRequested {
+                display_id: DisplayId(1),
+            },
+        );
+        let effects_before = state.effects.len();
+
+        assert_eq!(
+            focus_workspace(&mut state, "chat"),
+            WorkspaceCommandResult::Focused(WorkspaceFocusApplied::FocusedExisting {
+                name: ws("chat"),
+                display_id: DisplayId(2),
+                focused_window: Some(WindowId(2)),
+            })
+        );
+        assert_eq!(state.workspaces.display_of(&ws("chat")), Some(DisplayId(2)));
+        assert_eq!(state.focused_display, Some(DisplayId(2)));
+        assert_eq!(
+            &state.effects[effects_before..],
+            &[EngineEffect::FocusWindow {
+                window_id: WindowId(2)
+            }]
+        );
+    }
+
+    #[test]
+    fn focusing_a_hidden_workspace_needs_a_focused_display_and_refuses_while_paused() {
+        let mut state = workspace_state(&[1], &["dev", "chat"]);
+        state.focused_display = None;
+        assert_eq!(
+            focus_workspace(&mut state, "chat"),
+            WorkspaceCommandResult::Refused(WorkspaceRefusal::NoFocusedDisplay)
+        );
+
+        state.focused_display = Some(DisplayId(1));
+        state.paused = true;
+        assert_eq!(
+            focus_workspace(&mut state, "chat"),
+            WorkspaceCommandResult::Refused(WorkspaceRefusal::Paused)
+        );
+        assert_eq!(
+            state.workspaces.displayed(),
+            vec![(DisplayId(1), ws("dev"))]
+        );
+    }
+
+    #[test]
+    fn moving_a_displayed_workspace_swaps_it_with_the_target_and_keeps_its_tree() {
+        let mut state = workspace_state(&[1, 2], &["dev", "chat"]);
+        observe(
+            &mut state,
+            vec![
+                app_window_at(1, "a.exe", 1, Rect::new(0, 0, 400, 300)),
+                app_window_at(2, "b.exe", 1, Rect::new(500, 0, 400, 300)),
+                app_window_at(3, "c.exe", 2, Rect::new(1920, 0, 400, 300)),
+            ],
+        );
+        focus(&mut state, 1, Rect::new(0, 0, 960, 1080));
+        resize(&mut state, CardinalDirection::Right);
+        let shape_before = state.trees[&DisplayId(1)].clone();
+        assert_eq!(
+            arrangement(&state)[0],
+            (1, Rect::new(0, 0, 1056, 1080)),
+            "the resize took"
+        );
+
+        apply(
+            &mut state,
+            Event::WorkspaceMoveRequested {
+                name: "dev".to_owned(),
+                display_id: DisplayId(2),
+            },
+        );
+
+        assert_eq!(
+            state.last_workspace_result,
+            Some(WorkspaceCommandResult::Moved(WorkspaceMoveApplied {
+                name: ws("dev"),
+                from_display_id: DisplayId(1),
+                to_display_id: DisplayId(2),
+                swapped_with: Some(ws("chat")),
+            }))
+        );
+        assert_eq!(
+            state.workspaces.displayed(),
+            vec![(DisplayId(1), ws("chat")), (DisplayId(2), ws("dev"))]
+        );
+        assert_eq!(
+            state.trees[&DisplayId(2)],
+            shape_before,
+            "the tree travelled with the workspace, weights and all"
+        );
+        assert_eq!(
+            arrangement(&state),
+            vec![
+                (1, Rect::new(1920, 0, 1056, 1080)),
+                (2, Rect::new(2976, 0, 864, 1080)),
+                (3, Rect::new(0, 0, 1920, 1080)),
+            ]
+        );
+        assert_eq!(state.workspaces.workspace_of(WindowId(1)), Some(&ws("dev")));
+        assert_eq!(
+            state.workspaces.workspace_of(WindowId(3)),
+            Some(&ws("chat"))
+        );
+    }
+
+    #[test]
+    fn a_move_refuses_a_hidden_workspace_an_unknown_display_and_the_same_display() {
+        let mut state = workspace_state(&[1], &["dev", "chat"]);
+        let attempt = |state: &mut EngineState, name: &str, display: isize| {
+            apply(
+                state,
+                Event::WorkspaceMoveRequested {
+                    name: name.to_owned(),
+                    display_id: DisplayId(display),
+                },
+            );
+            state.last_workspace_result.clone().unwrap()
+        };
+
+        assert_eq!(
+            attempt(&mut state, "chat", 1),
+            WorkspaceCommandResult::Refused(WorkspaceRefusal::NotDisplayed { name: ws("chat") })
+        );
+        assert_eq!(
+            attempt(&mut state, "dev", 9),
+            WorkspaceCommandResult::Refused(WorkspaceRefusal::UnknownDisplay {
+                display_id: DisplayId(9)
+            })
+        );
+        assert_eq!(
+            attempt(&mut state, "dev", 1),
+            WorkspaceCommandResult::Refused(WorkspaceRefusal::AlreadyDisplayedThere {
+                name: ws("dev"),
+                display_id: DisplayId(1)
+            })
+        );
+    }
+
+    #[test]
+    fn delete_succeeds_only_for_a_hidden_empty_command_workspace() {
+        let mut state = workspace_state(&[1], &["dev"]);
+        observe(
+            &mut state,
+            vec![app_window_at(1, "a.exe", 1, Rect::new(0, 0, 400, 300))],
+        );
+        create(&mut state, "scratch");
+        let attempt = |state: &mut EngineState, name: &str| {
+            apply(
+                state,
+                Event::WorkspaceDeleteRequested {
+                    name: name.to_owned(),
+                },
+            );
+            state.last_workspace_result.clone().unwrap()
+        };
+
+        assert_eq!(
+            attempt(&mut state, "dev"),
+            WorkspaceCommandResult::Refused(WorkspaceRefusal::Displayed {
+                name: ws("dev"),
+                display_id: DisplayId(1)
+            })
+        );
+        // Display scratch, give it a window, hide it again: now it owns a
+        // live member.
+        focus_workspace(&mut state, "scratch");
+        observe(
+            &mut state,
+            vec![
+                app_window_at(1, "a.exe", 1, Rect::new(0, 0, 400, 300)),
+                app_window_at(2, "b.exe", 1, Rect::new(0, 0, 400, 300)),
+            ],
+        );
+        focus_workspace(&mut state, "dev");
+        assert_eq!(
+            attempt(&mut state, "scratch"),
+            WorkspaceCommandResult::Refused(WorkspaceRefusal::NotEmpty {
+                name: ws("scratch"),
+                live_members: 1,
+                dormant_positions: 0
+            })
+        );
+        // The member closes while scratch is hidden: it goes dormant, and
+        // deletion still refuses, because the position is still owned.
+        observe(
+            &mut state,
+            vec![app_window_at(1, "a.exe", 1, Rect::new(0, 0, 400, 300))],
+        );
+        assert_eq!(
+            attempt(&mut state, "scratch"),
+            WorkspaceCommandResult::Refused(WorkspaceRefusal::NotEmpty {
+                name: ws("scratch"),
+                live_members: 0,
+                dormant_positions: 1
+            })
+        );
+        // Removing the dormant position by displaying and pruning is a
+        // tree command; here the stash is emptied directly to show the
+        // last refusal was the only thing in the way.
+        state
+            .workspaces
+            .get_mut(&ws("scratch"))
+            .unwrap()
+            .stashed_tree = None;
+        assert_eq!(
+            attempt(&mut state, "scratch"),
+            WorkspaceCommandResult::Deleted(WorkspaceDeleteApplied {
+                name: ws("scratch")
+            })
+        );
+        assert!(state
+            .persistence_intents
+            .iter()
+            .any(|intent| *intent == PersistenceIntent::DeleteWorkspace(ws("scratch"))));
+    }
+
+    #[test]
+    fn a_vanished_display_hides_its_workspace_without_displacing_survivors() {
+        let mut state = workspace_state(&[1, 2], &["dev", "chat"]);
+        observe(
+            &mut state,
+            vec![
+                app_window_at(1, "a.exe", 1, Rect::new(0, 0, 400, 300)),
+                app_window_at(2, "b.exe", 2, Rect::new(1920, 0, 400, 300)),
+            ],
+        );
+
+        apply(
+            &mut state,
+            Event::DisplayTopologyChanged(vec![display(1, "DISPLAY1", 0)]),
+        );
+
+        assert_eq!(
+            state.workspaces.displayed(),
+            vec![(DisplayId(1), ws("dev"))]
+        );
+        let chat = state.workspaces.get(&ws("chat")).unwrap();
+        assert!(chat.stashed_tree.as_ref().unwrap().contains(&WindowId(2)));
+        assert_eq!(
+            state.workspaces.workspace_of(WindowId(2)),
+            Some(&ws("chat")),
+            "the migrated window keeps its membership"
+        );
+        assert_eq!(
+            state.trees[&DisplayId(1)].windows(),
+            vec![&WindowId(1)],
+            "the survivor's workspace is untouched; the hidden member is not arranged into it"
+        );
+
+        // Reconnecting reveals nothing: chat has a live member.
+        apply(
+            &mut state,
+            Event::DisplayTopologyChanged(vec![
+                display(1, "DISPLAY1", 0),
+                display(2, "DISPLAY2", 1920),
+            ]),
+        );
+        assert_eq!(
+            state.workspaces.displayed(),
+            vec![(DisplayId(1), ws("dev"))]
+        );
+        assert_eq!(state.workspaces.displayed_on(DisplayId(2)), None);
+
+        // An explicit focus is what brings it back.
+        apply(
+            &mut state,
+            Event::FocusDisplayRequested {
+                display_id: DisplayId(2),
+            },
+        );
+        focus_workspace(&mut state, "chat");
+        assert_eq!(state.workspaces.display_of(&ws("chat")), Some(DisplayId(2)));
+        assert_eq!(
+            arrangement(&state)
+                .iter()
+                .find(|(id, _)| *id == 2)
+                .unwrap()
+                .1,
+            Rect::new(1920, 0, 1920, 1080)
+        );
+    }
+
+    #[test]
+    fn last_focused_is_forgotten_when_the_window_closes_and_focus_falls_back_to_a_member() {
+        let mut state = workspace_state(&[1, 2], &["dev", "chat"]);
+        observe(
+            &mut state,
+            vec![
+                app_window_at(1, "a.exe", 2, Rect::new(1920, 0, 400, 300)),
+                app_window_at(2, "b.exe", 2, Rect::new(2400, 0, 400, 300)),
+            ],
+        );
+        apply(
+            &mut state,
+            Event::WindowFocused {
+                window_id: WindowId(2),
+                display_id: DisplayId(2),
+                bounds: Rect::new(2400, 0, 400, 300),
+            },
+        );
+        observe(
+            &mut state,
+            vec![app_window_at(1, "a.exe", 2, Rect::new(1920, 0, 400, 300))],
+        );
+        apply(
+            &mut state,
+            Event::FocusDisplayRequested {
+                display_id: DisplayId(1),
+            },
+        );
+
+        assert_eq!(
+            state.workspaces.get(&ws("chat")).unwrap().last_focused,
+            None
+        );
+        assert_eq!(
+            plan_workspace_focus(&state, "chat"),
+            Ok(WorkspaceFocusApplied::FocusedExisting {
+                name: ws("chat"),
+                display_id: DisplayId(2),
+                focused_window: Some(WindowId(1)),
+            })
+        );
+    }
+
+    #[test]
+    fn workspace_changes_are_written_as_intents_with_display_origin_and_tree() {
+        let mut state = workspace_state(&[1], &["dev"]);
+        observe(
+            &mut state,
+            vec![app_window_at(1, "a.exe", 1, Rect::new(0, 0, 400, 300))],
+        );
+        let dev = saved_workspaces(&state).last().copied().unwrap().clone();
+        assert_eq!(dev.name, ws("dev"));
+        assert_eq!(dev.origin, WorkspaceOrigin::Configuration);
+        assert_eq!(dev.displayed_fingerprint.as_deref(), Some("DISPLAY1"));
+        assert_eq!(dev.tree.as_ref().unwrap().windows().len(), 1);
+        assert!(
+            !state
+                .persistence_intents
+                .iter()
+                .any(|intent| matches!(intent, PersistenceIntent::SaveContainerTree { .. })),
+            "a display with a workspace stores its tree under the workspace"
+        );
+
+        create(&mut state, "chat");
+        let chat = saved_workspaces(&state).last().copied().unwrap().clone();
+        assert_eq!(
+            chat,
+            PersistedWorkspace {
+                name: ws("chat"),
+                origin: WorkspaceOrigin::Command,
+                displayed_fingerprint: None,
+                tree: None,
+            }
+        );
+
+        let before = state.persistence_intents.len();
+        observe(
+            &mut state,
+            vec![app_window_at(1, "a.exe", 1, Rect::new(0, 0, 1920, 1080))],
+        );
+        assert_eq!(
+            state.persistence_intents.len(),
+            before,
+            "a reflow that changed nothing writes nothing"
+        );
+    }
+
+    #[test]
+    fn restart_restores_command_workspaces_their_displays_and_their_trees() {
+        let mut state = workspace_state(&[1, 2], &["dev"]);
+        let b = app_window_at(1, "b.exe", 2, Rect::new(1920, 0, 960, 1080));
+        let a = app_window_at(2, "a.exe", 2, Rect::new(2880, 0, 960, 1080));
+        let stored_tree = {
+            let mut tree = PersistedTree::new();
+            tree.insert_first(WindowEvidence::capture(&a, 0, "DISPLAY2"));
+            tree.split_root(
+                SplitAxis::Horizontal,
+                WindowEvidence::capture(&b, 0, "DISPLAY2"),
+            );
+            tree
+        };
+
+        apply(
+            &mut state,
+            Event::WorkspacesLoaded(vec![
+                PersistedWorkspace {
+                    name: ws("chat"),
+                    origin: WorkspaceOrigin::Command,
+                    displayed_fingerprint: Some("DISPLAY2".to_owned()),
+                    tree: Some(stored_tree),
+                },
+                PersistedWorkspace {
+                    name: ws("dev"),
+                    origin: WorkspaceOrigin::Command,
+                    displayed_fingerprint: Some("DISPLAY1".to_owned()),
+                    tree: None,
+                },
+                PersistedWorkspace {
+                    name: ws("old"),
+                    origin: WorkspaceOrigin::Configuration,
+                    displayed_fingerprint: Some("DISPLAY9".to_owned()),
+                    tree: None,
+                },
+            ]),
+        );
+
+        assert_eq!(
+            state.workspaces.displayed(),
+            vec![(DisplayId(1), ws("dev")), (DisplayId(2), ws("chat"))],
+            "each workspace went back to the display it was on"
+        );
+        assert_eq!(
+            state.workspaces.get(&ws("dev")).unwrap().origin,
+            WorkspaceOrigin::Configuration,
+            "configuration still declares dev, so configuration owns it"
+        );
+        assert_eq!(
+            state.workspaces.get(&ws("old")).unwrap().origin,
+            WorkspaceOrigin::Command,
+            "a workspace configuration stopped declaring becomes deletable by command"
+        );
+        assert!(!state.workspaces.is_displayed(&ws("old")));
+
+        observe(&mut state, vec![b, a]);
+        assert_eq!(
+            state.trees[&DisplayId(2)].windows(),
+            vec![&WindowId(2), &WindowId(1)],
+            "the stored tree placed a.exe before b.exe regardless of observation order"
+        );
+    }
+
+    #[test]
+    fn a_removed_declaration_keeps_the_workspace_and_a_new_one_creates_it() {
+        let mut state = workspace_state(&[1], &["dev", "chat"]);
+        let mut set = state.config_set.clone();
+        set.base.workspaces = vec![ws("dev"), ws("media")];
+        set.base.tiling_mode = TilingMode::Tree;
+        set.base.automatic_tiling_enabled = true;
+
+        apply(&mut state, Event::ConfigChanged(Box::new(set)));
+
+        assert_eq!(
+            state.workspaces.names(),
+            vec![ws("chat"), ws("dev"), ws("media")]
+        );
+        assert_eq!(
+            state.workspaces.get(&ws("chat")).unwrap().origin,
+            WorkspaceOrigin::Command
+        );
+        assert_eq!(
+            state.workspaces.get(&ws("media")).unwrap().origin,
+            WorkspaceOrigin::Configuration
+        );
+    }
+
+    // ---- Experimental switching mappings (ADR 0028) --------------------
+
+    fn switching_set(
+        displays: &[Display],
+        workspaces: &[&str],
+        experimental: bool,
+        mapping: &[(&str, &str)],
+    ) -> ResolvedConfigSet {
+        let config = ResolvedConfig {
+            workspaces: workspaces.iter().map(|name| ws(name)).collect(),
+            workspace_switching: Some(mosaix_config::ResolvedWorkspaceSwitching {
+                experimental,
+                displayed: mapping
+                    .iter()
+                    .map(|(display, name)| ((*display).to_owned(), ws(name)))
+                    .collect(),
+            }),
+            automatic_tiling_enabled: true,
+            tiling_mode: TilingMode::Tree,
+            ..ResolvedConfig::default()
+        };
+        ResolvedConfigSet {
+            base: ResolvedConfig {
+                workspaces: config.workspaces.clone(),
+                ..ResolvedConfig::default()
+            },
+            profiles: vec![ResolvedProfile {
+                fingerprint: topology_fingerprint(displays),
+                config,
+            }],
+        }
+    }
+
+    #[test]
+    fn base_config_cannot_request_switching_so_it_stays_disabled() {
+        let state = workspace_state(&[1], &["dev"]);
+        assert_eq!(
+            state.workspace_switching_status(),
+            WorkspaceSwitchingStatus::Disabled
+        );
+    }
+
+    #[test]
+    fn a_valid_profile_mapping_applies_to_every_display_at_once_and_is_requested() {
+        let mut state = workspace_state(&[1, 2], &["dev", "chat", "media"]);
+        observe(
+            &mut state,
+            vec![
+                app_window_at(1, "a.exe", 1, Rect::new(0, 0, 400, 300)),
+                app_window_at(2, "b.exe", 2, Rect::new(1920, 0, 400, 300)),
+            ],
+        );
+        assert_eq!(
+            state.workspaces.displayed(),
+            vec![(DisplayId(1), ws("dev")), (DisplayId(2), ws("chat"))]
+        );
+        let set = switching_set(
+            &state.displays,
+            &["dev", "chat", "media"],
+            true,
+            &[("DISPLAY1", "media"), ("DISPLAY2", "dev")],
+        );
+
+        apply(&mut state, Event::ConfigChanged(Box::new(set)));
+
+        assert_eq!(
+            state.workspaces.displayed(),
+            vec![(DisplayId(1), ws("media")), (DisplayId(2), ws("dev"))],
+            "the whole mapping applied as one transition"
+        );
+        assert!(
+            state
+                .workspaces
+                .get(&ws("chat"))
+                .unwrap()
+                .stashed_tree
+                .as_ref()
+                .unwrap()
+                .contains(&WindowId(2)),
+            "the displaced workspace kept its tree"
+        );
+        assert_eq!(
+            state.trees[&DisplayId(2)].windows(),
+            vec![&WindowId(1)],
+            "dev carried its tree to its new display"
+        );
+        assert_eq!(
+            state.workspace_switching_status(),
+            WorkspaceSwitchingStatus::Requested {
+                pending: SwitchingPending::ParkingCapabilityUnverified
+            },
+            "the mapping is in effect; switching itself waits for a verified parking site"
+        );
+    }
+
+    #[test]
+    fn an_inert_mapping_changes_nothing_and_reports_disabled() {
+        let mut state = workspace_state(&[1, 2], &["dev", "chat"]);
+        let set = switching_set(
+            &state.displays,
+            &["dev", "chat"],
+            false,
+            &[("DISPLAY1", "chat"), ("DISPLAY2", "dev")],
+        );
+
+        apply(&mut state, Event::ConfigChanged(Box::new(set)));
+
+        assert_eq!(
+            state.workspaces.displayed(),
+            vec![(DisplayId(1), ws("dev")), (DisplayId(2), ws("chat"))]
+        );
+        assert_eq!(
+            state.workspace_switching_status(),
+            WorkspaceSwitchingStatus::Disabled
+        );
+    }
+
+    #[test]
+    fn a_mapping_that_cannot_be_completed_changes_nothing_and_is_unavailable() {
+        let mut state = workspace_state(&[1, 2], &["dev", "chat"]);
+        let before = state.workspaces.displayed();
+
+        // Validation would refuse these; the reducer still must not apply
+        // half of one if they ever arrive.
+        let unknown = switching_set(
+            &state.displays,
+            &["dev", "chat"],
+            true,
+            &[("DISPLAY1", "chat"), ("DISPLAY2", "media")],
+        );
+        apply(&mut state, Event::ConfigChanged(Box::new(unknown)));
+        assert_eq!(state.workspaces.displayed(), before);
+        assert_eq!(
+            state.workspace_switching_status(),
+            WorkspaceSwitchingStatus::Unavailable {
+                reason: WorkspaceSwitchingUnavailable::UnknownWorkspace {
+                    name: "media".to_owned()
+                }
+            }
+        );
+        assert_eq!(
+            state.workspaces.names(),
+            vec![ws("chat"), ws("dev")],
+            "no name was invented"
+        );
+
+        let incomplete = switching_set(
+            &state.displays,
+            &["dev", "chat"],
+            true,
+            &[("DISPLAY1", "chat")],
+        );
+        apply(&mut state, Event::ConfigChanged(Box::new(incomplete)));
+        assert_eq!(state.workspaces.displayed(), before);
+        assert_eq!(
+            state.workspace_switching_status(),
+            WorkspaceSwitchingStatus::Unavailable {
+                reason: WorkspaceSwitchingUnavailable::MappingIncomplete {
+                    display_fingerprint: "DISPLAY2".to_owned()
+                }
+            }
+        );
+
+        let stray = switching_set(
+            &state.displays,
+            &["dev", "chat"],
+            true,
+            &[
+                ("DISPLAY1", "chat"),
+                ("DISPLAY2", "dev"),
+                ("DISPLAY9", "dev"),
+            ],
+        );
+        apply(&mut state, Event::ConfigChanged(Box::new(stray)));
+        assert_eq!(state.workspaces.displayed(), before);
+        assert_eq!(
+            state.workspace_switching_status(),
+            WorkspaceSwitchingStatus::Unavailable {
+                reason: WorkspaceSwitchingUnavailable::DisplayNotConnected {
+                    display_fingerprint: "DISPLAY9".to_owned()
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn a_mapping_already_in_effect_leaves_the_trees_alone_on_reload() {
+        let mut state = workspace_state(&[1], &["dev"]);
+        observe(
+            &mut state,
+            vec![
+                app_window_at(1, "a.exe", 1, Rect::new(0, 0, 400, 300)),
+                app_window_at(2, "b.exe", 1, Rect::new(500, 0, 400, 300)),
+            ],
+        );
+        let set = switching_set(&state.displays, &["dev"], true, &[("DISPLAY1", "dev")]);
+        apply(&mut state, Event::ConfigChanged(Box::new(set.clone())));
+        let tree = state.trees[&DisplayId(1)].clone();
+        let mut again = set;
+        again.base.gaps = mosaix_domain::Gaps::new(4, 4);
+
+        apply(&mut state, Event::ConfigChanged(Box::new(again)));
+
+        assert_eq!(state.trees[&DisplayId(1)], tree);
+        assert!(state
+            .workspaces
+            .get(&ws("dev"))
+            .unwrap()
+            .stashed_tree
+            .is_none());
+    }
+
+    #[test]
+    fn switching_status_follows_persistence_health_and_parking_capability() {
+        let mut state = workspace_state(&[1], &["dev"]);
+        let set = switching_set(&state.displays, &["dev"], true, &[("DISPLAY1", "dev")]);
+        apply(&mut state, Event::ConfigChanged(Box::new(set)));
+
+        apply(
+            &mut state,
+            Event::PersistenceHealthChanged(PersistenceHealth::Degraded {
+                last_durable_revision: 1,
+                reason: mosaix_persistence::PersistenceFailure::WriteFailed,
+            }),
+        );
+        assert_eq!(
+            state.workspace_switching_status(),
+            WorkspaceSwitchingStatus::Requested {
+                pending: SwitchingPending::PersistenceDegraded
+            }
+        );
+
+        apply(
+            &mut state,
+            Event::PersistenceHealthChanged(PersistenceHealth::Healthy {
+                last_durable_revision: 2,
+            }),
+        );
+        state.parking_capability = ParkingCapability::Verified;
+        assert_eq!(
+            state.workspace_switching_status(),
+            WorkspaceSwitchingStatus::Experimental
+        );
+
+        state.parking_capability = ParkingCapability::Refused {
+            reason: "no off-screen edge".to_owned(),
+        };
+        assert_eq!(
+            state.workspace_switching_status(),
+            WorkspaceSwitchingStatus::Unavailable {
+                reason: WorkspaceSwitchingUnavailable::ParkingRefused {
+                    reason: "no off-screen edge".to_owned()
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn a_profile_mapping_outranks_a_remembered_assignment_at_restart() {
+        let mut state = workspace_state(&[1], &["dev", "chat"]);
+        let set = switching_set(
+            &state.displays,
+            &["dev", "chat"],
+            true,
+            &[("DISPLAY1", "chat")],
+        );
+        apply(&mut state, Event::ConfigChanged(Box::new(set)));
+        assert_eq!(
+            state.workspaces.displayed(),
+            vec![(DisplayId(1), ws("chat"))]
+        );
+
+        apply(
+            &mut state,
+            Event::WorkspacesLoaded(vec![PersistedWorkspace {
+                name: ws("dev"),
+                origin: WorkspaceOrigin::Configuration,
+                displayed_fingerprint: Some("DISPLAY1".to_owned()),
+                tree: None,
+            }]),
+        );
+
+        assert_eq!(
+            state.workspaces.displayed(),
+            vec![(DisplayId(1), ws("chat"))]
+        );
+    }
+
+    // ---- Recovery ledger authorisation (ADR 0023, issue #58) ----------
+
+    fn parkable_state() -> EngineState {
+        let mut state = workspace_state(&[1], &["dev"]);
+        state.session_id = "session-1".to_owned();
+        state.parking_capability = ParkingCapability::Verified;
+        observe(
+            &mut state,
+            vec![app_window_at(1, "a.exe", 1, Rect::new(0, 0, 400, 300))],
+        );
+        state
+    }
+
+    fn recovery_intents(state: &EngineState) -> Vec<&PersistenceIntent> {
+        state
+            .persistence_intents
+            .iter()
+            .filter(|intent| {
+                matches!(
+                    intent,
+                    PersistenceIntent::RecordRecovery { .. }
+                        | PersistenceIntent::MarkParked(_)
+                        | PersistenceIntent::MarkRestored(_)
+                )
+            })
+            .collect()
+    }
+
+    fn park_effects(state: &EngineState) -> Vec<(WindowId, RecoveryEntryId)> {
+        state
+            .effects
+            .iter()
+            .filter_map(|effect| match effect {
+                EngineEffect::ParkWindow {
+                    window_id,
+                    entry_id,
+                } => Some((*window_id, *entry_id)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn parking_is_authorised_only_after_the_ledger_acknowledges_the_entry() {
+        let mut state = parkable_state();
+
+        apply(
+            &mut state,
+            Event::ParkingAuthorizationRequested {
+                window_id: WindowId(1),
+            },
+        );
+
+        assert_eq!(state.last_parking_refusal, None);
+        assert_eq!(
+            state.pending_parking,
+            vec![PendingParking {
+                token: 1,
+                window_id: WindowId(1)
+            }]
+        );
+        let intents = recovery_intents(&state);
+        assert_eq!(intents.len(), 1);
+        let PersistenceIntent::RecordRecovery { token, draft } = intents[0] else {
+            panic!("expected a recovery intent");
+        };
+        assert_eq!(*token, 1);
+        assert_eq!(draft.session_id, "session-1");
+        assert_eq!(draft.native_handle, 1);
+        assert_eq!(draft.original_display_fingerprint, "DISPLAY1");
+        assert_eq!(draft.visible_bounds, Rect::new(0, 0, 1920, 1080));
+        assert!(
+            park_effects(&state).is_empty(),
+            "nothing may move before the entry is durable"
+        );
+
+        apply(
+            &mut state,
+            Event::RecoveryEntryDurable {
+                token: 1,
+                entry_id: RecoveryEntryId(9),
+            },
+        );
+
+        assert!(state.pending_parking.is_empty());
+        assert_eq!(
+            park_effects(&state),
+            vec![(WindowId(1), RecoveryEntryId(9))]
+        );
+    }
+
+    #[test]
+    fn a_refused_ledger_write_parks_nothing() {
+        let mut state = parkable_state();
+        apply(
+            &mut state,
+            Event::ParkingAuthorizationRequested {
+                window_id: WindowId(1),
+            },
+        );
+
+        apply(&mut state, Event::RecoveryEntryRefused { token: 1 });
+
+        assert!(state.pending_parking.is_empty());
+        assert!(park_effects(&state).is_empty());
+    }
+
+    #[test]
+    fn a_degraded_state_database_refuses_new_parking_but_tiling_continues() {
+        let mut state = parkable_state();
+        apply(
+            &mut state,
+            Event::PersistenceHealthChanged(PersistenceHealth::Degraded {
+                last_durable_revision: 1,
+                reason: mosaix_persistence::PersistenceFailure::WriteFailed,
+            }),
+        );
+
+        apply(
+            &mut state,
+            Event::ParkingAuthorizationRequested {
+                window_id: WindowId(1),
+            },
+        );
+        assert_eq!(
+            state.last_parking_refusal,
+            Some(ParkingRefusal::PersistenceDegraded)
+        );
+        assert!(recovery_intents(&state).is_empty());
+
+        // Ordinary in-memory tiling is untouched: a second window still
+        // gets arranged.
+        observe(
+            &mut state,
+            vec![
+                app_window_at(1, "a.exe", 1, Rect::new(0, 0, 1920, 1080)),
+                app_window_at(2, "b.exe", 1, Rect::new(0, 0, 400, 300)),
+            ],
+        );
+        assert_eq!(
+            arrangement(&state),
+            vec![
+                (1, Rect::new(0, 0, 960, 1080)),
+                (2, Rect::new(960, 0, 960, 1080))
+            ]
+        );
+    }
+
+    #[test]
+    fn parking_refuses_without_a_verified_site_a_fullscreen_window_or_an_unmanaged_one() {
+        let mut state = parkable_state();
+        state.parking_capability = ParkingCapability::Unverified;
+        assert_eq!(
+            plan_parking_authorization(&state, WindowId(1)),
+            Err(ParkingRefusal::ParkingCapabilityUnverified)
+        );
+        state.parking_capability = ParkingCapability::Refused {
+            reason: "no edge".to_owned(),
+        };
+        assert_eq!(
+            plan_parking_authorization(&state, WindowId(1)),
+            Err(ParkingRefusal::ParkingRefused {
+                reason: "no edge".to_owned()
+            })
+        );
+        state.parking_capability = ParkingCapability::Verified;
+        assert_eq!(
+            plan_parking_authorization(&state, WindowId(99)),
+            Err(ParkingRefusal::NotManaged {
+                window_id: WindowId(99)
+            })
+        );
+        let mut fullscreen = app_window_at(1, "a.exe", 1, Rect::new(0, 0, 1920, 1080));
+        fullscreen.lifecycle = WindowLifecycle::Fullscreen;
+        observe(&mut state, vec![fullscreen]);
+        assert_eq!(
+            plan_parking_authorization(&state, WindowId(1)),
+            Err(ParkingRefusal::Fullscreen {
+                window_id: WindowId(1)
+            })
+        );
+    }
+
+    #[test]
+    fn a_parked_window_is_marked_in_the_ledger_and_restoration_consumes_the_entry() {
+        let mut state = parkable_state();
+        apply(
+            &mut state,
+            Event::ParkingAuthorizationRequested {
+                window_id: WindowId(1),
+            },
+        );
+        apply(
+            &mut state,
+            Event::RecoveryEntryDurable {
+                token: 1,
+                entry_id: RecoveryEntryId(9),
+            },
+        );
+
+        apply(
+            &mut state,
+            Event::WindowParked {
+                window_id: WindowId(1),
+                entry_id: RecoveryEntryId(9),
+            },
+        );
+        assert_eq!(
+            state.parked_windows.get(&WindowId(1)),
+            Some(&RecoveryEntryId(9))
+        );
+        assert_eq!(
+            plan_parking_authorization(&state, WindowId(1)).map(|_| ()),
+            Ok(()),
+            "a parked window may be re-recorded; the ledger keeps every entry"
+        );
+
+        apply(
+            &mut state,
+            Event::WindowRestored {
+                window_id: WindowId(1),
+            },
+        );
+        assert!(state.parked_windows.is_empty());
+        assert!(recovery_intents(&state)
+            .iter()
+            .any(|intent| matches!(intent, PersistenceIntent::MarkRestored(RecoveryEntryId(9)))));
+    }
+
+    #[test]
+    fn an_acknowledgement_for_a_window_that_left_management_parks_nothing() {
+        let mut state = parkable_state();
+        apply(
+            &mut state,
+            Event::ParkingAuthorizationRequested {
+                window_id: WindowId(1),
+            },
+        );
+        observe(&mut state, vec![]);
+
+        apply(
+            &mut state,
+            Event::RecoveryEntryDurable {
+                token: 1,
+                entry_id: RecoveryEntryId(9),
+            },
+        );
+
+        assert!(park_effects(&state).is_empty());
+    }
+
+    #[test]
+    fn startup_recovery_outcomes_are_published() {
+        let mut state = parkable_state();
+        let outcome = RecoveryOutcome {
+            entry_id: RecoveryEntryId(3),
+            native_handle: 77,
+            application_id: mosaix_domain::ApplicationId("code.exe".to_owned()),
+            verdict: mosaix_domain::HandleVerdict::Stale,
+            restored: false,
+            failure: None,
+        };
+
+        apply(&mut state, Event::RecoveryReported(vec![outcome.clone()]));
+
+        assert_eq!(state.recovery_outcomes, vec![outcome]);
     }
 }

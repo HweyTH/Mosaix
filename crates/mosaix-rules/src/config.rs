@@ -58,6 +58,11 @@ pub struct MatcherConfig {
 pub struct ActionConfig {
     #[serde(default = "default_manage")]
     pub manage: ManageAction,
+    /// The logical workspace a matching window joins. Names an existing
+    /// workspace; an unknown name is a typed refusal at evaluation time,
+    /// never an implicit creation (ADR 0028).
+    #[serde(default)]
+    pub workspace: Option<String>,
 }
 
 fn default_manage() -> ManageAction {
@@ -68,6 +73,7 @@ impl Default for ActionConfig {
     fn default() -> Self {
         Self {
             manage: default_manage(),
+            workspace: None,
         }
     }
 }
@@ -134,6 +140,7 @@ impl TryFrom<RuleConfig> for Rule {
             },
             actions: RuleActions {
                 manage: config.actions.manage,
+                workspace: config.actions.workspace,
             },
         })
     }

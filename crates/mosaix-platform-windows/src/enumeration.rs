@@ -141,6 +141,7 @@ fn build_window_info_with_displays(hwnd: HWND, displays: &[Display]) -> Window {
     let display_id = crate::window_display_id(hwnd).unwrap_or(DisplayId(0));
     let lifecycle = determine_lifecycle(hwnd, bounds, display_id, displays);
     let elevated = win32_helpers::is_process_elevated(pid).unwrap_or(true);
+    let minimum_size = win32_helpers::get_minimum_size(hwnd);
 
     if exe_path.is_none() {
         debug!(
@@ -166,6 +167,7 @@ fn build_window_info_with_displays(hwnd: HWND, displays: &[Display]) -> Window {
         capabilities,
         elevated,
         lifecycle,
+        minimum_size,
     }
 }
 

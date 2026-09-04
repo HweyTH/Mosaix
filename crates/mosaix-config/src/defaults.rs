@@ -52,10 +52,18 @@ pub fn default_base_config() -> BaseConfig {
     hotkeys.insert(Command::SwapDown, shifted_combo("J"));
     hotkeys.insert(Command::SwapUp, shifted_combo("K"));
     hotkeys.insert(Command::SwapRight, shifted_combo("L"));
+    hotkeys.insert(Command::ResizeLeft, shifted_combo("LEFT"));
+    hotkeys.insert(Command::ResizeRight, shifted_combo("RIGHT"));
+    hotkeys.insert(Command::ResizeUp, shifted_combo("UP"));
+    hotkeys.insert(Command::ResizeDown, shifted_combo("DOWN"));
     hotkeys.insert(Command::TogglePause, arrow_combo("P"));
 
     BaseConfig {
         version: CURRENT_VERSION,
+        // One workspace, so a fresh install tiles exactly as it did before
+        // workspaces existed. More are declared by the user, never
+        // invented by the engine (ADR 0028).
+        workspaces: crate::schema::default_workspaces(),
         hotkeys,
         gaps: Gaps::default(),
         behavior: BehaviorSection::default(),
@@ -63,6 +71,7 @@ pub fn default_base_config() -> BaseConfig {
         // No layouts ship as defaults: a saved layout describes a shape one
         // user chose, so Mosaix has nothing to guess at (ADR 0018).
         layouts: BTreeMap::new(),
+        workspace_switching: None,
     }
 }
 

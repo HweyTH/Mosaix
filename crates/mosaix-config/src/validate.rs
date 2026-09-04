@@ -12,8 +12,10 @@ use std::collections::BTreeMap;
 use crate::schema::layout_names_collide;
 use crate::schema::{
     BaseConfig, Command, ConfigLayer, KeyCombo, ProfileConfig, ResolvedConfig, ResolvedConfigSet,
-    ResolvedProfile, SavedLayout, TilingMode, BASE_CONFIG_FILE_NAME, CURRENT_VERSION,
+    ResolvedProfile, ResolvedWorkspaceSwitching, SavedLayout, TilingMode,
+    WorkspaceSwitchingSection, BASE_CONFIG_FILE_NAME, CURRENT_VERSION,
 };
+use mosaix_domain::{display_fingerprints, WorkspaceName, WorkspaceNameError};
 
 /// One profile candidate: its filename (for error messages -- profiles are
 /// matched by content, not filename, per ADR 0004, but the filename is
@@ -111,6 +113,171 @@ pub enum ValidationError {
         binding: String,
         layout: String,
     },
+
+    #[error("{file}: hotkey {binding:?} focuses workspace {workspace:?}, which is not declared")]
+    UnknownWorkspaceBinding {
+        file: String,
+        binding: String,
+        workspace: String,
+    },
+
+    #[error("{file}: workspace name {name:?} is invalid: {reason}")]
+    InvalidWorkspaceName {
+        file: String,
+        name: String,
+        reason: WorkspaceNameError,
+    },
+
+    #[error(
+        "{file}: workspaces {first:?} and {second:?} are the same name; \
+         a workspace may be declared once"
+    )]
+    DuplicateWorkspaceName {
+        file: String,
+        first: String,
+        second: String,
+    },
+
+    #[error(
+        "{file}: [workspace_switching] belongs in a topology profile, never in base config; \
+         experimental switching activates only for a matched topology"
+    )]
+    WorkspaceSwitchingInBaseConfig { file: String },
+
+    #[error(
+        "{file}: [workspace_switching.displayed] maps display {display:?} to workspace \
+         {workspace:?}, which no configuration file declares"
+    )]
+    UnknownWorkspaceMapping {
+        file: String,
+        display: String,
+        workspace: String,
+    },
+
+    #[error(
+        "{file}: [workspace_switching.displayed] maps workspace {workspace:?} to both \
+         {first_display:?} and {second_display:?}; a workspace is displayed on at most one"
+    )]
+    DuplicateWorkspaceMapping {
+        file: String,
+        workspace: String,
+        first_display: String,
+        second_display: String,
+    },
+
+    #[error(
+        "{file}: [workspace_switching.displayed] maps no workspace to display {display:?}, \
+         which the profile's topology contains"
+    )]
+    MissingWorkspaceMapping { file: String, display: String },
+
+    #[error(
+        "{file}: [workspace_switching.displayed] maps display {display:?}, which the \
+         profile's topology does not contain"
+    )]
+    MismatchedWorkspaceMapping { file: String, display: String },
+}
+
+/// Every rule a profile's switching mapping must satisfy, against the
+/// workspaces the resolved config declares and the displays the profile's
+/// own topology fingerprint names. The whole set of violations is
+/// reported, so one pass shows a user everything to fix.
+fn workspace_switching_errors(
+    file: &str,
+    fingerprint: &str,
+    section: &WorkspaceSwitchingSection,
+    declared: &[WorkspaceName],
+) -> Vec<ValidationError> {
+    let mut errors = Vec::new();
+    let mut claimed: Vec<(WorkspaceName, &str)> = Vec::new();
+    for (display, workspace) in &section.displayed {
+        let Some(name) = WorkspaceName::new(workspace).ok().and_then(|name| {
+            declared
+                .iter()
+                .find(|declared| declared.collides_with(&name))
+        }) else {
+            errors.push(ValidationError::UnknownWorkspaceMapping {
+                file: file.to_owned(),
+                display: display.clone(),
+                workspace: workspace.clone(),
+            });
+            continue;
+        };
+        if let Some((_, first_display)) = claimed.iter().find(|(claimed, _)| claimed == name) {
+            errors.push(ValidationError::DuplicateWorkspaceMapping {
+                file: file.to_owned(),
+                workspace: name.as_str().to_owned(),
+                first_display: (*first_display).to_owned(),
+                second_display: display.clone(),
+            });
+        } else {
+            claimed.push((name.clone(), display));
+        }
+    }
+    let topology = display_fingerprints(fingerprint);
+    for display in &topology {
+        if !section.displayed.contains_key(display) {
+            errors.push(ValidationError::MissingWorkspaceMapping {
+                file: file.to_owned(),
+                display: display.clone(),
+            });
+        }
+    }
+    for display in section.displayed.keys() {
+        if !topology.contains(display) {
+            errors.push(ValidationError::MismatchedWorkspaceMapping {
+                file: file.to_owned(),
+                display: display.clone(),
+            });
+        }
+    }
+    errors
+}
+
+/// Every rule a declared workspace list must satisfy: each entry a valid
+/// name, and no two entries the same workspace under case folding. A
+/// profile repeating a base name is not a duplicate -- it is the same
+/// workspace, which the merge keeps once -- so this checks one file at a
+/// time.
+fn workspace_errors(file: &str, workspaces: &[String]) -> Vec<ValidationError> {
+    let mut errors = Vec::new();
+    let mut seen: Vec<WorkspaceName> = Vec::new();
+    for raw in workspaces {
+        match WorkspaceName::new(raw) {
+            Ok(name) => {
+                if let Some(first) = seen.iter().find(|seen| seen.collides_with(&name)) {
+                    errors.push(ValidationError::DuplicateWorkspaceName {
+                        file: file.to_owned(),
+                        first: first.as_str().to_owned(),
+                        second: raw.clone(),
+                    });
+                } else {
+                    seen.push(name);
+                }
+            }
+            Err(reason) => errors.push(ValidationError::InvalidWorkspaceName {
+                file: file.to_owned(),
+                name: raw.clone(),
+                reason,
+            }),
+        }
+    }
+    errors
+}
+
+/// The declared workspace names of one layer, in order, skipping any the
+/// validator has already rejected. `merge` runs on unvalidated input too,
+/// so an invalid entry here is dropped rather than trusted.
+fn declared_workspaces(workspaces: &[String]) -> Vec<WorkspaceName> {
+    let mut names: Vec<WorkspaceName> = Vec::new();
+    for raw in workspaces {
+        if let Ok(name) = WorkspaceName::new(raw) {
+            if !names.iter().any(|seen| seen.collides_with(&name)) {
+                names.push(name);
+            }
+        }
+    }
+    names
 }
 
 /// How far past 1.0 a cell edge may land before it counts as outside the
@@ -242,8 +409,38 @@ pub fn merge(base: &BaseConfig, profile: Option<&ProfileConfig>) -> ResolvedConf
         .keys()
         .map(|name| (name.clone(), ConfigLayer::Base))
         .collect();
+    let mut workspaces = declared_workspaces(&base.workspaces);
+    let mut workspace_switching = None;
 
     if let Some(profile) = profile {
+        // Base names first, then the profile's additions: a workspace the
+        // profile repeats is the same workspace and is kept once.
+        for name in declared_workspaces(&profile.workspaces) {
+            if !workspaces.iter().any(|seen| seen.collides_with(&name)) {
+                workspaces.push(name);
+            }
+        }
+        // The mapping is resolved to the declared spelling of each name,
+        // dropping any entry validation rejects, so a consumer of an
+        // unvalidated merge still sees only names that exist.
+        workspace_switching =
+            profile
+                .workspace_switching
+                .as_ref()
+                .map(|section| ResolvedWorkspaceSwitching {
+                    experimental: section.experimental,
+                    displayed: section
+                        .displayed
+                        .iter()
+                        .filter_map(|(display, workspace)| {
+                            let name = WorkspaceName::new(workspace).ok()?;
+                            let declared = workspaces
+                                .iter()
+                                .find(|declared| declared.collides_with(&name))?;
+                            Some((display.clone(), declared.clone()))
+                        })
+                        .collect(),
+                });
         for (command, combo) in &profile.hotkeys {
             hotkeys.insert(command.clone(), combo.clone());
             binding_sources.insert(command.clone(), ConfigLayer::Profile);
@@ -279,6 +476,8 @@ pub fn merge(base: &BaseConfig, profile: Option<&ProfileConfig>) -> ResolvedConf
     }
 
     ResolvedConfig {
+        workspaces,
+        workspace_switching,
         hotkeys,
         binding_sources,
         gaps,
@@ -357,6 +556,21 @@ fn unknown_layout_bindings(file: &str, resolved: &ResolvedConfig) -> Vec<Validat
                     layout: name.clone(),
                 })
             }
+            // A workspace binding may only name a workspace configuration
+            // declares: a command-created one exists only in the running
+            // agent, and a binding to it would be a binding to nothing
+            // after a restart in which it had been deleted.
+            Command::FocusWorkspace { name }
+                if !resolved.workspaces.iter().any(|declared| {
+                    WorkspaceName::new(name).is_ok_and(|name| declared.collides_with(&name))
+                }) =>
+            {
+                Some(ValidationError::UnknownWorkspaceBinding {
+                    file: file.to_owned(),
+                    binding: combo.to_string(),
+                    workspace: name.clone(),
+                })
+            }
             _ => None,
         })
         .collect()
@@ -403,6 +617,12 @@ pub fn validate(candidate: &CandidateConfig) -> Result<ResolvedConfigSet, Vec<Va
     };
 
     errors.extend(layout_errors(BASE_CONFIG_FILE_NAME, &base.layouts));
+    errors.extend(workspace_errors(BASE_CONFIG_FILE_NAME, &base.workspaces));
+    if base.workspace_switching.is_some() {
+        errors.push(ValidationError::WorkspaceSwitchingInBaseConfig {
+            file: BASE_CONFIG_FILE_NAME.to_owned(),
+        });
+    }
 
     let base_resolved = merge(&base, None);
     if !(1..=16).contains(&base_resolved.focus_border.thickness) {
@@ -440,6 +660,15 @@ pub fn validate(candidate: &CandidateConfig) -> Result<ResolvedConfigSet, Vec<Va
             &base.layouts,
             &profile.layouts,
         ));
+        layout_problems.extend(workspace_errors(file_name, &profile.workspaces));
+        if let Some(section) = &profile.workspace_switching {
+            layout_problems.extend(workspace_switching_errors(
+                file_name,
+                &profile.fingerprint,
+                section,
+                &resolved.workspaces,
+            ));
+        }
         let referential = unknown_layout_bindings(file_name, &resolved);
         let duplicate = duplicate_binding(file_name, &resolved);
         if duplicate.is_some() || !referential.is_empty() || !layout_problems.is_empty() {
@@ -706,6 +935,8 @@ snap-right = "ctrl+alt+left"
         assert_eq!(
             resolved,
             ResolvedConfig {
+                workspaces: vec![WorkspaceName::new("main").unwrap()],
+                workspace_switching: None,
                 hotkeys: base.hotkeys.clone(),
                 binding_sources: base
                     .hotkeys
@@ -1585,5 +1816,270 @@ snap-right = "ctrl+alt+right"
             !rendered.contains("[layouts]"),
             "rewriting a layout-free profile must not add a header, got:\n{rendered}"
         );
+    }
+
+    #[test]
+    fn a_base_config_that_names_no_workspaces_declares_main() {
+        let result = validate(&base_only(VALID_BASE)).unwrap();
+
+        assert_eq!(
+            result.base.workspaces,
+            vec![WorkspaceName::new("main").unwrap()]
+        );
+    }
+
+    #[test]
+    fn declared_workspaces_resolve_in_order_with_the_profiles_additions_after() {
+        let base = VALID_BASE.replace(
+            "version = 1\n",
+            "version = 1\nworkspaces = [\"dev\", \"chat\"]\n",
+        );
+        let profile = r#"
+fingerprint = "MON-A@0,0 1920x1080 scale=1"
+workspaces = ["Chat", "media"]
+"#;
+        let candidate = CandidateConfig {
+            base,
+            profiles: vec![CandidateProfile {
+                file_name: "office.toml".to_owned(),
+                contents: profile.to_owned(),
+            }],
+        };
+
+        let result = validate(&candidate).unwrap();
+
+        let names = |config: &ResolvedConfig| -> Vec<String> {
+            config
+                .workspaces
+                .iter()
+                .map(|name| name.as_str().to_owned())
+                .collect()
+        };
+        assert_eq!(names(&result.base), vec!["dev", "chat"]);
+        assert_eq!(
+            names(&result.profiles[0].config),
+            vec!["dev", "chat", "media"],
+            "a profile repeating a base name is the same workspace, kept once as base spelled it"
+        );
+    }
+
+    #[test]
+    fn an_invalid_workspace_name_rejects_the_whole_candidate_naming_the_file() {
+        let base = VALID_BASE.replace(
+            "version = 1\n",
+            "version = 1\nworkspaces = [\"dev\", \"  \"]\n",
+        );
+
+        let errors = validate(&base_only(&base)).unwrap_err();
+
+        assert_eq!(
+            errors,
+            vec![ValidationError::InvalidWorkspaceName {
+                file: "config.toml".to_owned(),
+                name: "  ".to_owned(),
+                reason: WorkspaceNameError::Empty,
+            }]
+        );
+    }
+
+    #[test]
+    fn two_workspaces_that_differ_only_by_case_are_rejected_in_the_file_that_declares_them() {
+        let profile = r#"
+fingerprint = "MON-A@0,0 1920x1080 scale=1"
+workspaces = ["Dev", "dev"]
+"#;
+        let candidate = CandidateConfig {
+            base: VALID_BASE.to_owned(),
+            profiles: vec![CandidateProfile {
+                file_name: "office.toml".to_owned(),
+                contents: profile.to_owned(),
+            }],
+        };
+
+        let errors = validate(&candidate).unwrap_err();
+
+        assert_eq!(
+            errors,
+            vec![ValidationError::DuplicateWorkspaceName {
+                file: "office.toml".to_owned(),
+                first: "Dev".to_owned(),
+                second: "dev".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn a_workspace_binding_must_name_a_declared_workspace() {
+        let base = VALID_BASE.replace("version = 1\n", "version = 1\nworkspaces = [\"dev\"]\n")
+            + "\n[hotkeys.focus-workspace]\nDev = \"ctrl+alt+1\"\nchat = \"ctrl+alt+2\"\n";
+
+        let errors = validate(&base_only(&base)).unwrap_err();
+
+        assert_eq!(
+            errors,
+            vec![ValidationError::UnknownWorkspaceBinding {
+                file: "config.toml".to_owned(),
+                binding: "ctrl+alt+2".to_owned(),
+                workspace: "chat".to_owned(),
+            }],
+            "the binding to Dev matches the declared dev under case folding; only chat is unknown"
+        );
+    }
+
+    #[test]
+    fn a_profile_may_bind_a_workspace_it_declares_itself() {
+        let profile = r#"
+fingerprint = "MON-A@0,0 1920x1080 scale=1"
+workspaces = ["chat"]
+
+[hotkeys.focus-workspace]
+chat = "ctrl+alt+2"
+"#;
+        let candidate = CandidateConfig {
+            base: VALID_BASE.to_owned(),
+            profiles: vec![CandidateProfile {
+                file_name: "office.toml".to_owned(),
+                contents: profile.to_owned(),
+            }],
+        };
+
+        let result = validate(&candidate).unwrap();
+
+        assert_eq!(
+            result.profiles[0]
+                .config
+                .hotkeys
+                .get(&Command::FocusWorkspace {
+                    name: "chat".to_owned()
+                }),
+            Some(&combo("ctrl+alt+2"))
+        );
+    }
+
+    /// A profile for a two-display topology whose stable fingerprints
+    /// contain the separators, as the Windows adapter's do.
+    const TWO_DISPLAY_FINGERPRINT: &str = r"\\.\DISPLAY1|1920x1080|scale=1@0,0 1920x1080 scale=1|\\.\DISPLAY2|2560x1440|scale=1@1920,0 2560x1440 scale=1";
+
+    fn switching_profile(mapping: &str) -> CandidateConfig {
+        let profile = format!(
+            "fingerprint = '{TWO_DISPLAY_FINGERPRINT}'\nworkspaces = [\"chat\"]\n\n[workspace_switching]\nexperimental = true\n\n[workspace_switching.displayed]\n{mapping}\n"
+        );
+        CandidateConfig {
+            base: VALID_BASE.replace("version = 1\n", "version = 1\nworkspaces = [\"dev\"]\n"),
+            profiles: vec![CandidateProfile {
+                file_name: "office.toml".to_owned(),
+                contents: profile,
+            }],
+        }
+    }
+
+    #[test]
+    fn a_complete_distinct_mapping_resolves_with_validated_names() {
+        let result = validate(&switching_profile(
+            "'\\\\.\\DISPLAY1|1920x1080|scale=1' = \"Dev\"\n'\\\\.\\DISPLAY2|2560x1440|scale=1' = \"chat\"",
+        ))
+        .unwrap();
+
+        let switching = result.profiles[0]
+            .config
+            .workspace_switching
+            .clone()
+            .unwrap();
+        assert!(switching.experimental);
+        assert_eq!(
+            switching
+                .displayed
+                .iter()
+                .map(|(display, name)| (display.as_str(), name.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (r"\\.\DISPLAY1|1920x1080|scale=1", "dev"),
+                (r"\\.\DISPLAY2|2560x1440|scale=1", "chat"),
+            ],
+            "names resolve to the declared spelling"
+        );
+        assert_eq!(result.base.workspace_switching, None);
+    }
+
+    #[test]
+    fn switching_in_base_config_is_rejected_with_where_it_belongs() {
+        let base = format!("{VALID_BASE}\n[workspace_switching]\nexperimental = true\n");
+
+        let errors = validate(&base_only(&base)).unwrap_err();
+
+        assert_eq!(
+            errors,
+            vec![ValidationError::WorkspaceSwitchingInBaseConfig {
+                file: "config.toml".to_owned()
+            }]
+        );
+    }
+
+    #[test]
+    fn an_unknown_name_a_duplicate_a_missing_display_and_a_stray_display_each_reject_the_candidate()
+    {
+        let errors = validate(&switching_profile(
+            "'\\\\.\\DISPLAY1|1920x1080|scale=1' = \"dev\"\n'\\\\.\\DISPLAY9|800x600|scale=1' = \"dev\"\n'other' = \"media\"",
+        ))
+        .unwrap_err();
+
+        let display1 = r"\\.\DISPLAY1|1920x1080|scale=1".to_owned();
+        let display2 = r"\\.\DISPLAY2|2560x1440|scale=1".to_owned();
+        let display9 = r"\\.\DISPLAY9|800x600|scale=1".to_owned();
+        assert_eq!(
+            errors,
+            vec![
+                ValidationError::DuplicateWorkspaceMapping {
+                    file: "office.toml".to_owned(),
+                    workspace: "dev".to_owned(),
+                    first_display: display1,
+                    second_display: display9.clone(),
+                },
+                ValidationError::UnknownWorkspaceMapping {
+                    file: "office.toml".to_owned(),
+                    display: "other".to_owned(),
+                    workspace: "media".to_owned(),
+                },
+                ValidationError::MissingWorkspaceMapping {
+                    file: "office.toml".to_owned(),
+                    display: display2,
+                },
+                ValidationError::MismatchedWorkspaceMapping {
+                    file: "office.toml".to_owned(),
+                    display: display9,
+                },
+                ValidationError::MismatchedWorkspaceMapping {
+                    file: "office.toml".to_owned(),
+                    display: "other".to_owned(),
+                },
+            ],
+            "every problem is reported and no partial result is produced"
+        );
+    }
+
+    #[test]
+    fn a_mapping_with_switching_off_is_still_validated_but_resolves_inert() {
+        let candidate = switching_profile(
+            "'\\\\.\\DISPLAY1|1920x1080|scale=1' = \"dev\"\n'\\\\.\\DISPLAY2|2560x1440|scale=1' = \"chat\"",
+        );
+        let candidate = CandidateConfig {
+            profiles: vec![CandidateProfile {
+                file_name: "office.toml".to_owned(),
+                contents: candidate.profiles[0]
+                    .contents
+                    .replace("experimental = true", "experimental = false"),
+            }],
+            ..candidate
+        };
+
+        let result = validate(&candidate).unwrap();
+
+        let switching = result.profiles[0]
+            .config
+            .workspace_switching
+            .clone()
+            .unwrap();
+        assert!(!switching.experimental);
+        assert_eq!(switching.displayed.len(), 2);
     }
 }

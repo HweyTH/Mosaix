@@ -4,10 +4,13 @@ use mosaix_config::{
     BindingEdit, BindingWrite, Command, ConfigLayer, KeyCombo, LayoutEdit, LayoutWrite,
     ResolvedConfig, SavedLayout,
 };
+use mosaix_domain::commands::{DirectionalSwapResult, RemovePositionResult, TreeResizeResult};
+use mosaix_domain::undo::UndoResult;
+use mosaix_domain::workspace::{WorkspaceCommandResult, WorkspaceSwitchingStatus};
+use mosaix_domain::DisplayId;
 use mosaix_engine::{
     EligibilityReason, EngineState, Event, EventSender, StateReader, ZoneSnapDirection,
 };
-use mosaix_domain::undo::UndoResult;
 use mosaix_persistence::PersistenceHealth;
 use mosaix_rules::ManageAction;
 use serde::{Deserialize, Serialize};
@@ -18,7 +21,109 @@ use crate::protocol::{IpcRequest, IpcResponse};
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct ContainerTreeSnapshot {
     pub display_id: isize,
+    /// Every window holding a leaf, in visual order, whether or not it is
+    /// currently arranged.
     pub windows: Vec<isize>,
+    /// The windows the display cannot fit at their minimum size, newest
+    /// insertion first (CONTEXT.md "Constraint-overflow window"). They
+    /// appear in `windows` too, because they keep their leaves.
+    #[serde(default)]
+    pub constraint_overflow: Vec<isize>,
+    /// Slots kept for windows that have gone, in visual order (CONTEXT.md
+    /// "Dormant tree leaf"). What the remove-position command names.
+    #[serde(default)]
+    pub dormant_positions: Vec<DormantPositionSnapshot>,
+}
+
+/// One dormant slot, described by the same privacy-safe evidence that
+/// would recognise its window: never a title.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct DormantPositionSnapshot {
+    /// The number the remove-position command takes.
+    pub position: u64,
+    pub application: String,
+    pub native_class: Option<String>,
+    pub role: String,
+    pub dormant_since_unix: i64,
+    /// When retention will prune the slot on its own.
+    pub expires_unix: i64,
+}
+
+/// One logical workspace as published state describes it (CONTEXT.md
+/// "Logical workspace"). Membership is by window id, which is what every
+/// other part of the snapshot uses; names carry no window titles.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceSnapshot {
+    pub name: String,
+    /// `configuration` or `command`: which of the two ways a workspace
+    /// comes to exist made this one, and so whether a command may delete
+    /// it.
+    pub origin: String,
+    /// The display it is shown on, or `None` while hidden.
+    pub displayed_on: Option<isize>,
+    /// Every managed window that belongs to it, in window-id order.
+    pub members: Vec<isize>,
+    /// The member that last had focus, if it is still open.
+    pub last_focused_window: Option<isize>,
+    /// Positions the hidden workspace keeps for closed windows. A
+    /// displayed workspace's dormant positions are listed under its
+    /// display's container tree instead.
+    pub dormant_positions: usize,
+}
+
+/// Experimental workspace switching as published state describes it
+/// (ADR 0023, ADR 0028): one of `disabled`, `requested`, `unavailable`,
+/// or `experimental`, with the machine-readable reason a client can act
+/// on, and the mapping the matched profile declares.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceSwitchingSnapshot {
+    pub status: String,
+    /// Why `requested` has not become `experimental`, or why
+    /// `unavailable`; `None` for `disabled` and `experimental`.
+    pub reason: Option<String>,
+    /// The profile file making the request, when one does.
+    pub profile_file: Option<String>,
+    /// The mapping the profile declares, display fingerprint to workspace
+    /// name, whether or not it is currently in effect.
+    pub displayed: BTreeMap<String, String>,
+    /// Whether the adapter has verified a recoverable parking site:
+    /// `unverified`, `verified`, or `refused`.
+    pub parking_capability: String,
+}
+
+/// The recovery ledger as published state describes it (ADR 0023).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct RecoverySnapshot {
+    /// This agent session's identity in the ledger.
+    pub session_id: String,
+    /// Windows whose recovery entry is not yet durable; none is parked.
+    pub pending_parking: Vec<isize>,
+    /// Windows this session has parked and not yet restored.
+    pub parked_windows: Vec<isize>,
+    /// Why the last parking request was refused, if it was.
+    pub last_parking_refusal: Option<String>,
+    /// What startup recovery did with the previous session's entries.
+    pub outcomes: Vec<RecoveryOutcomeSnapshot>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct RecoveryOutcomeSnapshot {
+    pub entry_id: i64,
+    pub native_handle: isize,
+    pub application: String,
+    /// `verified`, `stale`, `reused`, or `ambiguous`.
+    pub verdict: String,
+    pub restored: bool,
+    pub failure: Option<String>,
+}
+
+/// A rule that named a workspace the pool does not hold, so the window
+/// stayed in the workspace of the display it appeared on (ADR 0028).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct RuleWorkspaceRefusalSnapshot {
+    pub window_id: isize,
+    pub rule_id: Option<String>,
+    pub workspace: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -48,6 +153,19 @@ pub struct StateSnapshot {
     /// Each display's container tree, as the windows it holds in visual
     /// order. Empty under the balanced grid, which keeps no structure.
     pub container_trees: Vec<ContainerTreeSnapshot>,
+    /// The global workspace pool, in name order (ADR 0028).
+    #[serde(default)]
+    pub workspaces: Vec<WorkspaceSnapshot>,
+    /// Rules whose workspace target named nothing in the pool.
+    #[serde(default)]
+    pub rule_workspace_refusals: Vec<RuleWorkspaceRefusalSnapshot>,
+    /// Experimental switching for the current topology.
+    #[serde(default)]
+    pub workspace_switching: Option<WorkspaceSwitchingSnapshot>,
+    /// The recovery ledger: what is pending, what is parked, and what
+    /// startup recovery found.
+    #[serde(default)]
+    pub recovery: Option<RecoverySnapshot>,
     pub paused: bool,
     pub automatic_tiling_active: bool,
     pub automatic_tiling_suspended: bool,
@@ -200,6 +318,14 @@ fn bindable_commands(config: &ResolvedConfig) -> Vec<Command> {
                 .keys()
                 .map(|name| Command::ApplyLayout { name: name.clone() }),
         )
+        .chain(
+            config
+                .workspaces
+                .iter()
+                .map(|name| Command::FocusWorkspace {
+                    name: name.as_str().to_owned(),
+                }),
+        )
         .collect();
     // Whatever is actually bound is listed too, even a layout binding
     // whose layout is not declared -- which validation rejects, so it
@@ -278,6 +404,16 @@ pub struct ManagedWindowSnapshot {
     pub display_id: isize,
     pub action: String,
     pub eligibility: String,
+    /// Whether the container tree is currently leaving this window where
+    /// it is because the display cannot fit it at its minimum size.
+    /// Separate from `eligibility`, which stays `eligible`: overflow is a
+    /// planner outcome, not a rule or a session-floating choice.
+    #[serde(default)]
+    pub constraint_overflow: bool,
+    /// The logical workspace this window belongs to. `None` only on a
+    /// display the pool had no workspace left to fill.
+    #[serde(default)]
+    pub workspace: Option<String>,
 }
 
 fn action_name(action: ManageAction) -> &'static str {
@@ -336,9 +472,109 @@ impl From<EngineState> for StateSnapshot {
                 display_id: managed.window.display_id.0,
                 action: action_name(managed.action).to_owned(),
                 eligibility: eligibility_name(managed.eligibility).to_owned(),
+                constraint_overflow: state
+                    .constraint_overflow
+                    .get(&managed.window.display_id)
+                    .is_some_and(|overflow| overflow.contains(&managed.window.id)),
+                workspace: state
+                    .workspaces
+                    .workspace_of(managed.window.id)
+                    .map(|name| name.as_str().to_owned()),
             })
             .collect();
         managed_windows.sort_by_key(|window| window.window_id);
+        let workspaces = state
+            .workspaces
+            .iter()
+            .map(|(name, workspace)| WorkspaceSnapshot {
+                name: name.as_str().to_owned(),
+                origin: workspace.origin.code().to_owned(),
+                displayed_on: state.workspaces.display_of(name).map(|id| id.0),
+                members: state
+                    .workspaces
+                    .members_of(name)
+                    .into_iter()
+                    .map(|id| id.0)
+                    .collect(),
+                last_focused_window: workspace
+                    .last_focused
+                    .filter(|id| state.inventory.contains_key(id))
+                    .map(|id| id.0),
+                dormant_positions: workspace
+                    .stashed_tree
+                    .as_ref()
+                    .map_or(0, |tree| tree.dormant_positions().len()),
+            })
+            .collect();
+        let rule_workspace_refusals = state
+            .rule_workspace_refusals
+            .iter()
+            .map(|refusal| RuleWorkspaceRefusalSnapshot {
+                window_id: refusal.window_id.0,
+                rule_id: refusal.rule_id.clone(),
+                workspace: refusal.workspace.clone(),
+            })
+            .collect();
+        let mut parked_windows: Vec<isize> = state.parked_windows.keys().map(|id| id.0).collect();
+        parked_windows.sort_unstable();
+        let recovery = Some(RecoverySnapshot {
+            session_id: state.session_id.clone(),
+            pending_parking: state
+                .pending_parking
+                .iter()
+                .map(|pending| pending.window_id.0)
+                .collect(),
+            parked_windows,
+            last_parking_refusal: state
+                .last_parking_refusal
+                .as_ref()
+                .map(|refusal| refusal.code().to_owned()),
+            outcomes: state
+                .recovery_outcomes
+                .iter()
+                .map(|outcome| RecoveryOutcomeSnapshot {
+                    entry_id: outcome.entry_id.0,
+                    native_handle: outcome.native_handle,
+                    application: outcome.application_id.0.clone(),
+                    verdict: outcome.verdict.code().to_owned(),
+                    restored: outcome.restored,
+                    failure: outcome.failure.clone(),
+                })
+                .collect(),
+        });
+        let switching_status = state.workspace_switching_status();
+        let workspace_switching = Some(WorkspaceSwitchingSnapshot {
+            status: switching_status.code().to_owned(),
+            reason: match &switching_status {
+                WorkspaceSwitchingStatus::Requested { pending } => Some(pending.code().to_owned()),
+                WorkspaceSwitchingStatus::Unavailable { reason } => Some(reason.code().to_owned()),
+                WorkspaceSwitchingStatus::Disabled | WorkspaceSwitchingStatus::Experimental => None,
+            },
+            profile_file: state
+                .resolved_config
+                .workspace_switching
+                .as_ref()
+                .filter(|switching| switching.experimental)
+                .and(state.resolved_config.profile_file.clone()),
+            displayed: state
+                .resolved_config
+                .workspace_switching
+                .as_ref()
+                .map(|switching| {
+                    switching
+                        .displayed
+                        .iter()
+                        .map(|(display, name)| (display.clone(), name.as_str().to_owned()))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            parking_capability: match &state.parking_capability {
+                mosaix_domain::ParkingCapability::Unverified => "unverified",
+                mosaix_domain::ParkingCapability::Verified => "verified",
+                mosaix_domain::ParkingCapability::Refused { .. } => "refused",
+            }
+            .to_owned(),
+        });
         let last_applied_layouts = state
             .last_applied_layouts
             .iter()
@@ -384,16 +620,30 @@ impl From<EngineState> for StateSnapshot {
             .iter()
             .map(|(display_id, tree)| ContainerTreeSnapshot {
                 display_id: display_id.0,
-                windows: tree.leaves().into_iter().map(|id| id.0).collect(),
+                windows: tree.windows().into_iter().map(|id| id.0).collect(),
+                constraint_overflow: state
+                    .constraint_overflow
+                    .get(display_id)
+                    .map(|overflow| overflow.iter().map(|id| id.0).collect())
+                    .unwrap_or_default(),
+                dormant_positions: tree
+                    .dormant_positions()
+                    .into_iter()
+                    .map(|(position, dormant)| DormantPositionSnapshot {
+                        position,
+                        application: dormant.evidence.application_id.0.clone(),
+                        native_class: dormant.evidence.native_class.clone(),
+                        role: dormant.evidence.role.code().to_owned(),
+                        dormant_since_unix: dormant.since_unix,
+                        expires_unix: dormant.expires_unix(),
+                    })
+                    .collect(),
             })
             .collect();
         container_trees.sort_by_key(|snapshot| snapshot.display_id);
 
         let (undo_command, undo_transaction_id) = match &state.newest_undo {
-            Some(transaction) => (
-                Some(transaction.command.clone()),
-                Some(transaction.id.0),
-            ),
+            Some(transaction) => (Some(transaction.command.clone()), Some(transaction.id.0)),
             None => (None, None),
         };
         Self {
@@ -412,6 +662,10 @@ impl From<EngineState> for StateSnapshot {
             undo_blocked_reason,
             tiling_mode: state.resolved_config.tiling_mode.code().to_owned(),
             container_trees,
+            workspaces,
+            rule_workspace_refusals,
+            workspace_switching,
+            recovery,
             paused: state.paused,
             automatic_tiling_active: state.automatic_tiling_active,
             automatic_tiling_suspended: state.automatic_tiling_suspended,
@@ -713,34 +967,129 @@ pub fn handle_request(
                 direction: mosaix_engine::CardinalDirection::Down,
             },
         ),
-        IpcRequest::SwapLeft => send_event(
+        IpcRequest::SwapLeft => swap(events, state_reader, mosaix_engine::CardinalDirection::Left),
+        IpcRequest::SwapRight => swap(
             events,
-            Event::DirectionalSwapRequested {
-                direction: mosaix_engine::CardinalDirection::Left,
-            },
+            state_reader,
+            mosaix_engine::CardinalDirection::Right,
         ),
-        IpcRequest::SwapRight => send_event(
+        IpcRequest::SwapUp => swap(events, state_reader, mosaix_engine::CardinalDirection::Up),
+        IpcRequest::SwapDown => swap(events, state_reader, mosaix_engine::CardinalDirection::Down),
+        IpcRequest::ResizeLeft => {
+            resize_tree(events, state_reader, mosaix_engine::CardinalDirection::Left)
+        }
+        IpcRequest::ResizeRight => resize_tree(
             events,
-            Event::DirectionalSwapRequested {
-                direction: mosaix_engine::CardinalDirection::Right,
-            },
+            state_reader,
+            mosaix_engine::CardinalDirection::Right,
         ),
-        IpcRequest::SwapUp => send_event(
-            events,
-            Event::DirectionalSwapRequested {
-                direction: mosaix_engine::CardinalDirection::Up,
-            },
-        ),
-        IpcRequest::SwapDown => send_event(
-            events,
-            Event::DirectionalSwapRequested {
-                direction: mosaix_engine::CardinalDirection::Down,
-            },
-        ),
+        IpcRequest::ResizeUp => {
+            resize_tree(events, state_reader, mosaix_engine::CardinalDirection::Up)
+        }
+        IpcRequest::ResizeDown => {
+            resize_tree(events, state_reader, mosaix_engine::CardinalDirection::Down)
+        }
+        IpcRequest::RemoveTreePosition {
+            display_id,
+            position,
+        } => {
+            let display_id = mosaix_domain::DisplayId(*display_id);
+            let result = match mosaix_engine::plan_remove_position(
+                &state_reader.snapshot(),
+                display_id,
+                *position,
+            ) {
+                Ok(applied) => {
+                    if let other @ IpcResponse::Error { .. } = send_event(
+                        events,
+                        Event::TreePositionRemoveRequested {
+                            display_id,
+                            position: *position,
+                        },
+                    ) {
+                        return other;
+                    }
+                    RemovePositionResult::Applied(applied)
+                }
+                Err(refusal) => RemovePositionResult::Refused(refusal),
+            };
+            IpcResponse::Ok {
+                data: Some(serde_json::to_value(result).expect("tree results serialize")),
+            }
+        }
         IpcRequest::GetPauseState => {
             let state = state_reader.snapshot();
             let value = serde_json::json!({ "paused": state.paused });
             IpcResponse::Ok { data: Some(value) }
+        }
+        IpcRequest::CreateWorkspace { name } => {
+            let result = match mosaix_engine::plan_workspace_create(&state_reader.snapshot(), name)
+            {
+                Ok(applied) => {
+                    if let other @ IpcResponse::Error { .. } = send_event(
+                        events,
+                        Event::WorkspaceCreateRequested { name: name.clone() },
+                    ) {
+                        return other;
+                    }
+                    WorkspaceCommandResult::Created(applied)
+                }
+                Err(refusal) => WorkspaceCommandResult::Refused(refusal),
+            };
+            workspace_answer(result)
+        }
+        IpcRequest::DeleteWorkspace { name } => {
+            let result = match mosaix_engine::plan_workspace_delete(&state_reader.snapshot(), name)
+            {
+                Ok(applied) => {
+                    if let other @ IpcResponse::Error { .. } = send_event(
+                        events,
+                        Event::WorkspaceDeleteRequested { name: name.clone() },
+                    ) {
+                        return other;
+                    }
+                    WorkspaceCommandResult::Deleted(applied)
+                }
+                Err(refusal) => WorkspaceCommandResult::Refused(refusal),
+            };
+            workspace_answer(result)
+        }
+        IpcRequest::FocusWorkspace { name } => {
+            let result = match mosaix_engine::plan_workspace_focus(&state_reader.snapshot(), name) {
+                Ok(applied) => {
+                    if let other @ IpcResponse::Error { .. } = send_event(
+                        events,
+                        Event::WorkspaceFocusRequested { name: name.clone() },
+                    ) {
+                        return other;
+                    }
+                    WorkspaceCommandResult::Focused(applied)
+                }
+                Err(refusal) => WorkspaceCommandResult::Refused(refusal),
+            };
+            workspace_answer(result)
+        }
+        IpcRequest::MoveWorkspace { name, display_id } => {
+            let result = match mosaix_engine::plan_workspace_move(
+                &state_reader.snapshot(),
+                name,
+                DisplayId(*display_id),
+            ) {
+                Ok(applied) => {
+                    if let other @ IpcResponse::Error { .. } = send_event(
+                        events,
+                        Event::WorkspaceMoveRequested {
+                            name: name.clone(),
+                            display_id: DisplayId(*display_id),
+                        },
+                    ) {
+                        return other;
+                    }
+                    WorkspaceCommandResult::Moved(applied)
+                }
+                Err(refusal) => WorkspaceCommandResult::Refused(refusal),
+            };
+            workspace_answer(result)
         }
         IpcRequest::FocusDisplay { display_id } => send_event(
             events,
@@ -1006,6 +1355,66 @@ impl CaptureHold {
     }
 }
 
+/// Asks for a directional swap and answers with the typed outcome: the
+/// neighbor it will exchange with, or the structured no-target result
+/// ADR 0026 calls for. Preflighted the way undo is.
+fn swap(
+    events: &EventSender,
+    state_reader: &StateReader,
+    direction: mosaix_engine::CardinalDirection,
+) -> IpcResponse {
+    let result = match mosaix_engine::plan_directional_swap(&state_reader.snapshot(), direction) {
+        Ok(applied) => {
+            if let other @ IpcResponse::Error { .. } =
+                send_event(events, Event::DirectionalSwapRequested { direction })
+            {
+                return other;
+            }
+            DirectionalSwapResult::Applied(applied)
+        }
+        Err(refusal) => DirectionalSwapResult::Refused(refusal),
+    };
+    IpcResponse::Ok {
+        data: Some(serde_json::to_value(result).expect("tree results serialize")),
+    }
+}
+
+/// Asks for a tree resize and answers with the typed outcome.
+///
+/// Preflighted the way undo is: the reducer reaches the same verdict
+/// against its own state, so the answer describes the plan rather than a
+/// completed movement, and a refusal comes back as data rather than as a
+/// string the caller would have to parse.
+fn resize_tree(
+    events: &EventSender,
+    state_reader: &StateReader,
+    direction: mosaix_engine::CardinalDirection,
+) -> IpcResponse {
+    let result = match mosaix_engine::plan_tree_resize(&state_reader.snapshot(), direction) {
+        Ok(plan) => {
+            if let other @ IpcResponse::Error { .. } =
+                send_event(events, Event::TreeResizeRequested { direction })
+            {
+                return other;
+            }
+            TreeResizeResult::Applied(plan.applied)
+        }
+        Err(refusal) => TreeResizeResult::Refused(refusal),
+    };
+    IpcResponse::Ok {
+        data: Some(serde_json::to_value(result).expect("tree results serialize")),
+    }
+}
+
+/// A workspace lifecycle answer: applied or refused, both as data. The
+/// reducer reaches the same verdict against its own state, so the answer
+/// describes the plan rather than a completed movement.
+fn workspace_answer(result: WorkspaceCommandResult) -> IpcResponse {
+    IpcResponse::Ok {
+        data: Some(serde_json::to_value(result).expect("workspace results serialize")),
+    }
+}
+
 fn send_event(events: &EventSender, event: Event) -> IpcResponse {
     if events.send(event).is_err() {
         IpcResponse::Error {
@@ -1022,6 +1431,29 @@ mod tests {
     use mosaix_domain::{ApplicationId, Window, WindowCapabilities, WindowLifecycle, WindowRole};
     use mosaix_domain::{DisplayId, Rect, WindowId};
     use mosaix_engine::{ManagedWindow, WindowPlacement, CIRCUIT_BREAKER_THRESHOLD};
+
+    fn sample_window(id: isize) -> Window {
+        Window {
+            id: WindowId(id),
+            process_id: 1,
+            application_id: ApplicationId("test.exe".to_owned()),
+            executable_path: None,
+            title: "non-sensitive".to_owned(),
+            native_class: None,
+            role: WindowRole::Normal,
+            bounds: Rect::new(0, 0, 100, 100),
+            display_id: DisplayId(1),
+            capabilities: WindowCapabilities {
+                can_move: true,
+                can_resize: true,
+                can_minimize: true,
+                can_maximize: true,
+            },
+            elevated: false,
+            lifecycle: WindowLifecycle::Active,
+            minimum_size: None,
+        }
+    }
 
     #[test]
     fn state_snapshot_exposes_each_degraded_window_with_a_stable_reason() {
@@ -1069,6 +1501,112 @@ mod tests {
     }
 
     #[test]
+    fn a_resize_outside_tree_mode_answers_with_a_typed_refusal_not_an_error() {
+        let engine = mosaix_engine::spawn_engine(Vec::new(), Default::default());
+        let response = handle_request(
+            &IpcRequest::ResizeLeft,
+            &engine.events(),
+            &engine.state_reader(),
+            &RecordingStore::wrote("config.toml", &[]),
+            &no_probe(),
+        );
+        engine.stop();
+
+        let IpcResponse::Ok { data: Some(data) } = response else {
+            panic!("a refusal is an answer, got {response:?}");
+        };
+        assert_eq!(data["refused"], "not_tree_mode");
+        let parsed: TreeResizeResult =
+            serde_json::from_value(data).expect("the payload is the typed result");
+        assert!(!parsed.is_applied());
+    }
+
+    #[test]
+    fn a_swap_with_nothing_focused_answers_with_a_typed_no_target_result() {
+        let engine = mosaix_engine::spawn_engine(Vec::new(), Default::default());
+        let response = handle_request(
+            &IpcRequest::SwapLeft,
+            &engine.events(),
+            &engine.state_reader(),
+            &RecordingStore::wrote("config.toml", &[]),
+            &no_probe(),
+        );
+        engine.stop();
+
+        let IpcResponse::Ok { data: Some(data) } = response else {
+            panic!("a no-target result is an answer, got {response:?}");
+        };
+        assert_eq!(data["refused"], "no_focused_window");
+        let parsed: DirectionalSwapResult = serde_json::from_value(data).unwrap();
+        assert!(!parsed.is_applied());
+    }
+
+    #[test]
+    fn removing_a_position_outside_tree_mode_answers_with_a_typed_refusal() {
+        let engine = mosaix_engine::spawn_engine(Vec::new(), Default::default());
+        let response = handle_request(
+            &IpcRequest::RemoveTreePosition {
+                display_id: 1,
+                position: 3,
+            },
+            &engine.events(),
+            &engine.state_reader(),
+            &RecordingStore::wrote("config.toml", &[]),
+            &no_probe(),
+        );
+        engine.stop();
+
+        let IpcResponse::Ok { data: Some(data) } = response else {
+            panic!("a refusal is an answer, got {response:?}");
+        };
+        assert_eq!(data["refused"], "not_tree_mode");
+    }
+
+    #[test]
+    fn state_snapshot_lists_dormant_positions_without_titles() {
+        use mosaix_domain::identity::WindowEvidence;
+        use mosaix_domain::tree::{ContainerTree, DormantPosition, SplitAxis};
+
+        let mut state = EngineState::default();
+        state.resolved_config.tiling_mode = mosaix_config::TilingMode::Tree;
+        let mut tree = ContainerTree::new();
+        tree.insert_first(WindowId(11));
+        tree.split_leaf(&WindowId(11), SplitAxis::Horizontal, WindowId(12));
+        tree.make_dormant(
+            &WindowId(12),
+            DormantPosition {
+                evidence: WindowEvidence {
+                    application_id: ApplicationId("Code.exe".to_owned()),
+                    executable_path: Some("C:/apps/Code.exe".to_owned()),
+                    native_class: Some("Chrome_WidgetWin_1".to_owned()),
+                    role: WindowRole::Normal,
+                    launch_order: 0,
+                    last_placement: Rect::new(960, 0, 960, 1080),
+                    display_fingerprint: "DISPLAY1".to_owned(),
+                },
+                since_unix: 1_756_000_000,
+            },
+        );
+        state.trees.insert(DisplayId(1), tree);
+
+        let json = serde_json::to_value(StateSnapshot::from(state)).unwrap();
+
+        let tree = &json["container_trees"][0];
+        assert_eq!(tree["windows"], serde_json::json!([11]));
+        assert_eq!(tree["dormant_positions"][0]["position"], 1);
+        assert_eq!(tree["dormant_positions"][0]["application"], "Code.exe");
+        assert_eq!(
+            tree["dormant_positions"][0]["expires_unix"],
+            1_756_000_000 + mosaix_domain::DORMANT_RETENTION_SECONDS
+        );
+        let rendered = json.to_string();
+        assert!(
+            !rendered.contains("title"),
+            "a dormant slot is described by evidence, never a title: {rendered}"
+        );
+    }
+
+    #[test]
     fn state_snapshot_reports_the_balanced_grid_and_no_trees_by_default() {
         let json = serde_json::to_value(StateSnapshot::from(EngineState::default())).unwrap();
 
@@ -1096,8 +1634,61 @@ mod tests {
         assert_eq!(json["tiling_mode"], "tree");
         assert_eq!(
             json["container_trees"],
-            serde_json::json!([{ "display_id": 2, "windows": [11, 12] }])
+            serde_json::json!([{
+                "display_id": 2,
+                "windows": [11, 12],
+                "constraint_overflow": [],
+                "dormant_positions": [],
+            }])
         );
+    }
+
+    #[test]
+    fn state_snapshot_reports_constraint_overflow_apart_from_floating() {
+        use mosaix_domain::tree::{ContainerTree, SplitAxis};
+
+        let mut state = EngineState::default();
+        state.resolved_config.tiling_mode = mosaix_config::TilingMode::Tree;
+        let mut tree = ContainerTree::new();
+        tree.insert_first(mosaix_domain::WindowId(11));
+        tree.split_leaf(
+            &mosaix_domain::WindowId(11),
+            SplitAxis::Horizontal,
+            mosaix_domain::WindowId(12),
+        );
+        state.trees.insert(DisplayId(2), tree);
+        state
+            .constraint_overflow
+            .insert(DisplayId(2), vec![mosaix_domain::WindowId(12)]);
+        for id in [11, 12] {
+            let mut window = sample_window(id);
+            window.display_id = DisplayId(2);
+            state.inventory.insert(
+                WindowId(id),
+                ManagedWindow {
+                    window,
+                    action: ManageAction::Tile,
+                    eligibility: EligibilityReason::Eligible,
+                },
+            );
+        }
+
+        let json = serde_json::to_value(StateSnapshot::from(state)).unwrap();
+
+        assert_eq!(
+            json["container_trees"][0]["constraint_overflow"],
+            serde_json::json!([12]),
+            "the tree names what it could not fit"
+        );
+        let managed = json["managed_windows"].as_array().unwrap();
+        let overflowed = managed.iter().find(|w| w["window_id"] == 12).unwrap();
+        assert_eq!(overflowed["constraint_overflow"], true);
+        assert_eq!(
+            overflowed["eligibility"], "eligible",
+            "overflow is reported beside eligibility, not as a kind of floating"
+        );
+        let arranged = managed.iter().find(|w| w["window_id"] == 11).unwrap();
+        assert_eq!(arranged["constraint_overflow"], false);
     }
 
     #[test]
@@ -1122,6 +1713,7 @@ mod tests {
             topology_fingerprint: String::new(),
             durable_revision: 3,
             members: Vec::new(),
+            prior_trees: Vec::new(),
         });
         state.persistence_health = PersistenceHealth::Degraded {
             last_durable_revision: 3,
@@ -1180,6 +1772,7 @@ mod tests {
                     },
                     elevated: true,
                     lifecycle: WindowLifecycle::Active,
+                    minimum_size: None,
                 },
                 action: ManageAction::Tile,
                 eligibility: EligibilityReason::Elevated,
@@ -1656,6 +2249,7 @@ mod tests {
             },
             elevated: false,
             lifecycle: WindowLifecycle::Active,
+            minimum_size: None,
         }
     }
 
@@ -2375,5 +2969,282 @@ mod tests {
             }
             other => panic!("expected a verdict, got {other:?}"),
         }
+    }
+
+    fn tiling_engine_with_workspaces(workspaces: &[&str]) -> mosaix_engine::EngineHandle {
+        let display = mosaix_domain::Display {
+            id: DisplayId(1),
+            stable_fingerprint: "MON-A".to_owned(),
+            full_bounds: Rect::new(0, 0, 1920, 1080),
+            work_area: Rect::new(0, 0, 1920, 1080),
+            scale_factor: 1.0,
+            rotation: mosaix_domain::Rotation::Landscape,
+            is_primary: true,
+        };
+        let config_set = mosaix_config::ResolvedConfigSet {
+            base: mosaix_config::ResolvedConfig {
+                workspaces: workspaces
+                    .iter()
+                    .map(|name| mosaix_domain::WorkspaceName::new(name).unwrap())
+                    .collect(),
+                ..mosaix_config::ResolvedConfig::default()
+            },
+            profiles: Vec::new(),
+        };
+        mosaix_engine::spawn_engine(vec![display], config_set)
+    }
+
+    /// The store for a test whose request never writes configuration.
+    fn no_store() -> UnavailableConfigStore {
+        UnavailableConfigStore {
+            reason: "the test scripted no configuration directory".to_owned(),
+        }
+    }
+
+    fn workspace_result(response: IpcResponse) -> mosaix_domain::WorkspaceCommandResult {
+        let IpcResponse::Ok { data: Some(data) } = response else {
+            panic!("expected a typed workspace answer, got {response:?}");
+        };
+        serde_json::from_value(data).unwrap()
+    }
+
+    #[test]
+    fn creating_a_workspace_answers_with_the_typed_result_and_reaches_the_reducer() {
+        let engine = tiling_engine_with_workspaces(&["dev"]);
+        let response = handle_request(
+            &IpcRequest::CreateWorkspace {
+                name: "chat".to_owned(),
+            },
+            &engine.events(),
+            &engine.state_reader(),
+            &no_store(),
+            &no_probe(),
+        );
+
+        assert_eq!(
+            workspace_result(response),
+            mosaix_domain::WorkspaceCommandResult::Created(mosaix_domain::WorkspaceCreateApplied {
+                name: mosaix_domain::WorkspaceName::new("chat").unwrap()
+            })
+        );
+        wait_for_revision(&engine, 1);
+        let snapshot = StateSnapshot::from(engine.snapshot());
+        assert_eq!(
+            snapshot
+                .workspaces
+                .iter()
+                .map(|workspace| (
+                    workspace.name.as_str(),
+                    workspace.origin.as_str(),
+                    workspace.displayed_on
+                ))
+                .collect::<Vec<_>>(),
+            vec![("chat", "command", None), ("dev", "configuration", Some(1))]
+        );
+    }
+
+    #[test]
+    fn naming_an_unknown_workspace_answers_with_a_typed_refusal_not_an_error() {
+        let engine = tiling_engine_with_workspaces(&["dev"]);
+        let response = handle_request(
+            &IpcRequest::FocusWorkspace {
+                name: "typo".to_owned(),
+            },
+            &engine.events(),
+            &engine.state_reader(),
+            &no_store(),
+            &no_probe(),
+        );
+
+        assert_eq!(
+            workspace_result(response),
+            mosaix_domain::WorkspaceCommandResult::Refused(
+                mosaix_domain::WorkspaceRefusal::UnknownWorkspace {
+                    name: "typo".to_owned()
+                }
+            )
+        );
+        assert_eq!(
+            StateSnapshot::from(engine.snapshot()).workspaces.len(),
+            1,
+            "a refused name creates nothing"
+        );
+    }
+
+    #[test]
+    fn deleting_a_declared_workspace_is_refused_by_reason() {
+        let engine = tiling_engine_with_workspaces(&["dev", "chat"]);
+        let response = handle_request(
+            &IpcRequest::DeleteWorkspace {
+                name: "chat".to_owned(),
+            },
+            &engine.events(),
+            &engine.state_reader(),
+            &no_store(),
+            &no_probe(),
+        );
+
+        assert_eq!(
+            workspace_result(response),
+            mosaix_domain::WorkspaceCommandResult::Refused(
+                mosaix_domain::WorkspaceRefusal::DeclaredByConfiguration {
+                    name: mosaix_domain::WorkspaceName::new("chat").unwrap()
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn moving_to_the_only_display_is_refused_with_the_display_named() {
+        let engine = tiling_engine_with_workspaces(&["dev"]);
+        let response = handle_request(
+            &IpcRequest::MoveWorkspace {
+                name: "dev".to_owned(),
+                display_id: 1,
+            },
+            &engine.events(),
+            &engine.state_reader(),
+            &no_store(),
+            &no_probe(),
+        );
+
+        assert_eq!(
+            workspace_result(response),
+            mosaix_domain::WorkspaceCommandResult::Refused(
+                mosaix_domain::WorkspaceRefusal::AlreadyDisplayedThere {
+                    name: mosaix_domain::WorkspaceName::new("dev").unwrap(),
+                    display_id: DisplayId(1),
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn state_snapshot_names_each_windows_workspace_and_lists_members() {
+        let engine = tiling_engine_with_workspaces(&["dev"]);
+        engine
+            .events()
+            .send(Event::WindowsObserved {
+                windows: vec![managed_window(11, Rect::new(0, 0, 400, 300))],
+            })
+            .unwrap();
+        engine
+            .events()
+            .send(Event::WindowFocused {
+                window_id: WindowId(11),
+                display_id: DisplayId(1),
+                bounds: Rect::new(0, 0, 400, 300),
+            })
+            .unwrap();
+        wait_for_revision(&engine, 2);
+
+        let snapshot = StateSnapshot::from(engine.snapshot());
+        assert_eq!(
+            snapshot.managed_windows[0].workspace.as_deref(),
+            Some("dev")
+        );
+        assert_eq!(
+            snapshot.workspaces,
+            vec![WorkspaceSnapshot {
+                name: "dev".to_owned(),
+                origin: "configuration".to_owned(),
+                displayed_on: Some(1),
+                members: vec![11],
+                last_focused_window: Some(11),
+                dormant_positions: 0,
+            }]
+        );
+        let json = serde_json::to_string(&snapshot).unwrap();
+        assert!(!json.contains("non-sensitive-test-title"));
+    }
+
+    #[test]
+    fn state_snapshot_reports_switching_as_disabled_without_a_requesting_profile() {
+        let json = serde_json::to_value(StateSnapshot::from(EngineState::default())).unwrap();
+
+        assert_eq!(json["workspace_switching"]["status"], "disabled");
+        assert_eq!(
+            json["workspace_switching"]["reason"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            json["workspace_switching"]["parking_capability"],
+            "unverified"
+        );
+    }
+
+    #[test]
+    fn state_snapshot_reports_a_requested_mapping_with_what_it_waits_for() {
+        let display = mosaix_domain::Display {
+            id: DisplayId(1),
+            stable_fingerprint: "MON-A".to_owned(),
+            full_bounds: Rect::new(0, 0, 1920, 1080),
+            work_area: Rect::new(0, 0, 1920, 1080),
+            scale_factor: 1.0,
+            rotation: mosaix_domain::Rotation::Landscape,
+            is_primary: true,
+        };
+        let name = mosaix_domain::WorkspaceName::new("dev").unwrap();
+        let config = mosaix_config::ResolvedConfig {
+            workspaces: vec![name.clone()],
+            workspace_switching: Some(mosaix_config::ResolvedWorkspaceSwitching {
+                experimental: true,
+                displayed: [("MON-A".to_owned(), name)].into_iter().collect(),
+            }),
+            profile_file: Some("office.toml".to_owned()),
+            ..mosaix_config::ResolvedConfig::default()
+        };
+        let engine = mosaix_engine::spawn_engine(
+            vec![display.clone()],
+            mosaix_config::ResolvedConfigSet {
+                base: mosaix_config::ResolvedConfig {
+                    workspaces: config.workspaces.clone(),
+                    ..mosaix_config::ResolvedConfig::default()
+                },
+                profiles: vec![mosaix_config::ResolvedProfile {
+                    fingerprint: mosaix_domain::topology_fingerprint(&[display]),
+                    config,
+                }],
+            },
+        );
+
+        let json = serde_json::to_value(StateSnapshot::from(engine.snapshot())).unwrap();
+
+        assert_eq!(json["workspace_switching"]["status"], "requested");
+        assert_eq!(
+            json["workspace_switching"]["reason"],
+            "parking_capability_unverified"
+        );
+        assert_eq!(json["workspace_switching"]["profile_file"], "office.toml");
+        assert_eq!(json["workspace_switching"]["displayed"]["MON-A"], "dev");
+    }
+
+    #[test]
+    fn state_snapshot_reports_recovery_outcomes_pending_and_parked_windows() {
+        let mut state = EngineState::default();
+        state.session_id = "42-1".to_owned();
+        state
+            .parked_windows
+            .insert(WindowId(7), mosaix_domain::RecoveryEntryId(3));
+        state.last_parking_refusal = Some(mosaix_domain::ParkingRefusal::PersistenceDegraded);
+        state.recovery_outcomes = vec![mosaix_domain::RecoveryOutcome {
+            entry_id: mosaix_domain::RecoveryEntryId(2),
+            native_handle: 99,
+            application_id: mosaix_domain::ApplicationId("code.exe".to_owned()),
+            verdict: mosaix_domain::HandleVerdict::Stale,
+            restored: false,
+            failure: None,
+        }];
+
+        let json = serde_json::to_value(StateSnapshot::from(state)).unwrap();
+
+        assert_eq!(json["recovery"]["session_id"], "42-1");
+        assert_eq!(json["recovery"]["parked_windows"], serde_json::json!([7]));
+        assert_eq!(
+            json["recovery"]["last_parking_refusal"],
+            "persistence_degraded"
+        );
+        assert_eq!(json["recovery"]["outcomes"][0]["verdict"], "stale");
+        assert_eq!(json["recovery"]["outcomes"][0]["native_handle"], 99);
     }
 }

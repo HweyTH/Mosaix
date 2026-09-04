@@ -95,11 +95,11 @@ Adding a tiled window by dividing the focused tiled leaf into equal siblings alo
 _Avoid_: Append, preselection, insertion direction
 
 **Dormant tree leaf**:
-A persisted window position whose window is closed or not currently matched, retained without consuming screen space so a later confident match can reclaim its structural position. It expires after seven days unless a saved scene retains it, and an explicit remove-position command deletes it immediately.
+A persisted window position whose window is closed or not currently matched, retained without consuming screen space so a later confident match can reclaim its structural position. A window that is still open but leaves the tree -- floated, minimized, or transferred to another display -- leaves no dormant leaf behind. It expires after seven days unless a saved scene retains it (scene retention arrives with issue #28; until then expiry is unconditional), and an explicit remove-position command deletes it immediately.
 _Avoid_: Empty tile, placeholder window, missing window
 
 **Tree resize**:
-Moving the closest container-tree divider facing the requested direction by five percentage points per command while keeping every affected window at or above its minimum size. The resulting placements form one undo transaction.
+Moving the closest container-tree divider facing the requested direction by five percentage points per command while keeping every affected window at or above its minimum size. A resize never pays for itself by reducing gaps or overflowing a window: when the full step would, the largest smaller whole-point step that does not is taken, and none if none fits. The resulting placements, and the tree as it stood before, form one undo transaction.
 _Avoid_: Window resize (alone), free resize, pixel resize
 
 **Logical workspace**:
@@ -110,6 +110,14 @@ _Avoid_: Virtual desktop, Space, saved workspace
 Displaying a hidden logical workspace on the focused monitor, or focusing its last-focused live window when it is already displayed on another monitor. It never moves a displayed workspace between monitors.
 _Avoid_: Workspace move, display transfer, workspace switch (alone)
 
+**Workspace move**:
+An explicit command that transfers a displayed logical workspace to another monitor, exchanging it with whatever that monitor showed so nothing becomes hidden. Identity, membership, and the container tree travel with it; the last-focused window is retained. It is the only way a displayed workspace changes monitor: `Workspace focus` never moves one.
+_Avoid_: Workspace switch, display transfer (which moves one window)
+
+**Unfilled display**:
+A display for which the workspace pool has no hidden, empty workspace to display. It arranges the windows physically on it exactly as it did before workspaces existed, those windows belong to no workspace, and published state reports both. The engine never invents a workspace name to fill it; declaring or creating one and focusing it there is the remedy.
+_Avoid_: Default workspace, anonymous workspace
+
 **Focused display**:
 The display targeted by display-scoped commands, following the focused managed window when one exists and otherwise retaining the last explicitly targeted display. It remains defined when the displayed logical workspace is empty.
 _Avoid_: Primary display, cursor display, focused window's display
@@ -118,9 +126,17 @@ _Avoid_: Primary display, cursor display, focused window's display
 The reversible relocation of windows from a non-displayed logical workspace to a recoverable edge position while their workspace membership remains unchanged.
 _Avoid_: Hide, cloak, minimize
 
+**Recovery ledger**:
+A small SQLite file beside the state database, written before any window is parked, that records the native handle, the owning process instance (process id plus kernel creation time), the window class, the original display, the visible and normal bounds, and the show state. An entry is acknowledged durable before the engine authorises the parking effect it describes. Startup and the out-of-process `restore-windows` command read it before any identity reconciliation and touch only a handle whose live evidence still matches; a stale, reused, or ambiguous handle is reported and left alone. It is never cross-session identity: the state database holds no native handle.
+_Avoid_: Undo history, session state, handle cache
+
 **Workspace switch transaction**:
 An all-or-nothing change of the logical workspace displayed on one monitor, durably recording recovery data before parking or restoring windows. Any placement failure cancels the switch and compensates completed moves; success creates one undo transaction covering both assignment and placements.
 _Avoid_: Placement transaction, partial workspace switch
+
+**Workspace switching status**:
+One of four states published for the current topology: disabled (no matched profile requests switching; base config cannot), requested (the matched profile's complete workspace-to-display mapping is in effect, but switching waits on a verified parking site or on persistence recovering), unavailable (the profile requests it but its mapping could not be applied, so the previous displayed assignment stands), or experimental (mapping in effect and parking authorised). A profile mapping applies to every display atomically or not at all, and the engine invents no workspace name to complete one.
+_Avoid_: Enabled (which does not say whether parking is authorised), workspace mode
 
 **Workspace-switch degraded**:
 A health condition in which compensation for a failed workspace switch could not restore every moved window. Further switching remains blocked until the explicit restore action reconciles the affected windows.

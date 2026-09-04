@@ -315,12 +315,14 @@ pub fn save_profile_settings(
 
     let mut profile = updated_profile.unwrap_or(ProfileConfig {
         fingerprint: update.fingerprint.clone(),
+        workspaces: Vec::new(),
         hotkeys: Default::default(),
         gaps: GapsOverride::default(),
         behavior: Default::default(),
         automatic_tiling: None,
         focus_border: FocusBorderOverride::default(),
         layouts: Default::default(),
+        workspace_switching: None,
     });
     // The settings surface toggles activation, not the arrangement, so the
     // profile's existing mode is carried through. Defaulting it here would

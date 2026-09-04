@@ -10,6 +10,10 @@
 //! failed migration is preserved byte-for-byte until a user asks for
 //! [`Persistence::reset`].
 
+mod ledger;
+
+pub use ledger::{default_ledger_path, recover_parked_windows, RecoveryLedger};
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -17,10 +21,13 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use mosaix_domain::identity::WindowEvidence;
+use mosaix_domain::recovery::{RecoveryDraft, RecoveryEntryId};
 use mosaix_domain::tree::PersistedTree;
 use mosaix_domain::undo::{
     now_unix, UndoMember, UndoTransaction, UndoTransactionDraft, UndoTransactionId,
+    UndoTreeSnapshot,
 };
+use mosaix_domain::workspace::{PersistedWorkspace, WorkspaceName, WorkspaceOrigin};
 use mosaix_domain::{ApplicationId, Rect, WindowRole};
 use rusqlite::Connection;
 use thiserror::Error;
@@ -103,6 +110,35 @@ const MIGRATIONS: &[Migration] = &[
         statements: "CREATE TABLE container_tree (
                          display_fingerprint TEXT PRIMARY KEY,
                          tree TEXT NOT NULL
+                     );",
+    },
+    // The container trees a command reshaped, as they stood before it, so
+    // undo restores structure as well as placements. Cascades with the
+    // transaction for the same reason members do.
+    Migration {
+        version: 4,
+        statements: "CREATE TABLE undo_tree (
+                         transaction_id INTEGER NOT NULL
+                             REFERENCES undo_transaction (id) ON DELETE CASCADE,
+                         display_fingerprint TEXT NOT NULL,
+                         tree TEXT NOT NULL,
+                         PRIMARY KEY (transaction_id, display_fingerprint)
+                     );",
+    },
+    // Logical workspaces (ADR 0028). One row per workspace in the global
+    // pool: where it was displayed when last written, and the tree it
+    // owns as a document, for the same reason a container tree is one.
+    // The name is the key because it is the identity (CONTEXT.md
+    // "Logical workspace"): a workspace that moves between monitors keeps
+    // its row, and only `displayed_fingerprint` changes. Membership and
+    // last focus are native window ids and deliberately have no column.
+    Migration {
+        version: 5,
+        statements: "CREATE TABLE workspace (
+                         name TEXT PRIMARY KEY,
+                         origin TEXT NOT NULL,
+                         displayed_fingerprint TEXT,
+                         tree TEXT
                      );",
     },
 ];
@@ -295,7 +331,10 @@ impl Persistence {
         // The state database sits beside the configuration directory but
         // does not depend on it having been created, so it makes its own
         // parent rather than assuming another subsystem already did.
-        if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
             std::fs::create_dir_all(parent).map_err(PersistenceError::Directory)?;
         }
         let connection = Connection::open(path).map_err(PersistenceError::Open)?;
@@ -332,12 +371,12 @@ impl Persistence {
             .iter()
             .filter(move |step| step.version > already_applied)
         {
-            let transaction = connection
-                .unchecked_transaction()
-                .map_err(|source| PersistenceError::Migration {
+            let transaction = connection.unchecked_transaction().map_err(|source| {
+                PersistenceError::Migration {
                     version: migration.version,
                     source,
-                })?;
+                }
+            })?;
             // The version bump rides inside the same transaction, so a
             // migration that fails halfway leaves neither its tables nor
             // its version number behind.
@@ -452,6 +491,18 @@ impl Persistence {
         &mut self,
         draft: &UndoTransactionDraft,
     ) -> Result<UndoTransactionId, PersistenceError> {
+        // Encoded before the write begins, so an unencodable tree fails
+        // the whole record rather than a transaction with its structure
+        // silently missing.
+        let trees: Vec<(String, String)> = draft
+            .prior_trees
+            .iter()
+            .map(|snapshot| {
+                serde_json::to_string(&snapshot.tree)
+                    .map(|document| (snapshot.display_fingerprint.clone(), document))
+                    .map_err(PersistenceError::TreeEncoding)
+            })
+            .collect::<Result<_, _>>()?;
         let outcome = self.write(|connection| {
             let transaction = connection.unchecked_transaction()?;
             transaction.execute(
@@ -498,6 +549,13 @@ impl Persistence {
                         member.evidence.last_placement.height,
                         member.evidence.display_fingerprint,
                     ],
+                )?;
+            }
+            for (display_fingerprint, document) in &trees {
+                transaction.execute(
+                    "INSERT INTO undo_tree (transaction_id, display_fingerprint, tree)
+                     VALUES (?1, ?2, ?3)",
+                    rusqlite::params![id.0, display_fingerprint, document],
                 )?;
             }
             // Pruning rides inside the insert's transaction, so history is
@@ -553,7 +611,35 @@ impl Persistence {
             topology_fingerprint,
             durable_revision,
             members: self.members_of(id)?,
+            prior_trees: self.trees_of(id)?,
         }))
+    }
+
+    fn trees_of(&self, id: UndoTransactionId) -> Result<Vec<UndoTreeSnapshot>, PersistenceError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT display_fingerprint, tree FROM undo_tree
+                 WHERE transaction_id = ?1 ORDER BY display_fingerprint",
+            )
+            .map_err(PersistenceError::Read)?;
+        let rows = statement
+            .query_map([id.0], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(PersistenceError::Read)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(PersistenceError::Read)?;
+        rows.into_iter()
+            .map(|(display_fingerprint, document)| {
+                serde_json::from_str::<PersistedTree>(&document)
+                    .map(|tree| UndoTreeSnapshot {
+                        display_fingerprint,
+                        tree,
+                    })
+                    .map_err(PersistenceError::TreeEncoding)
+            })
+            .collect()
     }
 
     fn members_of(&self, id: UndoTransactionId) -> Result<Vec<UndoMember>, PersistenceError> {
@@ -598,12 +684,10 @@ impl Persistence {
     /// Removes a transaction after it has been successfully undone.
     /// Answers whether there was one to remove, so a caller cannot mistake
     /// "already gone" for "consumed".
-    pub fn consume_transaction(
-        &mut self,
-        id: UndoTransactionId,
-    ) -> Result<bool, PersistenceError> {
+    pub fn consume_transaction(&mut self, id: UndoTransactionId) -> Result<bool, PersistenceError> {
         self.write(|connection| {
-            let removed = connection.execute("DELETE FROM undo_transaction WHERE id = ?1", [id.0])?;
+            let removed =
+                connection.execute("DELETE FROM undo_transaction WHERE id = ?1", [id.0])?;
             Ok(removed > 0)
         })
     }
@@ -674,6 +758,105 @@ impl Persistence {
             }
         }
         Ok(trees)
+    }
+
+    /// Stores one workspace, replacing whatever the pool held under that
+    /// name. An absent tree is stored as NULL rather than as an empty
+    /// document, so a hidden workspace with nothing arranged reads back
+    /// as exactly that.
+    pub fn save_workspace(
+        &mut self,
+        workspace: &PersistedWorkspace,
+    ) -> Result<(), PersistenceError> {
+        let document = workspace
+            .tree
+            .as_ref()
+            .filter(|tree| !tree.is_empty())
+            .map(|tree| serde_json::to_string(tree).map_err(PersistenceError::TreeEncoding))
+            .transpose()?;
+        self.write(|connection| {
+            connection.execute(
+                "INSERT INTO workspace (name, origin, displayed_fingerprint, tree)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT (name) DO UPDATE SET
+                     origin = excluded.origin,
+                     displayed_fingerprint = excluded.displayed_fingerprint,
+                     tree = excluded.tree",
+                rusqlite::params![
+                    workspace.name.as_str(),
+                    workspace.origin.code(),
+                    workspace.displayed_fingerprint,
+                    document,
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Removes a deleted workspace. Answers whether there was one.
+    pub fn delete_workspace(&mut self, name: &WorkspaceName) -> Result<bool, PersistenceError> {
+        self.write(|connection| {
+            let removed =
+                connection.execute("DELETE FROM workspace WHERE name = ?1", [name.as_str()])?;
+            Ok(removed > 0)
+        })
+    }
+
+    /// Every stored workspace, in name order.
+    ///
+    /// A row whose name or origin this build cannot read is skipped with a
+    /// warning, and a tree that cannot be read leaves its workspace with
+    /// no tree: one unreadable row is not a reason to lose the pool.
+    pub fn load_workspaces(&self) -> Result<Vec<PersistedWorkspace>, PersistenceError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT name, origin, displayed_fingerprint, tree FROM workspace ORDER BY name",
+            )
+            .map_err(PersistenceError::Read)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            })
+            .map_err(PersistenceError::Read)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(PersistenceError::Read)?;
+
+        let mut workspaces = Vec::with_capacity(rows.len());
+        for (name, origin, displayed_fingerprint, document) in rows {
+            let (Ok(name), Some(origin)) = (
+                WorkspaceName::new(&name),
+                WorkspaceOrigin::from_code(&origin),
+            ) else {
+                tracing::warn!(%name, "stored workspace could not be read; skipping it");
+                continue;
+            };
+            let tree = document.and_then(|document| {
+                match serde_json::from_str::<PersistedTree>(&document) {
+                    Ok(tree) => Some(tree),
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            %name,
+                            "stored workspace arrangement could not be read; the workspace starts empty"
+                        );
+                        None
+                    }
+                }
+            });
+            workspaces.push(PersistedWorkspace {
+                name,
+                origin,
+                displayed_fingerprint,
+                tree,
+            });
+        }
+        Ok(workspaces)
     }
 
     /// Runs a write, mapping any failure onto the same sticky degradation
@@ -778,6 +961,24 @@ pub enum PersistenceRequest {
         display_fingerprint: String,
         tree: Box<PersistedTree>,
     },
+    /// Store one logical workspace: its origin, where it is displayed,
+    /// and the tree it owns.
+    SaveWorkspace(Box<PersistedWorkspace>),
+    /// Forget a deleted workspace.
+    DeleteWorkspace(WorkspaceName),
+    /// Record recovery data for a window about to be parked, in the
+    /// current-session ledger. Answered through
+    /// [`PersistenceUpdate::recovery_acknowledged`] with the same token,
+    /// which is what lets the engine authorise the parking effect only
+    /// once the entry is durable (ADR 0023).
+    RecordRecovery {
+        token: u64,
+        draft: Box<RecoveryDraft>,
+    },
+    /// The parking effect an entry authorised was carried out.
+    MarkParked(RecoveryEntryId),
+    /// The window an entry describes is back in visible geometry.
+    MarkRestored(RecoveryEntryId),
 }
 
 /// What the worker reports after each request: how durability now stands,
@@ -793,6 +994,12 @@ pub struct PersistenceUpdate {
     /// display's tree is, and the database follows it. Re-sending them
     /// would let a stale arrangement overwrite a live one.
     pub restored_trees: Option<HashMap<String, PersistedTree>>,
+    /// The stored workspace pool, sent only in the worker's first update
+    /// for the same reason `restored_trees` is.
+    pub restored_workspaces: Option<Vec<PersistedWorkspace>>,
+    /// Ledger writes answered by this update: each token with the durable
+    /// entry it produced, or `None` when the ledger could not write it.
+    pub recovery_acknowledged: Vec<(u64, Option<RecoveryEntryId>)>,
 }
 
 #[derive(Debug)]
@@ -816,8 +1023,30 @@ pub struct PersistenceWorker {
 }
 
 impl PersistenceWorker {
+    /// Starts the worker over the state database at `path` alone. Ledger
+    /// requests are answered as refused, so nothing can be parked.
     pub fn start(path: impl AsRef<Path>) -> Result<Self, PersistenceError> {
+        Self::start_with_ledger(path, None)
+    }
+
+    /// Starts the worker over the state database at `path` and the
+    /// recovery ledger at `ledger_path`, so ledger writes are ordered
+    /// with every other durable write.
+    pub fn start_with_ledger(
+        path: impl AsRef<Path>,
+        ledger_path: Option<&Path>,
+    ) -> Result<Self, PersistenceError> {
         let mut persistence = Persistence::open(path.as_ref())?;
+        let mut ledger = match ledger_path {
+            Some(ledger_path) => match RecoveryLedger::open(ledger_path) {
+                Ok(ledger) => Some(ledger),
+                Err(error) => {
+                    tracing::error!(%error, "recovery ledger could not be opened; no window will be parked");
+                    None
+                }
+            },
+            None => None,
+        };
 
         // History that aged out while the agent was not running is dropped
         // before anyone is told what undo would do, so a stale transaction
@@ -839,8 +1068,16 @@ impl PersistenceWorker {
                 None
             }
         };
+        let restored_workspaces = match persistence.load_workspaces() {
+            Ok(workspaces) => Some(workspaces),
+            Err(error) => {
+                tracing::warn!(%error, "stored workspaces could not be read");
+                None
+            }
+        };
         let _ = update_sender.send(PersistenceUpdate {
             restored_trees,
+            restored_workspaces,
             ..snapshot_of(&persistence)
         });
 
@@ -852,10 +1089,28 @@ impl PersistenceWorker {
                 // The store itself tracks whether each write landed, so the
                 // health reported here is the truth rather than this
                 // thread's guess at it.
+                let mut recovery_acknowledged = Vec::new();
                 let outcome = match &request {
                     PersistenceRequest::Commit { revision } => {
                         persistence.commit_revision(*revision).map(|_| ())
                     }
+                    PersistenceRequest::RecordRecovery { token, draft } => {
+                        let recorded = ledger.as_mut().and_then(|ledger| ledger.record(draft).ok());
+                        recovery_acknowledged.push((*token, recorded));
+                        if recorded.is_none() {
+                            tracing::warn!(
+                                token,
+                                "recovery data could not be made durable; parking is not authorised"
+                            );
+                        }
+                        Ok(())
+                    }
+                    PersistenceRequest::MarkParked(id) => ledger
+                        .as_mut()
+                        .map_or(Ok(()), |ledger| ledger.mark_parked(*id).map(|_| ())),
+                    PersistenceRequest::MarkRestored(id) => ledger
+                        .as_mut()
+                        .map_or(Ok(()), |ledger| ledger.mark_restored(*id).map(|_| ())),
                     PersistenceRequest::RecordUndoTransaction(draft) => {
                         persistence.record_transaction(draft).map(|_| ())
                     }
@@ -869,6 +1124,12 @@ impl PersistenceWorker {
                         display_fingerprint,
                         tree,
                     } => persistence.save_tree(display_fingerprint, tree),
+                    PersistenceRequest::SaveWorkspace(workspace) => {
+                        persistence.save_workspace(workspace)
+                    }
+                    PersistenceRequest::DeleteWorkspace(name) => {
+                        persistence.delete_workspace(name).map(|_| ())
+                    }
                 };
                 if let Err(error) = outcome {
                     tracing::warn!(
@@ -878,7 +1139,10 @@ impl PersistenceWorker {
                          without a durability promise"
                     );
                 }
-                let _ = update_sender.send(snapshot_of(&persistence));
+                let _ = update_sender.send(PersistenceUpdate {
+                    recovery_acknowledged,
+                    ..snapshot_of(&persistence)
+                });
             }
         });
         Ok(Self {
@@ -934,6 +1198,8 @@ fn snapshot_of(persistence: &Persistence) -> PersistenceUpdate {
         health: persistence.health(),
         newest_undo,
         restored_trees: None,
+        restored_workspaces: None,
+        recovery_acknowledged: Vec::new(),
     }
 }
 
@@ -993,6 +1259,8 @@ mod tests {
                 },
                 newest_undo: None,
                 restored_trees: Some(HashMap::new()),
+                restored_workspaces: Some(Vec::new()),
+                recovery_acknowledged: Vec::new(),
             },
             "the worker states what the database already holds before any write"
         );

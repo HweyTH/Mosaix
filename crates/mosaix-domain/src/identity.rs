@@ -403,6 +403,7 @@ mod tests {
             },
             elevated: false,
             lifecycle: WindowLifecycle::Active,
+            minimum_size: None,
         }
     }
 
@@ -433,7 +434,12 @@ mod tests {
 
     #[test]
     fn evidence_never_captures_the_window_title() {
-        let subject = window(1, "Code.exe", "Chrome_WidgetWin_1", Rect::new(0, 0, 800, 600));
+        let subject = window(
+            1,
+            "Code.exe",
+            "Chrome_WidgetWin_1",
+            Rect::new(0, 0, 800, 600),
+        );
 
         let evidence = evidence_for(&subject, 0);
         let stored = serde_json::to_string(&evidence).expect("evidence serializes");
@@ -446,7 +452,12 @@ mod tests {
 
     #[test]
     fn an_unchanged_window_matches_confidently() {
-        let subject = window(1, "Code.exe", "Chrome_WidgetWin_1", Rect::new(0, 0, 800, 600));
+        let subject = window(
+            1,
+            "Code.exe",
+            "Chrome_WidgetWin_1",
+            Rect::new(0, 0, 800, 600),
+        );
         let evidence = evidence_for(&subject, 0);
 
         let outcome = match_window_with_order(&evidence, [&subject], on_display_one, |_| Some(0));
@@ -462,8 +473,18 @@ mod tests {
 
     #[test]
     fn two_identical_windows_of_one_application_are_ambiguous_rather_than_guessed() {
-        let first = window(1, "Code.exe", "Chrome_WidgetWin_1", Rect::new(0, 0, 800, 600));
-        let second = window(2, "Code.exe", "Chrome_WidgetWin_1", Rect::new(0, 0, 800, 600));
+        let first = window(
+            1,
+            "Code.exe",
+            "Chrome_WidgetWin_1",
+            Rect::new(0, 0, 800, 600),
+        );
+        let second = window(
+            2,
+            "Code.exe",
+            "Chrome_WidgetWin_1",
+            Rect::new(0, 0, 800, 600),
+        );
         let evidence = evidence_for(&first, 0);
 
         let outcome =
@@ -482,23 +503,36 @@ mod tests {
 
     #[test]
     fn launch_order_separates_two_windows_of_one_application() {
-        let first = window(1, "Code.exe", "Chrome_WidgetWin_1", Rect::new(0, 0, 800, 600));
-        let second = window(2, "Code.exe", "Chrome_WidgetWin_1", Rect::new(900, 0, 800, 600));
+        let first = window(
+            1,
+            "Code.exe",
+            "Chrome_WidgetWin_1",
+            Rect::new(0, 0, 800, 600),
+        );
+        let second = window(
+            2,
+            "Code.exe",
+            "Chrome_WidgetWin_1",
+            Rect::new(900, 0, 800, 600),
+        );
         let evidence = evidence_for(&first, 0);
 
-        let outcome = match_window_with_order(
-            &evidence,
-            [&first, &second],
-            on_display_one,
-            |window| Some(if window.id == WindowId(1) { 0 } else { 1 }),
-        );
+        let outcome =
+            match_window_with_order(&evidence, [&first, &second], on_display_one, |window| {
+                Some(if window.id == WindowId(1) { 0 } else { 1 })
+            });
 
         assert_eq!(outcome.confident_window(), Some(WindowId(1)));
     }
 
     #[test]
     fn a_different_application_is_no_match_however_alike_it_sits() {
-        let subject = window(1, "Code.exe", "Chrome_WidgetWin_1", Rect::new(0, 0, 800, 600));
+        let subject = window(
+            1,
+            "Code.exe",
+            "Chrome_WidgetWin_1",
+            Rect::new(0, 0, 800, 600),
+        );
         let evidence = evidence_for(&subject, 0);
         let impostor = window(
             2,
@@ -520,7 +554,12 @@ mod tests {
 
     #[test]
     fn no_candidates_at_all_is_no_match_with_nothing_to_report() {
-        let subject = window(1, "Code.exe", "Chrome_WidgetWin_1", Rect::new(0, 0, 800, 600));
+        let subject = window(
+            1,
+            "Code.exe",
+            "Chrome_WidgetWin_1",
+            Rect::new(0, 0, 800, 600),
+        );
         let evidence = evidence_for(&subject, 0);
 
         let outcome = match_window_with_order(&evidence, [], on_display_one, |_| Some(0));
@@ -535,13 +574,20 @@ mod tests {
 
     #[test]
     fn the_same_rectangle_on_another_display_earns_no_placement_credit() {
-        let subject = window(1, "Code.exe", "Chrome_WidgetWin_1", Rect::new(0, 0, 800, 600));
+        let subject = window(
+            1,
+            "Code.exe",
+            "Chrome_WidgetWin_1",
+            Rect::new(0, 0, 800, 600),
+        );
         let evidence = evidence_for(&subject, 0);
 
-        let elsewhere =
-            match_window_with_order(&evidence, [&subject], |_| Some("DISPLAY2".to_owned()), |_| {
-                Some(0)
-            });
+        let elsewhere = match_window_with_order(
+            &evidence,
+            [&subject],
+            |_| Some("DISPLAY2".to_owned()),
+            |_| Some(0),
+        );
 
         let MatchOutcome::Confident(candidate) = elsewhere else {
             panic!("the window is still recognisable, just not where it was");
@@ -552,12 +598,20 @@ mod tests {
             .find(|entry| entry.signal == EvidenceSignal::Placement)
             .expect("placement is always scored");
         assert_eq!(placement.awarded, 0);
-        assert_eq!(candidate.score, MAX_SCORE - EvidenceSignal::Placement.weight());
+        assert_eq!(
+            candidate.score,
+            MAX_SCORE - EvidenceSignal::Placement.weight()
+        );
     }
 
     #[test]
     fn contributions_explain_every_signal_that_was_weighed() {
-        let subject = window(1, "Code.exe", "Chrome_WidgetWin_1", Rect::new(0, 0, 800, 600));
+        let subject = window(
+            1,
+            "Code.exe",
+            "Chrome_WidgetWin_1",
+            Rect::new(0, 0, 800, 600),
+        );
         let evidence = evidence_for(&subject, 0);
 
         let outcome = match_window_with_order(&evidence, [&subject], on_display_one, |_| Some(0));
@@ -609,7 +663,12 @@ mod tests {
 
     #[test]
     fn an_unknown_launch_order_still_recognises_a_sole_candidate() {
-        let subject = window(1, "Code.exe", "Chrome_WidgetWin_1", Rect::new(0, 0, 800, 600));
+        let subject = window(
+            1,
+            "Code.exe",
+            "Chrome_WidgetWin_1",
+            Rect::new(0, 0, 800, 600),
+        );
         let evidence = evidence_for(&subject, 0);
 
         let outcome = match_window(&evidence, [&subject], on_display_one);

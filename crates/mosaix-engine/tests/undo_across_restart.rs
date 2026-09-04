@@ -78,6 +78,7 @@ fn window(id: isize, bounds: Rect) -> Window {
         },
         elevated: false,
         lifecycle: WindowLifecycle::Active,
+        minimum_size: None,
     }
 }
 

@@ -15,3 +15,6 @@ mosaix-ipc = { path = "../mosaix-ipc" }
 mosaix-persistence = { path = "../mosaix-persistence" }
 clap = { workspace = true }
 serde_json = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+mosaix-platform-windows = { path = "../mosaix-platform-windows" }

@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::geometry::Rect;
+use crate::geometry::{Rect, Size};
 use crate::id::{ApplicationId, DisplayId, WindowId};
 
 /// The semantic role of a window, inferred from native style flags.
@@ -131,6 +131,11 @@ pub struct Window {
     pub elevated: bool,
     /// Current lifecycle state.
     pub lifecycle: WindowLifecycle,
+    /// The smallest extent the window will accept, when the platform can
+    /// report it. `None` means unknown, which the planner treats as no
+    /// constraint beyond positive area -- never as a guess.
+    #[serde(default)]
+    pub minimum_size: Option<Size>,
 }
 
 #[cfg(test)]

@@ -25,6 +25,8 @@ pub mod hotkeys;
 #[cfg(windows)]
 pub mod overlay;
 #[cfg(windows)]
+pub mod recovery;
+#[cfg(windows)]
 pub mod shutdown;
 #[cfg(all(windows, test))]
 mod test_support;
@@ -50,6 +52,8 @@ pub use hotkeys::{
 };
 #[cfg(windows)]
 pub use overlay::{start_preview_overlay, PreviewOverlay};
+#[cfg(windows)]
+pub use recovery::{probe_handle, process_creation_time, restore_window, window_placement};
 #[cfg(windows)]
 pub use shutdown::register_shutdown_signal;
 #[cfg(windows)]

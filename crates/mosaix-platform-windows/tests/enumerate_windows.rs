@@ -33,10 +33,10 @@ mod tests {
             windows.len()
         );
         println!(
-            "{:<8} {:<8} {:<30} {:<30} {:<12} {:<20} {:<10}",
-            "HWND", "PID", "Title", "Class", "Role", "Bounds", "Lifecycle"
+            "{:<8} {:<8} {:<30} {:<30} {:<12} {:<20} {:<10} {:<10}",
+            "HWND", "PID", "Title", "Class", "Role", "Bounds", "Lifecycle", "MinSize"
         );
-        println!("{}", "-".repeat(120));
+        println!("{}", "-".repeat(132));
 
         for w in &windows {
             let bounds_str = format!(
@@ -44,7 +44,7 @@ mod tests {
                 w.bounds.width, w.bounds.height, w.bounds.x, w.bounds.y
             );
             println!(
-                "{:<8} {:<8} {:<30} {:<30} {:<12} {:<20} {:<10}",
+                "{:<8} {:<8} {:<30} {:<30} {:<12} {:<20} {:<10} {:<10}",
                 format!("{:#x}", w.id.0),
                 w.process_id,
                 truncate(&w.title, 28),
@@ -52,6 +52,8 @@ mod tests {
                 format!("{:?}", w.role),
                 bounds_str,
                 format!("{:?}", w.lifecycle),
+                w.minimum_size
+                    .map_or("(unknown)".to_owned(), |size| format!("{}x{}", size.width, size.height)),
             );
         }
         println!();

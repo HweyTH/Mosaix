@@ -1074,3 +1074,58 @@ fn a_malformed_saved_layout_is_rejected_and_the_previous_config_keeps_running() 
     watcher.stop();
     cleanup(&dir);
 }
+
+#[test]
+fn an_invalid_workspace_mapping_is_rejected_on_hot_reload_and_a_fix_recovers() {
+    let dir = temp_dir("invalid-mapping");
+    ensure_default_config(&dir).expect("should create the default config");
+    fs::create_dir_all(dir.join("profiles")).unwrap();
+    let fingerprint = "MON-A@0,0 1920x1080 scale=1|MON-B@1920,0 1920x1080 scale=1";
+    let valid = format!(
+        "fingerprint = \"{fingerprint}\"\nworkspaces = [\"dev\", \"chat\"]\n\n[workspace_switching]\nexperimental = true\n\n[workspace_switching.displayed]\n\"MON-A\" = \"dev\"\n\"MON-B\" = \"chat\"\n"
+    );
+    fs::write(dir.join("profiles").join("office.toml"), &valid).unwrap();
+    let loaded = load(&dir).unwrap().unwrap();
+    assert_eq!(loaded.profiles.len(), 1);
+
+    let (watcher, events) = watch(dir.clone()).expect("watcher should start");
+
+    // A mapping that names an undeclared workspace rejects the whole
+    // directory; the previous resolved set keeps running.
+    fs::write(
+        dir.join("profiles").join("office.toml"),
+        valid.replace("\"MON-B\" = \"chat\"", "\"MON-B\" = \"media\""),
+    )
+    .unwrap();
+    let event = events
+        .recv_timeout(Duration::from_secs(5))
+        .expect("expected a config event after the debounced edit");
+    match event {
+        ConfigEvent::Rejected(errors) => {
+            assert!(
+                errors.iter().any(|error| matches!(
+                    error,
+                    mosaix_config::ValidationError::UnknownWorkspaceMapping { workspace, .. }
+                        if workspace == "media"
+                )),
+                "got {errors:?}"
+            );
+        }
+        ConfigEvent::Changed(set) => panic!("expected the edit to be rejected, got: {set:?}"),
+    }
+
+    fs::write(dir.join("profiles").join("office.toml"), &valid).unwrap();
+    let event = events
+        .recv_timeout(Duration::from_secs(5))
+        .expect("expected a config event after the fix");
+    match event {
+        ConfigEvent::Changed(set) => {
+            let switching = set.profiles[0].config.workspace_switching.clone().unwrap();
+            assert_eq!(switching.displayed.len(), 2);
+        }
+        ConfigEvent::Rejected(errors) => panic!("expected the fix to be accepted, got: {errors:?}"),
+    }
+
+    watcher.stop();
+    cleanup(&dir);
+}
