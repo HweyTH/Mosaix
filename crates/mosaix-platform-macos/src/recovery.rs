@@ -346,6 +346,28 @@ pub fn frontmost_window_id() -> Option<u32> {
     })
 }
 
+/// Every on-screen ordinary window id, front to back. Used by the live
+/// probe and by focus measurement.
+pub fn on_screen_window_ids() -> Vec<u32> {
+    let array = unsafe {
+        CGWindowListCopyWindowInfo(K_CG_WINDOW_LIST_OPTION_ON_SCREEN_ONLY, K_CG_NULL_WINDOW_ID)
+    };
+    if array.is_null() {
+        return Vec::new();
+    }
+    let windows: CFArray<*const c_void> = unsafe { CFArray::wrap_under_create_rule(array) };
+    windows
+        .iter()
+        .filter_map(|entry| {
+            let info: CFDictionary<CFString, CFType> =
+                unsafe { CFDictionary::wrap_under_get_rule(*entry as _) };
+            (number(&info, "kCGWindowLayer")? == NORMAL_WINDOW_LAYER)
+                .then(|| u32::try_from(number(&info, "kCGWindowNumber")?).ok())
+                .flatten()
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

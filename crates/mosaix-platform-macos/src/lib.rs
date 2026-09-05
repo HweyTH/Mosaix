@@ -53,8 +53,9 @@ pub use parking::{
 };
 #[cfg(target_os = "macos")]
 pub use recovery::{
-    frontmost_window_id, is_same_window, probe_handle, process_creation_time, resolve_window,
-    restore_window, window_owner_pid, window_placement, window_server_info, WindowServerInfo,
+    frontmost_window_id, is_same_window, on_screen_window_ids, probe_handle, process_creation_time,
+    resolve_window, restore_window, window_owner_pid, window_placement, window_server_info,
+    WindowServerInfo,
 };
 #[cfg(target_os = "macos")]
 pub use shutdown::register_shutdown_signal;
