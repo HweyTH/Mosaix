@@ -96,14 +96,14 @@ button { color: inherit; }
 .tool-dock .icon-button.active { color: var(--accent-ink); background: var(--accent); }
 .dock-rule { height: 1px; margin: 2px 5px; background: var(--line); }
 
-.world { position: absolute; inset: 0; display: grid; place-items: center; padding: 84px 128px 116px 112px; }
-.display-meta { position: absolute; left: max(140px, 12%); right: max(158px, 13%); top: 79px; display: flex; justify-content: space-between; color: var(--muted); font-size: 8px; font-weight: 650; letter-spacing: .06em; }
+.world { position: absolute; inset: 0; display: grid; grid-auto-rows: min-content; place-items: center; align-content: center; padding: 84px 264px 116px 328px; }
+.display-meta { position: absolute; left: 328px; right: 264px; top: 79px; display: flex; justify-content: space-between; color: var(--muted); font-size: 8px; font-weight: 650; letter-spacing: .06em; }
 .display-meta i { display: inline-block; width: 5px; height: 5px; margin-right: 5px; border-radius: 50%; background: var(--live); }
-.monitor-shell { position: relative; width: min(1000px, 80vw); aspect-ratio: 16 / 9; padding: 7px; border: 1px solid color-mix(in srgb, var(--ink), transparent 74%); border-radius: 17px; background: var(--monitor); box-shadow: 0 50px 120px rgb(0 0 0 / 34%), 0 0 0 11px color-mix(in srgb, var(--ink), transparent 98%); }
+.monitor-shell { position: relative; width: min(1000px, 100%); aspect-ratio: 16 / 9; padding: 7px; border: 1px solid color-mix(in srgb, var(--ink), transparent 74%); border-radius: 17px; background: var(--monitor); box-shadow: 0 50px 120px rgb(0 0 0 / 34%), 0 0 0 11px color-mix(in srgb, var(--ink), transparent 98%); }
 .monitor-shell::before { content: ""; position: absolute; left: 50%; top: 2px; width: 4px; height: 4px; border-radius: 50%; background: color-mix(in srgb, var(--ink), transparent 65%); }
 .work-area { position: relative; width: 100%; height: 100%; overflow: hidden; border-radius: 11px; background: radial-gradient(circle at 50% 110%, var(--work-start), var(--work-end) 68%); }
 .work-label { position: absolute; right: 12px; bottom: 9px; color: color-mix(in srgb, var(--ink), transparent 30%); font: 700 8px/1 ui-monospace, monospace; letter-spacing: .06em; }
-.monitor-foot { position: absolute; left: 50%; bottom: 76px; display: flex; align-items: flex-end; transform: translateX(-50%); opacity: .28; }
+.monitor-foot { display: flex; align-items: flex-end; opacity: .28; }
 .monitor-foot span { width: 34px; height: 2px; background: var(--ink); }
 .monitor-foot i { width: 25px; height: 14px; border-left: 1px solid var(--ink); border-right: 1px solid var(--ink); }
 
@@ -171,7 +171,7 @@ button { color: inherit; }
 .range-line { display: flex; align-items: center; gap: 9px; }
 .range-line input { min-width: 0; accent-color: var(--accent); }
 .range-line output { min-width: 30px; color: var(--ink); font: 9px ui-monospace, monospace; }
-.toggle-line { display: flex; align-items: center; justify-content: space-between; margin-top: 15px; color: var(--ink); font-size: 9px; }
+.toggle-line { display: flex; align-items: center; justify-content: space-between; margin: 15px 0; color: var(--ink); font-size: 9px; }
 .toggle-line small { display: block; margin-top: 3px; color: var(--muted); font-size: 8px; }
 .toggle-line input { accent-color: var(--accent); }
 
@@ -198,9 +198,8 @@ button { color: inherit; }
 .startup-error p { max-width: 560px; margin: 0; color: #929aa4; font: 11px/1.5 ui-monospace, monospace; }
 
 @media (max-width: 1250px) {
-  .world { padding-left: 95px; padding-right: 110px; }
   .properties { right: 16px; width: 198px; }
-  .monitor-shell { width: 77vw; }
+  .world { padding-right: 238px; }
 }
 
 /* Hotkey capture dialog (ADR 0021). Layered over the whole editor rather

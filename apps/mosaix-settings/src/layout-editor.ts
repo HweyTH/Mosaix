@@ -643,7 +643,7 @@ export async function mountLayoutEditor(
           <div class="panel-title">AUTOMATIC TILING</div>
           <p><small>Current topology</small><br><code data-topology-fingerprint>${escapeHtml(tilingSettings.topologyFingerprint)}</code></p>
           <p data-profile-status>${tilingSettings.matchedProfile ? "Matched topology profile" : "No profile yet — saving creates one"}</p>
-          <label class="toggle-line"><span>Balanced grid<small>Enable for this whole topology</small></span><input data-auto-tiling type="checkbox" ${tilingSettings.enabled ? "checked" : ""} /></label>
+          <label class="toggle-line"><span>Balanced grid</span><input data-auto-tiling type="checkbox" ${tilingSettings.enabled ? "checked" : ""} /></label>
           <label class="field"><span>Outer gap</span><input data-outer-gap type="number" min="0" max="256" value="${tilingSettings.outerGap}" /></label>
           <label class="field"><span>Inner gap</span><input data-inner-gap type="number" min="0" max="256" value="${tilingSettings.innerGap}" /></label>
           <label class="toggle-line"><span>Focus border</span><input data-border-enabled type="checkbox" ${tilingSettings.focusBorderEnabled ? "checked" : ""} /></label>
@@ -676,7 +676,7 @@ export async function mountLayoutEditor(
             </div>
             <div class="panel-rule"></div>
             <label class="field"><span>Gap</span><div class="range-line"><input data-gap type="range" min="0" max="32" value="${snapshot.draft.gap}" /><output>${snapshot.draft.gap}px</output></div></label>
-            <label class="toggle-line"><span>Allow zone overlap<small>Zones can share the same space</small></span><input data-allow-overlap type="checkbox" ${snapshot.draft.allowOverlap ? "checked" : ""} /></label>
+            <label class="toggle-line"><span>Allow zone overlap</span><input data-allow-overlap type="checkbox" ${snapshot.draft.allowOverlap ? "checked" : ""} /></label>
           </aside>` : ""}
         <nav class="command-dock" aria-label="Zone commands">
           <button data-command="undo" ${history.length === 0 ? "disabled" : ""}><kbd>⌘ Z</kbd> Undo</button><button data-command="split"><kbd>S</kbd> Split</button><button data-command="duplicate"><kbd>D</kbd> Duplicate</button><button data-command="delete"><kbd>⌫</kbd> Delete</button>
