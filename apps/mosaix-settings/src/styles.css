@@ -72,8 +72,8 @@ button { color: inherit; }
 
 .brand-block { position: absolute; z-index: 5; left: 28px; top: 24px; display: grid; grid-template-columns: 24px 1fr; grid-template-rows: 17px 12px; column-gap: 11px; }
 .brand-mark { grid-row: 1 / 3; width: 24px; height: 24px; display: grid; grid-template: repeat(2, 1fr) / repeat(2, 1fr); gap: 2px; transform: rotate(4deg); }
-.brand-mark i { border-radius: 2px; background: var(--accent); }
-.brand-mark i:nth-child(2), .brand-mark i:nth-child(3) { opacity: .5; }
+.brand-mark i { border-radius: 2px; background: var(--accent); opacity: .45; }
+.brand-mark i:nth-child(2) { opacity: 1; transform: translate(2px, -2px); }
 .brand-name { align-self: center; font-size: 17px; font-weight: 750; line-height: 1; letter-spacing: -.45px; }
 .brand-block small { align-self: end; color: var(--muted-2); font-size: 8px; font-weight: 700; letter-spacing: .15em; text-transform: uppercase; }
 
@@ -112,10 +112,52 @@ button { color: inherit; }
 .zone.active .resize-handle { opacity: 1; }
 
 .properties { position: absolute; z-index: 6; right: 26px; top: 50%; width: 214px; padding: 16px; transform: translateY(-50%); border: 1px solid var(--line); border-radius: 14px; background: var(--panel); box-shadow: 0 25px 70px rgb(0 0 0 / 25%); backdrop-filter: blur(20px); }
+.left-rail { position: absolute; z-index: 6; left: 78px; top: 88px; bottom: 96px; width: 225px; display: flex; flex-direction: column; gap: 12px; overflow-y: auto; scrollbar-width: thin; }
+.panel { flex: none; padding: 16px; border: 1px solid var(--line); border-radius: 14px; background: var(--panel); box-shadow: 0 25px 70px rgb(0 0 0 / 25%); backdrop-filter: blur(20px); }
+.tiling-settings p, .hotkey-list p { margin: 0 0 12px; color: var(--muted); font-size: 9px; line-height: 1.4; }
+.hotkey-list p:last-child { margin-bottom: 0; }
+.binding-list, .library-list { display: flex; flex-direction: column; gap: 7px; margin: 0; padding: 0; list-style: none; }
+.library-item { display: grid; grid-template-columns: 1fr auto; gap: 3px 8px; padding: 8px 9px; border-left: 2px solid transparent; border-radius: 7px; background: color-mix(in srgb, var(--ink), transparent 95%); }
+.library-item.active { border-left-color: var(--accent); background: color-mix(in srgb, var(--accent), transparent 88%); }
+.library-item .layout-open { padding: 0; border: 0; color: var(--ink); background: none; font-size: 10px; font-weight: 650; text-align: left; cursor: pointer; }
+.library-detail { grid-column: 1; color: var(--muted-2); font: 8px ui-monospace, monospace; }
+.layout-actions { grid-row: 1 / 3; grid-column: 2; display: flex; align-items: center; gap: 4px; }
+.layout-actions button { width: 22px; height: 22px; border: 1px solid var(--line); border-radius: 6px; color: var(--muted); background: none; font-size: 10px; cursor: pointer; }
+.layout-actions button:hover { color: var(--ink); border-color: var(--zone-line); }
+.save-destination { margin: -4px 0 10px; color: var(--muted); font: 8px ui-monospace, monospace; overflow-wrap: anywhere; }
+.save-destination code { color: var(--ink); font: inherit; }
+.layout-library .redirect { margin-bottom: 12px; }
+.library-item[data-source="profile"] { border-left-color: var(--accent); }
+.library-item[data-source="profile"] .library-detail { color: var(--accent); }
+.library-actions { display: flex; gap: 6px; margin-bottom: 12px; }
+.library-actions .primary-button, .library-actions .soft-button { flex: 1; padding: 0 8px; }
+.library-actions button[disabled] { opacity: .45; cursor: default; }
+.display-meta select { border: 0; color: inherit; background: none; font: inherit; cursor: pointer; }
+/* Every cell is placed explicitly. Auto-placement puts a row-locked item
+   before an unpositioned one, so the combination would take the column
+   the command name is meant to have. */
+.binding { display: grid; grid-template-columns: 1fr auto; gap: 4px 8px; padding: 8px 9px; border-left: 2px solid transparent; border-radius: 7px; background: color-mix(in srgb, var(--ink), transparent 95%); }
+.binding-command { grid-row: 1; grid-column: 1; font-size: 10px; font-weight: 650; }
+.binding kbd { grid-row: 2; grid-column: 1; justify-self: start; padding: 2px 6px; border: 1px solid var(--line); border-radius: 5px; font: 8px/1.4 ui-monospace, monospace; white-space: nowrap; }
+.binding-file { grid-row: 3; grid-column: 1 / -1; color: var(--muted-2); font: 8px ui-monospace, monospace; overflow-wrap: anywhere; }
+/* --live, not --zone-line: Warm Paper sets --zone-line to a near-white,
+   which would leave this border and background invisible on a light
+   panel. --live reads on both grounds. */
+.binding-notice { padding: 8px 9px; border-left: 2px solid var(--live); border-radius: 7px; background: color-mix(in srgb, var(--live), transparent 92%); }
+.binding-notice.warning { border-left-color: var(--accent); background: color-mix(in srgb, var(--accent), transparent 92%); }
+.hotkey-list .binding-notice { color: var(--ink); }
+.binding-actions { grid-row: 1 / span 2; grid-column: 2; display: flex; align-items: center; gap: 4px; }
+.binding-actions button[disabled] { opacity: .35; cursor: default; }
+.binding-actions button { width: 22px; height: 22px; border: 1px solid var(--line); border-radius: 6px; color: var(--muted); background: none; font-size: 10px; cursor: pointer; }
+.binding-actions button:hover { color: var(--ink); border-color: var(--zone-line); }
+.binding[data-source="profile"] { border-left-color: var(--accent); }
+.binding[data-source="profile"] .binding-file { color: var(--accent); }
+.tiling-settings code { display: block; max-height: 34px; overflow: auto; color: var(--ink); font-size: 8px; overflow-wrap: anywhere; }
+.tiling-settings .primary-button { width: 100%; margin-top: 10px; }
 .panel-title { margin-bottom: 17px; font-size: 10px; font-weight: 800; letter-spacing: .05em; }
 .field { display: block; margin-bottom: 14px; }
 .field > span { display: block; margin-bottom: 7px; color: var(--muted); font-size: 8px; font-weight: 700; letter-spacing: .1em; text-transform: uppercase; }
-.field input:not([type]), .field input[type="text"] { width: 100%; height: 32px; padding: 0 10px; border: 1px solid var(--line); border-radius: 7px; color: var(--ink); background: color-mix(in srgb, var(--ink), transparent 95%); outline: none; font-size: 10px; }
+.field input:not([type]), .field input[type="text"], .field input[type="number"] { width: 100%; height: 32px; padding: 0 10px; border: 1px solid var(--line); border-radius: 7px; color: var(--ink); background: color-mix(in srgb, var(--ink), transparent 95%); outline: none; font-size: 10px; }
 .field input:focus { border-color: var(--zone-line); }
 .geometry-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
 .geometry-grid div { padding: 8px; border-radius: 7px; background: color-mix(in srgb, var(--ink), transparent 95%); }
@@ -136,13 +178,14 @@ button { color: inherit; }
 .command-dock kbd { margin-right: 4px; color: var(--ink); font: 8px ui-monospace, monospace; }
 .command-dock .new-zone { color: var(--accent-ink); background: var(--accent); font-weight: 800; }
 
-.appearance-toggle { position: fixed; z-index: 8; left: 50%; bottom: 18px; display: flex; gap: 4px; padding: 5px; transform: translateX(-50%); color: #fff; background: var(--switcher); border: 1px solid rgb(255 255 255 / 14%); border-radius: 14px; box-shadow: 0 18px 60px rgb(0 0 0 / 40%); backdrop-filter: blur(18px); }
-.appearance-toggle button { min-width: 126px; display: grid; grid-template-columns: 24px 1fr; grid-template-rows: 1fr 1fr; column-gap: 8px; padding: 7px 10px; border-radius: 9px; color: #8e939c; background: transparent; text-align: left; }
-.appearance-toggle button > i { grid-row: 1 / 3; width: 24px; height: 24px; display: grid; place-items: center; align-self: center; border-radius: 50%; color: #fff; background: rgb(255 255 255 / 10%); font-size: 11px; font-style: normal; }
-.appearance-toggle button > span { align-self: end; color: #fff; font-size: 10px; font-weight: 800; }
-.appearance-toggle small { display: block; color: #777d87; font-size: 8px; font-weight: 400; }
-.appearance-toggle button[aria-pressed="true"] { background: rgb(255 255 255 / 11%); box-shadow: inset 0 0 0 1px rgb(255 255 255 / 10%); }
-.appearance-toggle button[aria-pressed="true"] > i { color: #111; background: #fff; }
+/* A segmented pair sitting in the top actions, left of Live preview. Two
+   glyphs, no labels: the appearance is visible on screen the moment it
+   changes, so naming the theme in the control is a caption for something
+   the user is already looking at. */
+.appearance-toggle { display: flex; gap: 2px; height: 36px; padding: 4px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); backdrop-filter: blur(15px); }
+.appearance-toggle button { width: 30px; display: grid; place-items: center; border-radius: 7px; color: var(--muted); background: transparent; font-size: 12px; line-height: 1; }
+.appearance-toggle button:hover { color: var(--ink); }
+.appearance-toggle button[aria-pressed="true"] { color: var(--accent-ink); background: var(--accent); }
 .command-status { position: absolute; z-index: 5; right: 28px; bottom: 24px; color: var(--muted); font-size: 9px; }
 
 .startup-error { width: 100%; height: 100%; display: grid; place-content: center; justify-items: center; gap: 12px; padding: 48px; color: #f1f4f5; background: #080a0d; text-align: center; }
@@ -155,3 +198,18 @@ button { color: inherit; }
   .properties { right: 16px; width: 198px; }
   .monitor-shell { width: 77vw; }
 }
+
+/* Hotkey capture dialog (ADR 0021). Layered over the whole editor rather
+   than opened as a second window: registration is already suspended for
+   the editor's lifetime, and this only has to be the one surface that is
+   frontmost while the buffer is armed. */
+.capture-backdrop { position: absolute; z-index: 20; inset: 0; display: grid; place-items: center; background: color-mix(in srgb, var(--ground), transparent 25%); }
+.capture-dialog { width: 320px; padding: 20px; border: 1px solid var(--line); border-radius: 14px; background: var(--panel); box-shadow: 0 30px 80px rgb(0 0 0 / 40%); backdrop-filter: blur(20px); }
+.capture-combo { display: grid; place-items: center; min-height: 52px; margin-bottom: 14px; padding: 0 12px; border: 1px dashed var(--accent); border-radius: 9px; color: var(--ink); font: 13px/1.3 ui-monospace, monospace; text-align: center; }
+.capture-combo.incomplete { border-color: var(--line); color: var(--muted); font-size: 10px; }
+.capture-verdict { margin: 0 0 10px; padding: 8px 9px; border-left: 2px solid var(--line); border-radius: 7px; color: var(--ink); font-size: 9px; line-height: 1.4; }
+.capture-verdict.ok { border-left-color: var(--live); background: color-mix(in srgb, var(--live), transparent 92%); }
+.capture-verdict.warning { border-left-color: var(--accent); background: color-mix(in srgb, var(--accent), transparent 92%); }
+.capture-verdict.blocked { border-left-color: var(--accent); background: color-mix(in srgb, var(--accent), transparent 84%); }
+.capture-dialog .redirect { margin-bottom: 14px; }
+.capture-dialog .library-actions { margin-bottom: 0; }

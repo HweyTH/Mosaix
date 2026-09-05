@@ -9,15 +9,14 @@
 //! on windows that will be rejected early.
 
 use mosaix_domain::{
-    ApplicationId, DisplayId, Rect, Window, WindowCapabilities, WindowId, WindowLifecycle,
+    ApplicationId, Display, DisplayId, Rect, Window, WindowCapabilities, WindowId, WindowLifecycle,
     WindowRole,
 };
 use tracing::{debug, trace};
 use windows::Win32::Foundation::{BOOL, HWND, LPARAM, TRUE};
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetWindow, GW_OWNER, WS_CAPTION, WS_CHILD, WS_DLGFRAME, WS_EX_APPWINDOW,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP,
-    WS_THICKFRAME,
+    EnumWindows, WS_CAPTION, WS_CHILD, WS_DLGFRAME, WS_EX_TOOLWINDOW, WS_MAXIMIZEBOX,
+    WS_MINIMIZEBOX, WS_POPUP, WS_THICKFRAME,
 };
 
 use crate::win32_helpers;
@@ -26,15 +25,15 @@ use crate::win32_helpers;
 ///
 /// These are well-known Windows shell and system surfaces.
 const BLOCKED_CLASSES: &[&str] = &[
-    "Progman",                          // Desktop program manager
-    "WorkerW",                          // Desktop icon container
-    "Shell_TrayWnd",                    // Primary taskbar
-    "Shell_SecondaryTrayWnd",           // Secondary monitor taskbars
-    "Windows.UI.Core.CoreWindow",       // UWP core windows (Start, Search, etc.)
-    "ForegroundStaging",                // DWM staging surface
-    "MultitaskingViewFrame",            // Task View
+    "Progman",                               // Desktop program manager
+    "WorkerW",                               // Desktop icon container
+    "Shell_TrayWnd",                         // Primary taskbar
+    "Shell_SecondaryTrayWnd",                // Secondary monitor taskbars
+    "Windows.UI.Core.CoreWindow",            // UWP core windows (Start, Search, etc.)
+    "ForegroundStaging",                     // DWM staging surface
+    "MultitaskingViewFrame",                 // Task View
     "Windows.Internal.Shell.TabProxyWindow", // Edge tab proxy
-    "Xaml_WindowedPopupClass",          // XAML popup windows
+    "Xaml_WindowedPopupClass",               // XAML popup windows
 ];
 
 /// Enumerate all top-level window handles via `EnumWindows`.
@@ -61,73 +60,19 @@ unsafe extern "system" fn enum_windows_callback(hwnd: HWND, lparam: LPARAM) -> B
     TRUE // continue enumeration
 }
 
-/// Determine whether a window is a candidate for tiling management.
+/// Determine whether a top-level window is worth normalizing for the engine.
 ///
-/// The filter chain is ordered cheapest-first:
-/// 1. Visible?
-/// 2. Cloaked?
-/// 3. Has owner? (owned windows are secondary)
-/// 4. Style flags (must have caption, must not be child)
-/// 5. Extended style (tool window / no-activate checks)
-/// 6. Non-zero size?
-/// 7. Class blocklist?
-/// 8. Elevated process? (Feature 32 — UIPI would block `SetWindowPos`)
-pub fn is_manageable_window(hwnd: HWND) -> bool {
-    // 1. Must be visible
-    if !win32_helpers::is_window_visible(hwnd) {
-        trace!(?hwnd, "rejected: not visible");
-        return false;
-    }
-
-    // 2. Must not be cloaked (e.g. on another virtual desktop)
-    if win32_helpers::is_window_cloaked(hwnd) {
-        trace!(?hwnd, "rejected: cloaked");
-        return false;
-    }
-
-    // 3. Must not be an owned window (owned windows are typically secondary surfaces)
-    let owner = unsafe { GetWindow(hwnd, GW_OWNER) };
-    if let Ok(owner) = owner {
-        if !owner.is_invalid() {
-            trace!(?hwnd, "rejected: has owner");
-            return false;
-        }
-    }
-
-    // 4. Style flags
+/// Policy belongs to the ordered rule evaluator and the engine eligibility
+/// model, not this adapter. Consequently dialogs, tool windows, hidden or
+/// cloaked windows, and elevated windows must cross this seam so they can be
+/// reported with stable reasons instead of silently disappearing.
+pub fn is_observable_window(hwnd: HWND) -> bool {
     let style = win32_helpers::get_window_style(hwnd);
-
-    // Must have a caption (title bar) — this is the primary signal for a "normal" window
-    if style & WS_CAPTION.0 as u32 != WS_CAPTION.0 as u32 {
-        trace!(?hwnd, style, "rejected: no WS_CAPTION");
-        return false;
-    }
-
-    // Must not be a child window
-    if style & WS_CHILD.0 as u32 != 0 {
+    if style & WS_CHILD.0 != 0 {
         trace!(?hwnd, "rejected: WS_CHILD");
         return false;
     }
 
-    // 5. Extended style flags
-    let ex_style = win32_helpers::get_window_ex_style(hwnd);
-
-    // WS_EX_TOOLWINDOW windows are excluded UNLESS they also have WS_EX_APPWINDOW
-    // (WS_EX_APPWINDOW overrides and forces taskbar presence)
-    if ex_style & WS_EX_TOOLWINDOW.0 as u32 != 0
-        && ex_style & WS_EX_APPWINDOW.0 as u32 == 0
-    {
-        trace!(?hwnd, "rejected: WS_EX_TOOLWINDOW without WS_EX_APPWINDOW");
-        return false;
-    }
-
-    // WS_EX_NOACTIVATE windows cannot receive user focus
-    if ex_style & WS_EX_NOACTIVATE.0 as u32 != 0 {
-        trace!(?hwnd, "rejected: WS_EX_NOACTIVATE");
-        return false;
-    }
-
-    // 6. Must have non-zero dimensions
     if let Some(rect) = win32_helpers::get_window_rect(hwnd) {
         if !rect.has_positive_area() {
             trace!(?hwnd, ?rect, "rejected: zero/negative dimensions");
@@ -138,7 +83,6 @@ pub fn is_manageable_window(hwnd: HWND) -> bool {
         return false;
     }
 
-    // 7. Class blocklist
     let class_name = win32_helpers::get_class_name(hwnd);
     if is_blocked_class(&class_name) {
         trace!(?hwnd, %class_name, "rejected: blocked class");
@@ -154,33 +98,12 @@ pub fn is_manageable_window(hwnd: HWND) -> bool {
         }
     }
 
-    // 8. Feature 32 — elevated-process check (UIPI).
-    //
-    // Windows User Interface Privilege Isolation (UIPI) prevents unelevated
-    // processes (like Mosaix running normally) from sending window messages —
-    // including `SetWindowPos` — to elevated processes.  Attempting to resize
-    // an elevated window is a silent no-op at best; at worst it triggers
-    // repeated placement rejections that open the circuit breaker.
-    //
-    // We treat `None` (can't open token) the same as `Some(true)` (confirmed
-    // elevated): if we can't inspect the token we can't manage the window.
-    let pid = win32_helpers::get_process_id(hwnd);
-    match win32_helpers::is_process_elevated(pid) {
-        Some(true) | None => {
-            let title = win32_helpers::get_window_text(hwnd);
-            tracing::warn!(
-                ?hwnd,
-                pid,
-                %title,
-                "skipping elevated window: UIPI would block SetWindowPos \
-                 (run Mosaix as Administrator to manage elevated apps)"
-            );
-            return false;
-        }
-        Some(false) => {} // unelevated — proceed normally
-    }
-
     true
+}
+
+/// Backward-compatible name for callers that used the old pre-policy filter.
+pub fn is_manageable_window(hwnd: HWND) -> bool {
+    is_observable_window(hwnd)
 }
 
 /// Check if a class name is in the blocked list.
@@ -194,6 +117,11 @@ fn is_blocked_class(class_name: &str) -> bool {
 ///
 /// This should only be called on handles that have passed `is_manageable_window`.
 pub fn build_window_info(hwnd: HWND) -> Window {
+    let displays = crate::enumerate_displays().unwrap_or_default();
+    build_window_info_with_displays(hwnd, &displays)
+}
+
+fn build_window_info_with_displays(hwnd: HWND, displays: &[Display]) -> Window {
     let title = win32_helpers::get_window_text(hwnd);
     let class_name = win32_helpers::get_class_name(hwnd);
     let pid = win32_helpers::get_process_id(hwnd);
@@ -210,16 +138,14 @@ pub fn build_window_info(hwnd: HWND) -> Window {
 
     let role = classify_role(style, ex_style);
     let capabilities = extract_capabilities(style);
-    let lifecycle = determine_lifecycle(hwnd);
-
-    // Placeholder: use 0 as display ID until display enumeration is implemented.
-    // A future feature will use MonitorFromWindow to populate this properly.
-    let display_id = DisplayId(0);
+    let display_id = crate::window_display_id(hwnd).unwrap_or(DisplayId(0));
+    let lifecycle = determine_lifecycle(hwnd, bounds, display_id, displays);
+    let elevated = win32_helpers::is_process_elevated(pid).unwrap_or(true);
+    let minimum_size = win32_helpers::get_minimum_size(hwnd);
 
     if exe_path.is_none() {
         debug!(
             pid,
-            %title,
             "could not retrieve executable path (process may be elevated)"
         );
     }
@@ -239,24 +165,26 @@ pub fn build_window_info(hwnd: HWND) -> Window {
         bounds,
         display_id,
         capabilities,
+        elevated,
         lifecycle,
+        minimum_size,
     }
 }
 
 /// Infer the semantic window role from Win32 style flags.
 fn classify_role(style: u32, ex_style: u32) -> WindowRole {
-    if ex_style & WS_EX_TOOLWINDOW.0 as u32 != 0 {
+    if ex_style & WS_EX_TOOLWINDOW.0 != 0 {
         return WindowRole::ToolWindow;
     }
-    if style & WS_POPUP.0 as u32 != 0 {
+    if style & WS_POPUP.0 != 0 {
         // Popup with caption is often a dialog
-        if style & WS_DLGFRAME.0 as u32 != 0 {
+        if style & WS_DLGFRAME.0 != 0 {
             return WindowRole::Dialog;
         }
         return WindowRole::Popup;
     }
     // WS_DLGFRAME without WS_THICKFRAME suggests a dialog
-    if style & WS_DLGFRAME.0 as u32 != 0 && style & WS_THICKFRAME.0 as u32 == 0 {
+    if style & WS_DLGFRAME.0 != 0 && style & WS_THICKFRAME.0 == 0 {
         return WindowRole::Dialog;
     }
     WindowRole::Normal
@@ -266,16 +194,21 @@ fn classify_role(style: u32, ex_style: u32) -> WindowRole {
 fn extract_capabilities(style: u32) -> WindowCapabilities {
     WindowCapabilities {
         // A window with a caption can generally be moved
-        can_move: style & WS_CAPTION.0 as u32 != 0,
+        can_move: style & WS_CAPTION.0 != 0,
         // WS_THICKFRAME (sizing border) means resizable
-        can_resize: style & WS_THICKFRAME.0 as u32 != 0,
-        can_minimize: style & WS_MINIMIZEBOX.0 as u32 != 0,
-        can_maximize: style & WS_MAXIMIZEBOX.0 as u32 != 0,
+        can_resize: style & WS_THICKFRAME.0 != 0,
+        can_minimize: style & WS_MINIMIZEBOX.0 != 0,
+        can_maximize: style & WS_MAXIMIZEBOX.0 != 0,
     }
 }
 
 /// Determine the current lifecycle state of a window.
-fn determine_lifecycle(hwnd: HWND) -> WindowLifecycle {
+fn determine_lifecycle(
+    hwnd: HWND,
+    bounds: Rect,
+    display_id: DisplayId,
+    displays: &[Display],
+) -> WindowLifecycle {
     if !win32_helpers::is_window_visible(hwnd) {
         return WindowLifecycle::Hidden;
     }
@@ -288,6 +221,13 @@ fn determine_lifecycle(hwnd: HWND) -> WindowLifecycle {
     if win32_helpers::is_zoomed(hwnd) {
         return WindowLifecycle::Maximized;
     }
+    if displays
+        .iter()
+        .find(|display| display.id == display_id)
+        .is_some_and(|display| bounds == display.full_bounds)
+    {
+        return WindowLifecycle::Fullscreen;
+    }
     WindowLifecycle::Active
 }
 
@@ -296,7 +236,11 @@ fn determine_lifecycle(hwnd: HWND) -> WindowLifecycle {
 /// Returns a list of `Window` structs for all manageable windows.
 pub fn enumerate_windows() -> anyhow::Result<Vec<Window>> {
     let all_hwnds = enumerate_all_hwnds()?;
-    let manageable_count = all_hwnds.iter().filter(|h| is_manageable_window(**h)).count();
+    let displays = crate::enumerate_displays().unwrap_or_default();
+    let manageable_count = all_hwnds
+        .iter()
+        .filter(|h| is_observable_window(**h))
+        .count();
     debug!(
         total = all_hwnds.len(),
         manageable = manageable_count,
@@ -305,8 +249,8 @@ pub fn enumerate_windows() -> anyhow::Result<Vec<Window>> {
 
     let windows: Vec<Window> = all_hwnds
         .into_iter()
-        .filter(|hwnd| is_manageable_window(*hwnd))
-        .map(build_window_info)
+        .filter(|hwnd| is_observable_window(*hwnd))
+        .map(|hwnd| build_window_info_with_displays(hwnd, &displays))
         .collect();
 
     Ok(windows)
@@ -336,26 +280,25 @@ mod tests {
     #[test]
     fn role_classification() {
         // Normal window: WS_OVERLAPPEDWINDOW style
-        let normal_style = (WS_CAPTION.0 | WS_THICKFRAME.0) as u32;
+        let normal_style = WS_CAPTION.0 | WS_THICKFRAME.0;
         assert_eq!(classify_role(normal_style, 0), WindowRole::Normal);
 
         // Tool window
-        let tool_ex = WS_EX_TOOLWINDOW.0 as u32;
+        let tool_ex = WS_EX_TOOLWINDOW.0;
         assert_eq!(classify_role(normal_style, tool_ex), WindowRole::ToolWindow);
 
         // Dialog (popup + dlgframe)
-        let dialog_style = (WS_POPUP.0 | WS_DLGFRAME.0) as u32;
+        let dialog_style = WS_POPUP.0 | WS_DLGFRAME.0;
         assert_eq!(classify_role(dialog_style, 0), WindowRole::Dialog);
 
         // Pure popup
-        let popup_style = WS_POPUP.0 as u32;
+        let popup_style = WS_POPUP.0;
         assert_eq!(classify_role(popup_style, 0), WindowRole::Popup);
     }
 
     #[test]
     fn capability_extraction() {
-        let full_style =
-            (WS_CAPTION.0 | WS_THICKFRAME.0 | WS_MINIMIZEBOX.0 | WS_MAXIMIZEBOX.0) as u32;
+        let full_style = WS_CAPTION.0 | WS_THICKFRAME.0 | WS_MINIMIZEBOX.0 | WS_MAXIMIZEBOX.0;
         let caps = extract_capabilities(full_style);
         assert!(caps.can_move);
         assert!(caps.can_resize);
@@ -364,7 +307,7 @@ mod tests {
         assert!(caps.is_tileable());
 
         // No thick frame → not resizable
-        let no_resize = (WS_CAPTION.0 | WS_MINIMIZEBOX.0) as u32;
+        let no_resize = WS_CAPTION.0 | WS_MINIMIZEBOX.0;
         let caps2 = extract_capabilities(no_resize);
         assert!(caps2.can_move);
         assert!(!caps2.can_resize);

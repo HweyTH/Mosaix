@@ -93,7 +93,9 @@ mod tests {
                 can_minimize: true,
                 can_maximize: true,
             },
+            elevated: false,
             lifecycle: WindowLifecycle::Active,
+            minimum_size: None,
         }
     }
 
@@ -118,7 +120,10 @@ mod tests {
                 exe_path: None,
                 role: None,
             },
-            actions: RuleActions { manage: action },
+            actions: RuleActions {
+                manage: action,
+                workspace: None,
+            },
         }
     }
 

@@ -56,6 +56,28 @@ impl Rect {
     }
 }
 
+/// A width and height without a position, in logical coordinates.
+///
+/// What a window's minimum size is expressed as: the platform reports the
+/// smallest extent a window will accept, and the tree planner refuses to
+/// issue a placement below it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Size {
+    pub width: i32,
+    pub height: i32,
+}
+
+impl Size {
+    pub const fn new(width: i32, height: i32) -> Self {
+        Self { width, height }
+    }
+
+    /// Whether a rectangle of this size fits inside `rect`.
+    pub const fn fits_within(&self, rect: Rect) -> bool {
+        rect.width >= self.width && rect.height >= self.height
+    }
+}
+
 /// Configurable gap insets applied to a computed zone [`Rect`] as a
 /// post-processing step (ADR 0006), kept separate from the pure zone
 /// functions that compute the rect itself.

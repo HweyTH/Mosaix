@@ -1,0 +1,16 @@
+[package]
+name = "mosaix-persistence"
+description = "Ordered durable state boundary for Mosaix."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+mosaix-domain = { path = "../mosaix-domain" }
+rusqlite = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+rusqlite = { workspace = true }

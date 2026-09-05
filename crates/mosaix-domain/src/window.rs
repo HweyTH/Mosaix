@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::geometry::Rect;
+use crate::geometry::{Rect, Size};
 use crate::id::{ApplicationId, DisplayId, WindowId};
 
 /// The semantic role of a window, inferred from native style flags.
@@ -26,6 +26,37 @@ pub enum WindowRole {
     Splash,
     /// Role could not be determined.
     Unknown,
+}
+
+impl WindowRole {
+    /// A stable text code. Durable records store this rather than a
+    /// serialization of the variant, so renaming a variant is a compile
+    /// error here instead of a silent read failure against an existing
+    /// database.
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Dialog => "dialog",
+            Self::ToolWindow => "tool_window",
+            Self::Popup => "popup",
+            Self::Splash => "splash",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// The inverse of [`WindowRole::code`]. An unrecognised code reads back
+    /// as [`WindowRole::Unknown`] rather than failing, so a record written
+    /// by a future build stays loadable.
+    pub fn from_code(code: &str) -> Self {
+        match code {
+            "normal" => Self::Normal,
+            "dialog" => Self::Dialog,
+            "tool_window" => Self::ToolWindow,
+            "popup" => Self::Popup,
+            "splash" => Self::Splash,
+            _ => Self::Unknown,
+        }
+    }
 }
 
 /// Capability flags describing what operations the platform allows on a window.
@@ -58,6 +89,10 @@ pub enum WindowLifecycle {
     Minimized,
     /// Maximized to fill the work area.
     Maximized,
+    /// Application-controlled full-screen presentation. Unlike maximize,
+    /// this is temporarily ineligible and restores its visual-order slot on
+    /// exit (ADR 0014).
+    Fullscreen,
     /// Not visible (hidden by the application or system).
     Hidden,
     /// Cloaked by DWM (e.g. on another virtual desktop).
@@ -68,7 +103,7 @@ pub enum WindowLifecycle {
 ///
 /// Platform adapters populate this from native APIs. Native handles are
 /// stored only in `WindowId` and must never be persisted across sessions.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Window {
     /// Ephemeral native handle.
     pub id: WindowId,
@@ -90,13 +125,49 @@ pub struct Window {
     pub display_id: DisplayId,
     /// What the platform allows us to do with this window.
     pub capabilities: WindowCapabilities,
+    /// Whether the owning process has a higher integrity level than Mosaix.
+    /// Elevated windows remain observable for diagnostics and rules, but are
+    /// ineligible for placement because UIPI can reject the native call.
+    pub elevated: bool,
     /// Current lifecycle state.
     pub lifecycle: WindowLifecycle,
+    /// The smallest extent the window will accept, when the platform can
+    /// report it. `None` means unknown, which the planner treats as no
+    /// constraint beyond positive area -- never as a guess.
+    #[serde(default)]
+    pub minimum_size: Option<Size>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_role_code_round_trips_and_stays_distinct() {
+        let roles = [
+            WindowRole::Normal,
+            WindowRole::Dialog,
+            WindowRole::ToolWindow,
+            WindowRole::Popup,
+            WindowRole::Splash,
+            WindowRole::Unknown,
+        ];
+        for role in roles {
+            assert_eq!(WindowRole::from_code(role.code()), role);
+        }
+        let mut codes: Vec<&str> = roles.iter().map(WindowRole::code).collect();
+        codes.sort_unstable();
+        codes.dedup();
+        assert_eq!(codes.len(), roles.len());
+    }
+
+    #[test]
+    fn an_unrecognised_role_code_reads_back_as_unknown() {
+        assert_eq!(
+            WindowRole::from_code("a-role-a-later-build-invented"),
+            WindowRole::Unknown
+        );
+    }
 
     #[test]
     fn tileable_requires_move_and_resize() {

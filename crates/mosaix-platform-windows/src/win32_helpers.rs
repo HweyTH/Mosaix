@@ -5,21 +5,26 @@
 
 use std::path::PathBuf;
 
-use mosaix_domain::Rect;
-use windows::Win32::Foundation::{CloseHandle, HWND, RECT};
-use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
+use mosaix_domain::{Rect, Size};
 use windows::core::PWSTR;
-use windows::Win32::Security::{
-    GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
-};
+use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, RECT, WPARAM};
+use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
+use windows::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
 use windows::Win32::System::Threading::{
     OpenProcess, OpenProcessToken, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
     PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GetClassNameW, GetWindowLongW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
-    GetWindowThreadProcessId, IsIconic, IsWindowVisible, IsZoomed, GWL_EXSTYLE, GWL_STYLE,
+    GetWindowThreadProcessId, IsIconic, IsWindowVisible, IsZoomed, SendMessageTimeoutW,
+    GWL_EXSTYLE, GWL_STYLE, MINMAXINFO, SMTO_ABORTIFHUNG, SMTO_BLOCK, WM_GETMINMAXINFO,
 };
+
+/// How long to wait for a window to answer `WM_GETMINMAXINFO` before
+/// treating its minimum as unknown. Long enough for a responsive
+/// application, short enough that one busy window cannot stall an
+/// enumeration pass noticeably.
+const MINMAX_TIMEOUT_MS: u32 = 50;
 
 /// Retrieve the window title text.
 ///
@@ -51,6 +56,37 @@ pub fn get_class_name(hwnd: HWND) -> String {
             return String::new();
         }
         String::from_utf16_lossy(&buf[..len as usize])
+    }
+}
+
+/// The smallest size the window will accept, as it reports through
+/// `WM_GETMINMAXINFO`.
+///
+/// The message is sent with a timeout and abandoned if the window is
+/// hung, so a stuck application costs one short wait rather than the
+/// enumeration thread. `None` when the window did not answer, or answered
+/// with a size that is not positive -- an unknown minimum is reported as
+/// unknown, never guessed. The system fills in its own minimum track size
+/// for windows that do not handle the message, which is a real limit
+/// `SetWindowPos` would enforce and so is reported as such.
+pub fn get_minimum_size(hwnd: HWND) -> Option<Size> {
+    unsafe {
+        let mut info = MINMAXINFO::default();
+        let mut result = 0usize;
+        let sent = SendMessageTimeoutW(
+            hwnd,
+            WM_GETMINMAXINFO,
+            WPARAM(0),
+            LPARAM(&mut info as *mut MINMAXINFO as isize),
+            SMTO_ABORTIFHUNG | SMTO_BLOCK,
+            MINMAX_TIMEOUT_MS,
+            Some(&mut result),
+        );
+        if sent.0 == 0 {
+            return None;
+        }
+        let size = Size::new(info.ptMinTrackSize.x, info.ptMinTrackSize.y);
+        (size.width > 0 && size.height > 0).then_some(size)
     }
 }
 

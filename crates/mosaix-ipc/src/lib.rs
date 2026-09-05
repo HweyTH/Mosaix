@@ -12,10 +12,15 @@ pub mod protocol;
 pub mod unix_socket;
 
 #[cfg(windows)]
-pub use client::{send_request, IpcError};
+pub use client::{send_request, IpcConnection, IpcError};
 #[cfg(target_os = "macos")]
 pub use client_unix::{send_request, IpcError};
-pub use handler::handle_request;
+pub use handler::{
+    handle_request, CaptureHold, ConfigError, ConfigStore, ContainerTreeSnapshot,
+    DormantPositionSnapshot, HotkeyBindingSnapshot, HotkeyProbe, HotkeyVerdict,
+    LayoutSourceSnapshot, ProbeOutcome, StateSnapshot, UnavailableConfigStore,
+    UnavailableHotkeyProbe,
+};
 #[cfg(windows)]
 pub use pipe::{pipe_name, IpcServer, PIPE_NAME_PREFIX};
 pub use protocol::*;

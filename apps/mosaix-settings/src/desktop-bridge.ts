@@ -2,10 +2,16 @@ import { invoke } from "@tauri-apps/api/core";
 
 import type {
   Appearance,
+  BindingWriteReceipt,
   CommandReceipt,
   DesktopBridge,
   EditorSnapshot,
+  HotkeyList,
+  HotkeyProbeResult,
   LayoutDraft,
+  LayoutWriteReceipt,
+  SavedLayout,
+  SavedLayoutList,
 } from "./layout-editor";
 
 export type InvokeCommand = (
@@ -24,6 +30,23 @@ function fromNormalizedDraft(draft: LayoutDraft): LayoutDraft {
       y: zone.y * 100,
       width: zone.width * 100,
       height: zone.height * 100,
+    })),
+  };
+}
+
+/**
+ * A saved layout's cells arrive normalized, like an editor snapshot's --
+ * the canvas works in percentages, so both cross the bridge the same way.
+ */
+function fromNormalizedLayout(layout: SavedLayout): SavedLayout {
+  return {
+    ...layout,
+    cells: layout.cells.map((cell) => ({
+      ...cell,
+      x: cell.x * 100,
+      y: cell.y * 100,
+      width: cell.width * 100,
+      height: cell.height * 100,
     })),
   };
 }
@@ -49,11 +72,44 @@ export function createTauriDesktopBridge(
       const snapshot = await invokeCommand("load_editor_snapshot") as EditorSnapshot;
       return { ...snapshot, draft: fromNormalizedDraft(snapshot.draft) };
     },
+    loadHotkeyBindings: () =>
+      invokeCommand("load_hotkey_bindings") as Promise<HotkeyList>,
+    startHotkeyCapture: () =>
+      invokeCommand("start_hotkey_capture") as Promise<void>,
+    endHotkeyCapture: () => invokeCommand("end_hotkey_capture") as Promise<void>,
+    probeHotkey: (combo: string, forCommand: string) =>
+      invokeCommand("probe_hotkey", {
+        combo,
+        forCommand,
+      }) as Promise<HotkeyProbeResult>,
+    setBinding: (command: string, combo: string, toBase: boolean) =>
+      invokeCommand("set_binding", { command, combo, toBase }) as Promise<BindingWriteReceipt>,
+    resetBinding: (command: string) =>
+      invokeCommand("reset_binding", { command }) as Promise<BindingWriteReceipt>,
+    loadSavedLayouts: async () => {
+      const list = await invokeCommand("load_saved_layouts") as SavedLayoutList;
+      return { ...list, layouts: list.layouts.map(fromNormalizedLayout) };
+    },
+    saveLayout: (draft: LayoutDraft, toBase: boolean) =>
+      invokeCommand("save_layout", {
+        draft: toNormalizedDraft(draft),
+        toBase,
+      }) as Promise<LayoutWriteReceipt>,
+    renameLayout: (from: string, to: string) =>
+      invokeCommand("rename_layout", { from, to }) as Promise<LayoutWriteReceipt>,
+    duplicateLayout: (from: string, to: string) =>
+      invokeCommand("duplicate_layout", { from, to }) as Promise<LayoutWriteReceipt>,
+    deleteLayout: (name: string) =>
+      invokeCommand("delete_layout", { name }) as Promise<LayoutWriteReceipt>,
     previewLayout: (draft: LayoutDraft) =>
       invokeCommand("preview_layout", { draft: toNormalizedDraft(draft) }) as Promise<CommandReceipt>,
     saveAndApplyLayout: (draft: LayoutDraft) =>
       invokeCommand("save_and_apply_layout", { draft: toNormalizedDraft(draft) }) as Promise<CommandReceipt>,
     setAppearance: (appearance: Appearance) =>
       invokeCommand("set_appearance", { appearance }) as Promise<void>,
+    loadAutomaticTilingSettings: () =>
+      invokeCommand("load_automatic_tiling_settings") as ReturnType<DesktopBridge["loadAutomaticTilingSettings"]>,
+    saveAutomaticTilingSettings: (settings) =>
+      invokeCommand("save_automatic_tiling_settings", { settings }) as ReturnType<DesktopBridge["saveAutomaticTilingSettings"]>,
   };
 }

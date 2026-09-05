@@ -33,19 +33,24 @@ use windows::Win32::Graphics::Gdi::{
     DMDO_90, ENUM_CURRENT_SETTINGS, HDC, HMONITOR, MONITORINFOEXW,
 };
 
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, PostThreadMessageW,
-    RegisterClassW, TranslateMessage, MONITORINFOF_PRIMARY, MSG, WINDOW_EX_STYLE,
-    WM_DISPLAYCHANGE, WM_POWERBROADCAST, WM_QUIT, WNDCLASSW, WS_OVERLAPPED,
+    RegisterClassW, TranslateMessage, MONITORINFOF_PRIMARY, MSG, WINDOW_EX_STYLE, WM_DISPLAYCHANGE,
+    WM_POWERBROADCAST, WM_QUIT, WNDCLASSW, WS_OVERLAPPED,
 };
-use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Threading::GetCurrentThreadId;
 
 use crate::{Result, WindowError};
 
 fn rect_from_win32(rect: RECT) -> Rect {
-    Rect::new(rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top)
+    Rect::new(
+        rect.left,
+        rect.top,
+        rect.right - rect.left,
+        rect.bottom - rect.top,
+    )
 }
 
 fn wchar_array_to_string(chars: &[u16]) -> String {
@@ -61,7 +66,10 @@ fn monitor_scale_factor(hmonitor: HMONITOR) -> Option<f64> {
 }
 
 fn monitor_rotation(device_name: &str) -> Rotation {
-    let wide: Vec<u16> = device_name.encode_utf16().chain(std::iter::once(0)).collect();
+    let wide: Vec<u16> = device_name
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
     let mut devmode = DEVMODEW {
         dmSize: std::mem::size_of::<DEVMODEW>() as u16,
         ..Default::default()
@@ -357,7 +365,10 @@ mod tests {
         assert_eq!(primary_count, 1, "expected exactly one primary display");
 
         for d in &displays {
-            assert!(d.scale_factor > 0.0, "scale factor should be positive: {d:?}");
+            assert!(
+                d.scale_factor > 0.0,
+                "scale factor should be positive: {d:?}"
+            );
             assert!(
                 d.full_bounds.contains(&d.work_area),
                 "work area should fit inside full bounds: {d:?}"
@@ -379,10 +390,37 @@ mod tests {
 
         match event {
             TopologyEvent::Changed(displays) => {
-                assert!(!displays.is_empty(), "expected the fresh enumeration to be non-empty");
+                assert!(
+                    !displays.is_empty(),
+                    "expected the fresh enumeration to be non-empty"
+                );
             }
             TopologyEvent::WakeFromSleep(_) => {
                 panic!("expected TopologyEvent::Changed after WM_DISPLAYCHANGE, got WakeFromSleep");
+            }
+        }
+
+        watcher.stop();
+    }
+
+    #[test]
+    fn topology_watcher_translates_resume_power_broadcast() {
+        let (watcher, rx) = watch_display_topology().expect("watcher should start");
+
+        unsafe {
+            let _ = PostMessageW(watcher.hwnd(), WM_POWERBROADCAST, WPARAM(0x0012), LPARAM(0));
+        }
+
+        let event = rx
+            .recv_timeout(std::time::Duration::from_secs(4))
+            .expect("expected a wake event after PBT_APMRESUMEAUTOMATIC");
+        match event {
+            TopologyEvent::WakeFromSleep(displays) => assert!(
+                !displays.is_empty(),
+                "wake translation should carry a fresh usable topology"
+            ),
+            TopologyEvent::Changed(_) => {
+                panic!("expected WakeFromSleep after a resume power broadcast")
             }
         }
 

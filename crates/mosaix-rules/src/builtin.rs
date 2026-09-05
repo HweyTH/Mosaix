@@ -25,6 +25,7 @@ pub fn builtin_rules() -> Vec<Rule> {
             },
             actions: RuleActions {
                 manage: ManageAction::Float,
+                workspace: None,
             },
         },
         Rule {
@@ -43,6 +44,7 @@ pub fn builtin_rules() -> Vec<Rule> {
             },
             actions: RuleActions {
                 manage: ManageAction::Float,
+                workspace: None,
             },
         },
         Rule {
@@ -61,6 +63,7 @@ pub fn builtin_rules() -> Vec<Rule> {
             },
             actions: RuleActions {
                 manage: ManageAction::Exclude,
+                workspace: None,
             },
         },
         Rule {
@@ -79,6 +82,7 @@ pub fn builtin_rules() -> Vec<Rule> {
             },
             actions: RuleActions {
                 manage: ManageAction::Exclude,
+                workspace: None,
             },
         },
         Rule {
@@ -99,6 +103,7 @@ pub fn builtin_rules() -> Vec<Rule> {
             },
             actions: RuleActions {
                 manage: ManageAction::Float,
+                workspace: None,
             },
         },
         Rule {
@@ -120,6 +125,7 @@ pub fn builtin_rules() -> Vec<Rule> {
             },
             actions: RuleActions {
                 manage: ManageAction::Exclude,
+                workspace: None,
             },
         },
         Rule {
@@ -141,6 +147,7 @@ pub fn builtin_rules() -> Vec<Rule> {
             },
             actions: RuleActions {
                 manage: ManageAction::Exclude,
+                workspace: None,
             },
         },
     ]
@@ -176,7 +183,9 @@ mod tests {
                 can_minimize: true,
                 can_maximize: true,
             },
+            elevated: false,
             lifecycle: WindowLifecycle::Active,
+            minimum_size: None,
         }
     }
 

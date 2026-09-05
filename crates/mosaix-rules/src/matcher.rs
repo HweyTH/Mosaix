@@ -171,7 +171,9 @@ mod tests {
                 can_minimize: true,
                 can_maximize: true,
             },
+            elevated: false,
             lifecycle: WindowLifecycle::Active,
+            minimum_size: None,
         }
     }
 

@@ -1,0 +1,97 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="320" viewBox="0 0 1280 320" role="img" aria-label="Mosaix — tiling window management for Windows 11 and macOS">
+  <title>Mosaix</title>
+  <style>
+    :root {
+      --ground: #e9e3d8;
+      --grid: rgba(57, 46, 34, .055);
+      --plate: #f4eee1;
+      --plate-line: rgba(54, 47, 37, .14);
+      --ink: #282721;
+      --muted: #756f64;
+      --muted-2: #aaa293;
+      --line: rgba(54, 47, 37, .14);
+      --zone-fill: rgba(181, 77, 48, .3);
+      --zone-line: #b54d30;
+      --accent: #c94f2e;
+      --glow-one: rgba(190, 130, 62, .26);
+      --glow-two: rgba(83, 115, 94, .18);
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --ground: #080a0d;
+        --grid: rgba(255, 255, 255, .026);
+        --plate: #11151a;
+        --plate-line: rgba(255, 255, 255, .08);
+        --ink: #f1f4f5;
+        --muted: #747d87;
+        --muted-2: #4f5863;
+        --line: rgba(255, 255, 255, .1);
+        --zone-fill: rgba(54, 148, 145, .18);
+        --zone-line: #78dcd5;
+        --accent: #ff7558;
+        --glow-one: rgba(34, 159, 166, .26);
+        --glow-two: rgba(255, 117, 88, .14);
+      }
+    }
+    text { font-family: Inter, "Segoe UI Variable", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif; }
+    .bg { fill: var(--ground); }
+    .grid { stroke: var(--grid); }
+    .plate { fill: var(--plate); }
+    .plate-line { stroke: var(--plate-line); }
+    .mark { fill: var(--accent); }
+    .ink { fill: var(--ink); }
+    .muted { fill: var(--muted); }
+    .muted-2 { fill: var(--muted-2); }
+    .line { stroke: var(--line); }
+    .zone { fill: var(--zone-fill); stroke: var(--zone-line); stroke-opacity: .55; }
+    .float { fill: var(--plate); stroke: var(--accent); }
+    .float-bar { stroke: var(--accent); stroke-opacity: .45; }
+    .glow-one-from { stop-color: var(--glow-one); }
+    .glow-one-to { stop-color: var(--glow-one); stop-opacity: 0; }
+    .glow-two-from { stop-color: var(--glow-two); }
+    .glow-two-to { stop-color: var(--glow-two); stop-opacity: 0; }
+    .mono { font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; }
+  </style>
+  <defs>
+    <pattern id="grid" width="32" height="32" patternUnits="userSpaceOnUse">
+      <path class="grid" d="M32 0H0v32" fill="none" stroke-width="1"/>
+    </pattern>
+    <radialGradient id="glow-one">
+      <stop class="glow-one-from" offset="0"/>
+      <stop class="glow-one-to" offset="1"/>
+    </radialGradient>
+    <radialGradient id="glow-two">
+      <stop class="glow-two-from" offset="0"/>
+      <stop class="glow-two-to" offset="1"/>
+    </radialGradient>
+  </defs>
+
+  <rect class="bg" width="1280" height="320"/>
+  <rect width="1280" height="320" fill="url(#grid)"/>
+  <ellipse cx="250" cy="330" rx="430" ry="250" fill="url(#glow-one)"/>
+  <ellipse cx="1140" cy="-30" rx="380" ry="240" fill="url(#glow-two)"/>
+
+  <svg x="96" y="104" width="100" height="100" viewBox="0 0 512 512">
+    <rect class="plate" width="512" height="512" rx="112"/>
+    <rect class="plate-line" x=".5" y=".5" width="511" height="511" rx="111.5" fill="none"/>
+    <g class="mark" transform="translate(105 105) rotate(4 151 151)">
+      <rect width="142" height="142" rx="24" opacity=".45"/>
+      <rect y="160" width="142" height="142" rx="24" opacity=".45"/>
+      <rect x="160" y="160" width="142" height="142" rx="24" opacity=".45"/>
+      <rect x="186" y="-26" width="142" height="142" rx="24"/>
+    </g>
+  </svg>
+  <text class="ink" x="232" y="170" font-size="66" font-weight="750" letter-spacing="-2">Mosaix</text>
+  <text class="muted" x="235" y="209" font-size="17">Tiling window management for Windows 11 and macOS</text>
+
+  <rect class="plate line" x="824" y="76" width="360" height="202" rx="14"/>
+  <rect class="bg" x="832" y="84" width="344" height="186" rx="8"/>
+  <g class="zone">
+    <rect x="840" y="92" width="160" height="170" rx="5"/>
+    <rect x="1008" y="92" width="160" height="81" rx="5"/>
+    <rect x="1008" y="181" width="160" height="81" rx="5"/>
+  </g>
+  <rect class="float" x="938" y="138" width="172" height="112" rx="7" stroke-width="2"/>
+  <path class="float-bar" d="M938 158h172"/>
+  <text class="muted-2 mono" x="1176" y="296" text-anchor="end" font-size="10" letter-spacing="1.4">SESSION-FLOATING</text>
+</svg>
