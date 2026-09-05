@@ -18,6 +18,7 @@ Desktop.ini
 # Node (Tauri settings app)
 apps/mosaix-settings/node_modules/
 apps/mosaix-settings/dist/
+apps/mosaix-settings/dist-preview/
 apps/mosaix-settings/src-tauri/gen/schemas/
 
 # Database

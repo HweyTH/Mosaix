@@ -13,8 +13,8 @@
   --work-start: #14272d;
   --work-end: #0b1116;
   --ink: #f1f4f5;
-  --muted: #747d87;
-  --muted-2: #4f5863;
+  --muted: #778089;
+  --muted-2: #828890;
   --line: rgb(255 255 255 / 10%);
   --zone-fill: rgb(54 148 145 / 18%);
   --zone-fill-active: rgb(66 178 173 / 28%);
@@ -22,6 +22,8 @@
   --accent: #ff7558;
   --accent-ink: #24100b;
   --live: #72d9a5;
+  --badge: #78dcd5;
+  --badge-ink: #0b1116;
   --switcher: rgb(15 17 21 / 94%);
   --glow-one: rgb(34 159 166 / 12%);
   --glow-two: rgb(255 117 88 / 6%);
@@ -36,15 +38,17 @@
   --work-start: #d8d0c0;
   --work-end: #c7c1b7;
   --ink: #282721;
-  --muted: #756f64;
-  --muted-2: #aaa293;
+  --muted: #6a655b;
+  --muted-2: #666158;
   --line: rgb(54 47 37 / 14%);
   --zone-fill: rgb(181 77 48 / 34%);
   --zone-fill-active: rgb(196 77 43 / 52%);
   --zone-line: #fffaf0;
-  --accent: #c94f2e;
+  --accent: #c54d2d;
   --accent-ink: #fffaf2;
   --live: #55725c;
+  --badge: #c54d2d;
+  --badge-ink: #fffaf2;
   --switcher: rgb(39 37 32 / 94%);
   --glow-one: rgb(190 130 62 / 12%);
   --glow-two: rgb(83 115 94 / 9%);
@@ -92,22 +96,22 @@ button { color: inherit; }
 .tool-dock .icon-button.active { color: var(--accent-ink); background: var(--accent); }
 .dock-rule { height: 1px; margin: 2px 5px; background: var(--line); }
 
-.world { position: absolute; inset: 0; display: grid; place-items: center; padding: 84px 128px 116px 112px; }
-.display-meta { position: absolute; left: max(140px, 12%); right: max(158px, 13%); top: 79px; display: flex; justify-content: space-between; color: var(--muted); font-size: 8px; font-weight: 650; letter-spacing: .06em; }
+.world { position: absolute; inset: 0; display: grid; grid-auto-rows: min-content; place-items: center; align-content: center; padding: 84px 264px 116px 328px; }
+.display-meta { position: absolute; left: 328px; right: 264px; top: 79px; display: flex; justify-content: space-between; color: var(--muted); font-size: 8px; font-weight: 650; letter-spacing: .06em; }
 .display-meta i { display: inline-block; width: 5px; height: 5px; margin-right: 5px; border-radius: 50%; background: var(--live); }
-.monitor-shell { position: relative; width: min(1000px, 80vw); aspect-ratio: 16 / 9; padding: 7px; border: 1px solid color-mix(in srgb, var(--ink), transparent 74%); border-radius: 17px; background: var(--monitor); box-shadow: 0 50px 120px rgb(0 0 0 / 34%), 0 0 0 11px color-mix(in srgb, var(--ink), transparent 98%); }
+.monitor-shell { position: relative; width: min(1000px, 100%); aspect-ratio: 16 / 9; padding: 7px; border: 1px solid color-mix(in srgb, var(--ink), transparent 74%); border-radius: 17px; background: var(--monitor); box-shadow: 0 50px 120px rgb(0 0 0 / 34%), 0 0 0 11px color-mix(in srgb, var(--ink), transparent 98%); }
 .monitor-shell::before { content: ""; position: absolute; left: 50%; top: 2px; width: 4px; height: 4px; border-radius: 50%; background: color-mix(in srgb, var(--ink), transparent 65%); }
 .work-area { position: relative; width: 100%; height: 100%; overflow: hidden; border-radius: 11px; background: radial-gradient(circle at 50% 110%, var(--work-start), var(--work-end) 68%); }
-.work-label { position: absolute; right: 12px; bottom: 9px; color: color-mix(in srgb, var(--ink), transparent 73%); font: 700 8px/1 ui-monospace, monospace; letter-spacing: .06em; }
-.monitor-foot { position: absolute; left: 50%; bottom: 76px; display: flex; align-items: flex-end; transform: translateX(-50%); opacity: .28; }
+.work-label { position: absolute; right: 12px; bottom: 9px; color: color-mix(in srgb, var(--ink), transparent 30%); font: 700 8px/1 ui-monospace, monospace; letter-spacing: .06em; }
+.monitor-foot { display: flex; align-items: flex-end; opacity: .28; }
 .monitor-foot span { width: 34px; height: 2px; background: var(--ink); }
 .monitor-foot i { width: 25px; height: 14px; border-left: 1px solid var(--ink); border-right: 1px solid var(--ink); }
 
 .zone { position: absolute; display: flex; flex-direction: column; align-items: flex-start; justify-content: space-between; padding: 14px; border: 1px solid color-mix(in srgb, var(--zone-line), transparent 32%); color: var(--ink); background: var(--zone-fill); text-align: left; cursor: pointer; transition: .18s ease; }
 .zone:hover, .zone.active { border-color: var(--zone-line); background: var(--zone-fill-active); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--zone-line), transparent 48%), 0 0 26px color-mix(in srgb, var(--zone-line), transparent 88%); }
 .zone strong { font-size: 12px; line-height: 1.2; }
-.zone small { opacity: .48; font: 8px/1 ui-monospace, monospace; }
-.zone-index { position: absolute; right: 10px; top: 10px; width: 22px; height: 22px; display: grid; place-items: center; border-radius: 50%; color: var(--accent-ink); background: var(--zone-line); font-size: 9px; font-weight: 800; }
+.zone small { opacity: .81; font: 8px/1 ui-monospace, monospace; }
+.zone-index { position: absolute; right: 10px; top: 10px; width: 22px; height: 22px; display: grid; place-items: center; border-radius: 50%; color: var(--badge-ink); background: var(--badge); font-size: 9px; font-weight: 800; }
 .resize-handle { position: absolute; right: -4px; top: calc(50% - 18px); width: 7px; height: 36px; border: 2px solid var(--monitor); border-radius: 6px; background: var(--zone-line); opacity: 0; }
 .zone.active .resize-handle { opacity: 1; }
 
@@ -167,7 +171,7 @@ button { color: inherit; }
 .range-line { display: flex; align-items: center; gap: 9px; }
 .range-line input { min-width: 0; accent-color: var(--accent); }
 .range-line output { min-width: 30px; color: var(--ink); font: 9px ui-monospace, monospace; }
-.toggle-line { display: flex; align-items: center; justify-content: space-between; margin-top: 15px; color: var(--ink); font-size: 9px; }
+.toggle-line { display: flex; align-items: center; justify-content: space-between; margin: 15px 0; color: var(--ink); font-size: 9px; }
 .toggle-line small { display: block; margin-top: 3px; color: var(--muted); font-size: 8px; }
 .toggle-line input { accent-color: var(--accent); }
 
@@ -194,9 +198,8 @@ button { color: inherit; }
 .startup-error p { max-width: 560px; margin: 0; color: #929aa4; font: 11px/1.5 ui-monospace, monospace; }
 
 @media (max-width: 1250px) {
-  .world { padding-left: 95px; padding-right: 110px; }
   .properties { right: 16px; width: 198px; }
-  .monitor-shell { width: 77vw; }
+  .world { padding-right: 238px; }
 }
 
 /* Hotkey capture dialog (ADR 0021). Layered over the whole editor rather
