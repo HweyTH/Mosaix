@@ -1359,7 +1359,32 @@ fn main() {
     tracing::info!("mosaix-agent stopped");
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+fn main() {
+    use mosaix_platform_api::PlatformAdapter;
+
+    tracing_subscriber::fmt::init();
+    tracing::info!("mosaix-agent starting on macOS");
+    let adapter = mosaix_platform_macos::MacosPlatformAdapter::new().unwrap_or_else(|error| {
+        eprintln!("mosaix-agent: {error}");
+        std::process::exit(1);
+    });
+    match mosaix_platform_macos::enumerate_displays() {
+        Ok(displays) => tracing::info!(count = displays.len(), "enumerated macOS displays"),
+        Err(error) => tracing::error!(%error, "failed to enumerate macOS displays"),
+    }
+    match adapter.enumerate_windows() {
+        Ok(windows) => tracing::info!(count = windows.len(), "enumerated manageable macOS windows"),
+        Err(error) => tracing::error!(%error, "failed to enumerate macOS windows"),
+    }
+    let shutdown = mosaix_platform_macos::register_shutdown_signal()
+        .expect("failed to register macOS shutdown signal handler");
+    tracing::info!("mosaix-agent ready; waiting for SIGINT or SIGTERM");
+    let _ = shutdown.recv();
+    tracing::info!("mosaix-agent stopped");
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 fn main() {
     eprintln!("mosaix-agent currently only supports Windows (no macOS platform adapter yet).");
     std::process::exit(1);
@@ -1407,6 +1432,7 @@ impl mosaix_ipc::ConfigStore for DirectoryConfigStore {
 #[derive(Debug)]
 struct PlatformHotkeyProbe;
 
+#[cfg(windows)]
 impl mosaix_ipc::HotkeyProbe for PlatformHotkeyProbe {
     fn probe(&self, combo: &mosaix_config::KeyCombo) -> mosaix_ipc::ProbeOutcome {
         let Some((modifiers, vk)) = hotkeys::binding_parts(combo) else {
@@ -1419,6 +1445,34 @@ impl mosaix_ipc::HotkeyProbe for PlatformHotkeyProbe {
                 mosaix_ipc::ProbeOutcome::Available
             }
             mosaix_platform_windows::HotkeyAvailability::Taken => mosaix_ipc::ProbeOutcome::Taken,
+        }
+    }
+}
+
+/// The macOS probe asks Carbon the same question the Windows one asks
+/// `RegisterHotKey`: register the combination, then release it.
+///
+/// The key-name translation is the platform's, not the configuration's --
+/// Carbon key codes are positional, so a name that has a virtual-key code
+/// on Windows may genuinely have no code here, and that is reported as
+/// unsupported rather than as taken.
+#[cfg(target_os = "macos")]
+impl mosaix_ipc::HotkeyProbe for PlatformHotkeyProbe {
+    fn probe(&self, combo: &mosaix_config::KeyCombo) -> mosaix_ipc::ProbeOutcome {
+        let Some(key_code) = mosaix_platform_macos::key_code_for(&combo.key) else {
+            return mosaix_ipc::ProbeOutcome::Unsupported {
+                reason: format!("macOS has no key named {:?}", combo.key),
+            };
+        };
+        // `win` is the configuration's name for the platform modifier,
+        // which is Command here.
+        let modifiers =
+            mosaix_platform_macos::modifier_mask(combo.ctrl, combo.alt, combo.shift, combo.win);
+        match mosaix_platform_macos::probe_hotkey(modifiers, key_code) {
+            mosaix_platform_macos::HotkeyAvailability::Available => {
+                mosaix_ipc::ProbeOutcome::Available
+            }
+            mosaix_platform_macos::HotkeyAvailability::Taken => mosaix_ipc::ProbeOutcome::Taken,
         }
     }
 }
