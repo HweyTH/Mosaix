@@ -145,6 +145,27 @@ pub struct RecoverySnapshot {
     pub outcomes: Vec<RecoveryOutcomeSnapshot>,
 }
 
+/// One repair that is waiting on a person, and the command that carries
+/// it out (issue #63).
+///
+/// This is deliberately separate from `conditions`, which names what is
+/// wrong. A condition can hold without anything being asked of the user
+/// -- degraded tiling clears itself on the next successful placement --
+/// and a repair can be outstanding without a condition holding, because
+/// windows the *previous* session left parked are nobody's condition
+/// until someone puts them back. This list answers the different
+/// question: what will not fix itself.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct RecoveryActionSnapshot {
+    /// A stable machine-readable name for what needs doing.
+    pub reason: String,
+    /// The windows it concerns, in window-id order. Empty when the repair
+    /// is not about particular windows.
+    pub windows: Vec<isize>,
+    /// The command that performs it, spelled as the user would type it.
+    pub command: String,
+}
+
 /// A native parking step that failed, with the platform's reason.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct ParkingFailureSnapshot {
@@ -245,6 +266,44 @@ pub struct StateSnapshot {
     /// holds. Always `conditions`' first entry.
     #[serde(default)]
     pub primary_condition: Option<String>,
+    /// Whether the adapter has verified a recoverable parking site:
+    /// `unverified`, `verified`, or `refused` (CONTEXT.md "Parking site").
+    ///
+    /// Reported here as well as under `workspace_switching` because the
+    /// two answer different questions. There, it is one of the reasons a
+    /// requested switching mapping has not activated, and it is read
+    /// alongside a profile's mapping. Here, it is a fact about the
+    /// platform adapter on its own: parking governs every path in
+    /// CONTEXT.md "Window parking" -- a monitor disconnecting, a rule
+    /// naming a hidden workspace, an application restoring a minimized
+    /// member, a restart reapplying stored assignments -- and all of those
+    /// happen with switching `disabled`. Spec #45 lists it among the facts
+    /// status exposes at the top level for that reason.
+    #[serde(default)]
+    pub parking_capability: String,
+    /// The adapter's own reason, when the parking site was refused.
+    ///
+    /// The copy under `workspace_switching` flattens `Refused { reason }`
+    /// to the bare word `refused`, so the reason is reachable nowhere
+    /// else in published state.
+    #[serde(default)]
+    pub parking_capability_reason: Option<String>,
+    /// Every managed window currently in constraint overflow, across all
+    /// displays, in window-id order (issue #54).
+    ///
+    /// The per-display lists under `container_trees` and the per-window
+    /// flag under `managed_windows` remain the detail. This is the roll-up
+    /// a status report needs, so that "is anything overflowing?" is one
+    /// field rather than a walk of every tree.
+    #[serde(default)]
+    pub constraint_overflow: Vec<isize>,
+    /// Whether anything is waiting on a person right now. Always
+    /// `!recovery_actions.is_empty()`.
+    #[serde(default)]
+    pub recovery_required: bool,
+    /// Each outstanding repair, most serious first (issue #63).
+    #[serde(default)]
+    pub recovery_actions: Vec<RecoveryActionSnapshot>,
     /// Number of windows whose circuit breaker is currently open (Feature 31).
     /// These windows are excluded from automatic placement until the user
     /// explicitly resets them with a zone-snap command.
@@ -543,6 +602,76 @@ impl From<EngineState> for StateSnapshot {
             conditions.push("degraded_tiling".to_owned());
         }
         let primary_condition = conditions.first().cloned();
+        let (parking_capability, parking_capability_reason) = match &state.parking_capability {
+            mosaix_domain::ParkingCapability::Unverified => ("unverified".to_owned(), None),
+            mosaix_domain::ParkingCapability::Verified => ("verified".to_owned(), None),
+            mosaix_domain::ParkingCapability::Refused { reason } => {
+                ("refused".to_owned(), Some(reason.clone()))
+            }
+        };
+        let mut constraint_overflow: Vec<isize> = state
+            .constraint_overflow
+            .values()
+            .flat_map(|overflow| overflow.iter().map(|id| id.0))
+            .collect();
+        constraint_overflow.sort_unstable();
+        // Ordered by how much is at stake while the repair waits. A
+        // degraded switch comes first because windows are off screen and
+        // switching stays blocked; a failed restore next, because that
+        // window is off screen too but nothing is blocked; a previous
+        // session's unrestored entries next, because those windows are off
+        // screen with no session owning them; degraded persistence last,
+        // because everything on screen is still where it belongs.
+        let mut recovery_actions: Vec<RecoveryActionSnapshot> = Vec::new();
+        if let Some(degraded) = &state.switch_degraded {
+            let mut windows: Vec<isize> = degraded.stranded_windows.iter().map(|id| id.0).collect();
+            windows.sort_unstable();
+            recovery_actions.push(RecoveryActionSnapshot {
+                reason: "switch_degraded".to_owned(),
+                windows,
+                command: "mosaix workspace restore-switch".to_owned(),
+            });
+        }
+        // Only a failed *restore* is a repair. A failed park left the
+        // window exactly where the user last saw it, so there is nothing
+        // to put back.
+        if let Some(failure) = &state.last_parking_failure {
+            if failure.stage == mosaix_domain::ParkingStage::Restore {
+                recovery_actions.push(RecoveryActionSnapshot {
+                    reason: "parking_restore_failed".to_owned(),
+                    windows: vec![failure.window_id.0],
+                    command: "mosaix workspace restore".to_owned(),
+                });
+            }
+        }
+        // Startup read the previous session's ledger and could not put
+        // these back: a stale, reused, or ambiguous handle it refused to
+        // touch, or a verified one whose restore call failed. Either way
+        // the window is still parked and no running session owns it.
+        let unrestored: Vec<isize> = state
+            .recovery_outcomes
+            .iter()
+            .filter(|outcome| !outcome.restored)
+            .map(|outcome| outcome.native_handle)
+            .collect();
+        if !unrestored.is_empty() {
+            recovery_actions.push(RecoveryActionSnapshot {
+                reason: "startup_recovery_incomplete".to_owned(),
+                windows: unrestored,
+                command: "mosaix restore-windows".to_owned(),
+            });
+        }
+        if matches!(
+            state.persistence_health,
+            mosaix_persistence::PersistenceHealth::Degraded { .. }
+        ) {
+            recovery_actions.push(RecoveryActionSnapshot {
+                reason: "persistence_degraded".to_owned(),
+                windows: Vec::new(),
+                command: "mosaix persistence status".to_owned(),
+            });
+        }
+        let recovery_required = !recovery_actions.is_empty();
         let degraded_windows = state
             .windows
             .iter()
@@ -698,12 +827,7 @@ impl From<EngineState> for StateSnapshot {
                         .collect()
                 })
                 .unwrap_or_default(),
-            parking_capability: match &state.parking_capability {
-                mosaix_domain::ParkingCapability::Unverified => "unverified",
-                mosaix_domain::ParkingCapability::Verified => "verified",
-                mosaix_domain::ParkingCapability::Refused { .. } => "refused",
-            }
-            .to_owned(),
+            parking_capability: parking_capability.clone(),
         });
         let last_applied_layouts = state
             .last_applied_layouts
@@ -799,6 +923,11 @@ impl From<EngineState> for StateSnapshot {
             workspace_switch,
             conditions,
             primary_condition,
+            parking_capability,
+            parking_capability_reason,
+            constraint_overflow,
+            recovery_required,
+            recovery_actions,
             paused: state.paused,
             automatic_tiling_active: state.automatic_tiling_active,
             automatic_tiling_suspended: state.automatic_tiling_suspended,
@@ -3320,6 +3449,198 @@ mod tests {
 
         assert!(snapshot.conditions.is_empty());
         assert_eq!(snapshot.primary_condition, None);
+    }
+
+    #[test]
+    fn a_healthy_agent_has_nothing_waiting_on_a_person() {
+        let engine = tiling_engine_with_workspaces(&["dev"]);
+
+        let snapshot = StateSnapshot::from(engine.snapshot());
+
+        assert!(!snapshot.recovery_required);
+        assert!(snapshot.recovery_actions.is_empty());
+    }
+
+    #[test]
+    fn a_refused_parking_site_keeps_its_reason_at_the_top_level() {
+        // Switching is `disabled` here, which is the ordinary case, and
+        // every other parking path still depends on this capability. The
+        // switching section flattens the refusal to the bare word, so the
+        // adapter's reason has to survive somewhere.
+        let mut state = EngineState::default();
+        state.parking_capability = mosaix_domain::ParkingCapability::Refused {
+            reason: "no recoverable site beyond the virtual screen".to_owned(),
+        };
+
+        let snapshot = StateSnapshot::from(state);
+
+        assert_eq!(
+            snapshot
+                .workspace_switching
+                .as_ref()
+                .map(|switching| switching.status.as_str()),
+            Some("disabled"),
+        );
+        assert_eq!(snapshot.parking_capability, "refused");
+        assert_eq!(
+            snapshot.parking_capability_reason.as_deref(),
+            Some("no recoverable site beyond the virtual screen"),
+            "the switching section keeps only the word `refused`",
+        );
+    }
+
+    #[test]
+    fn constraint_overflow_is_rolled_up_across_every_display() {
+        use mosaix_domain::tree::{ContainerTree, SplitAxis};
+
+        let mut state = EngineState::default();
+        state.resolved_config.tiling_mode = mosaix_config::TilingMode::Tree;
+        for (display, first, second) in [(1, 11, 12), (2, 21, 22)] {
+            let mut tree = ContainerTree::new();
+            tree.insert_first(WindowId(first));
+            tree.split_leaf(&WindowId(first), SplitAxis::Horizontal, WindowId(second));
+            state.trees.insert(DisplayId(display), tree);
+        }
+        state
+            .constraint_overflow
+            .insert(DisplayId(2), vec![WindowId(22)].into_iter().collect());
+        state
+            .constraint_overflow
+            .insert(DisplayId(1), vec![WindowId(12)].into_iter().collect());
+
+        let snapshot = StateSnapshot::from(state);
+
+        assert_eq!(
+            snapshot.constraint_overflow,
+            vec![12, 22],
+            "the roll-up is every display's overflow in window-id order"
+        );
+    }
+
+    #[test]
+    fn a_degraded_switch_asks_for_the_reconcile_that_unblocks_switching() {
+        let mut state = EngineState::default();
+        state.switch_degraded = Some(mosaix_domain::WorkspaceSwitchDegraded {
+            display_id: mosaix_domain::DisplayId(1),
+            target: mosaix_domain::WorkspaceName::new("chat").unwrap(),
+            outgoing: None,
+            stranded_windows: vec![mosaix_domain::WindowId(41)],
+            reason: "the window would not come back".to_owned(),
+        });
+
+        let snapshot = StateSnapshot::from(state);
+
+        assert!(snapshot.recovery_required);
+        assert_eq!(
+            snapshot.recovery_actions,
+            vec![RecoveryActionSnapshot {
+                reason: "switch_degraded".to_owned(),
+                windows: vec![41],
+                command: "mosaix workspace restore-switch".to_owned(),
+            }],
+        );
+    }
+
+    #[test]
+    fn a_failed_park_asks_for_nothing_but_a_failed_restore_does() {
+        // A failed park left the window exactly where the user last saw
+        // it. A failed restore left it off screen.
+        let failure = |stage| mosaix_domain::ParkingFailure {
+            window_id: WindowId(7),
+            entry_id: mosaix_domain::RecoveryEntryId(3),
+            stage,
+            reason: "SetWindowPos refused".to_owned(),
+        };
+
+        let mut parked = EngineState::default();
+        parked.last_parking_failure = Some(failure(mosaix_domain::ParkingStage::Park));
+        assert!(!StateSnapshot::from(parked).recovery_required);
+
+        let mut stranded = EngineState::default();
+        stranded.last_parking_failure = Some(failure(mosaix_domain::ParkingStage::Restore));
+        let snapshot = StateSnapshot::from(stranded);
+        assert!(snapshot.recovery_required);
+        assert_eq!(
+            snapshot.recovery_actions,
+            vec![RecoveryActionSnapshot {
+                reason: "parking_restore_failed".to_owned(),
+                windows: vec![7],
+                command: "mosaix workspace restore".to_owned(),
+            }],
+        );
+    }
+
+    #[test]
+    fn startup_recovery_that_left_a_window_parked_asks_for_the_out_of_process_restore() {
+        let outcome = |handle, restored| mosaix_domain::RecoveryOutcome {
+            entry_id: mosaix_domain::RecoveryEntryId(handle),
+            native_handle: handle as isize,
+            application_id: ApplicationId("Code.exe".to_owned()),
+            verdict: mosaix_domain::HandleVerdict::Stale,
+            restored,
+            failure: None,
+        };
+        let mut state = EngineState::default();
+        state.recovery_outcomes = vec![outcome(1, true), outcome(2, false)];
+
+        let snapshot = StateSnapshot::from(state);
+
+        assert_eq!(
+            snapshot.recovery_actions,
+            vec![RecoveryActionSnapshot {
+                reason: "startup_recovery_incomplete".to_owned(),
+                windows: vec![2],
+                command: "mosaix restore-windows".to_owned(),
+            }],
+            "only the entry startup could not put back is a repair",
+        );
+    }
+
+    #[test]
+    fn outstanding_repairs_are_listed_by_how_much_is_at_stake_while_they_wait() {
+        let mut state = EngineState::default();
+        state.persistence_health = PersistenceHealth::Degraded {
+            last_durable_revision: 3,
+            reason: mosaix_persistence::PersistenceFailure::WriteFailed,
+        };
+        state.recovery_outcomes = vec![mosaix_domain::RecoveryOutcome {
+            entry_id: mosaix_domain::RecoveryEntryId(1),
+            native_handle: 9,
+            application_id: ApplicationId("Code.exe".to_owned()),
+            verdict: mosaix_domain::HandleVerdict::Stale,
+            restored: false,
+            failure: None,
+        }];
+        state.last_parking_failure = Some(mosaix_domain::ParkingFailure {
+            window_id: WindowId(7),
+            entry_id: mosaix_domain::RecoveryEntryId(3),
+            stage: mosaix_domain::ParkingStage::Restore,
+            reason: "SetWindowPos refused".to_owned(),
+        });
+        state.switch_degraded = Some(mosaix_domain::WorkspaceSwitchDegraded {
+            display_id: mosaix_domain::DisplayId(1),
+            target: mosaix_domain::WorkspaceName::new("chat").unwrap(),
+            outgoing: None,
+            stranded_windows: vec![mosaix_domain::WindowId(41)],
+            reason: "the window would not come back".to_owned(),
+        });
+
+        let snapshot = StateSnapshot::from(state);
+
+        let reasons: Vec<&str> = snapshot
+            .recovery_actions
+            .iter()
+            .map(|action| action.reason.as_str())
+            .collect();
+        assert_eq!(
+            reasons,
+            vec![
+                "switch_degraded",
+                "parking_restore_failed",
+                "startup_recovery_incomplete",
+                "persistence_degraded",
+            ],
+        );
     }
 
     #[test]

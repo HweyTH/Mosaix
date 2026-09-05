@@ -10,6 +10,13 @@ import {
   type CaptureSession,
 } from "./hotkey-capture";
 
+import {
+  bindWorkspaceRepairs,
+  renderWorkspaceStatus,
+  type RepairReceipt,
+  type WorkspaceStatus,
+} from "./workspace-status";
+
 export type Appearance = "dark" | "light";
 
 export interface ZoneDraft {
@@ -173,6 +180,9 @@ export interface DesktopBridge {
   setAppearance(appearance: Appearance): Promise<void>;
   loadAutomaticTilingSettings(): Promise<AutomaticTilingSettings>;
   saveAutomaticTilingSettings(settings: AutomaticTilingSettings): Promise<AutomaticTilingSettings>;
+  loadWorkspaceStatus(): Promise<WorkspaceStatus>;
+  restoreParkedWindows(): Promise<RepairReceipt>;
+  restoreWorkspaceSwitch(): Promise<RepairReceipt>;
 }
 
 /**
@@ -256,6 +266,19 @@ export function watchSavedLayouts(
   intervalMs = 2000,
 ): () => void {
   return watchChanges(() => bridge.loadSavedLayouts(), handlers, intervalMs);
+}
+
+/**
+ * Watches the experimental switching surface, so a profile match, a
+ * parking-site verification, or a failed switch appears without
+ * reopening the window (issue #63).
+ */
+export function watchWorkspaceStatus(
+  bridge: Pick<DesktopBridge, "loadWorkspaceStatus">,
+  handlers: WatchHandlers<WorkspaceStatus>,
+  intervalMs = 2000,
+): () => void {
+  return watchChanges(() => bridge.loadWorkspaceStatus(), handlers, intervalMs);
 }
 
 /**
@@ -559,6 +582,9 @@ export async function mountLayoutEditor(
   let hotkeyError: string | undefined;
   let layouts: SavedLayoutList | undefined;
   let layoutError: string | undefined;
+  let workspaceStatus: WorkspaceStatus | undefined;
+  let workspaceError: string | undefined;
+  let repairStatus: string | undefined;
   let selectedLayout: string | undefined;
   /** Whether the next save is redirected to base config (ADR 0022). */
   let redirectToBase = false;
@@ -665,6 +691,10 @@ export async function mountLayoutEditor(
           <div class="panel-title">HOTKEYS</div>
           ${renderBindings(hotkeys, hotkeyError)}
         </aside>
+        <aside class="panel workspace-status" aria-label="Experimental workspace switching">
+          <div class="panel-title">WORKSPACES <small class="experimental-tag">EXPERIMENTAL</small></div>
+          ${renderWorkspaceStatus(workspaceStatus, workspaceError, repairStatus)}
+        </aside>
         </div>
         ${selectedZone ? `
           <aside class="properties" aria-label="Zone properties">
@@ -685,6 +715,11 @@ export async function mountLayoutEditor(
         <div class="command-status" role="status">${commandStatus}</div>
         ${renderCaptureDialog(capture, hotkeys)}
       </main>`;
+
+    bindWorkspaceRepairs(root, bridge, (message) => {
+      repairStatus = message;
+      render();
+    });
 
     root.querySelector<HTMLSelectElement>("[data-display]")?.addEventListener("change", (event) => {
       selectedDisplayIndex = Number((event.currentTarget as HTMLSelectElement).value);
@@ -1136,12 +1171,25 @@ export async function mountLayoutEditor(
     },
   });
 
+  const stopWorkspaceWatch = watchWorkspaceStatus(bridge, {
+    onChange: (status) => {
+      workspaceStatus = status;
+      workspaceError = undefined;
+      render();
+    },
+    onError: (error) => {
+      workspaceError = `Could not read workspace status · ${String(error)}`;
+      render();
+    },
+  });
+
   return () => {
     // The agent would release suspension anyway when this connection
     // ends, so this is the clean-close path rather than the safety net.
     void bridge.endHotkeyCapture().catch(() => {});
     stopLayoutWatch();
     stopHotkeyWatch();
+    stopWorkspaceWatch();
     window.removeEventListener("keydown", onKeyDown);
     window.removeEventListener("keyup", onKeyUp);
     window.removeEventListener("blur", onBlur);

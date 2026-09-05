@@ -216,3 +216,22 @@ button { color: inherit; }
 .capture-verdict.blocked { border-left-color: var(--accent); background: color-mix(in srgb, var(--accent), transparent 84%); }
 .capture-dialog .redirect { margin-bottom: 14px; }
 .capture-dialog .library-actions { margin-bottom: 0; }
+
+/* Experimental workspace switching (issue #63). The panel borrows the
+   hotkey list's type scale so the left rail reads as one column; what it
+   adds is the two-state colouring for a mapping and for an outstanding
+   repair, which is the only thing here a user has to act on. */
+.workspace-status p { margin: 0 0 12px; color: var(--muted); font-size: 9px; line-height: 1.4; }
+.workspace-status p:last-child { margin-bottom: 0; }
+.workspace-status code { color: var(--ink); font: 8px ui-monospace, monospace; overflow-wrap: anywhere; }
+.experimental-tag { padding: 1px 5px; border-radius: 4px; color: var(--accent-ink); background: var(--accent); font-size: 7px; letter-spacing: .04em; }
+.mapping-list, .workspace-list, .repair-list { display: flex; flex-direction: column; gap: 6px; margin: 0 0 12px; padding: 0; list-style: none; font-size: 9px; }
+.mapping-list li, .workspace-list li { padding: 6px 8px; border-radius: 6px; color: var(--ink); background: color-mix(in srgb, var(--ink), transparent 95%); }
+.workspace-list small { color: var(--muted-2); font-size: 8px; }
+.workspace-status .mapping-complete { color: var(--live); }
+.workspace-status .mapping-incomplete { padding: 8px 9px; border-left: 2px solid var(--accent); border-radius: 7px; color: var(--ink); background: color-mix(in srgb, var(--accent), transparent 92%); }
+.repair-list li { padding: 8px 9px; border-left: 2px solid var(--accent); border-radius: 7px; color: var(--ink); background: color-mix(in srgb, var(--accent), transparent 88%); line-height: 1.4; }
+.repair-list small { color: var(--muted-2); font-size: 8px; }
+.repair-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.repair-actions button[disabled] { opacity: .35; cursor: default; }
+.workspace-status .repair-status { margin-top: 10px; color: var(--ink); }

@@ -25,6 +25,9 @@ pub fn run() {
             commands::set_appearance,
             commands::load_automatic_tiling_settings,
             commands::save_automatic_tiling_settings,
+            commands::load_workspace_status,
+            commands::restore_parked_windows,
+            commands::restore_workspace_switch,
         ])
         .run(tauri::generate_context!())
         .expect("failed to run the Mosaix settings application");

@@ -128,6 +128,19 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Report everything a release decision rests on, in one place: tree
+    /// mode, focused display, the workspace pool and where each workspace
+    /// is displayed, dormant positions, constraint overflow, durability,
+    /// undo availability, parking capability, and what recovery is
+    /// waiting on a person (issue #63).
+    ///
+    /// `mosaix state --json` remains the complete machine-readable
+    /// snapshot. This is the same facts, selected and ordered for someone
+    /// deciding whether the experiment is behaving.
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
     State {
         #[arg(long)]
         json: bool,
@@ -281,6 +294,12 @@ fn main() {
         report_arrangement(json);
         return;
     }
+    // So does status, which selects the same published fields a release
+    // decision rests on.
+    if let Command::Status { json } = cli.command {
+        report_status(json);
+        return;
+    }
     // Undo answers with a typed result either way, so a refusal has to be
     // rendered rather than printed as a bare error string.
     if let Command::Undo { dry_run, json } = cli.command {
@@ -366,7 +385,8 @@ fn main() {
         | Command::SwapLeft { .. }
         | Command::SwapRight { .. }
         | Command::SwapUp { .. }
-        | Command::SwapDown { .. } => {
+        | Command::SwapDown { .. }
+        | Command::Status { .. } => {
             unreachable!("handled above")
         }
     };
@@ -497,6 +517,56 @@ fn report_arrangement(json: bool) {
         return;
     }
     println!("{}", format_arrangement(&state));
+}
+
+/// Reports everything a release decision rests on (issue #63).
+///
+/// The JSON form is a selection of published fields under their published
+/// names, not a reshaping of them: a caller that wants one of these facts
+/// finds it spelled the same way in `mosaix state --json`. What this adds
+/// is that the selection itself is the contract -- the ten things spec #45
+/// requires status to expose -- so a client is not left to discover which
+/// of the snapshot's fifty fields those are.
+#[cfg(any(windows, target_os = "macos"))]
+fn report_status(json: bool) {
+    let Some(state) = published_persistence() else {
+        eprintln!("mosaix: no agent is running");
+        std::process::exit(1);
+    };
+
+    if json {
+        let value = serde_json::json!({
+            "mode": state["mode"],
+            "conditions": state["conditions"],
+            "primary_condition": state["primary_condition"],
+            "tiling_mode": state["tiling_mode"],
+            "display_count": state["display_count"],
+            "focused_display": state["focused_display"],
+            "container_trees": state["container_trees"],
+            "constraint_overflow": state["constraint_overflow"],
+            "workspaces": state["workspaces"],
+            "workspace_switching": state["workspace_switching"],
+            "workspace_switch": state["workspace_switch"],
+            "parking_capability": state["parking_capability"],
+            "parking_capability_reason": state["parking_capability_reason"],
+            "revision": state["revision"],
+            "persistence_status": state["persistence_status"],
+            "persistence_reason": state["persistence_reason"],
+            "last_durable_revision": state["last_durable_revision"],
+            "undo_available": state["undo_available"],
+            "undo_command": state["undo_command"],
+            "undo_blocked_reason": state["undo_blocked_reason"],
+            "recovery": state["recovery"],
+            "recovery_required": state["recovery_required"],
+            "recovery_actions": state["recovery_actions"],
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&value).expect("JSON value serializes")
+        );
+        return;
+    }
+    println!("{}", format_status(&state));
 }
 
 /// Reports whether undo would work right now, and why not if it would not.
@@ -842,6 +912,176 @@ fn format_switching(state: &serde_json::Value) -> String {
         ));
     }
     lines.join("\n")
+}
+
+/// Renders the recovery section: what will not fix itself, and the
+/// command that fixes it.
+///
+/// Distinct from `format_conditions`, which names what is wrong. A
+/// condition can hold with nothing asked of the user, and a repair can be
+/// outstanding with no condition holding -- windows a *previous* session
+/// left parked are nobody's condition until someone puts them back.
+fn format_recovery_actions(state: &serde_json::Value) -> String {
+    let actions = state["recovery_actions"].as_array();
+    let Some(actions) = actions.filter(|actions| !actions.is_empty()) else {
+        return "recovery: nothing is waiting on you".to_owned();
+    };
+    let mut lines = vec![format!(
+        "recovery: {} repair(s) waiting on you",
+        actions.len()
+    )];
+    for action in actions {
+        let reason = action["reason"].as_str().unwrap_or("?");
+        let command = action["command"].as_str().unwrap_or("?");
+        let described = match reason {
+            "switch_degraded" => {
+                "a failed switch left windows unaccounted for; switching is blocked until they are reconciled"
+            }
+            "parking_restore_failed" => {
+                "a window could not be put back and is still parked off screen"
+            }
+            "startup_recovery_incomplete" => {
+                "a previous session left windows parked that startup could not verify and put back"
+            }
+            "persistence_degraded" => {
+                "nothing new is becoming durable, so parking and new undo entries are unavailable"
+            }
+            other => other,
+        };
+        lines.push(format!("  {described}"));
+        let windows: Vec<String> = action["windows"]
+            .as_array()
+            .map(|windows| {
+                windows
+                    .iter()
+                    .filter_map(|id| id.as_i64())
+                    .map(|id| id.to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !windows.is_empty() {
+            lines.push(format!("    windows: {}", windows.join(" ")));
+        }
+        lines.push(format!("    run: {command}"));
+    }
+    lines.join("\n")
+}
+
+/// Renders the whole status report (issue #63).
+///
+/// A pure function of the snapshot, like every other formatter here, so
+/// the wording is testable without an agent to talk to.
+fn format_status(state: &serde_json::Value) -> String {
+    let mut sections = Vec::new();
+
+    let mode = state["mode"].as_str().unwrap_or("unknown");
+    let mut agent = format!("agent: {mode}");
+    if let Some(condition) = format_conditions(state) {
+        agent.push_str(&format!("\n  {condition}"));
+    }
+    sections.push(agent);
+
+    let tiling_mode = state["tiling_mode"].as_str().unwrap_or("unknown");
+    let focused = match state["focused_display"].as_i64() {
+        Some(display) => format!("display {display}"),
+        None => "none".to_owned(),
+    };
+    sections.push(format!(
+        "tiling: {tiling_mode} mode, {} display(s), focused display {focused}",
+        state["display_count"].as_u64().unwrap_or(0)
+    ));
+
+    // Overflow is rolled up here rather than walked per tree: the question
+    // this report answers is whether anything is overflowing at all.
+    let overflow: Vec<String> = state["constraint_overflow"]
+        .as_array()
+        .map(|windows| {
+            windows
+                .iter()
+                .filter_map(|id| id.as_i64())
+                .map(|id| id.to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    sections.push(if overflow.is_empty() {
+        "constraint overflow: none".to_owned()
+    } else {
+        format!(
+            "constraint overflow: window(s) {} are visible and floating because the tree cannot fit them at minimum size",
+            overflow.join(" ")
+        )
+    });
+
+    let dormant: u64 = state["container_trees"]
+        .as_array()
+        .map(|trees| {
+            trees
+                .iter()
+                .map(|tree| {
+                    tree["dormant_positions"]
+                        .as_array()
+                        .map(|slots| slots.len() as u64)
+                        .unwrap_or(0)
+                })
+                .sum()
+        })
+        .unwrap_or(0)
+        + state["workspaces"]
+            .as_array()
+            .map(|workspaces| {
+                workspaces
+                    .iter()
+                    .map(|workspace| workspace["dormant_positions"].as_u64().unwrap_or(0))
+                    .sum::<u64>()
+            })
+            .unwrap_or(0);
+    sections.push(format!("dormant positions: {dormant}"));
+
+    sections.push(format_workspaces(state));
+    sections.push(format_switching(state));
+
+    // Parking capability is read from the top level rather than from the
+    // switching section, because the switching section is absent exactly
+    // when no profile requests switching -- and the capability still
+    // governs every other parking path.
+    let capability = state["parking_capability"].as_str().unwrap_or("unknown");
+    let mut parking = format!(
+        "parking capability: {capability} (emulated via public APIs; not native virtual desktops or Spaces)"
+    );
+    if let Some(reason) = state["parking_capability_reason"].as_str() {
+        parking.push_str(&format!("\n  refused: {reason}"));
+    }
+    sections.push(parking);
+
+    let durability = state["persistence_status"].as_str().unwrap_or("unknown");
+    let mut durable = format!(
+        "durability: {durability}, revision {} durable of {}",
+        state["last_durable_revision"].as_u64().unwrap_or(0),
+        state["revision"].as_u64().unwrap_or(0)
+    );
+    if let Some(reason) = state["persistence_reason"].as_str() {
+        durable.push_str(&format!("\n  reason: {reason}"));
+    }
+    sections.push(durable);
+
+    sections.push(
+        match (
+            state["undo_available"].as_bool().unwrap_or(false),
+            state["undo_command"].as_str(),
+            state["undo_blocked_reason"].as_str(),
+        ) {
+            (true, Some(command), _) => format!("undo: available, would reverse {command}"),
+            (true, None, _) => "undo: available".to_owned(),
+            (false, Some(command), Some(reason)) => {
+                format!("undo: unavailable ({reason}); {command} is retained to retry")
+            }
+            (false, Some(command), None) => format!("undo: unavailable; next would be {command}"),
+            (false, None, _) => "undo: nothing to undo".to_owned(),
+        },
+    );
+
+    sections.push(format_recovery_actions(state));
+    sections.join("\n")
 }
 
 /// Renders the workspace section of published state.
@@ -2071,5 +2311,217 @@ mod tests {
             "restored 1 of 3 parked window(s)\n  entry 1 window 101 (code.exe): restored\n  entry 2 window 102 (code.exe): left alone: the handle no longer names a window\n  entry 3 window 103 (code.exe): left alone: 2 entries claim this handle"
         );
         assert_eq!(format_recovery(&[]), "no parked windows to restore");
+    }
+
+    /// A snapshot of a healthy agent, in the shape `mosaix state --json`
+    /// publishes it. Tests override only the fields they are about.
+    fn healthy_status() -> serde_json::Value {
+        serde_json::json!({
+            "mode": "active",
+            "conditions": [],
+            "primary_condition": null,
+            "revision": 42,
+            "tiling_mode": "tree",
+            "display_count": 2,
+            "focused_display": 1,
+            "container_trees": [],
+            "constraint_overflow": [],
+            "workspaces": [],
+            "rule_workspace_refusals": [],
+            "workspace_switching": {
+                "status": "disabled",
+                "reason": null,
+                "profile_file": null,
+                "displayed": {},
+                "parking_capability": "verified",
+            },
+            "workspace_switch": {},
+            "recovery": {},
+            "parking_capability": "verified",
+            "parking_capability_reason": null,
+            "persistence_status": "healthy",
+            "persistence_reason": null,
+            "last_durable_revision": 42,
+            "undo_available": false,
+            "undo_command": null,
+            "undo_blocked_reason": null,
+            "recovery_required": false,
+            "recovery_actions": [],
+        })
+    }
+
+    #[test]
+    fn status_reports_every_fact_a_release_decision_rests_on() {
+        // Spec #45 names ten: tree mode, focused display, workspace pool,
+        // displayed assignments, dormant positions, overflow windows,
+        // durability revision, undo availability, parking capability, and
+        // recovery-required status. This asserts each one is rendered.
+        let mut state = healthy_status();
+        state["workspaces"] = serde_json::json!([
+            {
+                "name": "dev",
+                "origin": "configuration",
+                "displayed_on": 1,
+                "members": [11, 12],
+                "last_focused_window": 11,
+                "dormant_positions": 2,
+            },
+            {
+                "name": "chat",
+                "origin": "command",
+                "displayed_on": null,
+                "members": [],
+                "last_focused_window": null,
+                "dormant_positions": 0,
+            },
+        ]);
+        state["constraint_overflow"] = serde_json::json!([12]);
+        state["undo_available"] = serde_json::json!(true);
+        state["undo_command"] = serde_json::json!("swap-left");
+
+        let rendered = format_status(&state);
+
+        assert!(rendered.contains("tiling: tree mode"), "{rendered}");
+        assert!(rendered.contains("focused display display 1"), "{rendered}");
+        assert!(rendered.contains("dev: display 1"), "{rendered}");
+        assert!(rendered.contains("chat: hidden"), "{rendered}");
+        assert!(rendered.contains("dormant positions: 2"), "{rendered}");
+        assert!(
+            rendered.contains("constraint overflow: window(s) 12"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("revision 42 durable of 42"), "{rendered}");
+        assert!(
+            rendered.contains("undo: available, would reverse swap-left"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("parking capability: verified"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("recovery: nothing is waiting on you"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn status_never_calls_parking_a_native_virtual_desktop() {
+        // User story 97: the feature is described honestly wherever it is
+        // described at all.
+        let rendered = format_status(&healthy_status());
+
+        assert!(
+            rendered.contains("emulated via public APIs; not native virtual desktops or Spaces"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn a_refused_parking_site_is_reported_with_the_adapters_reason() {
+        let mut state = healthy_status();
+        state["parking_capability"] = serde_json::json!("refused");
+        state["parking_capability_reason"] =
+            serde_json::json!("no recoverable site beyond the virtual screen");
+
+        let rendered = format_status(&state);
+
+        assert!(
+            rendered.contains("refused: no recoverable site beyond the virtual screen"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn status_names_each_repair_and_the_command_that_performs_it() {
+        let mut state = healthy_status();
+        state["recovery_required"] = serde_json::json!(true);
+        state["recovery_actions"] = serde_json::json!([
+            {
+                "reason": "switch_degraded",
+                "windows": [41, 42],
+                "command": "mosaix workspace restore-switch",
+            },
+            {
+                "reason": "startup_recovery_incomplete",
+                "windows": [9],
+                "command": "mosaix restore-windows",
+            },
+        ]);
+
+        let rendered = format_recovery_actions(&state);
+
+        assert!(
+            rendered.starts_with("recovery: 2 repair(s) waiting on you"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("windows: 41 42"), "{rendered}");
+        assert!(
+            rendered.contains("run: mosaix workspace restore-switch"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("run: mosaix restore-windows"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn a_blocked_undo_says_the_transaction_is_kept_to_retry() {
+        let mut state = healthy_status();
+        state["undo_command"] = serde_json::json!("swap-left");
+        state["undo_blocked_reason"] = serde_json::json!("topology_changed");
+
+        let rendered = format_status(&state);
+
+        assert!(
+            rendered
+                .contains("undo: unavailable (topology_changed); swap-left is retained to retry"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn status_leads_with_the_condition_every_other_client_leads_with() {
+        let mut state = healthy_status();
+        state["mode"] = serde_json::json!("degraded");
+        state["conditions"] = serde_json::json!(["persistence_degraded", "degraded_tiling"]);
+        state["primary_condition"] = serde_json::json!("persistence_degraded");
+
+        let rendered = format_status(&state);
+
+        let first = rendered.lines().next().expect("a first line");
+        assert_eq!(first, "agent: degraded");
+        assert!(
+            rendered
+                .lines()
+                .nth(1)
+                .expect("a condition line")
+                .contains("persistence degraded:"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn status_renders_the_shape_a_healthy_agent_actually_sends() {
+        // The optional sections serialize as `null`, not as `{}`, when
+        // nothing is switching and nothing is parked. The fixture above
+        // uses `{}`, so this pins the real shape rather than a convenient
+        // one.
+        let mut state = healthy_status();
+        state["workspace_switch"] = serde_json::Value::Null;
+        state["recovery"] = serde_json::Value::Null;
+        state["workspace_switching"] = serde_json::Value::Null;
+
+        let rendered = format_status(&state);
+
+        assert!(
+            rendered.contains("recovery: nothing is waiting on you"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("parking capability: verified"),
+            "{rendered}"
+        );
     }
 }

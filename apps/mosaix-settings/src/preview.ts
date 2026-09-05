@@ -1,3 +1,4 @@
+import type { WorkspaceStatus } from "./workspace-status";
 // Static preview harness: mounts the real editor against fixture data so
 // the rendered UI can be inspected without a Tauri backend. Not shipped.
 import "./styles.css";
@@ -68,6 +69,28 @@ const savedLayouts: SavedLayoutList = {
   ],
 };
 
+const workspaceStatus: WorkspaceStatus = {
+  topologyFingerprint: "MON-A+MON-B",
+  switchingStatus: "experimental",
+  switchingReason: null,
+  profileFile: "office.toml",
+  mapping: [
+    { display: "MON-A", workspace: "dev" },
+    { display: "MON-B", workspace: "chat" },
+  ],
+  mappingComplete: true,
+  displayCount: 2,
+  parkingCapability: "verified",
+  parkingCapabilityReason: null,
+  workspaces: [
+    { name: "dev", origin: "configuration", displayedOn: 1, memberCount: 3 },
+    { name: "chat", origin: "command", displayedOn: null, memberCount: 0 },
+  ],
+  recoveryRequired: false,
+  recoveryActions: [],
+  parkedWindows: [],
+}
+
 const clone = <T,>(value: T): T => structuredClone(value);
 
 const bridge: DesktopBridge = {
@@ -88,6 +111,9 @@ const bridge: DesktopBridge = {
   setAppearance: async () => undefined,
   loadAutomaticTilingSettings: async () => clone(tilingSettings),
   saveAutomaticTilingSettings: async (settings) => ({ ...settings, matchedProfile: true }),
+  loadWorkspaceStatus: async () => clone(workspaceStatus),
+  restoreParkedWindows: async () => ({ answer: { restored: [] } }),
+  restoreWorkspaceSwitch: async () => ({ answer: { reconciled: [] } }),
 };
 
 const root = document.querySelector<HTMLElement>("#app")!;

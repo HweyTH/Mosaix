@@ -4,7 +4,8 @@ use tauri::State;
 
 use crate::editor::{
     Appearance, BindingWriteReceipt, CommandReceipt, EditorSession, EditorSnapshot, HotkeyList,
-    HotkeyProbeResult, LayoutDraft, LayoutWriteReceipt, SavedLayoutList,
+    HotkeyProbeResult, LayoutDraft, LayoutWriteReceipt, RepairReceipt, SavedLayoutList,
+    WorkspaceStatusView,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -302,4 +303,36 @@ mod tests {
         );
         assert!(parse_color("#123456").is_err());
     }
+}
+
+/// The experimental switching surface: activation, mapping, capability,
+/// and what repair is outstanding (issue #63).
+#[tauri::command]
+pub fn load_workspace_status(state: State<'_, EditorState>) -> Result<WorkspaceStatusView, String> {
+    let mut session = state.0.lock().map_err(|_| "editor state is unavailable")?;
+    session
+        .workspace_status()
+        .map_err(|error| error.to_string())
+}
+
+/// Puts back every window this agent session parked.
+///
+/// The agent performs the repair; this reports what it confirms. There is
+/// no path here that touches the recovery ledger or the state database.
+#[tauri::command]
+pub fn restore_parked_windows(state: State<'_, EditorState>) -> Result<RepairReceipt, String> {
+    let mut session = state.0.lock().map_err(|_| "editor state is unavailable")?;
+    session
+        .restore_parked_windows()
+        .map_err(|error| error.to_string())
+}
+
+/// Reconciles the windows a failed switch left unaccounted for, which is
+/// the only way out of the workspace-switch-degraded condition.
+#[tauri::command]
+pub fn restore_workspace_switch(state: State<'_, EditorState>) -> Result<RepairReceipt, String> {
+    let mut session = state.0.lock().map_err(|_| "editor state is unavailable")?;
+    session
+        .restore_workspace_switch()
+        .map_err(|error| error.to_string())
 }

@@ -53,7 +53,10 @@ mod tests {
                 bounds_str,
                 format!("{:?}", w.lifecycle),
                 w.minimum_size
-                    .map_or("(unknown)".to_owned(), |size| format!("{}x{}", size.width, size.height)),
+                    .map_or("(unknown)".to_owned(), |size| format!(
+                        "{}x{}",
+                        size.width, size.height
+                    )),
             );
         }
         println!();
