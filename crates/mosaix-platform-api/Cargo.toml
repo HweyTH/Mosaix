@@ -7,5 +7,6 @@ license.workspace = true
 
 [dependencies]
 mosaix-domain = { path = "../mosaix-domain" }
+serde = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
