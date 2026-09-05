@@ -19,3 +19,8 @@ core-foundation = "0.10"
 libc = "0.2"
 cocoa-foundation = "0.2"
 objc2 = "0.6"
+
+[dev-dependencies]
+libc = "0.2"
+tracing-subscriber = { workspace = true }
+mosaix-platform-api = { path = "../mosaix-platform-api" }
