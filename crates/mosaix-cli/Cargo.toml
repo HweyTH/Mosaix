@@ -18,3 +18,6 @@ serde_json = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 mosaix-platform-windows = { path = "../mosaix-platform-windows" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+mosaix-platform-macos = { path = "../mosaix-platform-macos" }

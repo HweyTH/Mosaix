@@ -476,7 +476,7 @@ fn format_arrangement(state: &serde_json::Value) -> String {
     rendered
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn report_arrangement(json: bool) {
     let Some(state) = published_persistence() else {
         eprintln!("mosaix: no agent is running");
@@ -504,7 +504,7 @@ fn report_arrangement(json: bool) {
 /// Reads the agent's published state rather than asking undo to preflight,
 /// because the agent already computed the same verdict there -- and because
 /// a dry run must not be able to move a window by accident.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn report_undo_availability(json: bool) {
     let Some(state) = published_persistence() else {
         eprintln!("mosaix: no agent is running, so there is nothing to undo");
@@ -599,7 +599,7 @@ fn format_swap(result: &mosaix_domain::DirectionalSwapResult) -> String {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn run_swap(request: mosaix_ipc::IpcRequest, json: bool) {
     use mosaix_ipc::{send_request, IpcResponse};
 
@@ -895,7 +895,7 @@ fn format_workspaces(state: &serde_json::Value) -> String {
     lines.join("\n")
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn run_workspace(action: WorkspaceAction) {
     use mosaix_ipc::{send_request, IpcRequest, IpcResponse};
 
@@ -1003,7 +1003,7 @@ fn run_workspace(action: WorkspaceAction) {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn run_park_window(window: isize, json: bool) {
     use mosaix_ipc::{send_request, IpcRequest, IpcResponse};
 
@@ -1058,7 +1058,7 @@ fn run_park_window(window: isize, json: bool) {
 /// carried no data all end the process the same way wherever they
 /// happen, so every command that wants a payload asks through here
 /// rather than restating twenty lines of matching.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn agent_answer(request: mosaix_ipc::IpcRequest) -> serde_json::Value {
     use mosaix_ipc::{send_request, IpcResponse};
 
@@ -1089,7 +1089,7 @@ fn agent_answer(request: mosaix_ipc::IpcRequest) -> serde_json::Value {
 /// Exits non-zero when nothing was reconciled, so a script can tell "the
 /// condition is cleared" from "there was nothing to clear" without
 /// parsing prose.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn run_restore_switch(json: bool) {
     let data = agent_answer(mosaix_ipc::IpcRequest::RestoreWorkspaceSwitch);
     let result: mosaix_domain::WorkspaceSwitchRestoreResult =
@@ -1134,7 +1134,7 @@ fn run_restore_switch(json: bool) {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn run_restore_parked(json: bool) {
     let data = agent_answer(mosaix_ipc::IpcRequest::RestoreParkedWindows);
     if json {
@@ -1181,7 +1181,7 @@ fn format_remove_position(result: &mosaix_domain::RemovePositionResult) -> Strin
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn run_remove_position(display: isize, position: u64, json: bool) {
     use mosaix_ipc::{send_request, IpcRequest, IpcResponse};
 
@@ -1229,7 +1229,7 @@ fn run_remove_position(display: isize, position: u64, json: bool) {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn run_resize(direction: ResizeDirection, json: bool) {
     use mosaix_ipc::{send_request, IpcRequest, IpcResponse};
 
@@ -1280,7 +1280,7 @@ fn run_resize(direction: ResizeDirection, json: bool) {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn run_undo(json: bool) {
     use mosaix_domain::undo::{UndoRefusal, UndoResult};
     use mosaix_ipc::{send_request, IpcRequest, IpcResponse};
@@ -1395,7 +1395,7 @@ fn run_undo(json: bool) {
 
 /// The scored candidates a refusal has to show, whichever shape the
 /// outcome took.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn match_candidates(outcome: &mosaix_domain::MatchOutcome) -> &[mosaix_domain::ScoredCandidate] {
     use mosaix_domain::MatchOutcome;
 
@@ -1409,7 +1409,7 @@ fn match_candidates(outcome: &mosaix_domain::MatchOutcome) -> &[mosaix_domain::S
 /// The agent's published view of durability, or `None` when no agent
 /// answered. "No agent" and "an agent that cannot reach its database" are
 /// different situations and only the first is safe to reset blindly.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn published_persistence() -> Option<serde_json::Value> {
     use mosaix_ipc::{send_request, IpcRequest, IpcResponse};
 
@@ -1457,7 +1457,7 @@ fn format_recovery(outcomes: &[mosaix_domain::RecoveryOutcome]) -> String {
     lines.join("\n")
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn run_restore_windows(force: bool, json: bool) {
     use mosaix_ipc::{send_request, IpcRequest, IpcResponse};
 
@@ -1481,17 +1481,20 @@ fn run_restore_windows(force: bool, json: bool) {
             std::process::exit(2);
         }
     };
+    // The two closures are the whole platform surface of out-of-process
+    // recovery: what a recorded handle names now, and how a verified
+    // window is put back. Each adapter answers both through public API.
+    #[cfg(target_os = "macos")]
+    use mosaix_platform_macos as platform;
+    #[cfg(windows)]
+    use mosaix_platform_windows as platform;
+
     let outcomes = match mosaix_persistence::recover_parked_windows(
         &mut ledger,
-        |handle| {
-            mosaix_platform_windows::probe_handle(mosaix_platform_windows::WindowHandle(handle))
-        },
+        |handle| platform::probe_handle(platform::WindowHandle(handle)),
         |entry| {
-            mosaix_platform_windows::restore_window(
-                mosaix_platform_windows::WindowHandle(entry.draft.native_handle),
-                entry,
-            )
-            .map_err(|error| error.to_string())
+            platform::restore_window(platform::WindowHandle(entry.draft.native_handle), entry)
+                .map_err(|error| error.to_string())
         },
     ) {
         Ok(outcomes) => outcomes,
@@ -1515,7 +1518,7 @@ fn run_restore_windows(force: bool, json: bool) {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn run_persistence(action: PersistenceAction) {
     match action {
         PersistenceAction::Status { json } => {

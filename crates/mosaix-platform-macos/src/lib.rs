@@ -23,6 +23,10 @@ pub mod menubar;
 #[cfg(target_os = "macos")]
 pub mod overlay;
 #[cfg(target_os = "macos")]
+pub mod parking;
+#[cfg(target_os = "macos")]
+pub mod recovery;
+#[cfg(target_os = "macos")]
 pub mod shutdown;
 
 #[cfg(target_os = "macos")]
@@ -35,12 +39,23 @@ pub use enumeration::enumerate_windows;
 pub use events::{start_event_hooks, EventHooks, RawEvent, WindowHandle};
 #[cfg(target_os = "macos")]
 pub use hotkeys::{
-    start_hotkeys, HotkeyBinding, HotkeyFired, HotkeyRegistrationResult, HotkeyRegistrations,
+    key_code_for, modifier_mask, probe_hotkey, start_hotkeys, HotkeyAvailability, HotkeyBinding,
+    HotkeyFired, HotkeyRegistrationResult, HotkeyRegistrations,
 };
 #[cfg(target_os = "macos")]
 pub use menubar::{start_menu_bar, MenuBarEvent, MenuBarHandle};
 #[cfg(target_os = "macos")]
 pub use overlay::{start_preview_overlay, PreviewOverlay};
+#[cfg(target_os = "macos")]
+pub use parking::{
+    find_parking_site, foreground, is_parked, park_window, parking_capability, show_state,
+    verify_parking_site, ParkedAs, ParkingEdge, ParkingSite, ParkingSiteRefusal,
+};
+#[cfg(target_os = "macos")]
+pub use recovery::{
+    frontmost_window_id, is_same_window, probe_handle, process_creation_time, resolve_window,
+    restore_window, window_owner_pid, window_placement, window_server_info, WindowServerInfo,
+};
 #[cfg(target_os = "macos")]
 pub use shutdown::register_shutdown_signal;
 
@@ -51,6 +66,15 @@ pub enum MacosError {
     AccessibilityPermissionDenied,
     #[error("Accessibility API error: {0}")]
     Accessibility(i32),
+    #[error("no window is addressable for Core Graphics window {0}")]
+    WindowNotResolvable(u32),
+    #[error(
+        "Core Graphics window {window_id} matches {candidates} Accessibility windows, so it \
+         cannot be identified safely"
+    )]
+    AmbiguousWindow { window_id: u32, candidates: usize },
+    #[error("the window did not leave every display after being parked")]
+    ParkingNotEffective,
     #[error("Core Graphics error: {0}")]
     CoreGraphics(String),
     #[error("failed to start platform event loop")]
