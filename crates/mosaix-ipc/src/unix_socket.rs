@@ -1,9 +1,9 @@
 //! User-private Unix-domain socket transport for macOS.
-use crate::handler::handle_request;
+use crate::handler::{handle_request, ConfigStore, HotkeyProbe};
 use crate::protocol::{wrap_response, IpcEnvelope, IpcPayload, IpcResponse, PROTOCOL_VERSION};
 use mosaix_engine::{EventSender, StateReader};
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -23,7 +23,16 @@ pub struct IpcServer {
     path: PathBuf,
 }
 impl IpcServer {
-    pub fn start(events: EventSender, state: StateReader) -> std::io::Result<Self> {
+    /// `config` is what a request that changes configuration is performed
+    /// through, and `hotkeys` is what a combination-availability probe asks.
+    /// Both are shared across client threads, so both are behind an `Arc`,
+    /// matching the Windows named-pipe server's contract.
+    pub fn start(
+        events: EventSender,
+        state: StateReader,
+        config: Arc<dyn ConfigStore>,
+        hotkeys: Arc<dyn HotkeyProbe>,
+    ) -> std::io::Result<Self> {
         let path = socket_path();
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
@@ -40,7 +49,9 @@ impl IpcServer {
             .spawn(move || {
                 while !flag.load(Ordering::SeqCst) {
                     match listener.accept() {
-                        Ok((stream, _)) => serve(stream, &events, &state),
+                        Ok((stream, _)) => {
+                            serve(stream, &events, &state, config.as_ref(), hotkeys.as_ref())
+                        }
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                             thread::sleep(std::time::Duration::from_millis(25))
                         }
@@ -65,7 +76,13 @@ impl IpcServer {
         let _ = fs::remove_file(self.path);
     }
 }
-fn serve(stream: UnixStream, events: &EventSender, state: &StateReader) {
+fn serve(
+    stream: UnixStream,
+    events: &EventSender,
+    state: &StateReader,
+    config: &dyn ConfigStore,
+    hotkeys: &dyn HotkeyProbe,
+) {
     let mut reader = BufReader::new(stream);
     let mut bytes = Vec::new();
     if reader
@@ -84,7 +101,7 @@ fn serve(stream: UnixStream, events: &EventSender, state: &StateReader) {
         Ok(IpcEnvelope {
             payload: IpcPayload::Request(request),
             ..
-        }) => handle_request(&request, events, state),
+        }) => handle_request(&request, events, state, config, hotkeys),
         Ok(_) => IpcResponse::Error {
             message: "expected an IPC request".into(),
         },

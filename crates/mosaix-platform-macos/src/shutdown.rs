@@ -12,9 +12,13 @@ pub fn register_shutdown_signal() -> Result<Receiver<()>> {
     SHUTDOWN_SENDER
         .set(tx)
         .map_err(|_| MacosError::ShutdownHandlerAlreadyRegistered)?;
+    // Casting a function item straight to `usize` is a lint the compiler
+    // is right about: it goes through a data pointer, which is the only
+    // cast guaranteed to preserve the address.
+    let handler = signal_handler as *const () as usize;
     unsafe {
-        libc::signal(libc::SIGINT, signal_handler as usize);
-        libc::signal(libc::SIGTERM, signal_handler as usize);
+        libc::signal(libc::SIGINT, handler);
+        libc::signal(libc::SIGTERM, handler);
     }
     Ok(rx)
 }

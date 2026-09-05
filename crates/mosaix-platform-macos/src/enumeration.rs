@@ -2,8 +2,7 @@
 //! Accessibility boundary is used as the permission/capability authority.
 
 use mosaix_domain::{
-    ApplicationId, DisplayId, Rect, Window, WindowCapabilities, WindowId, WindowLifecycle,
-    WindowRole,
+    ApplicationId, DisplayId, Rect, Size, Window, WindowCapabilities, WindowId, WindowLifecycle,
 };
 
 use crate::{accessibility::ApplicationElement, classify_role, flip_y, is_blocked_bundle_id};
@@ -20,6 +19,13 @@ pub struct WindowCandidate {
     pub bounds: Rect,
     pub layer: i32,
     pub is_on_screen: bool,
+    /// Whether the owning process refuses Accessibility control.
+    ///
+    /// macOS has no UIPI, so this is not an integrity-level comparison as it
+    /// is on Windows. It carries the same *consequence* across the seam --
+    /// the window is observable but ineligible for placement -- which is what
+    /// the planner reads the flag for.
+    pub refuses_accessibility: bool,
 }
 
 /// Applies the policy portion of the macOS manageability chain.
@@ -61,7 +67,13 @@ pub fn build_window_info(candidate: WindowCandidate, primary_display_height: i32
             can_minimize: true,
             can_maximize: true,
         },
+        elevated: candidate.refuses_accessibility,
         lifecycle: WindowLifecycle::Active,
+        // The Accessibility API exposes no minimum-size attribute, and the
+        // domain treats `None` as "unknown, no constraint beyond positive
+        // area -- never a guess". Reporting a fabricated floor here would
+        // make the planner float windows that in fact fit.
+        minimum_size: None::<Size>,
     }
 }
 

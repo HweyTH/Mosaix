@@ -278,6 +278,7 @@ pub fn foreground_window_handle() -> Option<WindowHandle> {
 /// used by the placement executor to distinguish "the window is elevated and
 /// UIPI blocks us" from other failure modes when `SetWindowPos` returns an
 /// error.
+#[cfg(windows)]
 pub fn is_window_elevated(handle: WindowHandle) -> bool {
     let hwnd = HWND::from(handle);
     let pid = win32_helpers::get_process_id(hwnd);
