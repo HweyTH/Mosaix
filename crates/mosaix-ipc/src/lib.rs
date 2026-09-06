@@ -18,8 +18,8 @@ pub use client_unix::{send_request, IpcError};
 pub use handler::{
     handle_request, CaptureHold, ConfigError, ConfigStore, ContainerTreeSnapshot,
     DormantPositionSnapshot, HotkeyBindingSnapshot, HotkeyProbe, HotkeyVerdict,
-    LayoutSourceSnapshot, ProbeOutcome, StateSnapshot, UnavailableConfigStore,
-    UnavailableHotkeyProbe,
+    LayoutSourceSnapshot, ProbeOutcome, RecoveryActionSnapshot, StateSnapshot,
+    UnavailableConfigStore, UnavailableHotkeyProbe, WorkspaceSnapshot, WorkspaceSwitchingSnapshot,
 };
 #[cfg(windows)]
 pub use pipe::{pipe_name, IpcServer, PIPE_NAME_PREFIX};

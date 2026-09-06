@@ -76,6 +76,20 @@ pub trait AgentTransport: Send + std::fmt::Debug {
     /// Asks the agent to change a binding, returning the configuration
     /// file the write landed in and the combination now in effect.
     fn edit_binding(&mut self, edit: BindingEdit) -> Result<(String, Option<String>), AgentError>;
+
+    /// Asks the agent to put back every window this session parked,
+    /// through the verified restore path (issue #63).
+    ///
+    /// This and the reconcile below are the settings surface's two repair
+    /// actions. Both are ordinary agent requests: the settings
+    /// application never touches the recovery ledger or the state
+    /// database itself, exactly as it never writes a configuration file.
+    fn restore_parked_windows(&mut self) -> Result<serde_json::Value, AgentError>;
+
+    /// Asks the agent to reconcile the windows a failed switch left
+    /// unaccounted for, which is the only way out of the
+    /// workspace-switch-degraded condition.
+    fn restore_workspace_switch(&mut self) -> Result<serde_json::Value, AgentError>;
 }
 
 /// The transport this build talks to a real agent through.
@@ -127,6 +141,14 @@ impl AgentTransport for UnsupportedPlatform {
     }
 
     fn edit_binding(&mut self, _edit: BindingEdit) -> Result<(String, Option<String>), AgentError> {
+        Err(AgentError::Unavailable)
+    }
+
+    fn restore_parked_windows(&mut self) -> Result<serde_json::Value, AgentError> {
+        Err(AgentError::Unavailable)
+    }
+
+    fn restore_workspace_switch(&mut self) -> Result<serde_json::Value, AgentError> {
         Err(AgentError::Unavailable)
     }
 }
@@ -317,6 +339,18 @@ mod windows_transport {
                     detail: format!("could not read the agent's state: {error}"),
                 }
             })
+        }
+
+        fn restore_parked_windows(&mut self) -> Result<serde_json::Value, AgentError> {
+            Ok(self
+                .confirmed(IpcRequest::RestoreParkedWindows)?
+                .unwrap_or(serde_json::Value::Null))
+        }
+
+        fn restore_workspace_switch(&mut self) -> Result<serde_json::Value, AgentError> {
+            Ok(self
+                .confirmed(IpcRequest::RestoreWorkspaceSwitch)?
+                .unwrap_or(serde_json::Value::Null))
         }
     }
 

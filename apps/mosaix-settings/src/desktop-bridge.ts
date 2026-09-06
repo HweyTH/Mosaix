@@ -111,5 +111,11 @@ export function createTauriDesktopBridge(
       invokeCommand("load_automatic_tiling_settings") as ReturnType<DesktopBridge["loadAutomaticTilingSettings"]>,
     saveAutomaticTilingSettings: (settings) =>
       invokeCommand("save_automatic_tiling_settings", { settings }) as ReturnType<DesktopBridge["saveAutomaticTilingSettings"]>,
+    loadWorkspaceStatus: () =>
+      invokeCommand("load_workspace_status") as ReturnType<DesktopBridge["loadWorkspaceStatus"]>,
+    restoreParkedWindows: () =>
+      invokeCommand("restore_parked_windows") as ReturnType<DesktopBridge["restoreParkedWindows"]>,
+    restoreWorkspaceSwitch: () =>
+      invokeCommand("restore_workspace_switch") as ReturnType<DesktopBridge["restoreWorkspaceSwitch"]>,
   };
 }

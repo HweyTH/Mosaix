@@ -36,9 +36,22 @@ A cross-platform window tiling application for Windows 11 and macOS.
   zone layouts, and for asking the agent to apply one.
 - **Failure containment** -- placement rejection detection with a per-window
   circuit breaker, elevated-window skipping, and degraded-tiling diagnostics.
+- **Logical workspaces (experimental switching)** -- named groups of managed
+  windows, one shown per monitor. Switching between them is **emulated through
+  public-API window parking**, not Windows Virtual Desktops or macOS Spaces:
+  a hidden workspace's windows are moved beyond the edge of the virtual screen
+  and moved back, with the way back written to a recovery ledger first. It is
+  activated only by a matched topology profile, and stays experimental until it
+  passes its live matrix on both platforms. Read
+  [the limitations](docs/experimental-workspace-switching.md) before relying on
+  it.
+- **Status and recovery** -- `mosaix status` reports tree mode, focused display,
+  the workspace pool, constraint overflow, durability, undo availability,
+  parking capability, and any repair waiting on you, with the command that
+  performs it.
 
-Not yet built: the macOS adapter, workspaces, hotkey editing in the settings
-app, and saving a drafted layout back to configuration.
+Not yet built: hotkey editing in the settings app, and saving a drafted layout
+back to configuration.
 
 ## Installation
 

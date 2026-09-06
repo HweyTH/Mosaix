@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 use mosaix_config::{BindingEdit, Command, KeyCombo, LayoutEdit};
 use mosaix_domain::NormalizedRect;
 
+use mosaix_ipc::WorkspaceSwitchingSnapshot as SwitchingSnapshot;
+
 use crate::agent::{self, AgentError, AgentTransport};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -165,6 +167,79 @@ pub struct BindingWriteReceipt {
     /// The combination the binding now resolves to, absent when the edit
     /// left the command unbound.
     pub combo: Option<String>,
+}
+
+/// The experimental switching surface, as the settings window shows it
+/// (issue #63).
+///
+/// Deliberately read-only apart from the two repair actions. Activation
+/// is profile-only (ADR 0028, spec #45 user story 71), so there is no
+/// switch here to flip: showing one would imply the settings window could
+/// enable an experiment that only a matched topology profile can.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceStatusView {
+    pub topology_fingerprint: String,
+    /// `disabled`, `requested`, `unavailable`, or `experimental`.
+    pub switching_status: String,
+    pub switching_reason: Option<String>,
+    /// The profile file requesting it, when one does. Its presence is
+    /// what makes profile-only activation visible rather than asserted.
+    pub profile_file: Option<String>,
+    pub mapping: Vec<WorkspaceMappingView>,
+    /// Whether the mapping names a workspace for every connected display.
+    pub mapping_complete: bool,
+    pub display_count: usize,
+    /// `unverified`, `verified`, or `refused`.
+    pub parking_capability: String,
+    pub parking_capability_reason: Option<String>,
+    pub workspaces: Vec<WorkspaceView>,
+    pub recovery_required: bool,
+    pub recovery_actions: Vec<RecoveryActionView>,
+    pub parked_windows: Vec<isize>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceMappingView {
+    pub display: String,
+    pub workspace: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceView {
+    pub name: String,
+    pub origin: String,
+    pub displayed_on: Option<isize>,
+    pub member_count: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoveryActionView {
+    pub reason: String,
+    pub windows: Vec<isize>,
+    pub command: String,
+}
+
+/// What a repair action did, in the agent's own account of it.
+///
+/// The agent answers both repairs with a typed result, and this carries
+/// that result through unchanged rather than interpreting it: the
+/// settings window reports what the agent confirms (ADR 0022's rule for
+/// configuration, applied to repairs for the same reason).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RepairReceipt {
+    /// The agent's typed answer, verbatim.
+    pub answer: serde_json::Value,
+}
+
+impl RepairReceipt {
+    fn from_answer(answer: serde_json::Value) -> Self {
+        Self { answer }
+    }
 }
 
 /// Every binding in effect, plus the topology they are in effect for.
@@ -430,6 +505,88 @@ impl EditorSession {
                 })
                 .collect(),
         })
+    }
+
+    /// The experimental switching surface: how it is activated, the
+    /// mapping the matched profile declares, whether parking is
+    /// authorised, and what repair is waiting on a person (issue #63).
+    ///
+    /// Read through the agent, like every other view here. The settings
+    /// application never opens the state database or the recovery ledger:
+    /// the agent owns both, and a second reader would be reporting a file
+    /// rather than what is running.
+    pub fn workspace_status(&mut self) -> Result<WorkspaceStatusView, EditorCommandError> {
+        let state = self.agent.state().map_err(EditorCommandError::from)?;
+        let switching = state.workspace_switching.unwrap_or(SwitchingSnapshot {
+            status: "disabled".to_owned(),
+            reason: None,
+            profile_file: None,
+            displayed: Default::default(),
+            parking_capability: state.parking_capability.clone(),
+        });
+        // A mapping is complete only when it names every connected
+        // display. The engine has already decided this -- an incomplete
+        // mapping is why `status` is `unavailable` -- so this reports its
+        // verdict rather than recomputing one that could disagree.
+        let mapping_complete =
+            switching.displayed.len() == state.display_count && switching.status != "unavailable";
+        Ok(WorkspaceStatusView {
+            topology_fingerprint: state.topology_fingerprint,
+            switching_status: switching.status,
+            switching_reason: switching.reason,
+            profile_file: switching.profile_file,
+            mapping: switching
+                .displayed
+                .into_iter()
+                .map(|(display, workspace)| WorkspaceMappingView { display, workspace })
+                .collect(),
+            mapping_complete,
+            display_count: state.display_count,
+            parking_capability: state.parking_capability,
+            parking_capability_reason: state.parking_capability_reason,
+            workspaces: state
+                .workspaces
+                .into_iter()
+                .map(|workspace| WorkspaceView {
+                    name: workspace.name,
+                    origin: workspace.origin,
+                    displayed_on: workspace.displayed_on,
+                    member_count: workspace.members.len(),
+                })
+                .collect(),
+            recovery_required: state.recovery_required,
+            recovery_actions: state
+                .recovery_actions
+                .into_iter()
+                .map(|action| RecoveryActionView {
+                    reason: action.reason,
+                    windows: action.windows,
+                    command: action.command,
+                })
+                .collect(),
+            parked_windows: state
+                .recovery
+                .map(|recovery| recovery.parked_windows)
+                .unwrap_or_default(),
+        })
+    }
+
+    /// Puts back every window this agent session parked.
+    pub fn restore_parked_windows(&mut self) -> Result<RepairReceipt, EditorCommandError> {
+        let answer = self
+            .agent
+            .restore_parked_windows()
+            .map_err(EditorCommandError::from)?;
+        Ok(RepairReceipt::from_answer(answer))
+    }
+
+    /// Reconciles the windows a failed switch left unaccounted for.
+    pub fn restore_workspace_switch(&mut self) -> Result<RepairReceipt, EditorCommandError> {
+        let answer = self
+            .agent
+            .restore_workspace_switch()
+            .map_err(EditorCommandError::from)?;
+        Ok(RepairReceipt::from_answer(answer))
     }
 
     /// Asks the agent whether `combo` can be bound to `for_command`.
@@ -746,6 +903,8 @@ mod tests {
         binding_edits: Arc<Mutex<Vec<BindingEdit>>>,
         binding_outcome: Option<Result<(String, Option<String>), AgentError>>,
         probe_answer: Option<serde_json::Value>,
+        repairs: Arc<Mutex<Vec<String>>>,
+        repair_answer: Option<serde_json::Value>,
     }
 
     impl FakeAgent {
@@ -840,6 +999,22 @@ mod tests {
         fn end_hotkey_capture(&mut self) -> Result<(), AgentError> {
             self.capture.lock().unwrap().push(false);
             Ok(())
+        }
+
+        fn restore_parked_windows(&mut self) -> Result<serde_json::Value, AgentError> {
+            self.repairs
+                .lock()
+                .unwrap()
+                .push("restore_parked_windows".to_owned());
+            self.repair_answer.clone().ok_or(AgentError::Unavailable)
+        }
+
+        fn restore_workspace_switch(&mut self) -> Result<serde_json::Value, AgentError> {
+            self.repairs
+                .lock()
+                .unwrap()
+                .push("restore_workspace_switch".to_owned());
+            self.repair_answer.clone().ok_or(AgentError::Unavailable)
         }
     }
 
@@ -1546,5 +1721,157 @@ mod tests {
         let list = session.hotkeys().expect("the agent answered");
 
         assert_eq!(list.base_file, "config.toml");
+    }
+
+    /// A state snapshot describing an experimental switching setup.
+    fn switching_state() -> StateSnapshot {
+        let mut state = mosaix_engine::EngineState::default();
+        state.parking_capability = mosaix_domain::ParkingCapability::Verified;
+        let mut snapshot = StateSnapshot::from(state);
+        snapshot.topology_fingerprint = "MON-A+MON-B".to_owned();
+        snapshot.display_count = 2;
+        snapshot.workspace_switching = Some(mosaix_ipc::WorkspaceSwitchingSnapshot {
+            status: "experimental".to_owned(),
+            reason: None,
+            profile_file: Some("office.toml".to_owned()),
+            displayed: [
+                ("MON-A".to_owned(), "dev".to_owned()),
+                ("MON-B".to_owned(), "chat".to_owned()),
+            ]
+            .into_iter()
+            .collect(),
+            parking_capability: "verified".to_owned(),
+        });
+        snapshot
+    }
+
+    #[test]
+    fn workspace_status_names_the_profile_that_activates_switching() {
+        // Activation is profile-only, so the surface has to show *which*
+        // profile asks for it rather than offering a control of its own.
+        let mut session = EditorSession::with_agent(
+            Box::new(FakeAgent::reporting(Ok(switching_state()))),
+            vec![nominal_display()],
+        );
+
+        let status = session.workspace_status().expect("a status");
+
+        assert_eq!(status.switching_status, "experimental");
+        assert_eq!(status.profile_file.as_deref(), Some("office.toml"));
+    }
+
+    #[test]
+    fn workspace_status_reports_a_mapping_that_covers_every_display_as_complete() {
+        let mut session = EditorSession::with_agent(
+            Box::new(FakeAgent::reporting(Ok(switching_state()))),
+            vec![nominal_display()],
+        );
+
+        let status = session.workspace_status().expect("a status");
+
+        assert!(status.mapping_complete);
+        assert_eq!(status.display_count, 2);
+        let mut mapped: Vec<(String, String)> = status
+            .mapping
+            .into_iter()
+            .map(|entry| (entry.display, entry.workspace))
+            .collect();
+        mapped.sort();
+        assert_eq!(
+            mapped,
+            vec![
+                ("MON-A".to_owned(), "dev".to_owned()),
+                ("MON-B".to_owned(), "chat".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_mapping_missing_a_display_is_not_reported_complete() {
+        let mut state = switching_state();
+        state.display_count = 3;
+
+        let mut session = EditorSession::with_agent(
+            Box::new(FakeAgent::reporting(Ok(state))),
+            vec![nominal_display()],
+        );
+
+        let status = session.workspace_status().expect("a status");
+
+        assert!(
+            !status.mapping_complete,
+            "two mapped displays out of three connected is incomplete"
+        );
+    }
+
+    #[test]
+    fn workspace_status_carries_the_reason_a_parking_site_was_refused() {
+        let mut engine = mosaix_engine::EngineState::default();
+        engine.parking_capability = mosaix_domain::ParkingCapability::Refused {
+            reason: "no recoverable site beyond the virtual screen".to_owned(),
+        };
+        let mut session = EditorSession::with_agent(
+            Box::new(FakeAgent::reporting(Ok(StateSnapshot::from(engine)))),
+            vec![nominal_display()],
+        );
+
+        let status = session.workspace_status().expect("a status");
+
+        assert_eq!(status.parking_capability, "refused");
+        assert_eq!(
+            status.parking_capability_reason.as_deref(),
+            Some("no recoverable site beyond the virtual screen"),
+        );
+    }
+
+    #[test]
+    fn workspace_status_lists_the_repair_waiting_on_the_user() {
+        let mut engine = mosaix_engine::EngineState::default();
+        engine.switch_degraded = Some(mosaix_domain::WorkspaceSwitchDegraded {
+            display_id: mosaix_domain::DisplayId(1),
+            target: mosaix_domain::WorkspaceName::new("chat").unwrap(),
+            outgoing: None,
+            stranded_windows: vec![mosaix_domain::WindowId(41)],
+            reason: "the window would not come back".to_owned(),
+        });
+        let mut session = EditorSession::with_agent(
+            Box::new(FakeAgent::reporting(Ok(StateSnapshot::from(engine)))),
+            vec![nominal_display()],
+        );
+
+        let status = session.workspace_status().expect("a status");
+
+        assert!(status.recovery_required);
+        assert_eq!(status.recovery_actions.len(), 1);
+        assert_eq!(status.recovery_actions[0].reason, "switch_degraded");
+        assert_eq!(status.recovery_actions[0].windows, vec![41]);
+    }
+
+    #[test]
+    fn a_repair_asks_the_agent_and_reports_only_what_it_answered() {
+        let answer = serde_json::json!({ "restored": [41, 42] });
+        let agent = FakeAgent {
+            repair_answer: Some(answer.clone()),
+            ..FakeAgent::default()
+        };
+        let asked = Arc::clone(&agent.repairs);
+        let mut session = EditorSession::with_agent(Box::new(agent), vec![nominal_display()]);
+
+        let receipt = session.restore_workspace_switch().expect("a receipt");
+
+        assert_eq!(receipt.answer, answer);
+        assert_eq!(
+            asked.lock().unwrap().as_slice(),
+            ["restore_workspace_switch"],
+            "the agent performs the repair; the settings window only asks"
+        );
+    }
+
+    #[test]
+    fn a_repair_the_agent_could_not_confirm_is_an_error_not_a_claim() {
+        let mut session =
+            EditorSession::with_agent(Box::new(FakeAgent::never_asked()), vec![nominal_display()]);
+
+        assert!(session.restore_parked_windows().is_err());
     }
 }

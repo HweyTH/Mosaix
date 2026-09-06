@@ -1,3 +1,4 @@
+import type { WorkspaceStatus } from "./workspace-status";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
@@ -90,8 +91,33 @@ const savedLayouts: SavedLayoutList = {
   ],
 };
 
+const workspaceStatus: WorkspaceStatus = {
+  topologyFingerprint: "MON-A+MON-B",
+  switchingStatus: "experimental",
+  switchingReason: null,
+  profileFile: "office.toml",
+  mapping: [
+    { display: "MON-A", workspace: "dev" },
+    { display: "MON-B", workspace: "chat" },
+  ],
+  mappingComplete: true,
+  displayCount: 2,
+  parkingCapability: "verified",
+  parkingCapabilityReason: null,
+  workspaces: [
+    { name: "dev", origin: "configuration", displayedOn: 1, memberCount: 3 },
+    { name: "chat", origin: "command", displayedOn: null, memberCount: 0 },
+  ],
+  recoveryRequired: false,
+  recoveryActions: [],
+  parkedWindows: [],
+}
+
 function bridge(): DesktopBridge {
   return {
+    loadWorkspaceStatus: vi.fn().mockResolvedValue(structuredClone(workspaceStatus)),
+    restoreParkedWindows: vi.fn().mockResolvedValue({ answer: { restored: [] } }),
+    restoreWorkspaceSwitch: vi.fn().mockResolvedValue({ answer: { reconciled: [] } }),
     loadEditorSnapshot: vi.fn().mockResolvedValue(structuredClone(snapshot)),
     loadHotkeyBindings: vi.fn().mockResolvedValue(structuredClone(hotkeys)),
     startHotkeyCapture: vi.fn().mockResolvedValue(undefined),
