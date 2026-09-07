@@ -1,64 +1,139 @@
-![Mosaix -- tiling window management for Windows 11 and macOS](./assets/mosaix-banner.svg)
+![Mosaix -- tiling window management for Windows 11](./assets/mosaix-banner.svg)
 
-![Rust](https://img.shields.io/badge/Rust-000000?style=flat-square&logo=rust&logoColor=white) ![Tauri](https://img.shields.io/badge/Tauri_2-24C8DB?style=flat-square&logo=tauri&logoColor=white) ![TypeScript](https://img.shields.io/badge/TypeScript-007ACC?style=flat-square&logo=typescript&logoColor=white) ![Windows 11](https://img.shields.io/badge/Windows_11-supported-0078D6?style=flat-square&logo=windows&logoColor=white) ![macOS](https://img.shields.io/badge/macOS-planned-6E6E6E?style=flat-square&logo=apple&logoColor=white) ![License MIT](https://img.shields.io/badge/License-MIT-green?style=flat-square)
+# Mosaix
 
-A cross-platform window tiling application for Windows 11 and macOS.
+A keyboard-driven tiling window manager for Windows 11.
 
-## Features
+[Installation](#installation) · [Keybindings](#default-keybindings) · [Configuration](#configuration) · [CLI](#cli) · [Documentation](#documentation) · [Contributing](#contributing)
 
-- **Zone snapping with cycling** -- `Ctrl+Alt+Arrow` snaps the focused window to
-  a half zone; repeating a horizontal snap cycles half -> third -> two-thirds.
-- **Automatic tiling** -- a deterministic, aspect-aware balanced grid, opted into
-  per display topology, with runtime toggle, suspension, and `rearrange` recovery.
-- **Directional focus and swap** -- `Ctrl+Alt+H/J/K/L` moves focus across the
-  grid; add `Shift` to swap two windows' places.
-- **Multi-monitor handling** -- windows migrate off a disconnected display to
-  the nearest survivor, and topology is re-read across sleep, wake, and hotplug.
-- **Per-topology profiles** -- `profiles/*.toml` overlays matched by display
-  fingerprint, falling through to base config field by field.
-- **TOML config with hot reload** -- debounced, whole-directory atomic
-  validation; invalid edits keep the last known-good config instead of applying.
-- **Window rules** -- built-in dialog and tool-window floats plus user rules,
-  resolved by ordered precedence with a traceable explanation per window.
-- **Snap preview overlay** -- a click-through preview that flashes the committed
-  placement after a hotkey, and shows the target zone during an edge drag.
-- **Focus border** -- a click-through outline around the focused window while
-  automatic tiling is live, with configurable color and thickness.
-- **Tray and CLI control** -- pause/resume, open config folder, and quit from the
-  tray; the `mosaix` CLI drives every command over versioned named-pipe IPC,
-  including `mosaix state --json`.
-- **Saved layouts** -- named sets of normalized cells declared under
-  `[layouts]`, applied to the focused window's display with
-  `mosaix layout apply <name>` or a hotkey bound under
-  `[hotkeys.apply-layout]`. Gaps apply as they do to the grid; surplus cells
-  are left empty and surplus windows are reported rather than dropped.
-- **Visual layout editor** -- a Tauri 2 settings app for drafting and previewing
-  zone layouts, and for asking the agent to apply one.
-- **Failure containment** -- placement rejection detection with a per-window
-  circuit breaker, elevated-window skipping, and degraded-tiling diagnostics.
-- **Logical workspaces (experimental switching)** -- named groups of managed
-  windows, one shown per monitor. Switching between them is **emulated through
-  public-API window parking**, not Windows Virtual Desktops or macOS Spaces:
-  a hidden workspace's windows are moved beyond the edge of the virtual screen
-  and moved back, with the way back written to a recovery ledger first. It is
-  activated only by a matched topology profile, and stays experimental until it
-  passes its live matrix on both platforms. Read
-  [the limitations](docs/experimental-workspace-switching.md) before relying on
-  it.
+## Key features
+
+- **Zone snapping with cycling** -- snap the focused window to a half zone;
+  repeating a horizontal snap cycles half → third → two-thirds.
+- **Automatic tiling** -- a deterministic, aspect-aware balanced grid, opted
+  into per display topology, with a runtime toggle and `rearrange` recovery.
+- **Directional focus, swap, and resize** -- move focus across the grid, swap
+  two windows' places, or move the nearest divider, all from the home row.
+- **Per-topology profiles** -- sparse overlays matched by display fingerprint,
+  falling through to base config field by field, re-read across sleep, wake,
+  and hotplug.
+- **Logical workspaces** -- named groups of managed windows, one shown per
+  monitor, switched by hotkey or CLI. Experimental; see [Status](#status).
+- **Saved layouts** -- named sets of normalized cells, applied by hotkey or
+  CLI, drawn and edited in a visual editor.
+- **Hot-reloaded TOML config** -- whole-directory atomic validation; an invalid
+  edit keeps the last known-good configuration rather than applying.
+- **Settings app** -- a Tauri 2 desktop app for drafting layouts, editing
+  hotkeys by pressing them, and tuning tiling, each write naming the file it
+  lands in.
+- **Tray and CLI control** -- pause, resume, and quit from the tray; the
+  `mosaix` CLI drives every command over versioned named-pipe IPC.
 - **Status and recovery** -- `mosaix status` reports tree mode, focused display,
   the workspace pool, constraint overflow, durability, undo availability,
   parking capability, and any repair waiting on you, with the command that
   performs it.
 
-Not yet built: hotkey editing in the settings app, and saving a drafted layout
-back to configuration.
+## Status
+
+Pre-release. Windows 11 only, and there are no binary releases yet -- see
+[Installation](#installation).
+
+- The **macOS adapter is not implemented**; `mosaix-platform-macos` is a stub.
+  The name "cross-platform" describes the architecture, not today's build.
+- **Workspace switching is experimental** and off unless a matched profile
+  declares a mapping; `mosaix workspace switching` reports its state. It is
+  emulated through public-API window parking, not Windows Virtual Desktops --
+  read [the limitations](docs/experimental-workspace-switching.md) before
+  relying on it.
+- **Restoring a layout to particular windows** is not supported: a saved
+  layout stores zone geometry only, and restoring fills its cells with
+  whatever managed windows exist, in visual order.
 
 ## Installation
 
-There are no binary releases yet -- build from source.
+There are no binary releases yet. Build from source -- see
+[Building from source](#building-from-source).
 
-**Prerequisites:** Windows 11, a stable Rust toolchain (MSVC), and Node.js with
-npm for the settings app.
+On first run the agent writes a default configuration to
+`%APPDATA%\Mosaix\config\config.toml` and adds a tray icon.
+
+## Default keybindings
+
+Every binding below is a default that configuration can override, either by
+editing `config.toml` or by pressing a new combination in the settings app.
+
+| Keys | Command |
+| --- | --- |
+| `Ctrl+Alt+←` / `→` / `↑` / `↓` | Snap the focused window to a half zone; repeat to cycle |
+| `Ctrl+Alt+H` / `J` / `K` / `L` | Move focus left / down / up / right |
+| `Ctrl+Alt+Shift+H` / `J` / `K` / `L` | Swap the focused window with its neighbour |
+| `Ctrl+Alt+Shift+←` / `→` / `↑` / `↓` | Resize by moving the nearest divider |
+| `Ctrl+Alt+T` | Toggle automatic tiling for this topology |
+| `Ctrl+Alt+Space` | Float or unfloat the focused window |
+| `Ctrl+Alt+R` | Rearrange -- recover the grid after manual moves |
+| `Ctrl+Alt+P` | Pause and resume window management |
+
+## Configuration
+
+Configuration lives in `%APPDATA%\Mosaix\config\`: a `config.toml` base, plus
+sparse `profiles/*.toml` overlays matched by display topology. Edits are
+hot-reloaded, and the whole directory is validated as a unit -- an invalid
+edit is rejected and the last known-good configuration stays in effect.
+
+```toml
+version = 1
+workspaces = ["main"]
+
+[hotkeys]
+snap-left = "ctrl+alt+left"
+snap-right = "ctrl+alt+right"
+
+[hotkeys.apply-layout]
+writing = "ctrl+alt+1"
+
+[gaps]
+outer = 8
+inner = 4
+
+[focus_border]
+enabled = true
+thickness = 2
+
+[[layouts.writing.cells]]
+x = 0.0
+y = 0.0
+width = 0.62
+height = 1.0
+```
+
+## CLI
+
+The `mosaix` CLI drives a running agent over a versioned named pipe.
+
+```powershell
+mosaix snap left-half          # snap the focused window
+mosaix layout apply writing    # apply a saved layout
+mosaix arrangement             # report the tiling arrangement and container trees
+mosaix undo                    # reverse the newest placement command
+mosaix state --json            # the full agent state, for scripts and bug reports
+```
+
+Run `mosaix --help` for the complete command set, including workspaces,
+persistence, and recovery.
+
+## Documentation
+
+| Document | What it covers |
+| --- | --- |
+| [`ARCHITECTURE.md`](./ARCHITECTURE.md) | Logical architecture, repository structure, testing strategy, explicit non-goals |
+| [`CONTEXT.md`](./CONTEXT.md) | The domain glossary -- zone, profile, resolved config, balanced grid, and the rest |
+| [`docs/architecture-decisions/`](./docs/architecture-decisions/) | Architecture decision records: what was decided, what was rejected, and why |
+| [`docs/research/`](./docs/research/) | Cited research behind the decisions |
+
+## Building from source
+
+**Prerequisites:** Windows 11, a stable Rust toolchain (MSVC), and Node.js
+with npm for the settings app.
 
 ```powershell
 git clone https://github.com/HweyTH/Mosaix.git
@@ -66,8 +141,7 @@ cd Mosaix
 cargo build --release
 ```
 
-Start the background agent. On first run it writes a default config to
-`%APPDATA%\Mosaix\config\config.toml` and adds a tray icon:
+Start the background agent:
 
 ```powershell
 .\target\release\mosaix-agent.exe
@@ -88,8 +162,16 @@ npm install
 npm run tauri dev
 ```
 
-Run the test suite with `cargo test --workspace`.
+Run the test suite with `cargo test --workspace`, and the settings app's own
+with `npm test` in `apps/mosaix-settings`.
+
+## Contributing
+
+Issues and pull requests are welcome. Match the conventions already in the
+repository: one logical change per commit, Conventional Commit messages, and a
+failing test before a bug fix. Decisions that are hard to reverse belong in an
+ADR under [`docs/architecture-decisions/`](./docs/architecture-decisions/).
 
 ## License
 
-MIT
+[MIT](./LICENSE)
