@@ -1,4 +1,4 @@
-//! Recoverable window parking: the platform-neutral half (ADR 0023, ADR 0029).
+//! Recoverable window parking: the platform-neutral half.
 //!
 //! A parked window is moved to a *parking site*: a position outside every
 //! connected display, beyond one edge of the virtual screen, so that no
@@ -124,8 +124,7 @@ impl ParkingSite {
 }
 
 /// Why no recoverable parking site exists for this topology. Nothing is
-/// parked on a refusal, and no other hiding mechanism is tried instead
-/// (ADR 0023).
+/// parked on a refusal, and no other hiding mechanism is tried instead.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ParkingSiteRefusal {
     /// There is no display to be beyond the edge of.
@@ -331,10 +330,10 @@ mod tests {
 
     #[test]
     fn a_site_validated_for_one_topology_is_stale_for_the_next() {
-        // Issue #61: a display connected beyond the chosen edge would put
-        // parked windows back in view. This is why the site is re-planned
-        // on every topology change rather than carried over, and why it
-        // is stamped with the topology it was validated for.
+        // A display connected beyond the chosen edge would put parked
+        // windows back in view. This is why the site is re-planned on
+        // every topology change rather than carried over, and why it is
+        // stamped with the topology it was validated for.
         let before = [display(1, Rect::new(0, 0, 1920, 1080), true)];
         let first = plan_parking_sites(&before).expect("one display leaves every edge free");
         assert_eq!(first[0].edge, ParkingEdge::Right);

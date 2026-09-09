@@ -1,10 +1,10 @@
 //! TOML schema types for base config (`config.toml`) and profile overlays
 //! (`profiles/*.toml`), plus the merged [`ResolvedConfig`] shape they
-//! produce (CONTEXT.md "Base config"/"Profile"/"Resolved config").
+//! produce.
 //!
 //! Base config is the only place `version` is stamped -- a profile has no
 //! version of its own, it's an overlay validated against whatever base
-//! config it's paired with (ADR 0004).
+//! config it's paired with.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -15,26 +15,26 @@ use mosaix_domain::{Gaps, NormalizedRect, WorkspaceName};
 
 /// The base config file's name, and the name validation errors and
 /// provenance use to refer to it. Base config is one fixed file, unlike a
-/// profile, whose filename is whatever the user called it (ADR 0004).
+/// profile, whose filename is whatever the user called it.
 pub const BASE_CONFIG_FILE_NAME: &str = "config.toml";
 
-/// The `version` value this build of `mosaix-config` understands. Any other
-/// value (including a missing field, which fails to parse rather than
-/// defaulting) is a validation error -- no lenient guessing (ADR 0007).
+/// The `version` value this build of `mosaix-config` understands. Any
+/// other value (including a missing field, which fails to parse rather
+/// than defaulting) is a validation error -- no lenient guessing.
 pub const CURRENT_VERSION: u32 = 1;
 
 /// A command a hotkey can be bound to. Defined here rather than in
-/// `mosaix-engine` (ADR 0005: `mosaix-config` has no dependency back on
-/// `mosaix-engine`, only the reverse), so the four zone-snap variants
-/// mirror [`mosaix_engine::ZoneSnapDirection`] rather than reusing it.
+/// `mosaix-engine`, which `mosaix-config` deliberately does not depend on,
+/// so the four zone-snap variants mirror
+/// [`mosaix_engine::ZoneSnapDirection`] rather than reusing it.
 ///
 /// Sixteen unit verbs, plus one that carries a payload. A saved layout is
 /// named by the user, so a binding to one has to name a string the schema
 /// cannot know in advance, and [`Command::ApplyLayout`] is where that
-/// string lives (ADR 0019). Bindings stay a single keyspace:
-/// `ApplyLayout { name: "writing" }` and `ApplyLayout { name: "code" }`
-/// are two distinct keys of one `BTreeMap`, so merge, diff, and
-/// duplicate-binding detection keep operating on one set.
+/// string lives. Bindings stay a single keyspace: `ApplyLayout { name:
+/// "writing" }` and `ApplyLayout { name: "code" }` are two distinct keys
+/// of one `BTreeMap`, so merge, diff, and duplicate-binding detection keep
+/// operating on one set.
 ///
 /// Deliberately not `Copy`: the payload owns a `String`.
 ///
@@ -61,7 +61,7 @@ pub enum Command {
     SwapUp,
     SwapDown,
     /// Move the nearest container-tree divider facing that way by five
-    /// percentage points (CONTEXT.md "Tree resize").
+    /// percentage points.
     ResizeLeft,
     ResizeRight,
     ResizeUp,
@@ -75,11 +75,10 @@ pub enum Command {
     ApplyLayout {
         name: String,
     },
-    /// Display the logical workspace called `name` on the focused
-    /// display, or focus it where it is already displayed (CONTEXT.md
-    /// "Workspace focus"). The second parameterized command, written the
-    /// same way as `apply-layout`: `[hotkeys.focus-workspace]` with one
-    /// entry per workspace name.
+    /// Display the logical workspace called `name` on the focused display,
+    /// or focus it where it is already displayed. The second parameterized
+    /// command, written the same way as `apply-layout`:
+    /// `[hotkeys.focus-workspace]` with one entry per workspace name.
     FocusWorkspace {
         name: String,
     },
@@ -200,7 +199,7 @@ impl fmt::Display for Command {
 }
 
 /// Reads and writes a `[hotkeys]` table: one map holding both flat unit
-/// bindings and the nested `apply-layout` table (ADR 0019).
+/// bindings and the nested `apply-layout` table.
 ///
 /// ```toml
 /// [hotkeys]
@@ -210,12 +209,11 @@ impl fmt::Display for Command {
 /// writing = "ctrl+alt+1"
 /// ```
 ///
-/// Written by hand rather than derived because the two value shapes --
-/// a combo string for a unit verb, a table of layout-name-to-combo for
-/// the parameterized one -- cannot both come out of one derived map. The
+/// Written by hand rather than derived because the two value shapes -- a
+/// combo string for a unit verb, a table of layout-name-to-combo for the
+/// parameterized one -- cannot both come out of one derived map. The
 /// payoff is that an unrecognized verb is still a deserialization error,
-/// so TOML attaches the file and line to it, which is the error quality
-/// ADR 0019 exists to protect.
+/// so TOML attaches the file and line to it.
 pub(crate) mod hotkey_bindings {
     use std::collections::BTreeMap;
     use std::fmt;
@@ -443,15 +441,15 @@ impl<'de> Deserialize<'de> for KeyCombo {
 }
 
 /// The `[behavior]` table. Empty-but-valid today -- no behavior flags are
-/// implemented yet (adding one means adding the engine concept it controls
-/// first, out of this ticket's scope). `deny_unknown_fields` so a typo'd or
-/// speculative flag name is rejected rather than silently ignored.
+/// implemented yet, since adding one means adding the engine concept it
+/// controls first. `deny_unknown_fields` so a typo'd or speculative flag
+/// name is rejected rather than silently ignored.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BehaviorSection {}
 
 /// Automatic-tiling activation is intentionally available only to a
-/// topology profile (ADR 0010), never base config.
+/// topology profile, never base config.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AutomaticTilingSection {
@@ -463,10 +461,9 @@ pub struct AutomaticTilingSection {
     pub mode: TilingMode,
 }
 
-/// A profile's request for experimental workspace switching (ADR 0023,
-/// ADR 0028). Only a topology profile may carry it: base config applies
-/// to every unmatched topology, and parking must never activate merely
-/// because a user docked.
+/// A profile's request for experimental workspace switching. Only a
+/// topology profile may carry it: base config applies to every unmatched
+/// topology, and parking must never activate merely because a user docked.
 ///
 /// ```toml
 /// [workspace_switching]
@@ -501,7 +498,7 @@ pub struct ResolvedWorkspaceSwitching {
     pub displayed: BTreeMap<String, WorkspaceName>,
 }
 
-/// How automatic tiling arranges a display's windows (ADR 0023).
+/// How automatic tiling arranges a display's windows.
 ///
 /// The first tree release deliberately offers one tree policy. Stack,
 /// monocle, and the rest stay out of this enum until they exist, so a
@@ -573,9 +570,9 @@ pub struct FocusBorderOverride {
     pub thickness: Option<u16>,
 }
 
-/// A saved layout: shape only, never window identity (ADR 0018).
-/// Applying one lays its `cells` over a display's work area and fills them
-/// with whichever managed windows are there, in visual window order.
+/// A saved layout: shape only, never window identity. Applying one lays
+/// its `cells` over a display's work area and fills them with whichever
+/// managed windows are there, in visual window order.
 ///
 /// Cells are [`NormalizedRect`]s -- fractions of a display's work area,
 /// the same form zones already use, and the form that type's own docs call
@@ -585,7 +582,7 @@ pub struct FocusBorderOverride {
 ///
 /// A table rather than a bare cell list so the array-of-tables spelling
 /// (`[[layouts.writing.cells]]`) is available to a hand-editing user, and
-/// so later tickets have somewhere to put per-layout settings.
+/// so per-layout settings have somewhere to go.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SavedLayout {
@@ -593,18 +590,17 @@ pub struct SavedLayout {
     pub cells: Vec<NormalizedRect>,
 }
 
-/// Base config: `config.toml`'s full schema (CONTEXT.md "Base config").
-/// Applies whenever the current display topology matches no saved profile.
+/// Base config: `config.toml`'s full schema. Applies whenever the current
+/// display topology matches no saved profile.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BaseConfig {
     pub version: u32,
-    /// The logical workspaces this configuration declares (CONTEXT.md
-    /// "Logical workspace"). Configuration is one of the two ways a
-    /// workspace comes to exist (ADR 0028), and this is the declaration.
-    /// Omitted means one workspace called `main`, so a configuration file
-    /// written before workspaces existed keeps one workspace per display
-    /// it can fill.
+    /// The logical workspaces this configuration declares. Configuration
+    /// is one of the two ways a workspace comes to exist, and this is the
+    /// declaration. Omitted means one workspace called `main`, so a
+    /// configuration file written before workspaces existed keeps one
+    /// workspace per display it can fill.
     ///
     /// A scalar array, so it sits with `version` ahead of every table.
     #[serde(default = "default_workspaces")]
@@ -630,9 +626,9 @@ pub struct BaseConfig {
 }
 
 /// A sparse `outer`/`inner` override, letting a profile override just one
-/// of `Gaps`'s two fields while inheriting the other from base config
-/// (field-level merge, ADR 0004 -- applied down to `Gaps`'s own leaf
-/// fields, not just whole sections).
+/// of `Gaps`'s two fields while inheriting the other from base config. The
+/// field-level merge reaches `Gaps`'s own leaf fields, not just whole
+/// sections.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GapsOverride {
@@ -640,11 +636,11 @@ pub struct GapsOverride {
     pub inner: Option<i32>,
 }
 
-/// A profile overlay: a file under `profiles/` (CONTEXT.md "Profile"). All
-/// fields are optional except `fingerprint`, the match key compared
-/// against `mosaix_domain::topology_fingerprint()`'s current output (ADR
-/// 0004) -- never the filename. Any field a profile doesn't set falls
-/// through to base config when merged ([`crate::merge`]).
+/// A profile overlay: a file under `profiles/`. All fields are optional
+/// except `fingerprint`, the match key compared against
+/// `mosaix_domain::topology_fingerprint()`'s current output -- never the
+/// filename. Any field a profile doesn't set falls through to base config
+/// when merged ([`crate::merge`]).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProfileConfig {
@@ -666,9 +662,9 @@ pub struct ProfileConfig {
     /// A sparse saved-layout override. A layout the profile declares
     /// replaces base config's layout of that name; a layout it does not
     /// mention falls through to base config, the same field-level merge
-    /// every other profile field gets (ADR 0004). There is no way to
-    /// *remove* a base layout from a profile, matching the rest of the
-    /// overlay: a profile adds and overrides, it never subtracts.
+    /// every other profile field gets. There is no way to *remove* a base
+    /// layout from a profile, matching the rest of the overlay: a profile
+    /// adds and overrides, it never subtracts.
     ///
     /// Serialized last, and skipped entirely when empty, for the reason
     /// base config's `layouts` is serialized last -- TOML puts every table
@@ -697,13 +693,13 @@ pub const DEFAULT_WORKSPACE_NAME: &str = "main";
 /// A merge result reads the same whichever file supplied it, so this is
 /// the only record of where a value originated -- and the settings
 /// application needs it, because a binding edited there is written to the
-/// layer that currently supplies it (ADR 0022). Whenever a profile is
-/// matched, the value on screen and the file that would receive a write
-/// are different objects, and the user has to be told which.
+/// layer that currently supplies it. Whenever a profile is matched, the
+/// value on screen and the file that would receive a write are different
+/// objects, and the user has to be told which.
 ///
 /// Carries no filename: profiles are matched by fingerprint, never by
-/// filename (ADR 0004), so the file is a fact `validate` knows and `merge`
-/// does not. It is recorded once per resolved config, in
+/// filename, so the file is a fact `validate` knows and `merge` does not.
+/// It is recorded once per resolved config, in
 /// [`ResolvedConfig::profile_file`], rather than repeated per binding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -728,10 +724,9 @@ pub fn layout_names_collide(first: &str, second: &str) -> bool {
     first.to_lowercase() == second.to_lowercase()
 }
 
-/// The merged result of base config plus (optionally) one profile
-/// (CONTEXT.md "Resolved config") -- the actual settings in effect for one
-/// topology. What [`crate::merge`] produces and what
-/// `Event::ConfigChanged` (ADR 0005) will eventually carry into
+/// The merged result of base config plus (optionally) one profile -- the
+/// actual settings in effect for one topology. What [`crate::merge`]
+/// produces and what `Event::ConfigChanged` will eventually carry into
 /// `EngineState`.
 ///
 /// Derives `Default` (empty hotkeys, default `Gaps`, empty `[behavior]`) so
@@ -772,30 +767,30 @@ pub struct ResolvedConfig {
     /// every one with its origin would fan a UI concern out into all of
     /// them. Bindings got this first (#38) because that was all the hotkey
     /// list needed; showing a layout write's destination before the save
-    /// is what needs it here (ADR 0022).
+    /// is what needs it here.
     pub layout_sources: BTreeMap<String, ConfigLayer>,
     /// The profile file this config was merged from, or `None` when base
     /// config alone supplies it. Set by [`crate::validate`], which is
     /// where a filename is known; [`crate::merge`] leaves it `None`
     /// because a profile is matched by fingerprint and does not carry the
-    /// name of the file it was read from (ADR 0004).
+    /// name of the file it was read from.
     pub profile_file: Option<String>,
 }
 
 /// One profile's resolved settings, paired with the `fingerprint` it's
-/// matched against. Runtime profile selection (ticket 03/04's job, not
-/// this crate's `validate`) picks among these by comparing
-/// `topology_fingerprint()` to `fingerprint`, falling back to
-/// [`ResolvedConfigSet::base`] when nothing matches.
+/// matched against. Runtime profile selection, which happens outside this
+/// crate, picks among these by comparing `topology_fingerprint()` to
+/// `fingerprint`, falling back to [`ResolvedConfigSet::base`] when nothing
+/// matches.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedProfile {
     pub fingerprint: String,
     pub config: ResolvedConfig,
 }
 
-/// The full result of validating one config directory (ADR 0007): base
-/// config resolved on its own, plus every profile resolved against that
-/// same base. Each entry already passed its own duplicate-binding check
+/// The full result of validating one config directory: base config
+/// resolved on its own, plus every profile resolved against that same
+/// base. Each entry already passed its own duplicate-binding check
 /// ([`crate::validate`]) -- selecting among them by topology is the only
 /// step left to the caller.
 ///

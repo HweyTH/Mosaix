@@ -226,7 +226,7 @@ fn handle_client(
     // A settings application that is killed rather than closed never sends
     // capture-end; the operating system closing this pipe handle is what
     // breaks the read loop below, and releasing the hold there is what
-    // brings the hotkeys back without an agent restart (ADR 0021).
+    // brings the hotkeys back without an agent restart.
     let mut capture = CaptureHold::default();
     loop {
         let mut bytes = Vec::with_capacity(1024);

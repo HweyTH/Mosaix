@@ -1,25 +1,22 @@
 //! Coordinate system: logical/physical DPI conversion, normalized-fraction
-//! zones, and the deterministic edge-allocation algorithm (architecture doc
-//! section 10, "Geometry and coordinate rules").
+//! zones, and the deterministic edge-allocation algorithm.
 //!
-//! Three coordinate spaces appear in the architecture doc:
+//! Three coordinate spaces appear:
 //!
-//! - **Physical pixels** ([`Rect`], already used by [`Display`](crate::Display)):
-//!   raw device pixels as a platform adapter observes them (e.g. Win32
-//!   monitor/window rects under Per-Monitor DPI Awareness V2).
+//! - **Physical pixels** ([`Rect`], already used by
+//!   [`Display`](crate::Display)): raw device pixels as a platform adapter
+//!   observes them (e.g. Win32 monitor/window rects under Per-Monitor DPI
+//!   Awareness V2).
 //! - **Logical coordinates** ([`LogicalRect`]): the 96-DPI-baseline space
-//!   the doc says core/layout logic should operate in. `Display.full_bounds`/
-//!   `work_area` are still physical `Rect`s as populated by the Windows
-//!   adapter today -- routing them through `LogicalRect` is follow-up work
-//!   for whichever layer first needs DPI-independent math; only the
-//!   conversion itself lives here.
+//!   core and layout logic operate in. `Display.full_bounds`/`work_area`
+//!   are still physical `Rect`s as the Windows adapter populates them;
+//!   only the conversion itself lives here.
 //! - **Normalized fractions** ([`NormalizedRect`]): the persisted-zone
 //!   format, fractions of a reference rect's width/height.
 //!
 //! Every conversion here rounds *edges*, never width/height independently,
-//! and [`allocate_edges`] extends that to N-way splits. This is the "one
-//! deterministic edge-allocation algorithm" the doc requires so adjacent
-//! tiles neither overlap nor leave cumulative gaps.
+//! and [`allocate_edges`] extends that to N-way splits, so adjacent tiles
+//! neither overlap nor leave cumulative gaps.
 
 use serde::{Deserialize, Serialize};
 
@@ -32,9 +29,9 @@ fn round_half_away_from_zero(value: f64) -> i32 {
     value.round() as i32
 }
 
-/// A rectangle in logical (DPI-independent, 96-DPI-baseline) coordinates --
-/// the space the architecture doc says core and layout logic operate in.
-/// Only platform adapters convert to/from physical pixels.
+/// A rectangle in logical (DPI-independent, 96-DPI-baseline) coordinates
+/// -- the space core and layout logic operate in. Only platform adapters
+/// convert to/from physical pixels.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LogicalRect {
     pub x: f64,
@@ -80,9 +77,9 @@ impl Rect {
 }
 
 /// A rectangle as fractions (normally 0.0-1.0) of a reference rect's
-/// width/height -- the persisted-zone format from architecture doc section
-/// 10, e.g. `{ "x": 0.0, "y": 0.0, "width": 0.5, "height": 1.0 }` for the
-/// left half of a display's work area.
+/// width/height -- the persisted-zone format, e.g. `{ "x": 0.0, "y": 0.0,
+/// "width": 0.5, "height": 1.0 }` for the left half of a display's work
+/// area.
 ///
 /// Being the persisted form, this is the type a saved layout's cells are
 /// written and read as (`mosaix_config::SavedLayout`), the same way
@@ -103,12 +100,13 @@ impl NormalizedRect {
     /// width/height independently (see module docs).
     ///
     /// Safe to use independently for a set of zones meant to share an edge
+    /// Safe to use independently for a set of zones meant to share an edge
     /// as long as the shared boundary is the same fraction value each time
     /// (e.g. two halves both using the literal `0.5` boundary) -- rounding
     /// the same value the same way always agrees. When the boundaries come
     /// from relative weights instead of a literal shared fraction (an even
-    /// N-way split, or the container weights from architecture doc section
-    /// 7.3), compute them once with [`allocate_edges`] instead.
+    /// N-way split, or container weights), compute them once with
+    /// [`allocate_edges`] instead.
     pub fn to_rect(&self, container: Rect) -> Rect {
         debug_assert!(
             container.width > 0 && container.height > 0,
@@ -145,18 +143,16 @@ impl NormalizedRect {
 
 /// Splits `total` (pixels, physical or logical) into `weights.len()`
 /// contiguous, non-overlapping segments proportional to `weights` (which
-/// need not sum to 1 -- they're normalized by their sum, like the container
-/// weights in architecture doc section 7.3), returning each segment's
-/// `[start, end)` pixel range in order.
+/// need not sum to 1 -- they're normalized by their sum, like container
+/// weights), returning each segment's `[start, end)` pixel range in order.
 ///
-/// This is the "one deterministic edge-allocation algorithm" architecture
-/// doc section 10 requires: boundaries are rounded from *cumulative*
-/// weight, so `segments[i].1 == segments[i + 1].0` always holds exactly,
-/// and the final boundary is pinned to `total`. Rounding error lands as at
-/// most one pixel of width difference between segments, never as a gap or
-/// overlap between them -- rounding each segment's width independently
-/// (the naive approach) does not have this guarantee: three equal thirds
-/// of a 100px span each round to 33px, one pixel short of 100.
+/// Boundaries are rounded from *cumulative* weight, so `segments[i].1 ==
+/// segments[i + 1].0` always holds exactly, and the final boundary is
+/// pinned to `total`. Rounding error lands as at most one pixel of width
+/// difference between segments, never as a gap or overlap between them --
+/// rounding each segment's width independently (the naive approach) does
+/// not have this guarantee: three equal thirds of a 100px span each round
+/// to 33px, one pixel short of 100.
 pub fn allocate_edges(total: i32, weights: &[f64]) -> Vec<(i32, i32)> {
     if weights.is_empty() {
         return Vec::new();

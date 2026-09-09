@@ -59,7 +59,7 @@ pub enum IpcRequest {
     SwapUp,
     SwapDown,
     /// Move the nearest container-tree divider facing that way by five
-    /// percentage points (CONTEXT.md "Tree resize"). Answered with a typed
+    /// percentage points. Answered with a typed
     /// [`mosaix_domain::TreeResizeResult`] either way: a refusal is data
     /// the caller can inspect, not a transport error. Hence
     /// [`PROTOCOL_VERSION`] 10.
@@ -68,9 +68,9 @@ pub enum IpcRequest {
     ResizeUp,
     ResizeDown,
     /// Delete the dormant slot numbered `position` from `display_id`'s
-    /// container tree (CONTEXT.md "Dormant tree leaf"). Positions are the
-    /// numbers the state snapshot reports for each tree. Answered with a
-    /// typed [`mosaix_domain::RemovePositionResult`] either way, hence
+    /// container tree. Positions are the numbers the state snapshot
+    /// reports for each tree. Answered with a typed
+    /// [`mosaix_domain::RemovePositionResult`] either way, hence
     /// [`PROTOCOL_VERSION`] 11.
     RemoveTreePosition {
         display_id: isize,
@@ -81,10 +81,9 @@ pub enum IpcRequest {
     FocusDisplay {
         display_id: isize,
     },
-    /// Create a hidden, empty logical workspace (CONTEXT.md "Logical
-    /// workspace", ADR 0028). This and the three below are answered with
-    /// a typed [`mosaix_domain::WorkspaceCommandResult`] either way, so a
-    /// refusal is data the caller can inspect. Hence
+    /// Create a hidden, empty logical workspace. This and the three below
+    /// are answered with a typed [`mosaix_domain::WorkspaceCommandResult`]
+    /// either way, so a refusal is data the caller can inspect. Hence
     /// [`PROTOCOL_VERSION`] 12.
     CreateWorkspace {
         name: String,
@@ -94,8 +93,8 @@ pub enum IpcRequest {
         name: String,
     },
     /// Display a hidden workspace on the focused display, or focus the
-    /// last-focused window of one already displayed elsewhere (CONTEXT.md
-    /// "Workspace focus"). Never moves a displayed workspace.
+    /// last-focused window of one already displayed elsewhere. Never moves
+    /// a displayed workspace.
     FocusWorkspace {
         name: String,
     },
@@ -106,26 +105,25 @@ pub enum IpcRequest {
         display_id: isize,
     },
     /// Ask to park one managed window through the experimental public-API
-    /// parking path (CONTEXT.md "Window parking", ADR 0023): recovery data
-    /// is recorded first, and the window leaves visible geometry only once
-    /// that is durable. Answered with a typed
-    /// [`mosaix_domain::ParkWindowResult`]. Hence [`PROTOCOL_VERSION`] 13.
+    /// parking path: recovery data is recorded first, and the window
+    /// leaves visible geometry only once that is durable. Answered with a
+    /// typed [`mosaix_domain::ParkWindowResult`]. Hence
+    /// [`PROTOCOL_VERSION`] 13.
     ParkWindow {
         window_id: isize,
     },
     /// Put back every window this session parked, through the verified
     /// restore path. Answered with the windows a restore was asked for.
     RestoreParkedWindows,
-    /// Reconcile the windows a failed switch compensation left
-    /// unaccounted for, which is the only way out of the
-    /// workspace-switch-degraded condition (CONTEXT.md
-    /// "Workspace-switch degraded"). Answered with a typed
+    /// Reconcile the windows a failed switch compensation left unaccounted
+    /// for, which is the only way out of the workspace-switch-degraded
+    /// condition. Answered with a typed
     /// [`mosaix_domain::WorkspaceSwitchRestoreResult`], hence
     /// [`PROTOCOL_VERSION`] 14.
     RestoreWorkspaceSwitch,
-    /// Reverse the newest undo transaction, or answer with the typed reason
-    /// it was refused (ADR 0024). Carries no options: there is deliberately
-    /// no force or best-guess variant, hence [`PROTOCOL_VERSION`] 9.
+    /// Reverse the newest undo transaction, or answer with the typed
+    /// reason it was refused. Carries no options: there is deliberately no
+    /// force or best-guess variant, hence [`PROTOCOL_VERSION`] 9.
     Undo,
     /// Apply the saved layout called `name` to the focused display. The
     /// first request carrying a payload, hence
@@ -137,17 +135,16 @@ pub enum IpcRequest {
     /// that already exists.
     ///
     /// This and the three below are how the settings application changes
-    /// configuration: it asks, the agent writes (ADR 0022). Each lands in
-    /// the layer that supplies the layout being edited, and each is
-    /// answered with the file it went to.
+    /// configuration: it asks, the agent writes. Each lands in the layer
+    /// that supplies the layout being edited, and each is answered with
+    /// the file it went to.
     SaveLayout {
         name: String,
         cells: Vec<NormalizedRect>,
         /// Redirect this write to base config instead of the layer that
-        /// currently supplies the layout (ADR 0022). A layout the matched
-        /// profile declares is *moved*: base config gains it and the
-        /// profile gives it up, so the merge resolves to the copy the
-        /// user asked for.
+        /// currently supplies the layout. A layout the matched profile
+        /// declares is *moved*: base config gains it and the profile gives
+        /// it up, so the merge resolves to the copy the user asked for.
         to_base: bool,
     },
     RenameLayout {
@@ -162,7 +159,7 @@ pub enum IpcRequest {
         name: String,
     },
     /// The hotkey editor is open on this connection: unregister every
-    /// binding until it closes (ADR 0021).
+    /// binding until it closes.
     ///
     /// Suspension is bounded by the connection that asked for it, not by
     /// the matching request below. The agent emits capture-end when this
@@ -176,9 +173,8 @@ pub enum IpcRequest {
     /// Ask whether `combo` is free, before the user commits to it.
     ///
     /// Answered by attempting registration and releasing it again, then
-    /// naming who owns a refusal: another Mosaix binding, or the system
-    /// or another application (ADR 0021). The combination is not bound by
-    /// asking.
+    /// naming who owns a refusal: another Mosaix binding, or the system or
+    /// another application. The combination is not bound by asking.
     ProbeHotkey {
         combo: String,
         /// The command being rebound, so its own binding does not count
@@ -192,7 +188,8 @@ pub enum IpcRequest {
     /// `snap-left`, or `apply-layout.writing` -- so what the interface
     /// shows and what it sends back are one string. It is spelled out
     /// rather than called `command` because that name is this
-    /// enumeration's own serde tag. `to_base` is ADR 0022's redirect.
+    /// enumeration's own serde tag. `to_base` is the redirect to base
+    /// config.
     SetBinding {
         command_path: String,
         combo: String,

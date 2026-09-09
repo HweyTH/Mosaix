@@ -5,7 +5,7 @@ use mosaix_domain::{allocate_edges, Rect};
 /// Plans `members` cells that exactly cover `work_area` before gaps.
 ///
 /// Rows are distributed as evenly as possible, so a non-factorable count
-/// grows occupied cells instead of reserving an empty grid slot.  Column
+/// grows occupied cells instead of reserving an empty grid slot. Column
 /// count is selected by minimizing the difference between a cell's aspect
 /// ratio and a square, which naturally prefers more columns on wide work
 /// areas and more rows on tall ones.

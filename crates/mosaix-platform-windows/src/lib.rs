@@ -1,14 +1,10 @@
 //! Windows platform adapter: Win32 window management, event hooks, and DPI handling.
 //!
-//! Two things currently live side by side here, matching the architecture
-//! doc's phased approach (section 20, "Phase 0: Platform spikes"): the
-//! merged window-enumeration pipeline (`adapter`, `enumeration`,
-//! `win32_helpers`) behind the `PlatformAdapter` trait, and standalone
-//! Win32 spikes -- move/resize, OS event hooks, display-topology watching,
-//! and shutdown handling -- that haven't been wired into `PlatformAdapter`
-//! yet. That wiring happens once the risky Win32 behavior in the spikes
-//! (DPI handling, coordinate spaces, move/resize semantics, event
-//! delivery) has been proven out.
+//! Two things live side by side here: the merged window-enumeration
+//! pipeline (`adapter`, `enumeration`, `win32_helpers`) behind the
+//! `PlatformAdapter` trait, and standalone Win32 modules -- move/resize,
+//! OS event hooks, display-topology watching, and shutdown handling --
+//! that the trait does not yet cover.
 
 #[cfg(windows)]
 pub mod adapter;
@@ -262,9 +258,9 @@ fn foreground_handle_from_hwnd(hwnd: HWND) -> Option<WindowHandle> {
 /// foreground-*change* notification, so without this the engine has no
 /// focus anchor between agent startup and whenever the user next switches
 /// windows -- which leaves directional focus/swap as silent no-ops and the
-/// Focus border hidden even though automatic tiling is active (spec #11
-/// user stories 39 and 43). `mosaix-agent` reads it once during startup
-/// reconciliation and feeds it in as an ordinary `Event::WindowFocused`.
+/// focus border hidden even though automatic tiling is active.
+/// `mosaix-agent` reads it once during startup reconciliation and feeds it
+/// in as an ordinary `Event::WindowFocused`.
 #[cfg(windows)]
 pub fn foreground_window_handle() -> Option<WindowHandle> {
     foreground_handle_from_hwnd(unsafe { GetForegroundWindow() })
@@ -288,7 +284,7 @@ pub fn is_window_elevated(handle: WindowHandle) -> bool {
 }
 
 /// The current cursor position in physical-pixel screen coordinates
-/// (`GetCursorPos`). Used by the snap-preview drag controller (Feature 34).
+/// (`GetCursorPos`). Used by the snap-preview drag controller.
 #[cfg(windows)]
 pub fn cursor_position() -> Result<(i32, i32)> {
     let mut point = POINT::default();

@@ -31,8 +31,8 @@ pub struct TreePlan {
     /// Every arranged window, in visual order, gaps already applied.
     pub placements: Vec<(WindowId, Rect)>,
     /// Windows whose leaves are kept but which the display cannot fit at
-    /// their minimum size, newest insertion first (CONTEXT.md
-    /// "Constraint-overflow window"). Empty whenever everything fits.
+    /// their minimum size, newest insertion first. Empty whenever
+    /// everything fits.
     pub overflow: Vec<WindowId>,
     /// The gaps actually applied: the configured ones when they fit, and
     /// a reduced fraction of them when decoration had to give way.
@@ -49,13 +49,13 @@ pub fn plan_tree(tree: &ContainerTree, work_area: Rect, gaps: Gaps) -> Vec<(Wind
 /// Places every window in `tree` inside `work_area` that the display can
 /// fit, honouring each window's minimum size.
 ///
-/// The degradation order is fixed (spec user stories 43 and 44). Gaps are
-/// reduced together toward zero first, so a display too small for the
-/// configured decoration loses the decoration before it loses a window.
-/// Only if the windows still cannot fit at zero gaps does the newest
-/// inserted window leave the arrangement, and the rest are planned again
-/// without it; that repeats until the remainder fits. Established windows
-/// therefore keep their places, and the same tree on the same display
+/// The degradation order is fixed. Gaps are reduced together toward zero
+/// first, so a display too small for the configured decoration loses the
+/// decoration before it loses a window. Only if the windows still cannot
+/// fit at zero gaps does the newest inserted window leave the arrangement,
+/// and the rest are planned again without it; that repeats until the
+/// remainder fits. Established windows therefore keep their places, and
+/// the same tree on the same display
 /// always overflows the same windows in the same order.
 ///
 /// `minimum_size` answers `None` for a window whose minimum is unknown,
@@ -67,8 +67,8 @@ pub fn plan_tree_constrained(
     gaps: Gaps,
     minimum_size: impl Fn(WindowId) -> Option<Size>,
 ) -> TreePlan {
-    // Dormant slots take no space: the planner works on the projection
-    // in which their siblings have absorbed them (spec user story 42).
+    // Dormant slots take no space: the planner works on the projection in
+    // which their siblings have absorbed them.
     let mut arranged = tree.live_projection();
     let mut overflow = Vec::new();
     loop {
@@ -194,8 +194,7 @@ fn tile(node: &Node<WindowId>, area: Rect, placements: &mut Vec<(WindowId, Rect)
 /// The focused window's leaf is the target when there is one, so insertion
 /// follows attention. Without one, the largest leaf is split, and equal
 /// areas are broken by visual order -- `placements` is in tree order, which
-/// is that order -- so the result never depends on enumeration or hashing
-/// (spec user stories 29 and 30).
+/// is that order -- so the result never depends on enumeration or hashing.
 pub fn choose_insertion(
     placements: &[(WindowId, Rect)],
     focused: Option<WindowId>,
@@ -421,7 +420,7 @@ mod tests {
         );
     }
 
-    // ---- properties -------------------------------------------------
+    // ---- properties ---------------------------------------------------
 
     #[test]
     fn every_leaf_is_placed_exactly_once() {
@@ -578,7 +577,7 @@ mod tests {
         );
     }
 
-    // ---- minimum sizes and constraint overflow (issue #54) ------------
+    // ---- minimum sizes and constraint overflow ------------------------
 
     /// A minimum-size oracle over a fixed table, unknown for the rest.
     fn minimums(table: &[(isize, i32, i32)]) -> impl Fn(WindowId) -> Option<Size> + '_ {
@@ -705,9 +704,9 @@ mod tests {
     #[test]
     fn overflow_follows_the_newest_slot_which_a_swap_does_not_move() {
         // Window 9 arrived last and took half of window 1 space. Swapping
-        // them exchanges only the occupants (ADR 0026): the slot that was
-        // inserted last now holds window 1, and it is the slot that gives
-        // its space back, so window 1 overflows.
+        // them exchanges only the occupants: the slot that was inserted
+        // last now holds window 1, and it is the slot that gives its space
+        // back, so window 1 overflows.
         let mut tree = ContainerTree::new();
         tree.insert_first(WindowId(1));
         tree.split_leaf(&WindowId(1), SplitAxis::Horizontal, WindowId(2));

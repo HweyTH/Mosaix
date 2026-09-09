@@ -1,12 +1,11 @@
 //! Saved-layout planner: turning a saved layout's normalized cells into
-//! concrete rectangles for one display's work area (CONTEXT.md "Saved
-//! layout", ADR 0018).
+//! concrete rectangles for one display's work area.
 //!
 //! Sits alongside the zone planner in [`crate::zones`] and shares its
 //! rules: cells resolve through [`NormalizedRect::to_rect`], the one
-//! deterministic edge-allocation algorithm (architecture doc section 10),
-//! and gap insetting stays the separate post-processing step ADR 0006
-//! makes it -- nothing here knows about [`crate::apply_gaps`].
+//! deterministic edge-allocation algorithm, and gap insetting stays a
+//! separate post-processing step -- nothing here knows about
+//! [`crate::apply_gaps`].
 //!
 //! Unlike a balanced grid, a saved layout's cells come from the user, so
 //! this planner makes no claim that they tile the work area: they may
@@ -20,8 +19,8 @@ use mosaix_domain::{NormalizedRect, Rect};
 /// the result straight against the windows it means to place. An empty
 /// cell list resolves to an empty plan rather than an error: rejecting an
 /// empty layout, or one whose cells fall outside 0.0-1.0, belongs in
-/// `mosaix-config`'s validation where the file and line are known, and is
-/// issue #34's work -- the planner stays total either way.
+/// `mosaix-config`'s validation where the file and line are known. The
+/// planner stays total either way.
 pub fn resolve_saved_layout(work_area: Rect, cells: &[NormalizedRect]) -> Vec<Rect> {
     cells.iter().map(|cell| cell.to_rect(work_area)).collect()
 }

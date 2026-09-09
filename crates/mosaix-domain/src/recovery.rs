@@ -1,6 +1,6 @@
 //! The native recovery ledger: what must be durable before a window may
 //! leave visible geometry, and how a later session decides whether a
-//! recorded native handle still means the window it did (ADR 0023).
+//! recorded native handle still means the window it did.
 //!
 //! The ledger is deliberately separate from cross-session identity. The
 //! state database never treats a native handle as identity, because a
@@ -161,7 +161,7 @@ pub struct LiveHandleEvidence {
 
 /// What recovery concluded about one entry's handle. Only `Verified`
 /// authorises touching the window; every other verdict is reported with
-/// the evidence that produced it and moves nothing (ADR 0023).
+/// the evidence that produced it and moves nothing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum HandleVerdict {
     /// The handle is live and its process instance and class match.
@@ -297,8 +297,8 @@ pub struct ParkingFailure {
 pub enum ParkingRefusal {
     /// The window is not managed, so there is nothing to record.
     NotManaged { window_id: WindowId },
-    /// Committed state is not durable (CONTEXT.md "Persistence-degraded"),
-    /// so recovery data could not be promised.
+    /// Committed state is not durable, so recovery data could not be
+    /// promised.
     PersistenceDegraded,
     /// No adapter has verified a recoverable parking site.
     ParkingCapabilityUnverified,
@@ -306,8 +306,8 @@ pub enum ParkingRefusal {
     ParkingRefused { reason: String },
     /// A full-screen window is never forced out of full-screen.
     Fullscreen { window_id: WindowId },
-    /// A minimized window occupies no screen and is left minimized; it
-    /// is never restored in order to be parked (ADR 0029).
+    /// A minimized window occupies no screen and is left minimized; it is
+    /// never restored in order to be parked.
     Minimized { window_id: WindowId },
     /// The window's display is not in the topology, so there is no
     /// original display to record.

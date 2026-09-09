@@ -2,7 +2,7 @@
 //!
 //! Runs at login, owns the authoritative window-manager state via the
 //! reducer in `mosaix-engine`, and stays useful whether or not the
-//! settings UI is open (architecture doc section 5.1).
+//! settings UI is open.
 //!
 //! Two startup preconditions are treated as fatal (`.expect`, no degraded
 //! mode): DPI awareness, because every downstream geometry call is wrong
@@ -14,8 +14,7 @@
 //! failure (a topology read, the topology watcher, config directory
 //! creation/read/validation) is logged and degrades the agent instead --
 //! it's meant to run all day. An unusable config directory falls back to
-//! `mosaix_config::fallback_config()` rather than refusing to start (ADR
-//! 0007).
+//! `mosaix_config::fallback_config()` rather than refusing to start.
 
 #[cfg(windows)]
 mod hotkeys;
@@ -27,7 +26,7 @@ mod recovery;
 /// Starts `RegisterHotKey` registration for `bindings` and a forwarder
 /// thread translating each firing into `Event::ZoneSnapRequested`,
 /// mirroring the shape of every other OS-event forwarder in this file.
-/// Registration stays partial-success (ADR 0002), preserved through every
+/// Registration stays partial-success, preserved through every
 /// re-registration and not just the first; only a failure to start the
 /// registration thread itself is reported to the caller.
 ///
@@ -35,11 +34,11 @@ mod recovery;
 /// [`mosaix_engine::Event::HotkeyRegistrationReported`], so a combination
 /// another application took while hotkey capture held registration
 /// suspended is named to the user rather than left as a shortcut that
-/// silently stopped working (ADR 0021).
+/// silently stopped working.
 ///
 /// When `overlay_tx` is present, each successful enqueue also signals the
-/// snap-preview controller (Feature 34) with the pre-send revision so it
-/// can flash the committed placement.
+/// snap-preview controller with the pre-send revision so it can flash the
+/// committed placement.
 #[cfg(windows)]
 fn start_hotkeys_and_forward(
     bindings: Vec<mosaix_platform_windows::HotkeyBinding>,
@@ -145,14 +144,13 @@ fn main() {
     });
 
     // First-run default generation and the initial synchronous load both
-    // happen before the agent is considered started (ticket 03); an
+    // happen before the agent is considered started; an
     // unreadable/uncreatable directory, or one that fails validation with
     // no last-known-good yet to fall back to, degrades to the in-memory
-    // fallback constant rather than refusing to start (ADR 0007) -- the
-    // same posture every other subsystem in this file already takes.
-    // `Some(dir)` only once `dir` is confirmed to exist with a readable
-    // `config.toml` -- the one thing `watch` below needs and never
-    // establishes itself.
+    // fallback constant rather than refusing to start -- the same posture
+    // every other subsystem in this file already takes. `Some(dir)` only
+    // once `dir` is confirmed to exist with a readable `config.toml` --
+    // the one thing `watch` below needs and never establishes itself.
     let fallback_config_set = || mosaix_config::ResolvedConfigSet {
         base: mosaix_config::fallback_config(),
         profiles: Vec::new(),
@@ -200,9 +198,9 @@ fn main() {
     };
 
     // A recoverable parking site is validated for the initial topology
-    // before anything can ask to park (ADR 0023, ADR 0029), and again on
-    // every topology change below. The site itself stays with the agent;
-    // the engine only learns whether one is verified.
+    // before anything can ask to park, and again on every topology change
+    // below. The site itself stays with the agent; the engine only learns
+    // whether one is verified.
     let parking_site: recovery::SharedParkingSite = Default::default();
     let initial_parking = recovery::report_parking_capability(&initial_displays, &parking_site);
 
@@ -213,13 +211,13 @@ fn main() {
             initial_parking,
         ));
 
-    // Recovery first (ADR 0023). Before the state database is opened,
-    // before any window is observed, and before any stored identity is
-    // matched, every window a previous session parked and never put back
-    // is restored -- if its handle still verifiably names that window.
-    // A stale or reused handle is reported and left alone. Doing this
-    // before the worker starts is what makes "recovery precedes
-    // reconciliation" a fact of ordering rather than a hope.
+    // Recovery first. Before the state database is opened, before any
+    // window is observed, and before any stored identity is matched, every
+    // window a previous session parked and never put back is restored --
+    // if its handle still verifiably names that window. A stale or reused
+    // handle is reported and left alone. Doing this before the worker
+    // starts is what makes "recovery precedes reconciliation" a fact of
+    // ordering rather than a hope.
     let session_id = engine.state_reader().snapshot().session_id;
     let ledger_path = mosaix_persistence::default_ledger_path();
     if let Some(path) = &ledger_path {
@@ -427,13 +425,13 @@ fn main() {
         (None, None)
     };
 
-    // Feature 28 — startup reconciliation.
+    // Startup reconciliation.
     //
-    // Before the OS-event hooks are active, enumerate every existing window
-    // and register it with the engine so that already-open apps are tracked
-    // from the start.  Any windows that a very-early-arriving
-    // `Event::WindowFocused` already registered are silently skipped by the
-    // engine's `or_insert` logic.
+    // Before the OS-event hooks are active, enumerate every existing
+    // window and register it with the engine so that already-open apps are
+    // tracked from the start. Any windows that a very-early-arriving
+    // `Event::WindowFocused` already registered are silently skipped by
+    // the engine's `or_insert` logic.
     {
         let windows = match mosaix_platform_windows::enumerate_windows() {
             Ok(w) => w,
@@ -458,7 +456,7 @@ fn main() {
         // foreground-*change* notification, so a freshly started agent has
         // no focus anchor until the user next switches windows -- leaving
         // directional focus/swap silent no-ops and the Focus border hidden
-        // while automatic tiling is already active.  Seed it from whatever
+        // while automatic tiling is already active. Seed it from whatever
         // owns the foreground right now, as an ordinary observation.
         match mosaix_platform_windows::foreground_window_handle() {
             Some(handle) => {
@@ -564,9 +562,9 @@ fn main() {
                             // make parked windows visible, so it is re-validated
                             // before the engine hears about the change.
                             //
-                            // The capability goes first, because the topology
-                            // arm is where a vanished display's windows are
-                            // parked (issue #61) and it must decide that
+                            // The capability goes first, because the
+                            // topology arm is where a vanished display's
+                            // windows are parked and it must decide that
                             // against the new topology's site, not the old
                             // one's.
                             let capability =
@@ -583,12 +581,13 @@ fn main() {
                             let _ =
                                 events.send(mosaix_engine::Event::DisplayTopologyChanged(displays));
                         }
-                        // Feature 29 — sleep/wake recovery.
+                        // Sleep/wake recovery.
                         //
-                        // After wake the platform layer re-enumerates displays
-                        // and sends `WakeFromSleep`.  We also re-enumerate
-                        // windows here because the platform layer's hidden
-                        // window only sees display events, not window events.
+                        // After wake the platform layer re-enumerates
+                        // displays and sends `WakeFromSleep`. We also
+                        // re-enumerate windows here because the platform
+                        // layer's hidden window only sees display events,
+                        // not window events.
                         mosaix_platform_windows::TopologyEvent::WakeFromSleep(displays) => {
                             let displays = retry_empty_topology(displays);
                             let windows = match mosaix_platform_windows::enumerate_windows() {
@@ -633,9 +632,9 @@ fn main() {
         }
     };
 
-    // Feature 34 — snap preview overlay. Started before the hotkey and
-    // event-hook forwarders so both can feed it. Failure degrades to no
-    // overlay rather than blocking the rest of the agent.
+    // Snap preview overlay. Started before the hotkey and event-hook
+    // forwarders so both can feed it. Failure degrades to no overlay
+    // rather than blocking the rest of the agent.
     let (overlay_tx, overlay_controller) = match mosaix_platform_windows::start_preview_overlay() {
         Ok(preview) => {
             let (tx, join_handle) =
@@ -687,8 +686,8 @@ fn main() {
                             ) {
                                 return None;
                             }
-                            // The engine defers placement for a window being
-                            // dragged (ADR 0016), so anything drawn now would
+                            // The engine defers placement for a window
+                            // being dragged, so anything drawn now would
                             // trail it under the cursor until the drop.
                             if state
                                 .interactive_placement
@@ -696,12 +695,13 @@ fn main() {
                             {
                                 return None;
                             }
-                            // `observed_bounds`, not `bounds`: the latter is
-                            // the placement Mosaix last *intended*, kept stale
-                            // on purpose so the engine can detect an external
-                            // move by comparing the two (ADR 0001). Drawing
-                            // from it leaves the border behind any window
-                            // something else repositioned.
+                            // `observed_bounds`, not `bounds`: the latter
+                            // is the placement Mosaix last *intended*,
+                            // kept stale on purpose so the engine can
+                            // detect an external move by comparing the
+                            // two. Drawing from it leaves the border
+                            // behind any window something else
+                            // repositioned.
                             let bounds = state
                                 .windows
                                 .get(&window_id)
@@ -780,7 +780,7 @@ fn main() {
             });
             let forwarder = std::thread::spawn(move || {
                 // Focus and location changes feed the engine; move/resize
-                // start/end feed the snap-preview drag controller (Feature 34).
+                // start/end feed the snap-preview drag controller.
                 for event in raw_events {
                     match event {
                         mosaix_platform_windows::RawEvent::WindowCreated(_)
@@ -872,12 +872,11 @@ fn main() {
         }
     };
 
-    // Initial registration reads whatever the startup path above produced
-    // (generated default, loaded file, or the in-memory fallback, ADR
-    // 0007) -- there is no separate hardcoded table anymore (ADR 0003,
-    // superseded by ADR 0005). The hotkey-rebind poller further down keeps
-    // this in sync with `EngineState`'s resolved config for the rest of the
-    // agent's lifetime.
+    // Initial registration reads whatever the startup path above produced:
+    // a generated default, a loaded file, or the in-memory fallback. The
+    // hotkey-rebind poller further down keeps this in sync with
+    // `EngineState`'s resolved config for the rest of the agent's
+    // lifetime.
     let last_registered_hotkeys =
         hotkeys::runtime_hotkeys(&engine.state_reader().snapshot().resolved_config);
     let (initial_bindings, initial_registry) =
@@ -898,19 +897,19 @@ fn main() {
 
     // Diffs EngineState's resolved hotkey bindings against whatever was
     // last registered with the OS, and re-registers (stopping the old
-    // registration first) whenever `mosaix_config::diff_bindings` reports a
-    // change -- structurally identical to the placement-executor poller
-    // just below, but over hotkey bindings instead of window placements
-    // (ADR 0005). A hot-edited `config.toml` (ticket 03) and a
-    // topology-triggered profile switch (ticket 04) both flow through the
-    // same `EngineState::resolved_config`, so this one poller covers both.
+    // registration first) whenever `mosaix_config::diff_bindings` reports
+    // a change -- structurally identical to the placement-executor poller
+    // just below, but over hotkey bindings instead of window placements. A
+    // hot-edited `config.toml` and a topology-triggered profile switch
+    // both flow through the same `EngineState::resolved_config`, so this
+    // one poller covers both.
     //
     // It is also the one place that reads
     // `EngineState::hotkey_capture_suspended`: while the settings
     // application's hotkey editor is open, this registers nothing, so a
-    // combination the user is about to press reaches the editor instead
-    // of firing a command. Keeping that here rather than in a new engine
-    // effect is what keeps hotkey ownership in one place (ADR 0021).
+    // combination the user is about to press reaches the editor instead of
+    // firing a command. Keeping that here rather than in a new engine
+    // effect is what keeps hotkey ownership in one place.
     const HOTKEY_REBIND_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
     let (hotkey_rebind_stop_tx, hotkey_rebind_stop_rx) = std::sync::mpsc::channel::<()>();
     let hotkey_rebind_forwarder = {
@@ -987,13 +986,13 @@ fn main() {
     // Windows execution boundary and reports rejections back as normalized
     // engine events.
     //
-    // Feature 31 — after each `SetWindowPos` call, the executor waits
-    // briefly and re-reads the window's actual bounds.  If they differ
-    // significantly from the target, a `PlacementRejected` event is sent
-    // back to the engine, which increments the per-window circuit breaker.
+    // After each `SetWindowPos` call, the executor waits briefly and
+    // re-reads the window's actual bounds. If they differ significantly
+    // from the target, a `PlacementRejected` event is sent back to the
+    // engine, which increments the per-window circuit breaker.
     const PLACEMENT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
     /// How long to wait after a `SetWindowPos` before re-reading the
-    /// window's actual bounds to detect rejection (Feature 31).
+    /// window's actual bounds to detect rejection.
     const REJECTION_SETTLE_MILLIS: u64 = 500;
     /// Absolute pixel tolerance for rejection detection — if the observed
     /// bounds differ from the target by more than this in *any* axis, the
@@ -1046,11 +1045,12 @@ fn main() {
                                 window_id,
                                 entry_id,
                             } => {
-                                // Recovery data for this window is durable, so
-                                // parking is authorised (ADR 0023). The window is
-                                // moved beyond the validated edge without
-                                // activation; the reducer marks the entry parked
-                                // only when the move verifiably landed.
+                                // Recovery data for this window is
+                                // durable, so parking is authorised. The
+                                // window is moved beyond the validated
+                                // edge without activation; the reducer
+                                // marks the entry parked only when the
+                                // move verifiably landed.
                                 let _ = rejection_events.send(
                                     match recovery::park(window_id, &parking_site) {
                                         Ok(parked_as) => {
@@ -1122,12 +1122,13 @@ fn main() {
                         continue;
                     }
 
-                    // Feature 31 — rejection detection.
+                    // Rejection detection.
                     //
-                    // Wait briefly for the window to settle, then re-read its
-                    // actual bounds.  If they deviate too far from the
-                    // intended placement, the window is rejecting our resize
-                    // (e.g. min-size constraint), so we notify the engine.
+                    // Wait briefly for the window to settle, then re-read
+                    // its actual bounds. If they deviate too far from the
+                    // intended placement, the window is rejecting our
+                    // resize (e.g. min-size constraint), so we notify the
+                    // engine.
                     std::thread::sleep(std::time::Duration::from_millis(REJECTION_SETTLE_MILLIS));
                     let handle = mosaix_platform_windows::window_handle_from_id(window_id);
                     if let Some((_actual_display, actual_bounds)) =
@@ -1169,10 +1170,10 @@ fn main() {
         })
     };
 
-    // Feature 33 — system tray icon. Pause/Resume mirrors the IPC handler;
-    // Settings opens the config folder; Quit joins the merged shutdown path.
-    // The `TrayHandle` stays on the main path so console quit can stop it
-    // and unblock the forwarder (which only sees tray-channel disconnect).
+    // System tray icon. Pause/Resume mirrors the IPC handler; Settings
+    // opens the config folder; Quit joins the merged shutdown path. The
+    // `TrayHandle` stays on the main path so console quit can stop it and
+    // unblock the forwarder (which only sees tray-channel disconnect).
     let (quit_tx, quit_rx) = std::sync::mpsc::channel::<&'static str>();
     let tray_and_forwarder = match mosaix_platform_windows::start_tray() {
         Ok((tray, tray_events)) => {
@@ -1268,7 +1269,7 @@ fn main() {
     let shutdown = mosaix_platform_windows::register_shutdown_signal()
         .expect("failed to register shutdown signal handler at startup");
     // Console shutdown and tray Quit both feed one channel so main has a
-    // single place to wait (Feature 33).
+    // single place to wait.
     {
         let quit_tx = quit_tx.clone();
         std::thread::spawn(move || {
@@ -1336,8 +1337,8 @@ fn main() {
 
     // A clean exit puts back everything this session parked, through the
     // same verified path startup recovery uses, so a stop-and-uninstall
-    // never leaves a window off screen (ADR 0023). The worker has stopped
-    // by now, so the ledger is reopened here without contention.
+    // never leaves a window off screen. The worker has stopped by now, so
+    // the ledger is reopened here without contention.
     if let Some(path) = &ledger_path {
         match mosaix_persistence::RecoveryLedger::open(path) {
             Ok(mut ledger) => match recovery::recover_with_platform(&mut ledger) {

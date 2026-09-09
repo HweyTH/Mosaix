@@ -2,21 +2,20 @@
 //!
 //! A tree command either applies or refuses, and both are answers rather
 //! than errors: IPC returns them as data and the CLI renders them, the way
-//! persistent undo already reports (spec: "typed success and failure
-//! results rather than string-only errors"). Every refusal names what the
-//! user can act on, and a refused command mutates nothing.
+//! persistent undo already reports. Every refusal names what the user can
+//! act on, and a refused command mutates nothing.
 
 use serde::{Deserialize, Serialize};
 
 use crate::id::{DisplayId, WindowId};
 
-/// How far one tree-resize command moves its divider, in percentage
-/// points of the container's extent. Fixed in the first release (spec
-/// user story 33); a smaller step is taken only when the full one would
-/// push a window below its minimum size.
+/// How far one tree-resize command moves its divider, in percentage points
+/// of the container's extent. Fixed in the first release; a smaller step
+/// is taken only when the full one would push a window below its minimum
+/// size.
 pub const TREE_RESIZE_STEP_PERCENT: u32 = 5;
 
-/// Why a tree resize did nothing (CONTEXT.md "Tree resize").
+/// Why a tree resize did nothing.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TreeResizeRefusal {
@@ -31,11 +30,11 @@ pub enum TreeResizeRefusal {
     NotArranged { window_id: WindowId },
     /// The focused window's display is no longer connected.
     DisplayUnavailable { display_id: DisplayId },
-    /// No divider faces that way: the window is at the arrangement's
-    /// edge on that side (spec user story 37).
+    /// No divider faces that way: the window is at the arrangement's edge
+    /// on that side.
     NoDivider { command: String },
     /// A divider exists, but not even a one-point move keeps every
-    /// affected window at or above its minimum size (spec user story 34).
+    /// affected window at or above its minimum size.
     MinimumSizeReached { command: String },
 }
 
@@ -118,8 +117,8 @@ impl TreeResizeResult {
     }
 }
 
-/// Why a directional swap did nothing (CONTEXT.md "Directional swap",
-/// ADR 0026). Every variant leaves the arrangement untouched.
+/// Why a directional swap did nothing. Every variant leaves the
+/// arrangement untouched.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DirectionalSwapRefusal {
@@ -202,8 +201,7 @@ impl DirectionalSwapResult {
     }
 }
 
-/// Why removing a dormant position did nothing (CONTEXT.md "Dormant tree
-/// leaf").
+/// Why removing a dormant position did nothing.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RemovePositionRefusal {

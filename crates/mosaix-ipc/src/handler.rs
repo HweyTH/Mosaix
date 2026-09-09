@@ -25,12 +25,12 @@ pub struct ContainerTreeSnapshot {
     /// currently arranged.
     pub windows: Vec<isize>,
     /// The windows the display cannot fit at their minimum size, newest
-    /// insertion first (CONTEXT.md "Constraint-overflow window"). They
-    /// appear in `windows` too, because they keep their leaves.
+    /// insertion first. They appear in `windows` too, because they keep
+    /// their leaves.
     #[serde(default)]
     pub constraint_overflow: Vec<isize>,
-    /// Slots kept for windows that have gone, in visual order (CONTEXT.md
-    /// "Dormant tree leaf"). What the remove-position command names.
+    /// Slots kept for windows that have gone, in visual order. What the
+    /// remove-position command names.
     #[serde(default)]
     pub dormant_positions: Vec<DormantPositionSnapshot>,
 }
@@ -49,9 +49,9 @@ pub struct DormantPositionSnapshot {
     pub expires_unix: i64,
 }
 
-/// One logical workspace as published state describes it (CONTEXT.md
-/// "Logical workspace"). Membership is by window id, which is what every
-/// other part of the snapshot uses; names carry no window titles.
+/// One logical workspace as published state describes it. Membership is by
+/// window id, which is what every other part of the snapshot uses; names
+/// carry no window titles.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceSnapshot {
     pub name: String,
@@ -71,10 +71,10 @@ pub struct WorkspaceSnapshot {
     pub dormant_positions: usize,
 }
 
-/// Experimental workspace switching as published state describes it
-/// (ADR 0023, ADR 0028): one of `disabled`, `requested`, `unavailable`,
-/// or `experimental`, with the machine-readable reason a client can act
-/// on, and the mapping the matched profile declares.
+/// Experimental workspace switching as published state describes it: one
+/// of `disabled`, `requested`, `unavailable`, or `experimental`, with the
+/// machine-readable reason a client can act on, and the mapping the
+/// matched profile declares.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceSwitchingSnapshot {
     pub status: String,
@@ -91,9 +91,8 @@ pub struct WorkspaceSwitchingSnapshot {
     pub parking_capability: String,
 }
 
-/// Experimental switching as it is actually behaving right now: what is
-/// in flight, and what an earlier failure left behind (CONTEXT.md
-/// "Workspace switch transaction", "Workspace-switch degraded").
+/// Experimental switching as it is actually behaving right now: what is in
+/// flight, and what an earlier failure left behind.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceSwitchSnapshot {
     /// The switch in flight, if any.
@@ -127,7 +126,7 @@ pub struct WorkspaceSwitchDegradedSnapshot {
     pub reason: String,
 }
 
-/// The recovery ledger as published state describes it (ADR 0023).
+/// The recovery ledger as published state describes it.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct RecoverySnapshot {
     /// This agent session's identity in the ledger.
@@ -188,7 +187,7 @@ pub struct RecoveryOutcomeSnapshot {
 }
 
 /// A rule that named a workspace the pool does not hold, so the window
-/// stayed in the workspace of the display it appeared on (ADR 0028).
+/// stayed in the workspace of the display it appeared on.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct RuleWorkspaceRefusalSnapshot {
     pub window_id: isize,
@@ -223,7 +222,7 @@ pub struct StateSnapshot {
     /// Each display's container tree, as the windows it holds in visual
     /// order. Empty under the balanced grid, which keeps no structure.
     pub container_trees: Vec<ContainerTreeSnapshot>,
-    /// The global workspace pool, in name order (ADR 0028).
+    /// The global workspace pool, in name order.
     #[serde(default)]
     pub workspaces: Vec<WorkspaceSnapshot>,
     /// Rules whose workspace target named nothing in the pool.
@@ -245,8 +244,7 @@ pub struct StateSnapshot {
     pub automatic_tiling_suspended: bool,
     /// One precedence-resolved status for human-facing clients.
     pub mode: String,
-    /// Every health condition that currently holds, most serious first
-    /// (issue #61).
+    /// Every health condition that currently holds, most serious first.
     ///
     /// The three conditions are deliberately distinct facts, each with
     /// its own detail elsewhere in this snapshot -- `workspace_switch`,
@@ -304,8 +302,8 @@ pub struct StateSnapshot {
     /// Each outstanding repair, most serious first (issue #63).
     #[serde(default)]
     pub recovery_actions: Vec<RecoveryActionSnapshot>,
-    /// Number of windows whose circuit breaker is currently open (Feature 31).
-    /// These windows are excluded from automatic placement until the user
+    /// Number of windows whose circuit breaker is currently open. These
+    /// windows are excluded from automatic placement until the user
     /// explicitly resets them with a zone-snap command.
     pub circuit_breaker_count: usize,
     /// Each placement-circuit exclusion with a stable machine-readable
@@ -315,9 +313,9 @@ pub struct StateSnapshot {
     /// Sanitized authoritative inventory. Titles and executable paths never
     /// cross this diagnostics boundary.
     pub managed_windows: Vec<ManagedWindowSnapshot>,
-    /// The saved layouts the resolved config currently offers, by name
-    /// (CONTEXT.md "Saved layout"). Shape only -- a layout never names a
-    /// window, so there is nothing here to sanitize (ADR 0018).
+    /// The saved layouts the resolved config currently offers, by name.
+    /// Shape only -- a layout never names a window, so there is nothing
+    /// here to sanitize.
     pub saved_layouts: BTreeMap<String, SavedLayout>,
     /// The saved layout most recently applied to each display, keyed by
     /// display id.
@@ -330,17 +328,16 @@ pub struct StateSnapshot {
     /// Which layer supplies each entry of `saved_layouts`, keyed
     /// identically. This is what lets the settings application show a
     /// layout write's destination *before* the save rather than only in
-    /// the receipt afterwards (ADR 0022).
+    /// the receipt afterwards.
     pub layout_sources: BTreeMap<String, LayoutSourceSnapshot>,
     /// Every hotkey binding in effect for the current topology, each
     /// naming the configuration file that supplies it. This is what lets
     /// the settings application list bindings without reading a TOML file,
-    /// and what makes the write destination visible before a save
-    /// (ADR 0022).
+    /// and what makes the write destination visible before a save.
     pub hotkeys: Vec<HotkeyBindingSnapshot>,
-    /// Whether a hotkey editor currently holds registration suspended
-    /// (ADR 0021). The editor states this rather than leaving the user to
-    /// infer it from shortcuts that have stopped working.
+    /// Whether a hotkey editor currently holds registration suspended. The
+    /// editor states this rather than leaving the user to infer it from
+    /// shortcuts that have stopped working.
     pub hotkey_capture_suspended: bool,
     /// The commands whose bindings the last registration pass could not
     /// register, in the same TOML-path spelling
@@ -354,7 +351,7 @@ pub struct StateSnapshot {
 }
 
 /// Which layer supplies one saved layout, and so which file a save of it
-/// would be written to (ADR 0022).
+/// would be written to.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct LayoutSourceSnapshot {
     /// `base`, `profile`, or `unknown` for a resolved config that recorded
@@ -389,7 +386,7 @@ pub struct HotkeyBindingSnapshot {
     /// that recorded no source.
     pub source: String,
     /// The file that supplies it, and so the file a GUI edit of it would
-    /// be written to (ADR 0022).
+    /// be written to.
     ///
     /// `None` when this build cannot name it. A destination shown to a
     /// user before a write has to be the real one or absent -- a
@@ -416,7 +413,7 @@ fn layer_name(layer: Option<ConfigLayer>) -> String {
 
 /// The file `layer` means, given the profile (if any) this config was
 /// merged from -- and so the file an edit of that value would be written
-/// to (ADR 0022).
+/// to.
 ///
 /// `None` when this build cannot name it. A destination shown to a user
 /// before a write has to be the real one or absent: a plausible-looking
@@ -991,8 +988,7 @@ impl HotkeyProbe for UnavailableHotkeyProbe {
 /// `Win+L` and `Ctrl+Alt+Del` are handled by Windows itself and are never
 /// registered hotkeys, so `RegisterHotKey` accepts them and the binding
 /// then never fires. Hardcoding exactly these two is deliberate: every
-/// other refusal is left to the probe, including Windows-key chords
-/// (ADR 0021).
+/// other refusal is left to the probe, including Windows-key chords.
 fn is_reserved(combo: &KeyCombo) -> bool {
     let key = combo.key.to_ascii_uppercase();
     let win_lock = combo.win && !combo.ctrl && !combo.alt && !combo.shift && key == "L";
@@ -1005,7 +1001,7 @@ fn is_reserved(combo: &KeyCombo) -> bool {
 ///
 /// A warning rather than a block: the reservation is real but not
 /// absolute, and refusing a combination the user may well be able to use
-/// is a worse answer than saying so (ADR 0021).
+/// is a worse answer than saying so.
 fn advisory(combo: &KeyCombo) -> Option<String> {
     combo
         .key
@@ -1080,9 +1076,9 @@ fn availability(
     }
     match probe.probe(combo) {
         ProbeOutcome::Available => HotkeyVerdict::new("available", warning),
-        // An unexplained refusal is attributed to the system (ADR 0021):
-        // no Mosaix binding claimed it above, so whatever owns it is not
-        // something the user can resolve inside Mosaix.
+        // An unexplained refusal is attributed to the system: no Mosaix
+        // binding claimed it above, so whatever owns it is not something
+        // the user can resolve inside Mosaix.
         ProbeOutcome::Taken => HotkeyVerdict::new("system_or_other_application", warning),
         ProbeOutcome::Unsupported { reason } => HotkeyVerdict {
             reason: Some(reason),
@@ -1109,7 +1105,7 @@ pub trait ConfigStore: Send + Sync {
     /// the file it landed in and the configuration as it now stands.
     ///
     /// The binding twin of [`ConfigStore::edit_layouts`], for the same
-    /// reason: the settings application asks, the agent writes (ADR 0022).
+    /// reason: the settings application asks, the agent writes.
     fn edit_bindings(
         &self,
         fingerprint: &str,
@@ -1578,10 +1574,10 @@ fn unknown_command(path: &str) -> IpcResponse {
 /// The same shape [`edit_layouts`] has, and for the same reason:
 /// delivering the resulting configuration straight into the reducer is
 /// what makes a rebind take effect without restarting the agent, rather
-/// than after the reload debounce (ADR 0008). The rebind poller sees the
-/// new resolved bindings and re-registers -- unless hotkey capture still
-/// holds registration suspended, in which case the change takes effect
-/// when the editor closes.
+/// than after the reload debounce. The rebind poller sees the new resolved
+/// bindings and re-registers -- unless hotkey capture still holds
+/// registration suspended, in which case the change takes effect when the
+/// editor closes.
 fn edit_bindings(
     events: &EventSender,
     state_reader: &StateReader,
@@ -1609,11 +1605,11 @@ fn edit_bindings(
 /// Performs one saved-layout edit and makes the result live.
 ///
 /// The write is validated and persisted by `config`; delivering the
-/// resulting configuration straight into the reducer is what makes a layout
-/// applicable the moment the save is confirmed, rather than after the
-/// reload debounce (ADR 0008). The watcher's echo arrives shortly after
-/// carrying the identical set, and the reducer already discards a config
-/// change that changes nothing.
+/// resulting configuration straight into the reducer is what makes a
+/// layout applicable the moment the save is confirmed, rather than after
+/// the reload debounce. The watcher's echo arrives shortly after carrying
+/// the identical set, and the reducer already discards a config change
+/// that changes nothing.
 fn edit_layouts(
     events: &EventSender,
     state_reader: &StateReader,
@@ -1625,7 +1621,7 @@ fn edit_layouts(
         Ok(write) => match send_event(events, Event::ConfigChanged(Box::new(write.config))) {
             // The file is what the caller cannot work out for itself: with
             // a profile matched, the layer that received the write and the
-            // one the user was looking at are different objects (ADR 0022).
+            // one the user was looking at are different objects.
             IpcResponse::Ok { .. } => IpcResponse::Ok {
                 data: Some(serde_json::json!({ "file": write.file })),
             },
@@ -1638,10 +1634,10 @@ fn edit_layouts(
 /// One connection's hold on hotkey-capture suspension.
 ///
 /// Suspension is bounded by the connection that asked for it, not by a
-/// message (ADR 0021), and the transport owns that lifetime -- so the
-/// bookkeeping lives here, next to the request mapping, where it can be
-/// tested without a pipe: what a connection asked for, and what its
-/// ending therefore owes the engine.
+/// message, and the transport owns that lifetime -- so the bookkeeping
+/// lives here, next to the request mapping, where it can be tested without
+/// a pipe: what a connection asked for, and what its ending therefore owes
+/// the engine.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct CaptureHold {
     held: bool,
@@ -1676,8 +1672,8 @@ impl CaptureHold {
 }
 
 /// Asks for a directional swap and answers with the typed outcome: the
-/// neighbor it will exchange with, or the structured no-target result
-/// ADR 0026 calls for. Preflighted the way undo is.
+/// neighbor it will exchange with, or a structured no-target result.
+/// Preflighted the way undo is.
 fn swap(
     events: &EventSender,
     state_reader: &StateReader,
@@ -3015,7 +3011,7 @@ mod tests {
     #[test]
     fn the_two_combinations_the_probe_cannot_see_are_refused_without_asking() {
         // The probe would accept both -- neither is a registered hotkey --
-        // and the binding would then never fire (ADR 0021).
+        // and the binding would then never fire.
         let engine = engine_bound(&[]);
 
         for combo in ["win+l", "ctrl+alt+delete"] {

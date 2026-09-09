@@ -1,5 +1,5 @@
 //! The container tree: a normalized hierarchy of weighted splits and
-//! window leaves owning one display's tiled arrangement (ADR 0023).
+//! window leaves owning one display's tiled arrangement.
 //!
 //! This module owns the *structure* only -- what a tree is, and the
 //! operations that keep it normalized. Where its windows end up on screen
@@ -13,10 +13,10 @@
 //! [`WindowEvidence`](crate::identity::WindowEvidence), which is how the
 //! structure is recognised again in the next session.
 //!
-//! A leaf may also be *dormant* (CONTEXT.md "Dormant tree leaf"): its
-//! window has closed or cannot be matched, but the slot is kept, holding
-//! the evidence that would recognise the window if it came back. Dormant
-//! leaves take no screen space; they are structure waiting for a window.
+//! A leaf may also be *dormant*: its window has closed or cannot be
+//! matched, but the slot is kept, holding the evidence that would
+//! recognise the window if it came back. Dormant leaves take no screen
+//! space; they are structure waiting for a window.
 
 use serde::{Deserialize, Serialize};
 
@@ -52,15 +52,14 @@ pub struct Child<L> {
 }
 
 /// How long a dormant leaf is kept before it is pruned, in seconds. Seven
-/// days, matching undo retention (spec user story 40). Fixed in the first
-/// release.
+/// days, matching undo retention. Fixed in the first release.
 pub const DORMANT_RETENTION_SECONDS: i64 = 7 * 24 * 60 * 60;
 
 /// A slot whose window is gone for now: what would recognise the window
 /// if it returned, and when the slot went dormant so it can expire.
 ///
-/// The evidence is the same privacy-safe kind persistent undo keeps --
-/// no title is ever captured (ADR 0024).
+/// The evidence is the same privacy-safe kind persistent undo keeps -- no
+/// title is ever captured.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DormantPosition {
     pub evidence: WindowEvidence,
@@ -108,10 +107,10 @@ impl<L> Occupant<L> {
 ///
 /// `inserted` is the tree's insertion sequence: each window that joins the
 /// tree takes the next number, and the number stays with the slot rather
-/// than the window, so a directional swap leaves it where it was (ADR
-/// 0026). It is what makes "the newest window" a fact the planner can
-/// read rather than a guess from geometry (spec user story 44), and it is
-/// how a dormant position is named to the remove-position command.
+/// than the window, so a directional swap leaves it where it was. It is
+/// what makes "the newest window" a fact the planner can read rather than
+/// a guess from geometry, and it is how a dormant position is named to the
+/// remove-position command.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Leaf<L> {
     pub inserted: u64,
@@ -381,7 +380,7 @@ impl<L> Tree<L> {
 
     /// The tree as the planner sees it: dormant slots dropped and the
     /// space they held closed, so remaining windows use the whole
-    /// arrangement (spec user story 42).
+    /// arrangement.
     pub fn live_projection(&self) -> Tree<L>
     where
         L: Clone,
@@ -583,9 +582,9 @@ impl<L: PartialEq> Tree<L> {
     /// Replaces the leaf holding `target` with a container of `target` and
     /// `window` in equal shares, arranged along `axis`.
     ///
-    /// This is the whole of BSP insertion as far as structure goes: the new
-    /// window takes half of one existing window's space and nothing else in
-    /// the tree moves (spec user story 28).
+    /// This is the whole of BSP insertion as far as structure goes: the
+    /// new window takes half of one existing window's space and nothing
+    /// else in the tree moves.
     pub fn split_leaf(&mut self, target: &L, axis: SplitAxis, window: L) -> bool {
         if !self.contains(target) {
             return false;
@@ -666,7 +665,7 @@ impl<L: PartialEq> Tree<L> {
     ///
     /// Containers, axes, weights, parentage, dormant slots, and each
     /// slot's insertion number all stay exactly as they were -- only the
-    /// two occupants trade places (ADR 0026).
+    /// two occupants trade places.
     pub fn swap_leaves(&mut self, first: &L, second: &L) -> bool
     where
         L: Clone,
@@ -688,10 +687,9 @@ impl<L: PartialEq> Tree<L> {
     /// nearest ancestor container on `axis` in which the child holding
     /// `window` has a sibling with a window on the `toward` side. The
     /// immediate parent is tried first, and only when it cannot satisfy
-    /// the direction does the search climb outward (spec user story 36).
-    /// A sibling holding only dormant slots takes no space and so is not
-    /// a divider. `false` at a boundary of the arrangement, where no
-    /// ancestor qualifies.
+    /// the direction does the search climb outward. A sibling holding only
+    /// dormant slots takes no space and so is not a divider. `false` at a
+    /// boundary of the arrangement, where no ancestor qualifies.
     pub fn has_divider_toward(&self, window: &L, axis: SplitAxis, toward: Toward) -> bool {
         let Some(root) = self.root.as_ref() else {
             return false;
@@ -713,7 +711,7 @@ impl<L: PartialEq> Tree<L> {
 
     /// Moves the divider [`Tree::has_divider_toward`] describes by
     /// `fraction` of its container's visible extent, growing `window`'s
-    /// side and shrinking the sibling's (CONTEXT.md "Tree resize").
+    /// side and shrinking the sibling's.
     ///
     /// Only the two children on either side of the divider change share;
     /// the container's other children keep theirs, and its weights are
@@ -1435,7 +1433,7 @@ mod tests {
             .expect("window 2 is the divider to the right");
 
         assert_eq!(change.shrank, vec![leaf(2)]);
-        // 1:1:1 with 5% of the visible 2.0 (= 0.1) moved: 1.1 : 1.0 : 0.9,
+        // 1:1:1 with 5% of the visible 2.0 (= 0.1) moved: 1.1: 1.0: 0.9,
         // renormalized.
         let weights = root_weights(&tree);
         assert!((weights[0] / weights[2] - 1.1 / 0.9).abs() < 1e-9);
@@ -1516,7 +1514,7 @@ mod tests {
         );
     }
 
-    // ---- dormant positions (issue #53) ---------------------------------
+    // ---- dormant positions --------------------------------------------
 
     #[test]
     fn a_dormant_slot_keeps_its_place_and_number_but_holds_no_window() {

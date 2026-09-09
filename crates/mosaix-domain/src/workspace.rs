@@ -1,5 +1,5 @@
 //! Logical workspaces: one global pool of uniquely named managed-window
-//! groups (CONTEXT.md "Logical workspace", ADR 0028).
+//! groups.
 //!
 //! The pool is pure state with typed transitions. It knows which workspace
 //! is displayed on which display, which workspace each managed window
@@ -11,7 +11,7 @@
 //! [`WorkspaceRefusal`], so a caller is told why rather than hearing
 //! nothing back. Nothing here ever creates a workspace as a side effect of
 //! naming one: a focus, move, or rule target that names an unknown
-//! workspace is refused (ADR 0028).
+//! workspace is refused.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -149,9 +149,9 @@ pub struct Workspace {
 
 /// The durable form of one workspace: what survives a restart.
 ///
-/// Native window ids do not (ARCHITECTURE section 12.2), so membership
-/// and last focus are absent; the tree carries the same evidence a
-/// stored container tree does and is matched the same way.
+/// Native window ids do not, so membership and last focus are absent; the
+/// tree carries the same evidence a stored container tree does and is
+/// matched the same way.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PersistedWorkspace {
     pub name: WorkspaceName,
@@ -169,7 +169,7 @@ pub enum WorkspaceRefusal {
     /// The name is not a valid workspace name at all.
     InvalidName { reason: WorkspaceNameError },
     /// No workspace by that name exists, and naming one does not create
-    /// it (ADR 0028).
+    /// it.
     UnknownWorkspace { name: String },
     /// Create was asked for a name the pool already holds.
     AlreadyExists { name: WorkspaceName },
@@ -191,7 +191,7 @@ pub enum WorkspaceRefusal {
     /// displays one.
     NotDisplayed { name: WorkspaceName },
     /// Focus needed a display to show a hidden workspace on, and no
-    /// display is focused (ADR 0027).
+    /// display is focused.
     NoFocusedDisplay,
     /// The named display is not in the current topology.
     UnknownDisplay { display_id: DisplayId },
@@ -214,14 +214,13 @@ pub enum WorkspaceRefusal {
     /// promised for the windows the switch would park.
     PersistenceDegraded,
     /// Compensation for an earlier switch left windows unaccounted for.
-    /// Switching stays blocked until `restore-switch` reconciles them
-    /// (CONTEXT.md "Workspace-switch degraded").
+    /// Switching stays blocked until `restore-switch` reconciles them.
     SwitchDegraded { stranded_windows: usize },
     /// A switch is already in flight; a second one would interleave two
     /// sets of native moves over the same windows.
     SwitchInFlight { display_id: DisplayId },
     /// A window the switch would have to move is full-screen, and no
-    /// window is ever forced out of full-screen (ADR 0029).
+    /// window is ever forced out of full-screen.
     FullscreenMember {
         name: WorkspaceName,
         window_id: WindowId,
@@ -371,10 +370,9 @@ pub enum WorkspaceFocusApplied {
         display_id: DisplayId,
         focused_window: Option<WindowId>,
     },
-    /// The switch has windows to move, so it runs as a transaction
-    /// (CONTEXT.md "Workspace switch transaction") and has only started.
-    /// The displayed assignment does not change until every move lands;
-    /// a failure compensates and leaves `replaced` displayed.
+    /// The switch has windows to move, so it runs as a transaction and has
+    /// only started. The displayed assignment does not change until every
+    /// move lands; a failure compensates and leaves `replaced` displayed.
     SwitchStarted {
         name: WorkspaceName,
         display_id: DisplayId,
@@ -442,9 +440,9 @@ impl WorkspaceCommandResult {
 }
 
 /// Whether the platform adapter has verified a recoverable parking site
-/// for the current topology (ADR 0023). Parking is never authorised on
-/// `Unverified`, and a `Refused` site is never worked around by another
-/// hiding mechanism.
+/// for the current topology. Parking is never authorised on `Unverified`,
+/// and a `Refused` site is never worked around by another hiding
+/// mechanism.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum ParkingCapability {
     #[default]
@@ -513,8 +511,7 @@ impl std::fmt::Display for WorkspaceSwitchingUnavailable {
 pub enum SwitchingPending {
     /// No adapter has verified a recoverable parking site yet.
     ParkingCapabilityUnverified,
-    /// Recovery data would not be durable (CONTEXT.md
-    /// "Persistence-degraded"), so no window may be parked.
+    /// Recovery data would not be durable, so no window may be parked.
     PersistenceDegraded,
 }
 
@@ -527,8 +524,7 @@ impl SwitchingPending {
     }
 }
 
-/// The state of experimental workspace switching for the current
-/// topology (ADR 0023, ADR 0028).
+/// The state of experimental workspace switching for the current topology.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WorkspaceSwitchingStatus {
     /// No matched profile asks for it. Base config cannot.
@@ -556,8 +552,7 @@ impl WorkspaceSwitchingStatus {
     }
 }
 
-/// Which step of a workspace switch transaction is in flight (CONTEXT.md
-/// "Workspace switch transaction").
+/// Which step of a workspace switch transaction is in flight.
 ///
 /// The two forward phases run in order: everything the outgoing workspace
 /// still shows leaves the screen before anything the target workspace
@@ -597,8 +592,7 @@ impl WorkspaceSwitchPhase {
     }
 }
 
-/// The health condition a failed compensation leaves behind (CONTEXT.md
-/// "Workspace-switch degraded").
+/// The health condition a failed compensation leaves behind.
 ///
 /// It names the windows compensation could not account for, because those
 /// are what the explicit restore path has to reconcile. Switching stays
@@ -640,7 +634,7 @@ impl WorkspaceSwitchRestoreResult {
     }
 }
 
-/// The global pool (ADR 0028).
+/// The global pool.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct WorkspacePool {
     workspaces: BTreeMap<WorkspaceName, Workspace>,
@@ -714,7 +708,7 @@ impl WorkspacePool {
 
     /// Whether deletion would succeed, without deleting. Only a hidden
     /// workspace that owns neither a live member nor a dormant position
-    /// may go (ADR 0028), and never one configuration declares.
+    /// may go, and never one configuration declares.
     pub fn check_delete(&self, name: &str) -> Result<WorkspaceName, WorkspaceRefusal> {
         let name = self.require(name)?;
         let workspace = &self.workspaces[&name];

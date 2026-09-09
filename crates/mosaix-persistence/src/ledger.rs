@@ -1,7 +1,7 @@
-//! The current-session recovery ledger (ADR 0023): a small SQLite file
-//! beside the state database that records, before any native parking
-//! effect, everything needed to put a window back and everything needed
-//! to refuse a handle that no longer means the same window.
+//! The current-session recovery ledger: a small SQLite file beside the
+//! state database that records, before any native parking effect,
+//! everything needed to put a window back and everything needed to refuse
+//! a handle that no longer means the same window.
 //!
 //! It is its own file rather than tables in the state database on
 //! purpose. The state database holds cross-session identity and never a
@@ -263,7 +263,7 @@ impl RecoveryLedger {
 /// Restores every open entry whose handle verifies, and reports what
 /// happened to each. The one recovery routine, shared by the agent's
 /// startup pass and the out-of-process restore command, so the two can
-/// never disagree about which handles may be touched (ADR 0023).
+/// never disagree about which handles may be touched.
 ///
 /// `probe` says what a handle names now; `restore` puts a verified
 /// window back and answers with the platform's reason if it could not.

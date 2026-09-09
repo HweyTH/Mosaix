@@ -3,10 +3,9 @@
 //! `enumerate_displays` walks the current monitor set with
 //! `EnumDisplayMonitors`/`GetMonitorInfoW`, per-monitor DPI
 //! (`GetDpiForMonitor`), and current display settings
-//! (`EnumDisplaySettingsW`) for rotation, producing `mosaix_domain::Display`
-//! values directly -- unlike the move/resize and event-hook spikes, display
-//! topology is squarely a domain concept (architecture doc 7.1), so this
-//! module depends on `mosaix-domain` rather than staying standalone.
+//! (`EnumDisplaySettingsW`) for rotation, producing
+//! `mosaix_domain::Display` values directly: display topology is a domain
+//! concept, so this module depends on `mosaix-domain`.
 //!
 //! `watch_display_topology` owns a hidden top-level window (message-only
 //! windows are excluded from the `WM_DISPLAYCHANGE` broadcast, so a real
@@ -16,10 +15,9 @@
 //! is a hint, not a diff: callers compare `mosaix_domain::topology_fingerprint`
 //! across calls to decide whether anything meaningful actually changed.
 //!
-//! `stable_fingerprint` here is the architecture doc's documented fallback
-//! tier (device name + geometry + scale), not the strongest EDID-based
-//! identifier from `QueryDisplayConfig`/`DisplayConfigGetDeviceInfo` --
-//! upgrading to that is follow-up work.
+//! `stable_fingerprint` here is the fallback tier (device name + geometry
+//! + scale), not the strongest EDID-based identifier from
+//!   `QueryDisplayConfig`/`DisplayConfigGetDeviceInfo`.
 
 use std::cell::RefCell;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -156,12 +154,12 @@ pub enum TopologyEvent {
     /// resolution, DPI, or arrangement change via `WM_DISPLAYCHANGE`).
     Changed(Vec<Display>),
     /// The system just resumed from sleep or hibernation
-    /// (`WM_POWERBROADCAST` / `PBT_APMRESUMEAUTOMATIC`).  Carries a fresh
-    /// display enumeration taken after a brief settling delay (monitors need
-    /// time to re-initialize after wake).  The agent should use this to
-    /// send [`mosaix_engine::Event::WakeReconciliation`] rather than the
-    /// ordinary [`mosaix_engine::Event::DisplayTopologyChanged`], because
-    /// wake recovery also needs to re-enumerate windows.
+    /// (`WM_POWERBROADCAST` / `PBT_APMRESUMEAUTOMATIC`). Carries a fresh
+    /// display enumeration taken after a brief settling delay (monitors
+    /// need time to re-initialize after wake). The agent should use this
+    /// to send [`mosaix_engine::Event::WakeReconciliation`] rather than
+    /// the ordinary [`mosaix_engine::Event::DisplayTopologyChanged`],
+    /// because wake recovery also needs to re-enumerate windows.
     WakeFromSleep(Vec<Display>),
 }
 
@@ -173,7 +171,7 @@ thread_local! {
 ///
 /// Monitors need time to re-initialize after the system wakes from sleep.
 /// Querying the display list too quickly can return an empty or stale
-/// topology.  Two seconds is a conservative but safe budget that avoids
+/// topology. Two seconds is a conservative but safe budget that avoids
 /// returning a stale (possibly empty) topology.
 const WAKE_SETTLE_MILLIS: u64 = 2000;
 
@@ -193,10 +191,10 @@ unsafe extern "system" fn topology_wndproc(
         return LRESULT(0);
     }
 
-    // Feature 29 — sleep/wake recovery.
+    // Sleep/wake recovery.
     //
     // `PBT_APMRESUMEAUTOMATIC` (0x0012) fires when the system wakes (both
-    // from user action and automatic wake).  We wait for the display
+    // from user action and automatic wake). We wait for the display
     // subsystem to settle before re-enumerating, then emit `WakeFromSleep`
     // so the agent can send `Event::WakeReconciliation` and also
     // re-enumerate windows.

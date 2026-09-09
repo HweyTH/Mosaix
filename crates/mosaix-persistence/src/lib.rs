@@ -3,10 +3,10 @@
 //! This module owns every SQL connection. Callers exchange domain-oriented
 //! revisions and health snapshots; rusqlite types never cross this boundary.
 //!
-//! Two rules shape the whole module (ADR 0025). Storage failure never stops
-//! live window management, so every fallible operation reports health rather
-//! than panicking or unwinding into the reducer. And an unusable database is
-//! never repaired automatically -- a corrupt file, a newer schema, or a
+//! Two rules shape the whole module. Storage failure never stops live
+//! window management, so every fallible operation reports health rather
+//! than panicking or unwinding into the reducer. And an unusable database
+//! is never repaired automatically -- a corrupt file, a newer schema, or a
 //! failed migration is preserved byte-for-byte until a user asks for
 //! [`Persistence::reset`].
 
@@ -51,9 +51,9 @@ pub struct Migration {
     pub statements: &'static str,
 }
 
-/// The schema, in order. Per the spec, tables arrive with the slice that
-/// consumes them -- speculative tables would become a permanent
-/// compatibility obligation for no live reader.
+/// The schema, in order. Tables arrive with the slice that consumes them
+/// -- speculative tables would become a permanent compatibility obligation
+/// for no live reader.
 const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -64,9 +64,9 @@ const MIGRATIONS: &[Migration] = &[
                      INSERT INTO persistence_metadata (singleton, last_durable_revision)
                          VALUES (1, 0);",
     },
-    // Persistent undo (ADR 0024). Members cascade from their transaction,
-    // so consuming a transaction cannot leave rows describing a command
-    // that no longer exists. There is deliberately no title column: the
+    // Persistent undo. Members cascade from their transaction, so
+    // consuming a transaction cannot leave rows describing a command that
+    // no longer exists. There is deliberately no title column: the
     // evidence model has nowhere to put one.
     Migration {
         version: 2,
@@ -101,10 +101,10 @@ const MIGRATIONS: &[Migration] = &[
                      CREATE INDEX undo_transaction_recorded_at
                          ON undo_transaction (recorded_at_unix);",
     },
-    // Container trees (ADR 0023). One row per display, holding the whole
-    // arrangement as a document rather than a row per node: the tree is
-    // only ever read and written whole, and a document cannot be left
-    // half-updated the way a set of node rows could.
+    // Container trees. One row per display, holding the whole arrangement
+    // as a document rather than a row per node: the tree is only ever read
+    // and written whole, and a document cannot be left half-updated the
+    // way a set of node rows could.
     Migration {
         version: 3,
         statements: "CREATE TABLE container_tree (
@@ -125,13 +125,13 @@ const MIGRATIONS: &[Migration] = &[
                          PRIMARY KEY (transaction_id, display_fingerprint)
                      );",
     },
-    // Logical workspaces (ADR 0028). One row per workspace in the global
-    // pool: where it was displayed when last written, and the tree it
-    // owns as a document, for the same reason a container tree is one.
-    // The name is the key because it is the identity (CONTEXT.md
-    // "Logical workspace"): a workspace that moves between monitors keeps
-    // its row, and only `displayed_fingerprint` changes. Membership and
-    // last focus are native window ids and deliberately have no column.
+    // Logical workspaces. One row per workspace in the global pool: where
+    // it was displayed when last written, and the tree it owns as a
+    // document, for the same reason a container tree is one. The name is
+    // the key because it is the identity: a workspace that moves between
+    // monitors keeps its row, and only `displayed_fingerprint` changes.
+    // Membership and last focus are native window ids and deliberately
+    // have no column.
     Migration {
         version: 5,
         statements: "CREATE TABLE workspace (
@@ -141,12 +141,11 @@ const MIGRATIONS: &[Migration] = &[
                          tree TEXT
                      );",
     },
-    // The displayed workspace assignments a command changed, as they
-    // stood before it, so undoing a workspace switch puts the assignment
-    // back and not only the windows (CONTEXT.md "Workspace switch
-    // transaction"). Cascades with its transaction for the same reason
-    // members and trees do. `workspace` is nullable because a display
-    // that showed nothing is a state a switch can leave behind.
+    // The displayed workspace assignments a command changed, as they stood
+    // before it, so undoing a workspace switch puts the assignment back
+    // and not only the windows. Cascades with its transaction for the same
+    // reason members and trees do. `workspace` is nullable because a
+    // display that showed nothing is a state a switch can leave behind.
     Migration {
         version: 6,
         statements: "CREATE TABLE undo_assignment (
@@ -162,10 +161,10 @@ const MIGRATIONS: &[Migration] = &[
 /// The newest schema this build understands.
 pub const SUPPORTED_SCHEMA_VERSION: i32 = MIGRATIONS[MIGRATIONS.len() - 1].version;
 
-/// How many undo transactions history keeps at most (ADR 0024). Fixed in
-/// the first release: a configurable bound would be a promise about how
-/// much behavioural history Mosaix retains, and that is a decision worth
-/// making once rather than per user.
+/// How many undo transactions history keeps at most. Fixed in the first
+/// release: a configurable bound would be a promise about how much
+/// behavioural history Mosaix retains, and that is a decision worth making
+/// once rather than per user.
 pub const MAX_UNDO_TRANSACTIONS: u32 = 100;
 
 /// How long an undo transaction may live, in seconds. Seven days.
@@ -287,9 +286,9 @@ impl PersistenceError {
 /// Resolved here rather than in each binary so the agent and the CLI can
 /// never disagree about which file they are talking about. Both locations
 /// are the platform's per-user application-data directory, which carries
-/// the user-only protection the spec asks for without Mosaix setting an
-/// ACL of its own. `None` means this platform has no location yet, and so
-/// no durable state -- not that the location failed to be created.
+/// user-only protection without Mosaix setting an ACL of its own. `None`
+/// means this platform has no location yet, and so no durable state -- not
+/// that the location failed to be created.
 pub fn default_database_path() -> Option<PathBuf> {
     #[cfg(windows)]
     {
@@ -605,7 +604,7 @@ impl Persistence {
     }
 
     /// The transaction undo would examine next, or `None` when history is
-    /// empty. Undo never looks past this one (ADR 0024).
+    /// empty. Undo never looks past this one.
     pub fn newest_transaction(&self) -> Result<Option<UndoTransaction>, PersistenceError> {
         let header = self
             .connection
@@ -1019,7 +1018,7 @@ pub enum PersistenceRequest {
     /// current-session ledger. Answered through
     /// [`PersistenceUpdate::recovery_acknowledged`] with the same token,
     /// which is what lets the engine authorise the parking effect only
-    /// once the entry is durable (ADR 0023).
+    /// once the entry is durable.
     RecordRecovery {
         token: u64,
         draft: Box<RecoveryDraft>,

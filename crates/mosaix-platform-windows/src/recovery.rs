@@ -1,4 +1,4 @@
-//! Verifying and restoring recorded native handles (ADR 0023).
+//! Verifying and restoring recorded native handles.
 //!
 //! The recovery ledger records a native handle together with the process
 //! instance and window class that owned it. Windows reuses handle values

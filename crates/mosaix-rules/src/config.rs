@@ -60,7 +60,7 @@ pub struct ActionConfig {
     pub manage: ManageAction,
     /// The logical workspace a matching window joins. Names an existing
     /// workspace; an unknown name is a typed refusal at evaluation time,
-    /// never an implicit creation (ADR 0028).
+    /// never an implicit creation.
     #[serde(default)]
     pub workspace: Option<String>,
 }

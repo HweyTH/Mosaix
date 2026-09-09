@@ -1,5 +1,4 @@
-//! Experimental window parking through public APIs only (ADR 0023,
-//! ADR 0029).
+//! Experimental window parking through public APIs only.
 //!
 //! A parked window is moved to a *parking site*: a position outside every
 //! connected display, found beyond one edge of the virtual screen and

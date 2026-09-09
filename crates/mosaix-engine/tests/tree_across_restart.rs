@@ -1,5 +1,5 @@
 //! The container tree end to end, across a real state database and a real
-//! restart of the engine (issue #51).
+//! restart of the engine.
 //!
 //! The reducer's own tests cover insertion, removal, and swapping. What
 //! only this level can show is that a *user-shaped* arrangement comes
@@ -133,7 +133,7 @@ fn order_by_application(state: &EngineState) -> Vec<String> {
 fn a_user_shaped_arrangement_comes_back_after_a_restart() {
     let temporary = TempDatabase::new("shape");
 
-    // --- session one: build an arrangement, then reshape it ---
+    // ---- session one: build an arrangement, then reshape it -----------
     let saved = {
         let engine = spawn_engine(vec![display()], tree_config());
         let events = engine.events();
@@ -192,7 +192,7 @@ fn a_user_shaped_arrangement_comes_back_after_a_restart() {
         store.save_tree(&fingerprint, &tree).expect("it stores");
     }
 
-    // --- session two: same applications, different native handles ---
+    // ---- session two: same applications, different native handles -----
     let store = Persistence::open(&temporary.path()).expect("database reopens");
     let restored = store.load_trees().expect("arrangements are readable");
     assert_eq!(restored.len(), 1);
@@ -251,7 +251,7 @@ fn widths_by_application(state: &EngineState) -> Vec<(String, i32)> {
 fn resized_divider_weights_come_back_after_a_restart() {
     let temporary = TempDatabase::new("resize");
 
-    // --- session one: two windows, then grow the right one twice ---
+    // ---- session one: two windows, then grow the right one twice ------
     let saved = {
         let engine = spawn_engine(vec![display()], tree_config());
         let events = engine.events();
@@ -309,7 +309,7 @@ fn resized_divider_weights_come_back_after_a_restart() {
         store.save_tree(&saved.0, &saved.1).expect("it stores");
     }
 
-    // --- session two: the same applications, new handles ---
+    // ---- session two: the same applications, new handles --------------
     let restored = Persistence::open(&temporary.path())
         .expect("database reopens")
         .load_trees()
@@ -386,7 +386,7 @@ fn a_window_missing_at_restart_keeps_a_dormant_slot_it_reclaims_when_it_reopens(
         store.save_tree(&saved.0, &saved.1).expect("it stores");
     }
 
-    // --- session two: only alpha is open at first ---
+    // ---- session two: only alpha is open at first ---------------------
     let restored = Persistence::open(&temporary.path())
         .expect("database reopens")
         .load_trees()

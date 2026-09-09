@@ -1,5 +1,5 @@
 //! The logical workspace pool end to end, across a real state database and
-//! a real restart of the engine (issue #56).
+//! a real restart of the engine.
 //!
 //! The reducer's own tests cover the lifecycle. What only this level can
 //! show is that the pool as a whole comes back: a command-created
@@ -68,7 +68,7 @@ fn display() -> Display {
 
 /// A profile that turns on tree-mode automatic tiling for this topology,
 /// declares one workspace, `dev`, and requests experimental switching for
-/// it -- which is the only way a switch may move a window (ADR 0028).
+/// it -- which is the only way a switch may move a window.
 fn tree_config() -> ResolvedConfigSet {
     let config = ResolvedConfig {
         workspaces: vec![WorkspaceName::new("dev").unwrap()],
@@ -122,7 +122,7 @@ fn window(id: isize, application: &str, class: &str) -> Window {
 /// placement executor reporting each park and restore as landed.
 ///
 /// Without these the engine is right to sit still: a window may not leave
-/// visible geometry until its way back is on disk (ADR 0023).
+/// visible geometry until its way back is on disk.
 struct Adapter {
     intents: usize,
     effects: usize,
@@ -221,7 +221,7 @@ fn ws(name: &str) -> WorkspaceName {
 fn the_pool_its_displays_and_a_hidden_workspaces_tree_come_back_after_a_restart() {
     let temporary = TempDatabase::new("pool");
 
-    // --- session one: shape dev, switch away to a new workspace, back ---
+    // ---- session one: shape dev, switch away, then back -------------
     {
         let engine = spawn_engine(vec![display()], tree_config());
         let events = engine.events();
@@ -258,7 +258,7 @@ fn the_pool_its_displays_and_a_hidden_workspaces_tree_come_back_after_a_restart(
 
         // Switching to chat is a transaction: alpha and beta leave the
         // screen before chat is displayed, and only then does the
-        // assignment change (CONTEXT.md "Workspace switch transaction").
+        // assignment change.
         let _ = events.send(Event::WorkspaceCreateRequested {
             name: "chat".to_owned(),
         });
@@ -339,7 +339,7 @@ fn the_pool_its_displays_and_a_hidden_workspaces_tree_come_back_after_a_restart(
         engine.stop();
     }
 
-    // --- session two: same applications, different native handles ---
+    // ---- session two: same applications, different native handles -----
     let restored = {
         let store = Persistence::open(&temporary.path()).expect("database reopens");
         store.load_workspaces().expect("workspaces are readable")

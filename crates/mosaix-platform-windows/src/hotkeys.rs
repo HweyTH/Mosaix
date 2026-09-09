@@ -1,4 +1,4 @@
-//! Global hotkeys via `RegisterHotKey`/`WM_HOTKEY` (ADR 0002).
+//! Global hotkeys via `RegisterHotKey`/`WM_HOTKEY`.
 //!
 //! Same shape as `events.rs`: a dedicated thread owns the registrations
 //! and pumps the message loop `WM_HOTKEY` delivery requires. Registration
@@ -70,7 +70,7 @@ fn register_bindings(bindings: &[HotkeyBinding]) -> Vec<HotkeyRegistrationResult
 /// registered first -- both come back as a refusal -- and it cannot see
 /// `Win+L` or `Ctrl+Alt+Del` at all, because those are never registered
 /// hotkeys. Naming the owner is the caller's job: it knows Mosaix's own
-/// bindings, and it holds the short reserved list (ADR 0021).
+/// bindings, and it holds the short reserved list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HotkeyAvailability {
     /// `RegisterHotKey` accepted it, and the registration was released
@@ -81,7 +81,7 @@ pub enum HotkeyAvailability {
 }
 
 /// Asks the operating system whether `modifiers`+`vk` is free, by
-/// registering it and releasing it again (ADR 0021).
+/// registering it and releasing it again.
 ///
 /// The registration is undone before this returns, whether it succeeded
 /// or not, so probing never leaves a combination held -- which matters

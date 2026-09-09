@@ -1,9 +1,9 @@
 //! Platform adapter trait defining the contract for OS-specific implementations.
 //!
-//! Every platform (Windows, macOS) provides a concrete type that implements
-//! `PlatformAdapter`. The rest of the application depends only on this trait,
-//! keeping platform-specific code behind the adapter boundary
-//! (see ARCHITECTURE §9.1, §11).
+//! Every platform (Windows, macOS) provides a concrete type that
+//! implements `PlatformAdapter`. The rest of the application depends only
+//! on this trait, keeping platform-specific code behind the adapter
+//! boundary.
 
 use mosaix_domain::Window;
 

@@ -1,6 +1,5 @@
 //! Moving a window between displays: cycling to the adjacent monitor and
-//! preserving a window's zone ratio when it lands there (architecture doc
-//! section 20, "next-display" command).
+//! preserving a window's zone ratio when it lands there.
 //!
 //! Both helpers here are stateless, like [`crate::zones`] -- they take the
 //! current topology and bounds as input and return where the window should
@@ -10,9 +9,8 @@
 
 use mosaix_domain::{Display, DisplayId, NormalizedRect, Rect};
 
-/// Direction to cycle displays in, ordered left-to-right then top-to-bottom
-/// by `full_bounds` origin (architecture doc section 20, "next-display"
-/// command).
+/// Direction to cycle displays in, ordered left-to-right then
+/// top-to-bottom by `full_bounds` origin.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DisplayDirection {
     Next,
@@ -52,8 +50,7 @@ pub fn cycle_display(
 /// position and size as fractions of the container -- so a window snapped
 /// to a half, quarter, or third zone on one display lands in the
 /// equivalent zone on the other, and an unsnapped window keeps its
-/// relative position and size (architecture doc section 20, "next-display"
-/// command).
+/// relative position and size.
 ///
 /// Resolved through [`NormalizedRect`], so a window that doesn't fit
 /// `to_container` on an axis is clamped to it rather than hanging off the

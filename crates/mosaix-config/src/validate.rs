@@ -1,8 +1,8 @@
 //! Pure, I/O-free validation: parsing, field-level merge, and the
-//! whole-directory checks ADR 0007 requires (wrong version, a duplicate
-//! hotkey binding within a resolved config, two profiles sharing a
-//! `fingerprint`). Nothing here touches the filesystem or a watcher --
-//! callers hand in already-read file contents and get back either a full
+//! whole-directory checks (wrong version, a duplicate hotkey binding
+//! within a resolved config, two profiles sharing a `fingerprint`).
+//! Nothing here touches the filesystem or a watcher -- callers hand in
+//! already-read file contents and get back either a full
 //! [`ResolvedConfigSet`] or every error found, never a partial result.
 
 use thiserror::Error;
@@ -18,9 +18,8 @@ use crate::schema::{
 use mosaix_domain::{display_fingerprints, WorkspaceName, WorkspaceNameError};
 
 /// One profile candidate: its filename (for error messages -- profiles are
-/// matched by content, not filename, per ADR 0004, but the filename is
-/// still the natural way to point a user at which file is wrong) and its
-/// raw TOML content.
+/// matched by content, not filename, but the filename is still the natural
+/// way to point a user at which file is wrong) and its raw TOML content.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CandidateProfile {
     pub file_name: String,
@@ -28,8 +27,8 @@ pub struct CandidateProfile {
 }
 
 /// The whole config directory's contents, already read into memory --
-/// `config.toml` plus every file under `profiles/`. The unit
-/// [`validate`] validates atomically (ADR 0007).
+/// `config.toml` plus every file under `profiles/`. The unit [`validate`]
+/// validates atomically.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CandidateConfig {
     pub base: String,
@@ -292,7 +291,7 @@ const NORMALIZED_TOLERANCE: f64 = 1e-9;
 
 /// Every rule a saved layout must satisfy, checked against the file the
 /// layouts are *defined* in rather than a merged result -- a name and a
-/// cell list belong to whoever wrote them (ADR 0019).
+/// cell list belong to whoever wrote them.
 ///
 /// Returns every violation found rather than the first, matching how
 /// [`validate`] reports a whole directory: one pass should show a user
@@ -387,10 +386,10 @@ fn cross_layer_layout_collisions(
     errors
 }
 
-/// Field-level merges `profile` (if any) over `base`: any field the profile
-/// doesn't set falls through to `base`'s value, any field it does set
-/// overrides it -- down to individual hotkey commands and individual
-/// `Gaps` fields, not whole sections (ADR 0004).
+/// Field-level merges `profile` (if any) over `base`: any field the
+/// profile doesn't set falls through to `base`'s value, any field it does
+/// set overrides it -- down to individual hotkey commands and individual
+/// `Gaps` fields, not whole sections.
 pub fn merge(base: &BaseConfig, profile: Option<&ProfileConfig>) -> ResolvedConfig {
     let mut hotkeys = base.hotkeys.clone();
     let mut gaps = base.gaps;
@@ -468,7 +467,7 @@ pub fn merge(base: &BaseConfig, profile: Option<&ProfileConfig>) -> ResolvedConf
             focus_border.thickness = thickness;
         }
         // Keyed by name, so a profile overrides the layouts it names and
-        // leaves the rest of base config's set intact (ADR 0004).
+        // leaves the rest of base config's set intact.
         for (name, layout) in &profile.layouts {
             layouts.insert(name.clone(), layout.clone());
             layout_sources.insert(name.clone(), ConfigLayer::Profile);
@@ -538,7 +537,7 @@ fn duplicate_binding(file: &str, resolved: &ResolvedConfig) -> Option<Validation
 
 /// Every hotkey in `resolved` bound to a saved layout that `resolved` does
 /// not declare, as a validation error naming the file, the binding, and
-/// the layout (ADR 0019).
+/// the layout.
 ///
 /// Runs against the merged result rather than one file's own text, because
 /// a profile can bind a layout base config declares, or shadow a binding
@@ -576,11 +575,11 @@ fn unknown_layout_bindings(file: &str, resolved: &ResolvedConfig) -> Vec<Validat
         .collect()
 }
 
-/// Validates a whole candidate config directory atomically (ADR 0007): if
-/// any file is invalid -- bad TOML, wrong `version`, a duplicate hotkey
-/// binding in a resolved config, or two profiles sharing a `fingerprint`
-/// -- the entire candidate is rejected with every error found, and no
-/// partial [`ResolvedConfigSet`] is produced.
+/// Validates a whole candidate config directory atomically: if any file is
+/// invalid -- bad TOML, wrong `version`, a duplicate hotkey binding in a
+/// resolved config, or two profiles sharing a `fingerprint` -- the entire
+/// candidate is rejected with every error found, and no partial
+/// [`ResolvedConfigSet`] is produced.
 pub fn validate(candidate: &CandidateConfig) -> Result<ResolvedConfigSet, Vec<ValidationError>> {
     let mut errors = Vec::new();
 
@@ -1064,7 +1063,7 @@ cells = [{ x = 0.0, y = 0.0, width = 1.0, height = 1.0 }]
             "got {errors:?}"
         );
         // File, binding, and missing layout all in the one message the
-        // user sees (ADR 0019).
+        // user sees.
         let message = errors[0].to_string();
         assert!(message.contains("config.toml"), "{message}");
         assert!(message.contains("ctrl+alt+1"), "{message}");
@@ -1138,9 +1137,9 @@ cells = [{ x = 0.0, y = 0.0, width = 1.0, height = 1.0 }]
     #[test]
     fn a_profile_rebinding_a_layout_is_an_override_not_a_duplicate() {
         // Base and a profile both binding `apply-layout.writing` is the
-        // ordinary field-level merge every other binding gets (ADR 0004),
-        // not a collision -- the profile's combo simply wins for its
-        // topology, exactly as it would for `snap-left`.
+        // ordinary field-level merge every other binding gets, not a
+        // collision -- the profile's combo simply wins for its topology,
+        // exactly as it would for `snap-left`.
         let candidate = CandidateConfig {
             base: format!(
                 "{BASE_WITH_WRITING}\n[hotkeys.apply-layout]\nwriting = \"ctrl+alt+1\"\n"
@@ -1174,7 +1173,7 @@ cells = [{ x = 0.0, y = 0.0, width = 1.0, height = 1.0 }]
         // One layout is one key of one map, so two combos for it cannot
         // both survive. TOML catches the repeated key first, which is the
         // earliest and most precise place to catch it -- the alternative
-        // is a silent last-wins, which ADR 0019 rules out.
+        // is a silent last-wins.
         let base = format!(
             "{BASE_WITH_WRITING}\n\
              [hotkeys.apply-layout]\n\

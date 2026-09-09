@@ -164,8 +164,8 @@ pub fn load_saved_layouts(state: State<'_, EditorState>) -> Result<SavedLayoutLi
     session.layouts().map_err(|error| error.to_string())
 }
 
-/// Persists the drawn layout under the name it carries. The agent does
-/// the writing; this reports only what it confirmed (ADR 0022).
+/// Persists the drawn layout under the name it carries. The agent does the
+/// writing; this reports only what it confirmed.
 ///
 /// `to_base` is the interface's redirect control: it sends the write to
 /// base config rather than to the layer that supplies the layout.
@@ -232,7 +232,7 @@ pub fn probe_hotkey(
 }
 
 /// Binds a command to a combination. The agent does the writing; this
-/// reports only what it confirmed (ADR 0022).
+/// reports only what it confirmed.
 #[tauri::command]
 pub fn set_binding(
     command: String,
@@ -260,7 +260,7 @@ pub fn reset_binding(
 
 /// Opens hotkey capture: the agent unregisters every binding until the
 /// editor closes it, or until this application's connection ends -- so a
-/// crash brings the hotkeys back without an agent restart (ADR 0021).
+/// crash brings the hotkeys back without an agent restart.
 #[tauri::command]
 pub fn start_hotkey_capture(state: State<'_, EditorState>) -> Result<(), String> {
     let mut session = state.0.lock().map_err(|_| "editor state is unavailable")?;
