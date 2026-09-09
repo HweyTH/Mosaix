@@ -85,7 +85,15 @@ fn start_hotkeys_and_forward(
             // describe the same instant.
             let snapshot = state_reader.snapshot();
             let pre_revision = snapshot.revision;
-            let event = hotkeys::event_for_command(&command, snapshot.paused);
+            let Some(event) =
+                hotkeys::event_for_command(&command, snapshot.paused, snapshot.focused_window)
+            else {
+                tracing::debug!(
+                    command = %command,
+                    "hotkey needs a focused window and there is none; ignoring"
+                );
+                continue;
+            };
             if events.send(event).is_err() {
                 tracing::warn!("reducer stopped; hotkey forwarder exiting");
                 break;

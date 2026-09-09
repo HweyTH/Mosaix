@@ -1196,6 +1196,29 @@ pub fn handle_request(
                 send_event(events, Event::PauseRequested)
             }
         }
+        IpcRequest::RestoreWindow => {
+            with_focused_window(state_reader, |window_id| {
+                send_event(events, Event::WindowRestoreRequested { window_id })
+            })
+        }
+        IpcRequest::ThrowNext => with_focused_window(state_reader, |window_id| {
+            send_event(
+                events,
+                Event::WindowThrowToDisplayRequested {
+                    window_id,
+                    direction: mosaix_layout::DisplayDirection::Next,
+                },
+            )
+        }),
+        IpcRequest::ThrowPrev => with_focused_window(state_reader, |window_id| {
+            send_event(
+                events,
+                Event::WindowThrowToDisplayRequested {
+                    window_id,
+                    direction: mosaix_layout::DisplayDirection::Prev,
+                },
+            )
+        }),
         IpcRequest::Rearrange => send_event(events, Event::RearrangeRequested),
         IpcRequest::ToggleAutomaticTiling => {
             send_event(events, Event::ToggleAutomaticTilingRequested)
@@ -1728,6 +1751,24 @@ fn resize_tree(
 fn workspace_answer(result: WorkspaceCommandResult) -> IpcResponse {
     IpcResponse::Ok {
         data: Some(serde_json::to_value(result).expect("workspace results serialize")),
+    }
+}
+
+/// Runs `request` against the focused window, or refuses.
+///
+/// A window-scoped command has nothing to act on when no window is
+/// focused, and answering `Ok` there would tell the caller a placement
+/// happened when none did. An `Error` is what the CLI turns into a
+/// non-zero exit.
+fn with_focused_window(
+    state_reader: &StateReader,
+    request: impl FnOnce(mosaix_domain::WindowId) -> IpcResponse,
+) -> IpcResponse {
+    match state_reader.snapshot().focused_window {
+        Some(window_id) => request(window_id),
+        None => IpcResponse::Error {
+            message: "no focused window".to_string(),
+        },
     }
 }
 

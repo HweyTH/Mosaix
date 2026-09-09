@@ -11,7 +11,9 @@
 use std::collections::BTreeMap;
 
 use mosaix_config::{Command, KeyCombo, ResolvedConfig};
+use mosaix_domain::WindowId;
 use mosaix_engine::{CardinalDirection, Event, ZoneSnapDirection};
+use mosaix_layout::DisplayDirection;
 use mosaix_platform_windows::HotkeyBinding;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_WIN, VK_BACK, VK_DELETE, VK_DOWN,
@@ -42,8 +44,12 @@ pub fn is_zone_snap(command: &Command) -> bool {
 /// mapping a keypress goes through is the thing under test rather than a
 /// branch buried in a thread that only exists on Windows. Every variant is
 /// matched explicitly so it stays that way as the enum grows.
-pub fn event_for_command(command: &Command, paused: bool) -> Event {
-    match command {
+pub fn event_for_command(
+    command: &Command,
+    paused: bool,
+    focused_window: Option<WindowId>,
+) -> Option<Event> {
+    let event = match command {
         Command::SnapLeft => Event::ZoneSnapRequested {
             direction: ZoneSnapDirection::Left,
         },
@@ -106,7 +112,23 @@ pub fn event_for_command(command: &Command, paused: bool) -> Event {
         // binding to a user-named layout needs nothing looked up here.
         Command::ApplyLayout { name } => Event::SavedLayoutApplyRequested { name: name.clone() },
         Command::FocusWorkspace { name } => Event::WorkspaceFocusRequested { name: name.clone() },
-    }
+        // The three below are the only commands that name a window rather
+        // than a direction, so they are the only ones with nothing to do
+        // when no window is focused. `None` says so, rather than sending
+        // an event the reducer would drop on the floor.
+        Command::RestoreWindow => Event::WindowRestoreRequested {
+            window_id: focused_window?,
+        },
+        Command::ThrowNext => Event::WindowThrowToDisplayRequested {
+            window_id: focused_window?,
+            direction: DisplayDirection::Next,
+        },
+        Command::ThrowPrev => Event::WindowThrowToDisplayRequested {
+            window_id: focused_window?,
+            direction: DisplayDirection::Prev,
+        },
+    };
+    Some(event)
 }
 
 /// The `RegisterHotKey` ids allocated for one registration pass, mapped
@@ -423,11 +445,63 @@ mod tests {
     /// `PartialEq`. Its `Debug` output separates every variant and every
     /// payload these tests turn on, which is enough to assert against.
     fn dispatched(command: Command, paused: bool) -> String {
-        format!("{:?}", event_for_command(&command, paused))
+        format!(
+            "{:?}",
+            // A window is focused, so the window-scoped commands map like
+            // every other one. Their behaviour with none is asserted on
+            // its own below.
+            event_for_command(&command, paused, Some(WindowId(1)))
+                .expect("a command with a focused window always maps to an event")
+        )
     }
 
     fn rendered(event: Event) -> String {
         format!("{event:?}")
+    }
+
+    /// These three had no CLI subcommand, no IPC request and no binding,
+    /// so the engine events behind them could not be reached at all.
+    #[test]
+    fn the_window_scoped_commands_carry_the_focused_window() {
+        assert_eq!(
+            dispatched(Command::RestoreWindow, false),
+            rendered(Event::WindowRestoreRequested {
+                window_id: WindowId(1)
+            })
+        );
+        assert_eq!(
+            dispatched(Command::ThrowNext, false),
+            rendered(Event::WindowThrowToDisplayRequested {
+                window_id: WindowId(1),
+                direction: DisplayDirection::Next,
+            })
+        );
+        assert_eq!(
+            dispatched(Command::ThrowPrev, false),
+            rendered(Event::WindowThrowToDisplayRequested {
+                window_id: WindowId(1),
+                direction: DisplayDirection::Prev,
+            })
+        );
+    }
+
+    /// A window-scoped command with no window has nothing to act on, and
+    /// says so rather than sending an event the reducer would drop.
+    #[test]
+    fn a_window_scoped_command_maps_to_nothing_without_a_focused_window() {
+        for command in [
+            Command::RestoreWindow,
+            Command::ThrowNext,
+            Command::ThrowPrev,
+        ] {
+            assert!(
+                event_for_command(&command, false, None).is_none(),
+                "{command:?} needs a focused window"
+            );
+        }
+        // Every other command still maps, focused window or not.
+        assert!(event_for_command(&Command::SnapLeft, false, None).is_some());
+        assert!(event_for_command(&Command::Rearrange, false, None).is_some());
     }
 
     #[test]
@@ -602,8 +676,8 @@ mod tests {
         };
 
         assert!(matches!(
-            event_for_command(&command, false),
-            Event::WorkspaceFocusRequested { name } if name == "chat"
+            event_for_command(&command, false, None),
+            Some(Event::WorkspaceFocusRequested { name }) if name == "chat"
         ));
         let hotkeys = BTreeMap::from([(command.clone(), combo("ctrl+alt+2"))]);
         let manual = ResolvedConfig {

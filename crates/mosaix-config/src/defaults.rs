@@ -63,6 +63,9 @@ pub fn default_base_config() -> BaseConfig {
     hotkeys.insert(Command::ResizeUp, shifted_combo("UP"));
     hotkeys.insert(Command::ResizeDown, shifted_combo("DOWN"));
     hotkeys.insert(Command::TogglePause, default_combo("P"));
+    hotkeys.insert(Command::RestoreWindow, default_combo("Z"));
+    hotkeys.insert(Command::ThrowNext, default_combo("N"));
+    hotkeys.insert(Command::ThrowPrev, shifted_combo("N"));
 
     BaseConfig {
         version: CURRENT_VERSION,
