@@ -36,8 +36,9 @@ use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, KillTimer, PostThreadMessageW,
-    RegisterClassW, SetTimer, TranslateMessage, MONITORINFOF_PRIMARY, MSG, WINDOW_EX_STYLE,
-    WM_DISPLAYCHANGE, WM_POWERBROADCAST, WM_QUIT, WM_TIMER, WNDCLASSW, WS_OVERLAPPED,
+    RegisterClassW, SetTimer, TranslateMessage, MONITORINFOF_PRIMARY, MSG, SPI_SETWORKAREA,
+    WINDOW_EX_STYLE, WM_DISPLAYCHANGE, WM_POWERBROADCAST, WM_QUIT, WM_SETTINGCHANGE, WM_TIMER,
+    WNDCLASSW, WS_OVERLAPPED,
 };
 
 use crate::{Result, WindowError};
@@ -192,6 +193,29 @@ unsafe extern "system" fn topology_wndproc(
 ) -> LRESULT {
     if msg == WM_DISPLAYCHANGE {
         let displays = enumerate_displays().unwrap_or_default();
+        TOPOLOGY_SENDER.with(|sender| {
+            if let Some(tx) = sender.borrow().as_ref() {
+                let _ = tx.send(TopologyEvent::Changed(displays));
+            }
+        });
+        return LRESULT(0);
+    }
+
+    // Work-area changes: the taskbar being resized, moved to another edge,
+    // or switched to auto-hide. No `WM_DISPLAYCHANGE` is sent for any of
+    // them -- the monitors are untouched -- so without this the tiling
+    // arrangement kept using the old work area until something else
+    // happened to trigger a reflow.
+    //
+    // Reported as an ordinary `Changed`, because it is the same topology:
+    // `topology_fingerprint` deliberately ignores `work_area`, so the
+    // reducer reflows without re-selecting the profile.
+    if msg == WM_SETTINGCHANGE && wparam.0 as u32 == SPI_SETWORKAREA.0 {
+        let displays = enumerate_displays().unwrap_or_default();
+        tracing::debug!(
+            display_count = displays.len(),
+            "work area changed; re-enumerating displays"
+        );
         TOPOLOGY_SENDER.with(|sender| {
             if let Some(tx) = sender.borrow().as_ref() {
                 let _ = tx.send(TopologyEvent::Changed(displays));
