@@ -111,7 +111,28 @@ x = 0.0
 y = 0.0
 width = 0.62
 height = 1.0
+
+[[rules]]
+id = "float-calculator"
+priority = 10
+match.application_id = "Microsoft.WindowsCalculator"
+actions.manage = "float"
 ```
+
+### Window rules
+
+Each `[[rules]]` entry decides how one kind of window is managed. `match`
+takes any of `application_id`, `application_regex`, `title_regex`,
+`native_class`, `class_regex`, `exe_path`, `exe_path_regex` and `role`, and
+every field given must match. `actions.manage` is `tile`, `float` or
+`exclude`, and `actions.workspace` names a workspace the window joins --
+one that already exists, since a rule never creates one.
+
+Higher `priority` wins; Mosaix's own built-in rules sit below every rule you
+write. Rules live in `config.toml` only, never in a profile: a window's
+management decision must not change under it when a monitor is unplugged.
+An unparseable regex or a repeated `id` is rejected with the rest of the
+directory, so a rule either works or says why.
 
 ## CLI
 

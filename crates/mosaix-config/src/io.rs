@@ -317,6 +317,9 @@ pub fn save_profile_settings(
         fingerprint: update.fingerprint.clone(),
         workspaces: Vec::new(),
         hotkeys: Default::default(),
+        // Always empty: a profile carrying rules is refused by
+        // `validate`, and this crate never writes one.
+        rules: Vec::new(),
         gaps: GapsOverride::default(),
         behavior: Default::default(),
         automatic_tiling: None,

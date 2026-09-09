@@ -7,7 +7,7 @@
 
 use thiserror::Error;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::schema::layout_names_collide;
 use crate::schema::{
@@ -16,6 +16,7 @@ use crate::schema::{
     WorkspaceSwitchingSection, BASE_CONFIG_FILE_NAME, CURRENT_VERSION,
 };
 use mosaix_domain::{display_fingerprints, WorkspaceName, WorkspaceNameError};
+use mosaix_rules::{Rule, RuleConfig};
 
 /// One profile candidate: its filename (for error messages -- profiles are
 /// matched by content, not filename, but the filename is still the natural
@@ -144,6 +145,14 @@ pub enum ValidationError {
     WorkspaceSwitchingInBaseConfig { file: String },
 
     #[error(
+        "{file}: [[rules]] belongs in base config, never in a topology profile;          a window's management decision must not change when a monitor is unplugged"
+    )]
+    RulesInProfile { file: String },
+
+    #[error("{file}: {message}")]
+    InvalidRule { file: String, message: String },
+
+    #[error(
         "{file}: [workspace_switching.displayed] maps display {display:?} to workspace \
          {workspace:?}, which no configuration file declares"
     )]
@@ -238,6 +247,43 @@ fn workspace_switching_errors(
 /// profile repeating a base name is not a duplicate -- it is the same
 /// workspace, which the merge keeps once -- so this checks one file at a
 /// time.
+/// Every problem base config's `[[rules]]` entries have.
+///
+/// A rule is checked by compiling it: `Rule`'s own `TryFrom` is the single
+/// definition of what a valid rule is, so this cannot drift from what the
+/// evaluator will later accept. An invalid regex is therefore a rejected
+/// config directory, not a rule that silently never matches.
+///
+/// Duplicate ids are refused as well, because a rule id is what the
+/// evaluation trace names when it explains why a window was floated, and
+/// two rules answering to one name make that explanation ambiguous.
+fn rule_errors(file: &str, rules: &[RuleConfig]) -> Vec<ValidationError> {
+    let mut errors = Vec::new();
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+
+    for rule in rules {
+        if rule.id.trim().is_empty() {
+            errors.push(ValidationError::InvalidRule {
+                file: file.to_owned(),
+                message: "a [[rules]] entry has an empty id".to_owned(),
+            });
+        } else if !seen.insert(rule.id.as_str()) {
+            errors.push(ValidationError::InvalidRule {
+                file: file.to_owned(),
+                message: format!("duplicate rule id {:?}", rule.id),
+            });
+        }
+        if let Err(error) = Rule::try_from(rule.clone()) {
+            errors.push(ValidationError::InvalidRule {
+                file: file.to_owned(),
+                message: error.to_string(),
+            });
+        }
+    }
+
+    errors
+}
+
 fn workspace_errors(file: &str, workspaces: &[String]) -> Vec<ValidationError> {
     let mut errors = Vec::new();
     let mut seen: Vec<WorkspaceName> = Vec::new();
@@ -486,6 +532,9 @@ pub fn merge(base: &BaseConfig, profile: Option<&ProfileConfig>) -> ResolvedConf
         focus_border,
         layouts,
         layout_sources,
+        // Base config's alone: a profile carrying rules is refused, so
+        // there is nothing here for the profile branch above to overlay.
+        rules: base.rules.clone(),
         // Attached by `validate`, which is the only place a profile's
         // filename is known.
         profile_file: None,
@@ -622,6 +671,7 @@ pub fn validate(candidate: &CandidateConfig) -> Result<ResolvedConfigSet, Vec<Va
             file: BASE_CONFIG_FILE_NAME.to_owned(),
         });
     }
+    errors.extend(rule_errors(BASE_CONFIG_FILE_NAME, &base.rules));
 
     let base_resolved = merge(&base, None);
     if !(1..=16).contains(&base_resolved.focus_border.thickness) {
@@ -660,6 +710,11 @@ pub fn validate(candidate: &CandidateConfig) -> Result<ResolvedConfigSet, Vec<Va
             &profile.layouts,
         ));
         layout_problems.extend(workspace_errors(file_name, &profile.workspaces));
+        if !profile.rules.is_empty() {
+            layout_problems.push(ValidationError::RulesInProfile {
+                file: (*file_name).to_owned(),
+            });
+        }
         if let Some(section) = &profile.workspace_switching {
             layout_problems.extend(workspace_switching_errors(
                 file_name,
@@ -953,6 +1008,7 @@ snap-right = "ctrl+alt+left"
                     .keys()
                     .map(|name| (name.clone(), ConfigLayer::Base))
                     .collect(),
+                rules: base.rules.clone(),
                 profile_file: None,
             }
         );
@@ -2081,4 +2137,133 @@ chat = "ctrl+alt+2"
         assert!(!switching.experimental);
         assert_eq!(switching.displayed.len(), 2);
     }
+
+    /// `[[rules]]` was previously rejected outright by
+    /// `deny_unknown_fields`, so the whole rules engine was unreachable
+    /// from configuration.
+    #[test]
+    fn base_config_accepts_rules_and_carries_them_into_the_resolved_config() {
+        let base = format!(
+            "{VALID_BASE}
+             [[rules]]
+             id = \"float-calculator\"
+             priority = 10
+             match.application_id = \"Microsoft.WindowsCalculator\"
+             actions.manage = \"float\"
+"
+        );
+
+        let result = validate(&base_only(&base)).expect("rules are valid base config");
+
+        assert_eq!(result.base.rules.len(), 1);
+        let rule = &result.base.rules[0];
+        assert_eq!(rule.id, "float-calculator");
+        assert_eq!(rule.priority, 10);
+        assert!(rule.enabled, "a rule is enabled unless it says otherwise");
+        assert_eq!(rule.actions.manage, mosaix_rules::ManageAction::Float);
+    }
+
+    #[test]
+    fn a_rule_whose_regex_does_not_compile_is_refused() {
+        let base = format!(
+            "{VALID_BASE}
+             [[rules]]
+             id = \"broken\"
+             match.title_regex = \"(unclosed\"
+"
+        );
+
+        let errors = validate(&base_only(&base)).expect_err("an invalid regex is a config error");
+
+        assert!(
+            errors.iter().any(|error| matches!(
+                error,
+                ValidationError::InvalidRule { message, .. } if message.contains("title_regex")
+            )),
+            "got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn two_rules_sharing_an_id_are_refused() {
+        let base = format!(
+            "{VALID_BASE}
+             [[rules]]
+             id = \"same\"
+             match.native_class = \"A\"
+             
+             [[rules]]
+             id = \"same\"
+             match.native_class = \"B\"
+"
+        );
+
+        let errors = validate(&base_only(&base)).expect_err("a duplicate rule id is a config error");
+
+        assert!(
+            errors.iter().any(|error| matches!(
+                error,
+                ValidationError::InvalidRule { message, .. } if message.contains("duplicate rule id")
+            )),
+            "got {errors:?}"
+        );
+    }
+
+    /// Rules are global on purpose: a window's management decision must
+    /// not change under it when a monitor is unplugged.
+    #[test]
+    fn a_profile_carrying_rules_is_refused_and_says_where_they_belong() {
+        let profile = "fingerprint = \"MON-A@0,0 1920x1080 scale=1\"
+                       
+                       [[rules]]
+                       id = \"per-topology\"
+                       match.native_class = \"A\"
+";
+        let candidate = CandidateConfig {
+            base: VALID_BASE.to_string(),
+            profiles: vec![CandidateProfile {
+                file_name: "desk.toml".to_string(),
+                contents: profile.to_string(),
+            }],
+        };
+
+        let errors = validate(&candidate).expect_err("rules in a profile are a config error");
+
+        assert!(
+            errors
+                .iter()
+                .any(|error| matches!(error, ValidationError::RulesInProfile { file } if file == "desk.toml")),
+            "got {errors:?}"
+        );
+    }
+
+    /// A profile inherits base config's rules rather than being given
+    /// none, so switching topology never silently unmanages a window.
+    #[test]
+    fn a_profile_inherits_base_configs_rules() {
+        let base = format!(
+            "{VALID_BASE}
+             [[rules]]
+             id = \"exclude-splash\"
+             match.role = \"splash\"
+             actions.manage = \"exclude\"
+"
+        );
+        let candidate = CandidateConfig {
+            base,
+            profiles: vec![CandidateProfile {
+                file_name: "desk.toml".to_string(),
+                contents: "fingerprint = \"MON-A@0,0 1920x1080 scale=1\"
+".to_string(),
+            }],
+        };
+
+        let result = validate(&candidate).expect("a profile without rules is valid");
+
+        assert_eq!(
+            result.profiles[0].config.rules, result.base.rules,
+            "a profile sees exactly base config's rules"
+        );
+    }
+
 }
