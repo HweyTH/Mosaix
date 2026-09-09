@@ -4,7 +4,7 @@
 
 A keyboard-driven tiling window manager for Windows 11.
 
-[Installation](#installation) · [Keybindings](#default-keybindings) · [Configuration](#configuration) · [CLI](#cli) · [Documentation](#documentation) · [Contributing](#contributing)
+[Installation](#installation) · [Keybindings](#default-keybindings) · [Configuration](#configuration) · [CLI](#cli) · [Documentation](#documentation)
 
 ## Key features
 
@@ -164,13 +164,6 @@ npm run tauri dev
 
 Run the test suite with `cargo test --workspace`, and the settings app's own
 with `npm test` in `apps/mosaix-settings`.
-
-## Contributing
-
-Issues and pull requests are welcome. Match the conventions already in the
-repository: one logical change per commit, Conventional Commit messages, and a
-failing test before a bug fix. Decisions that are hard to reverse belong in an
-ADR under [`docs/architecture-decisions/`](./docs/architecture-decisions/).
 
 ## License
 
