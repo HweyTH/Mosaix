@@ -77,6 +77,10 @@ pub fn default_base_config() -> BaseConfig {
         // No layouts ship as defaults: a saved layout describes a shape
         // one user chose, so Mosaix has nothing to guess at.
         layouts: BTreeMap::new(),
+        // No rules ship as defaults either: the built-in rules in
+        // `mosaix-rules` already cover what Mosaix should never manage,
+        // and they are the low-priority fallback rather than config.
+        rules: Vec::new(),
         workspace_switching: None,
     }
 }

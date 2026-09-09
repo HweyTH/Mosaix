@@ -2275,6 +2275,7 @@ fn apply(state: &mut EngineState, event: Event) {
             }
             tracing::info!("resolved config changed");
             state.resolved_config = select_resolved_config(&config_set, &state.displays);
+            state.rules = compile_rules(&state.resolved_config);
             if !state.resolved_config.automatic_tiling_enabled {
                 state.automatic_tiling_suspended = false;
             }
@@ -5749,6 +5750,32 @@ pub fn spawn_engine(
 }
 
 /// Like [`spawn_engine`], with an explicit event-queue bound.
+/// The compiled form of a resolved config's `[[rules]]` entries.
+///
+/// `mosaix_config::validate` has already proved every pattern compiles by
+/// the time a `ResolvedConfig` exists, so an error here means one reached
+/// the reducer without passing through validation. The offending rule is
+/// dropped and named rather than passed on: a rule that cannot compile
+/// has no matcher, and keeping it would mean a rule the user wrote that
+/// never matches and never says why.
+fn compile_rules(resolved: &ResolvedConfig) -> Vec<Rule> {
+    resolved
+        .rules
+        .iter()
+        .filter_map(|config| match Rule::try_from(config.clone()) {
+            Ok(rule) => Some(rule),
+            Err(error) => {
+                tracing::error!(
+                    %error,
+                    id = %config.id,
+                    "a rule reached the reducer without passing validation; ignoring it"
+                );
+                None
+            }
+        })
+        .collect()
+}
+
 pub fn spawn_engine_with_capacity(
     initial_displays: Vec<Display>,
     initial_config_set: ResolvedConfigSet,
@@ -5798,7 +5825,7 @@ pub fn spawn_engine_with_capacity(
         windows: HashMap::new(),
         inventory: HashMap::new(),
         observed_windows: HashMap::new(),
-        rules: Vec::new(),
+        rules: compile_rules(&initial_resolved_config),
         visual_window_order: HashMap::new(),
         session_floating: HashSet::new(),
         session_tiled: HashSet::new(),
@@ -7288,6 +7315,63 @@ mod tests {
             EligibilityReason::FloatingRule
         );
         assert!(!state.inventory.contains_key(&WindowId(3)));
+    }
+
+    /// Rules were unreachable from configuration before this: nothing
+    /// ever sent `Event::RulesChanged`, so `state.rules` stayed empty
+    /// however many `[[rules]]` the user wrote. Configuration is now the
+    /// source, and a config change is what delivers them.
+    #[test]
+    fn rules_written_in_configuration_reach_the_evaluator() {
+        let mut state = EngineState::default();
+
+        apply(
+            &mut state,
+            Event::ConfigChanged(Box::new(ResolvedConfigSet {
+                base: ResolvedConfig {
+                    rules: vec![mosaix_rules::RuleConfig {
+                        id: "float-the-test-window".to_owned(),
+                        // Above the built-ins, which sit at -100.
+                        priority: 10,
+                        enabled: true,
+                        matcher: mosaix_rules::MatcherConfig {
+                            title_regex: Some("^non-sensitive".to_owned()),
+                            ..Default::default()
+                        },
+                        actions: mosaix_rules::ActionConfig {
+                            manage: ManageAction::Float,
+                            workspace: None,
+                        },
+                    }],
+                    ..ResolvedConfig::default()
+                },
+                profiles: Vec::new(),
+            })),
+        );
+
+        assert_eq!(state.rules.len(), 1, "configuration is a source of rules");
+        assert_eq!(state.rules[0].id, "float-the-test-window");
+
+        apply(
+            &mut state,
+            Event::WindowsObserved {
+                windows: vec![observed_window(
+                    1,
+                    mosaix_domain::WindowRole::Normal,
+                    WindowLifecycle::Active,
+                )],
+            },
+        );
+
+        assert_eq!(
+            state.inventory[&WindowId(1)].action,
+            ManageAction::Float,
+            "a normal window the user's rule matched floats instead of tiling"
+        );
+        assert_eq!(
+            state.inventory[&WindowId(1)].eligibility,
+            EligibilityReason::FloatingRule
+        );
     }
 
     #[test]

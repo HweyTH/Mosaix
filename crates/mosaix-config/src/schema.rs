@@ -11,6 +11,7 @@ use std::fmt;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use mosaix_rules::RuleConfig;
 use mosaix_domain::{Gaps, NormalizedRect, WorkspaceName};
 
 /// The base config file's name, and the name validation errors and
@@ -618,6 +619,16 @@ pub struct BaseConfig {
     /// scalar fields of the table containing it.
     #[serde(default)]
     pub layouts: BTreeMap<String, SavedLayout>,
+    /// Ordered window rules, each an `[[rules]]` entry. Precedence is by
+    /// each rule's own `priority`, not by position, so the order here is
+    /// only the order the file happens to list them in.
+    ///
+    /// Serialized after `layouts` because TOML puts every table -- and
+    /// every array of tables -- after the scalar fields of the table
+    /// containing it, and skipped when empty so a generated `config.toml`
+    /// does not grow a stray `[[rules]]` header.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rules: Vec<RuleConfig>,
     /// Present only so a switching request written into base config is
     /// refused with a reason that says where it belongs, rather than as
     /// an unknown field. Never written.
@@ -678,6 +689,15 @@ pub struct ProfileConfig {
     /// TOML ordering reason.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_switching: Option<WorkspaceSwitchingSection>,
+    /// Present only so rules written into a profile are refused with a
+    /// reason that says where they belong, rather than as an unknown
+    /// field. Never written -- the exact mirror of base config's
+    /// `workspace_switching`.
+    ///
+    /// Rules are global because a window's management decision must not
+    /// change under it when a monitor is unplugged.
+    #[serde(default, skip_serializing)]
+    pub rules: Vec<RuleConfig>,
 }
 
 /// What `workspaces` means when a base config does not mention it.
@@ -769,6 +789,14 @@ pub struct ResolvedConfig {
     /// list needed; showing a layout write's destination before the save
     /// is what needs it here.
     pub layout_sources: BTreeMap<String, ConfigLayer>,
+    /// The ordered window rules in effect, still in their config form.
+    ///
+    /// Not compiled to `mosaix_rules::Rule` here because a compiled rule
+    /// owns a `Regex`, which has no `PartialEq`, and this type's equality
+    /// is what lets the reducer tell a real config change from a rewrite
+    /// of the same content. `crate::validate` has already proved every
+    /// pattern compiles by the time one of these is handed out.
+    pub rules: Vec<RuleConfig>,
     /// The profile file this config was merged from, or `None` when base
     /// config alone supplies it. Set by [`crate::validate`], which is
     /// where a filename is known; [`crate::merge`] leaves it `None`
@@ -1140,6 +1168,7 @@ mod tests {
             version: CURRENT_VERSION,
             workspaces: vec!["dev".to_owned(), "chat".to_owned()],
             hotkeys: BTreeMap::new(),
+            rules: Vec::new(),
             gaps: Gaps::default(),
             behavior: BehaviorSection::default(),
             focus_border: FocusBorderSection::default(),
@@ -1200,6 +1229,7 @@ mod tests {
             fingerprint: "MON".to_owned(),
             workspaces: vec!["dev".to_owned()],
             hotkeys: BTreeMap::new(),
+            rules: Vec::new(),
             gaps: GapsOverride::default(),
             behavior: BehaviorSection::default(),
             automatic_tiling: None,

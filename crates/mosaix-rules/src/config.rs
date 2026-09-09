@@ -22,7 +22,7 @@ pub enum RuleConfigError {
 }
 
 /// A single rule as it appears in config.toml under `[[rules]]`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuleConfig {
     pub id: String,
@@ -40,7 +40,7 @@ fn default_enabled() -> bool {
     true
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MatcherConfig {
     pub application_id: Option<String>,
@@ -53,7 +53,7 @@ pub struct MatcherConfig {
     pub role: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ActionConfig {
     #[serde(default = "default_manage")]
