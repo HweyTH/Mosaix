@@ -39,6 +39,97 @@ mod recovery;
 /// When `overlay_tx` is present, each successful enqueue also signals the
 /// snap-preview controller with the pre-send revision so it can flash the
 /// committed placement.
+/// How often a config directory that could not be prepared or watched is
+/// retried.
+///
+/// Slow enough to cost nothing while the condition persists, and fast
+/// enough that someone who has just repaired the directory does not have
+/// to wonder whether it took.
+#[cfg(windows)]
+const CONFIG_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Forwards each validated reload into the reducer as
+/// `Event::ConfigChanged`, structurally identical to the display-topology
+/// forwarder.
+///
+/// A rejected reload is already logged inside `mosaix_config::watch`'s own
+/// debounce loop, so there is nothing left for this forwarder to do with
+/// it -- `EngineState`'s resolved config simply stays at its
+/// last-known-good value.
+#[cfg(windows)]
+fn spawn_config_forwarder(
+    config_events: std::sync::mpsc::Receiver<mosaix_config::ConfigEvent>,
+    events: mosaix_engine::EventSender,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        for event in config_events {
+            if let mosaix_config::ConfigEvent::Changed(set) = event {
+                if events
+                    .send(mosaix_engine::Event::ConfigChanged(Box::new(set)))
+                    .is_err()
+                {
+                    tracing::warn!("reducer stopped; config forwarder exiting");
+                    break;
+                }
+            }
+        }
+    })
+}
+
+/// Keeps trying to prepare and watch `dir` until it succeeds, then hands
+/// over to the ordinary forwarder and stops retrying.
+///
+/// The first successful attempt loads the directory once before watching
+/// it, because the watcher only reports *changes*: without that load, a
+/// directory that became readable would go unnoticed until someone
+/// happened to edit it.
+///
+/// The thread owns the watcher for the rest of the process's life, which
+/// is what keeps it alive -- there is no later point that could hold it.
+/// While the directory stays unavailable it simply keeps sleeping; the
+/// process exiting is what ends it, and the forwarder it hands over to
+/// stops itself once the reducer has.
+#[cfg(windows)]
+fn spawn_config_retry(dir: std::path::PathBuf, events: mosaix_engine::EventSender) {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(CONFIG_RETRY_INTERVAL);
+        if let Err(err) = mosaix_config::ensure_default_config(&dir) {
+            tracing::debug!(%err, path = %dir.display(), "config directory still unavailable");
+            continue;
+        }
+        match mosaix_config::watch(dir.clone()) {
+            Ok((watcher, config_events)) => {
+                tracing::info!(
+                    path = %dir.display(),
+                    "config directory became available; watching it"
+                );
+                match mosaix_config::load(&dir) {
+                    Ok(Ok(set)) => {
+                        let _ = events.send(mosaix_engine::Event::ConfigChanged(Box::new(set)));
+                    }
+                    Ok(Err(errors)) => {
+                        for error in &errors {
+                            tracing::error!(%error, "config directory failed validation on retry");
+                        }
+                    }
+                    Err(err) => {
+                        tracing::error!(%err, "config directory could not be read on retry");
+                    }
+                }
+                // Both outlive this loop deliberately: dropping the
+                // watcher would stop the watching this just established.
+                let forwarder = spawn_config_forwarder(config_events, events);
+                let _ = forwarder.join();
+                drop(watcher);
+                return;
+            }
+            Err(err) => {
+                tracing::debug!(%err, path = %dir.display(), "config directory not watchable yet");
+            }
+        }
+    });
+}
+
 #[cfg(windows)]
 fn start_hotkeys_and_forward(
     bindings: Vec<mosaix_platform_windows::HotkeyBinding>,
@@ -528,30 +619,27 @@ fn main() {
     // debounce loop, so there's nothing left for this forwarder to do with
     // it -- `EngineState`'s resolved config simply stays at its
     // last-known-good value.
-    let config_watcher_and_forwarder = match watchable_config_dir.map(mosaix_config::watch) {
+    let config_watcher_and_forwarder = match watchable_config_dir.clone().map(mosaix_config::watch)
+    {
         Some(Ok((watcher, config_events))) => {
-            let events = engine.events();
-            let forwarder = std::thread::spawn(move || {
-                for event in config_events {
-                    if let mosaix_config::ConfigEvent::Changed(set) = event {
-                        if events
-                            .send(mosaix_engine::Event::ConfigChanged(Box::new(set)))
-                            .is_err()
-                        {
-                            tracing::warn!("reducer stopped; config forwarder exiting");
-                            break;
-                        }
-                    }
-                }
-            });
-            Some((watcher, forwarder))
+            Some((watcher, spawn_config_forwarder(config_events, engine.events())))
         }
         Some(Err(err)) => {
-            tracing::error!(%err, "failed to start config directory watcher; the agent will not observe config file edits");
+            tracing::error!(%err, "failed to start config directory watcher; retrying in the background");
             None
         }
         None => None,
     };
+
+    // A config directory that could not be prepared or watched at startup
+    // is retried rather than abandoned. Every reason it fails is external
+    // and fixable without stopping the agent -- a permissions repair, a
+    // roaming profile that has not arrived, a directory about to be
+    // created -- and requiring a restart to pick the fix up meant the
+    // agent kept running with configuration it could no longer see.
+    if let (Some(dir), false) = (&config_dir, config_watcher_and_forwarder.is_some()) {
+        spawn_config_retry(dir.clone(), engine.events());
+    }
 
     // Display topology watcher — forwards `WM_DISPLAYCHANGE` events (hotplug,
     // resolution change) and `WM_POWERBROADCAST` wake events from the
