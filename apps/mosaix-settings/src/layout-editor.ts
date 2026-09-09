@@ -63,8 +63,7 @@ export interface SavedLayout {
   source: "base" | "profile" | "unknown";
   /**
    * The configuration file supplying it, and so the file a save of it
-   * would be written to (ADR 0022). Absent when the agent could not name
-   * it.
+   * would be written to. Absent when the agent could not name it.
    */
   file: string | null;
 }
@@ -102,7 +101,7 @@ export interface AutomaticTilingSettings {
 /**
  * One bindable command as the interface shows it. `file` is the
  * configuration file that currently supplies it, and so the file an edit
- * of it would be written to (ADR 0022).
+ * of it would be written to.
  *
  * Every command appears, bound or not: a saved layout that is not yet a
  * keystroke away is exactly the one a user wants to reach, and a binding
@@ -149,9 +148,9 @@ export interface HotkeyList {
   baseFile: string;
   /**
    * Whether the agent currently has every binding unregistered for a
-   * hotkey editor. While it is true no Mosaix hotkey works anywhere on
-   * the system, so the interface says so rather than leaving the user to
-   * read it as Mosaix having stopped working (ADR 0021).
+   * hotkey editor. While it is true no Mosaix hotkey works anywhere on the
+   * system, so the interface says so rather than leaving the user to read
+   * it as Mosaix having stopped working.
    */
   captureSuspended: boolean;
   /**
@@ -299,7 +298,7 @@ export interface WriteDestination {
  *
  * The same rule saved layouts follow: the write goes to the layer that
  * currently supplies the value, and only a profile-supplied one has
- * anywhere to be redirected from (ADR 0022).
+ * anywhere to be redirected from.
  */
 export function bindingDestination(
   binding: HotkeyBinding | undefined,
@@ -317,10 +316,10 @@ export function bindingDestination(
  * The configuration file a save of `name` would land in, and whether the
  * redirect control can change it.
  *
- * The destination is the layer that currently supplies the layout
- * (ADR 0022). Two cases leave nothing for a redirect to do: a layout base
- * config already supplies, and a name no layer declares yet -- a new
- * layout goes to base config regardless, so it is available at every desk.
+ * The destination is the layer that currently supplies the layout. Two
+ * cases leave nothing for a redirect to do: a layout base config already
+ * supplies, and a name no layer declares yet -- a new layout goes to base
+ * config regardless, so it is available at every desk.
  *
  * Names are matched the way configuration matches them, ignoring case, so
  * what the interface promises and where the agent writes cannot disagree
@@ -403,10 +402,10 @@ function renderLayouts(
  * receipt afterwards.
  *
  * Whenever a profile is matched, the value on screen and the file that
- * would receive the write are different objects, so naming the
- * destination is load-bearing rather than decorative (ADR 0022) -- and
- * the redirect beside it is the only way to move a desk-specific layout
- * or binding out of its profile without editing TOML.
+ * would receive the write are different objects, so naming the destination
+ * is load-bearing rather than decorative -- and the redirect beside it is
+ * the only way to move a desk-specific layout or binding out of its
+ * profile without editing TOML.
  *
  * `marker` is the data attribute a test reaches for, which is the only
  * thing that differs between the layout panel's copy and the capture
@@ -424,9 +423,9 @@ function renderWriteDestination(
 }
 
 /**
- * What the user needs told about the state of registration, above the
- * list itself: that hotkeys are off while the editor holds them, and
- * which of them another application took while they were off (ADR 0021).
+ * What the user needs told about the state of registration, above the list
+ * itself: that hotkeys are off while the editor holds them, and which of
+ * them another application took while they were off.
  *
  * Both are stated rather than left to be inferred from a shortcut that
  * has stopped working.
@@ -475,7 +474,7 @@ function renderBindings(hotkeys: HotkeyList | undefined, hotkeyError: string | u
  * Rendered as part of the page rather than as a second window, because
  * suspension is already held for the editor's whole lifetime -- the
  * dialog's own job is only the fine scope, arming the buffer while it is
- * frontmost (ADR 0021).
+ * frontmost.
  */
 function renderCaptureDialog(
   capture: CaptureDialog | undefined,
@@ -491,14 +490,13 @@ function renderCaptureDialog(
   // reason the user cannot argue with:
   //
   // - `reserved` -- Windows handles the combination itself, so a binding
-  //   to it would be accepted and then never fire (ADR 0021).
+  //   to it would be accepted and then never fire.
   // - `unsupported` -- Mosaix has no virtual-key code for the key.
   // - `mosaix_binding` -- whole-directory validation rejects two commands
-  //   on one combination, so this write can only ever be refused. ADR
-  //   0021's "save a conflicting binding deliberately" is about a
-  //   combination *another application* owns, which Mosaix cannot
-  //   arbitrate; one Mosaix owns is the case the user can resolve
-  //   themselves, by freeing it first.
+  //   on one combination, so this write can only ever be refused. Saving a
+  //   conflicting binding deliberately is about a combination *another
+  //   application* owns, which Mosaix cannot arbitrate; one Mosaix owns is
+  //   the case the user can resolve themselves, by freeing it first.
   const blocked =
     capture.verdict !== undefined &&
     ["reserved", "unsupported", "mosaix_binding"].includes(
@@ -529,7 +527,7 @@ function renderCaptureDialog(
  * markup so each case reads as the thing the user has to decide about.
  *
  * A conflict names its owner and is still savable: Mosaix does not
- * overrule the user about their own machine (ADR 0021).
+ * overrule the user about their own machine.
  */
 function renderVerdict(verdict: HotkeyProbeResult | undefined): string {
   if (verdict === undefined) return "";
@@ -560,7 +558,7 @@ interface CaptureDialog {
   session: CaptureSession;
   /** The agent's answer about what is captured, once it has arrived. */
   verdict: HotkeyProbeResult | undefined;
-  /** Whether the save is redirected to base config (ADR 0022). */
+  /** Whether the save is redirected to base config. */
   toBase: boolean;
 }
 
@@ -586,7 +584,7 @@ export async function mountLayoutEditor(
   let workspaceError: string | undefined;
   let repairStatus: string | undefined;
   let selectedLayout: string | undefined;
-  /** Whether the next save is redirected to base config (ADR 0022). */
+  /** Whether the next save is redirected to base config. */
   let redirectToBase = false;
   /** The open capture dialog, if any. */
   let capture: CaptureDialog | undefined;
@@ -632,9 +630,7 @@ export async function mountLayoutEditor(
       <main class="spatial-editor">
         <div class="ambient ambient-one"></div><div class="ambient ambient-two"></div>
         <header class="brand-block">
-          <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
-          <span class="brand-name">Mosaix</span>
-          <small data-product-subtitle>Layout Tab</small>
+          <span class="brand-mark" aria-label="Mosaix" role="img"><i></i><i></i><i></i><i></i></span>
         </header>
         <div class="top-actions">
           <nav class="appearance-toggle" aria-label="Appearance">
@@ -645,9 +641,9 @@ export async function mountLayoutEditor(
           <button class="primary-button" data-save-apply>Save &amp; apply</button>
         </div>
         <aside class="tool-dock" aria-label="Canvas tools">
-          <button class="icon-button active" aria-label="Select zone">↖</button>
-          <button class="icon-button" data-command="split" aria-label="Split zone">⑂</button>
-          <button class="icon-button" data-add-zone aria-label="Add zone">＋</button>
+          <button class="icon-button active" aria-label="Select zone" title="Select">↖</button>
+          <button class="icon-button" data-command="split" aria-label="Split zone" title="Split">◫</button>
+          <button class="icon-button" data-add-zone aria-label="Add zone" title="New zone">＋</button>
         </aside>
         <section class="world" aria-label="Layout canvas">
           <div class="display-meta">
@@ -660,14 +656,13 @@ export async function mountLayoutEditor(
             <span>${escapeHtml(display.resolution)} · ${display.scalePercent}%</span>
           </div>
           <div class="monitor-shell" data-monitor style="aspect-ratio:${display.workAreaWidth} / ${display.workAreaHeight}">
-            <div class="work-area">${renderZones(snapshot, selectedZoneId)}<span class="work-label">WORK AREA · ${escapeHtml(display.resolution)}</span></div>
+            <div class="work-area">${renderZones(snapshot, selectedZoneId)}</div>
           </div>
-          <div class="monitor-foot"><span></span><i></i><span></span></div>
         </section>
         <div class="left-rail">
         <aside class="panel tiling-settings" aria-label="Automatic tiling settings">
           <div class="panel-title">AUTOMATIC TILING</div>
-          <p><small>Current topology</small><br><code data-topology-fingerprint>${escapeHtml(tilingSettings.topologyFingerprint)}</code></p>
+          <p><small>Current topology</small><br><code data-topology-fingerprint title="${escapeHtml(tilingSettings.topologyFingerprint)}">${escapeHtml(tilingSettings.topologyFingerprint)}</code></p>
           <p data-profile-status>${tilingSettings.matchedProfile ? "Matched topology profile" : "No profile yet — saving creates one"}</p>
           <label class="toggle-line"><span>Balanced grid</span><input data-auto-tiling type="checkbox" ${tilingSettings.enabled ? "checked" : ""} /></label>
           <label class="field"><span>Outer gap</span><input data-outer-gap type="number" min="0" max="256" value="${tilingSettings.outerGap}" /></label>
@@ -1010,7 +1005,7 @@ export async function mountLayoutEditor(
       button.addEventListener("click", (event) => {
         // The click's own modifier flags are the snapshot: a user who
         // opened this while holding Ctrl must not have Ctrl baked into
-        // every combination they then press (ADR 0021).
+        // every combination they then press.
         capture = {
           command: button.dataset.rebind!,
           session: openCapture(event as MouseEvent),
@@ -1114,7 +1109,7 @@ export async function mountLayoutEditor(
   };
   // A dialog that is not frontmost captures nothing, and throws away what
   // it held: a buffer left armed behind another window would record a
-  // combination the user meant for something else (ADR 0021).
+  // combination the user meant for something else.
   const onBlur = (): void => {
     if (capture === undefined) return;
     capture.session = blurCapture(capture.session);
@@ -1132,11 +1127,11 @@ export async function mountLayoutEditor(
   window.addEventListener("focus", onFocus);
 
   // Suspension is held for this window's whole lifetime, not for one
-  // dialog and not while it happens to have focus (ADR 0021). Anything
-  // narrower churns RegisterHotKey and risks losing a combination to
-  // another application on each cycle. The cost -- no Mosaix hotkey works
-  // anywhere while this window is open -- is what the hotkeys panel
-  // states rather than leaving the user to infer.
+  // dialog and not while it happens to have focus. Anything narrower
+  // churns RegisterHotKey and risks losing a combination to another
+  // application on each cycle. The cost -- no Mosaix hotkey works anywhere
+  // while this window is open -- is what the hotkeys panel states rather
+  // than leaving the user to infer.
   void bridge.startHotkeyCapture().catch((error: unknown) => {
     hotkeyError = `Could not suspend hotkeys for editing · ${String(error)}`;
     render();
