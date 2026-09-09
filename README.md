@@ -12,8 +12,9 @@ A keyboard-driven tiling window manager for Windows 11.
   repeating a horizontal snap cycles half → third → two-thirds.
 - **Automatic tiling** -- a deterministic, aspect-aware balanced grid, opted
   into per display topology, with a runtime toggle and `rearrange` recovery.
-- **Directional focus, swap, and resize** -- move focus across the grid, swap
-  two windows' places, or move the nearest divider, all from the home row.
+- **Directional focus, swap, and resize** -- move focus across the grid and
+  swap two windows' places from the home row, or move the nearest divider
+  with the arrow keys.
 - **Per-topology profiles** -- sparse overlays matched by display fingerprint,
   falling through to base config field by field, re-read across sleep, wake,
   and hotplug.
@@ -64,14 +65,20 @@ editing `config.toml` or by pressing a new combination in the settings app.
 
 | Keys | Command |
 | --- | --- |
-| `Ctrl+Alt+←` / `→` / `↑` / `↓` | Snap the focused window to a half zone; repeat to cycle |
-| `Ctrl+Alt+H` / `J` / `K` / `L` | Move focus left / down / up / right |
-| `Ctrl+Alt+Shift+H` / `J` / `K` / `L` | Swap the focused window with its neighbour |
-| `Ctrl+Alt+Shift+←` / `→` / `↑` / `↓` | Resize by moving the nearest divider |
-| `Ctrl+Alt+T` | Toggle automatic tiling for this topology |
-| `Ctrl+Alt+Space` | Float or unfloat the focused window |
-| `Ctrl+Alt+R` | Rearrange -- recover the grid after manual moves |
-| `Ctrl+Alt+P` | Pause and resume window management |
+| `Win+Alt+←` / `→` / `↑` / `↓` | Snap the focused window to a half zone; repeat to cycle |
+| `Win+Alt+H` / `J` / `K` / `L` | Move focus left / down / up / right |
+| `Win+Alt+Shift+H` / `J` / `K` / `L` | Swap the focused window with its neighbour |
+| `Win+Alt+Shift+←` / `→` / `↑` / `↓` | Resize by moving the nearest divider |
+| `Win+Alt+A` | Toggle automatic tiling for this topology |
+| `Win+Alt+Space` | Float or unfloat the focused window |
+| `Win+Alt+E` | Rearrange -- recover the grid after manual moves |
+| `Win+Alt+P` | Pause and resume window management |
+
+`Win+Alt` rather than `Ctrl+Alt`, because `Ctrl+Alt` is `AltGr`: on a European
+layout every binding here would fire while you were typing an ordinary
+character. It also collides with JetBrains IDEs, where `Ctrl+Alt+L` reformats
+code. `A` and `E` rather than the more obvious `T` and `R` because Xbox Game
+Bar holds `Win+Alt+R` and `Win+Alt+T` system-wide.
 
 ## Configuration
 
@@ -85,11 +92,11 @@ version = 1
 workspaces = ["main"]
 
 [hotkeys]
-snap-left = "ctrl+alt+left"
-snap-right = "ctrl+alt+right"
+snap-left = "win+alt+left"
+snap-right = "win+alt+right"
 
 [hotkeys.apply-layout]
-writing = "ctrl+alt+1"
+writing = "win+alt+1"
 
 [gaps]
 outer = 8

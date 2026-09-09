@@ -1,7 +1,16 @@
 //! Default config generation and the startup-failure fallback.
 //!
-//! The bindings here (Ctrl+Alt+Arrow) are what a first-run generated
+//! The bindings here (Win+Alt) are what a first-run generated
 //! `config.toml` and the in-memory fallback both reproduce.
+//!
+//! Win rather than Ctrl as the second modifier because Ctrl+Alt *is*
+//! AltGr: on a European layout every Ctrl+Alt binding here would fire
+//! while the user was typing an ordinary character. Ctrl+Alt also runs
+//! straight into JetBrains' own table (Ctrl+Alt+L reformats code).
+//!
+//! Plain Alt, which GlazeWM and komorebi default to, is not open to us:
+//! RegisterHotKey is OS-arbitrated and cannot swallow the keystroke, so
+//! an Alt binding would eat the menu mnemonic underneath it.
 
 use std::collections::BTreeMap;
 
@@ -12,12 +21,12 @@ use crate::schema::{
 };
 use crate::validate::merge;
 
-fn arrow_combo(key: &str) -> KeyCombo {
+fn default_combo(key: &str) -> KeyCombo {
     KeyCombo {
-        ctrl: true,
+        ctrl: false,
         alt: true,
         shift: false,
-        win: false,
+        win: true,
         key: key.to_string(),
     }
 }
@@ -25,7 +34,7 @@ fn arrow_combo(key: &str) -> KeyCombo {
 fn shifted_combo(key: &str) -> KeyCombo {
     KeyCombo {
         shift: true,
-        ..arrow_combo(key)
+        ..default_combo(key)
     }
 }
 
@@ -34,17 +43,17 @@ fn shifted_combo(key: &str) -> KeyCombo {
 /// TOML and this crate's own schema/parsing never drift apart.
 pub fn default_base_config() -> BaseConfig {
     let mut hotkeys = BTreeMap::new();
-    hotkeys.insert(Command::SnapLeft, arrow_combo("LEFT"));
-    hotkeys.insert(Command::SnapRight, arrow_combo("RIGHT"));
-    hotkeys.insert(Command::SnapTop, arrow_combo("UP"));
-    hotkeys.insert(Command::SnapBottom, arrow_combo("DOWN"));
-    hotkeys.insert(Command::Rearrange, arrow_combo("R"));
-    hotkeys.insert(Command::ToggleAutomaticTiling, arrow_combo("T"));
-    hotkeys.insert(Command::ToggleFloating, arrow_combo("SPACE"));
-    hotkeys.insert(Command::FocusLeft, arrow_combo("H"));
-    hotkeys.insert(Command::FocusDown, arrow_combo("J"));
-    hotkeys.insert(Command::FocusUp, arrow_combo("K"));
-    hotkeys.insert(Command::FocusRight, arrow_combo("L"));
+    hotkeys.insert(Command::SnapLeft, default_combo("LEFT"));
+    hotkeys.insert(Command::SnapRight, default_combo("RIGHT"));
+    hotkeys.insert(Command::SnapTop, default_combo("UP"));
+    hotkeys.insert(Command::SnapBottom, default_combo("DOWN"));
+    hotkeys.insert(Command::Rearrange, default_combo("E"));
+    hotkeys.insert(Command::ToggleAutomaticTiling, default_combo("A"));
+    hotkeys.insert(Command::ToggleFloating, default_combo("SPACE"));
+    hotkeys.insert(Command::FocusLeft, default_combo("H"));
+    hotkeys.insert(Command::FocusDown, default_combo("J"));
+    hotkeys.insert(Command::FocusUp, default_combo("K"));
+    hotkeys.insert(Command::FocusRight, default_combo("L"));
     hotkeys.insert(Command::SwapLeft, shifted_combo("H"));
     hotkeys.insert(Command::SwapDown, shifted_combo("J"));
     hotkeys.insert(Command::SwapUp, shifted_combo("K"));
@@ -53,7 +62,7 @@ pub fn default_base_config() -> BaseConfig {
     hotkeys.insert(Command::ResizeRight, shifted_combo("RIGHT"));
     hotkeys.insert(Command::ResizeUp, shifted_combo("UP"));
     hotkeys.insert(Command::ResizeDown, shifted_combo("DOWN"));
-    hotkeys.insert(Command::TogglePause, arrow_combo("P"));
+    hotkeys.insert(Command::TogglePause, default_combo("P"));
 
     BaseConfig {
         version: CURRENT_VERSION,
@@ -96,41 +105,48 @@ mod tests {
     use crate::schema::KeyCombo;
 
     #[test]
-    fn default_bindings_mirror_the_current_hardcoded_ctrl_alt_arrow_table() {
+    fn default_bindings_use_win_alt_and_avoid_the_reserved_letters() {
         let base = default_base_config();
 
         assert_eq!(base.version, CURRENT_VERSION);
         assert_eq!(
             base.hotkeys.get(&Command::SnapLeft),
-            Some(&arrow_combo("LEFT"))
+            Some(&default_combo("LEFT"))
         );
         assert_eq!(
             base.hotkeys.get(&Command::SnapRight),
-            Some(&arrow_combo("RIGHT"))
+            Some(&default_combo("RIGHT"))
         );
         assert_eq!(
             base.hotkeys.get(&Command::SnapTop),
-            Some(&arrow_combo("UP"))
+            Some(&default_combo("UP"))
         );
         assert_eq!(
             base.hotkeys.get(&Command::SnapBottom),
-            Some(&arrow_combo("DOWN"))
+            Some(&default_combo("DOWN"))
         );
         assert_eq!(base.gaps, Gaps::default());
         assert!(base.focus_border.enabled);
         assert_eq!(base.focus_border.color, crate::schema::RgbaColor::default());
         assert_eq!(base.focus_border.thickness, 2);
+        // Not R: Xbox Game Bar holds Win+Alt+R system-wide, so
+        // RegisterHotKey would simply fail for it on a stock Windows 11.
         assert_eq!(
             base.hotkeys.get(&Command::Rearrange),
-            Some(&arrow_combo("R"))
+            Some(&default_combo("E"))
+        );
+        // Not T, for the same reason -- Game Bar's recording timer.
+        assert_eq!(
+            base.hotkeys.get(&Command::ToggleAutomaticTiling),
+            Some(&default_combo("A"))
         );
         assert_eq!(
             base.hotkeys.get(&Command::FocusLeft),
-            Some(&arrow_combo("H"))
+            Some(&default_combo("H"))
         );
         assert_eq!(
             base.hotkeys.get(&Command::SwapRight),
-            Some(&KeyCombo::parse("ctrl+alt+shift+l").unwrap())
+            Some(&KeyCombo::parse("win+alt+shift+l").unwrap())
         );
         assert_eq!(base.behavior, BehaviorSection::default());
     }
@@ -141,7 +157,7 @@ mod tests {
 
         assert_eq!(
             fallback.hotkeys.get(&Command::SnapLeft),
-            Some(&KeyCombo::parse("ctrl+alt+left").unwrap())
+            Some(&KeyCombo::parse("win+alt+left").unwrap())
         );
         assert_eq!(fallback.gaps, Gaps::default());
     }
