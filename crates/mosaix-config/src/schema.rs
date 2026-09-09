@@ -29,7 +29,7 @@ pub const CURRENT_VERSION: u32 = 1;
 /// so the four zone-snap variants mirror
 /// [`mosaix_engine::ZoneSnapDirection`] rather than reusing it.
 ///
-/// Sixteen unit verbs, plus one that carries a payload. A saved layout is
+/// Twenty-three unit verbs, plus two that carry a payload. A saved layout is
 /// named by the user, so a binding to one has to name a string the schema
 /// cannot know in advance, and [`Command::ApplyLayout`] is where that
 /// string lives. Bindings stay a single keyspace: `ApplyLayout { name:

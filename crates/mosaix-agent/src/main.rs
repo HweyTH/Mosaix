@@ -105,7 +105,13 @@ fn spawn_config_retry(dir: std::path::PathBuf, events: mosaix_engine::EventSende
                 );
                 match mosaix_config::load(&dir) {
                     Ok(Ok(set)) => {
-                        let _ = events.send(mosaix_engine::Event::ConfigChanged(Box::new(set)));
+                        if events
+                            .send(mosaix_engine::Event::ConfigChanged(Box::new(set)))
+                            .is_err()
+                        {
+                            tracing::warn!("reducer stopped; config retry exiting");
+                            return;
+                        }
                     }
                     Ok(Err(errors)) => {
                         for error in &errors {
@@ -1371,7 +1377,9 @@ fn main() {
                                     tray.notify(
                                         "Mosaix could not register a hotkey",
                                         &format!(
-                                            "{refused} is already held by another application.                                              Pick a different combination in the settings app                                              or in config.toml."
+                                            "{refused} is already held by another application. \
+                                             Pick a different combination in the \
+                                             settings app or in config.toml."
                                         ),
                                     );
                                 }

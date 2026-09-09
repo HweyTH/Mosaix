@@ -1217,7 +1217,7 @@ pub fn handle_request(
             let state = state_reader.snapshot();
             match state.focused_window {
                 None => IpcResponse::Error {
-                    message: "no focused window".to_string(),
+                    message: NO_FOCUSED_WINDOW.to_string(),
                 },
                 Some(window_id) if !state.inventory.contains_key(&window_id) => {
                     IpcResponse::Error {
@@ -1227,30 +1227,38 @@ pub fn handle_request(
                 Some(_) => send_event(events, Event::ToggleFloatingRequested),
             }
         }
-        IpcRequest::FocusLeft => send_event(
-            events,
-            Event::DirectionalFocusRequested {
-                direction: mosaix_engine::CardinalDirection::Left,
-            },
-        ),
-        IpcRequest::FocusRight => send_event(
-            events,
-            Event::DirectionalFocusRequested {
-                direction: mosaix_engine::CardinalDirection::Right,
-            },
-        ),
-        IpcRequest::FocusUp => send_event(
-            events,
-            Event::DirectionalFocusRequested {
-                direction: mosaix_engine::CardinalDirection::Up,
-            },
-        ),
-        IpcRequest::FocusDown => send_event(
-            events,
-            Event::DirectionalFocusRequested {
-                direction: mosaix_engine::CardinalDirection::Down,
-            },
-        ),
+        IpcRequest::FocusLeft => require_focused_window(state_reader).unwrap_or_else(|| {
+            send_event(
+                events,
+                Event::DirectionalFocusRequested {
+                    direction: mosaix_engine::CardinalDirection::Left,
+                },
+            )
+        }),
+        IpcRequest::FocusRight => require_focused_window(state_reader).unwrap_or_else(|| {
+            send_event(
+                events,
+                Event::DirectionalFocusRequested {
+                    direction: mosaix_engine::CardinalDirection::Right,
+                },
+            )
+        }),
+        IpcRequest::FocusUp => require_focused_window(state_reader).unwrap_or_else(|| {
+            send_event(
+                events,
+                Event::DirectionalFocusRequested {
+                    direction: mosaix_engine::CardinalDirection::Up,
+                },
+            )
+        }),
+        IpcRequest::FocusDown => require_focused_window(state_reader).unwrap_or_else(|| {
+            send_event(
+                events,
+                Event::DirectionalFocusRequested {
+                    direction: mosaix_engine::CardinalDirection::Down,
+                },
+            )
+        }),
         IpcRequest::SwapLeft => swap(events, state_reader, mosaix_engine::CardinalDirection::Left),
         IpcRequest::SwapRight => swap(
             events,
@@ -1757,6 +1765,29 @@ fn workspace_answer(result: WorkspaceCommandResult) -> IpcResponse {
     }
 }
 
+/// The answer a window-scoped command gives when nothing is focused.
+///
+/// One constant rather than three copies of the literal, so the CLI
+/// cannot end up wording the same condition differently depending on
+/// which command hit it.
+const NO_FOCUSED_WINDOW: &str = "no focused window";
+
+/// Refuses a command that needs a focused window when there is none.
+///
+/// The reducer re-checks this -- it owns the decision, and state can move
+/// between the read and the event arriving. What the check adds is an
+/// answer: without it these commands returned `Ok`, and the CLI exited 0,
+/// which a script cannot tell from having worked.
+fn require_focused_window(state_reader: &StateReader) -> Option<IpcResponse> {
+    state_reader
+        .snapshot()
+        .focused_window
+        .is_none()
+        .then(|| IpcResponse::Error {
+            message: NO_FOCUSED_WINDOW.to_string(),
+        })
+}
+
 /// Runs `request` against the focused window, or refuses.
 ///
 /// A window-scoped command has nothing to act on when no window is
@@ -1770,7 +1801,7 @@ fn with_focused_window(
     match state_reader.snapshot().focused_window {
         Some(window_id) => request(window_id),
         None => IpcResponse::Error {
-            message: "no focused window".to_string(),
+            message: NO_FOCUSED_WINDOW.to_string(),
         },
     }
 }
@@ -1792,7 +1823,7 @@ fn snap(
         Some("window management is paused")
     } else {
         match state.focused_window {
-            None => Some("no focused window"),
+            None => Some(NO_FOCUSED_WINDOW),
             Some(window_id) if !state.windows.contains_key(&window_id) => {
                 Some("the focused window is not tracked by mosaix")
             }
@@ -4022,6 +4053,12 @@ mod tests {
             IpcRequest::SnapRight,
             IpcRequest::SnapTop,
             IpcRequest::SnapBottom,
+            // Directional focus needs a window to move *from*, so it is
+            // the same refusal, not a different one.
+            IpcRequest::FocusLeft,
+            IpcRequest::FocusRight,
+            IpcRequest::FocusUp,
+            IpcRequest::FocusDown,
         ] {
             let response = handle_request(
                 &request,
