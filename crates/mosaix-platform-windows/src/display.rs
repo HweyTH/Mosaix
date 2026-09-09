@@ -35,9 +35,9 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, PostThreadMessageW,
-    RegisterClassW, TranslateMessage, MONITORINFOF_PRIMARY, MSG, WINDOW_EX_STYLE, WM_DISPLAYCHANGE,
-    WM_POWERBROADCAST, WM_QUIT, WNDCLASSW, WS_OVERLAPPED,
+    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, KillTimer, PostThreadMessageW,
+    RegisterClassW, SetTimer, TranslateMessage, MONITORINFOF_PRIMARY, MSG, WINDOW_EX_STYLE,
+    WM_DISPLAYCHANGE, WM_POWERBROADCAST, WM_QUIT, WM_TIMER, WNDCLASSW, WS_OVERLAPPED,
 };
 
 use crate::{Result, WindowError};
@@ -173,7 +173,16 @@ thread_local! {
 /// Querying the display list too quickly can return an empty or stale
 /// topology. Two seconds is a conservative but safe budget that avoids
 /// returning a stale (possibly empty) topology.
-const WAKE_SETTLE_MILLIS: u64 = 2000;
+const WAKE_SETTLE_MILLIS: u32 = 2000;
+
+/// Timer id for the wake settling delay.
+///
+/// The delay is a `SetTimer` rather than a sleep because it runs inside
+/// the window procedure: sleeping there stops this thread's message pump
+/// for its whole duration, so a `WM_DISPLAYCHANGE` arriving during the
+/// wake -- exactly when monitors are coming back -- waits behind it, and
+/// Windows counts the window as not responding meanwhile.
+const WAKE_SETTLE_TIMER_ID: usize = 1;
 
 unsafe extern "system" fn topology_wndproc(
     hwnd: HWND,
@@ -204,7 +213,19 @@ unsafe extern "system" fn topology_wndproc(
     // https://learn.microsoft.com/en-us/windows/win32/power/pbt-apmresumeautomatic
     if msg == WM_POWERBROADCAST && wparam.0 as u32 == 0x0012u32 {
         tracing::info!("system wake detected; waiting for display subsystem to settle");
-        std::thread::sleep(std::time::Duration::from_millis(WAKE_SETTLE_MILLIS));
+        // Arm the settling delay and return, so the pump keeps running
+        // through it. A second wake before the first fires just resets
+        // the same timer id, which is what we want: settle from the
+        // latest wake, not the earliest.
+        unsafe { SetTimer(hwnd, WAKE_SETTLE_TIMER_ID, WAKE_SETTLE_MILLIS, None) };
+        return LRESULT(0);
+    }
+
+    if msg == WM_TIMER && wparam.0 == WAKE_SETTLE_TIMER_ID {
+        // One-shot: `SetTimer` repeats until killed.
+        unsafe {
+            let _ = KillTimer(hwnd, WAKE_SETTLE_TIMER_ID);
+        }
         let displays = enumerate_displays().unwrap_or_default();
         tracing::info!(
             display_count = displays.len(),
