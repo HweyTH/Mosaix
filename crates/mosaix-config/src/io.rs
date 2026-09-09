@@ -936,7 +936,13 @@ pub fn load(dir: &Path) -> Result<Result<ResolvedConfigSet, Vec<ValidationError>
 #[derive(Debug, Clone)]
 pub enum ConfigEvent {
     /// The directory reloaded and validated successfully.
-    Changed(ResolvedConfigSet),
+    ///
+    /// Boxed because a resolved set is far larger than the error list
+    /// beside it, and every send would otherwise pay for the bigger
+    /// variant. It also travels onward as one:
+    /// `mosaix_engine::Event::ConfigChanged` is boxed too, so the
+    /// agent's forwarder passes this straight through.
+    Changed(Box<ResolvedConfigSet>),
     /// The directory reloaded but its content failed validation; the
     /// caller should keep whatever config it already had active. Already
     /// logged by the watcher thread itself when this is produced.
@@ -1035,7 +1041,7 @@ pub fn watch(dir: PathBuf) -> Result<(ConfigWatcher, Receiver<ConfigEvent>), Con
 
             match load(&dir) {
                 Ok(Ok(set)) => {
-                    if event_tx.send(ConfigEvent::Changed(set)).is_err() {
+                    if event_tx.send(ConfigEvent::Changed(Box::new(set))).is_err() {
                         return;
                     }
                 }

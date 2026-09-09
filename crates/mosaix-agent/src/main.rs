@@ -65,7 +65,7 @@ fn spawn_config_forwarder(
         for event in config_events {
             if let mosaix_config::ConfigEvent::Changed(set) = event {
                 if events
-                    .send(mosaix_engine::Event::ConfigChanged(Box::new(set)))
+                    .send(mosaix_engine::Event::ConfigChanged(set))
                     .is_err()
                 {
                     tracing::warn!("reducer stopped; config forwarder exiting");
