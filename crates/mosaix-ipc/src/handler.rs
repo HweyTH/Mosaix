@@ -1196,7 +1196,7 @@ pub fn handle_request(
                 send_event(events, Event::PauseRequested)
             }
         }
-        IpcRequest::RestoreWindow => {
+        IpcRequest::RestorePlacement => {
             with_focused_window(state_reader, |window_id| {
                 send_event(events, Event::WindowRestoreRequested { window_id })
             })
