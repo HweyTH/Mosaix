@@ -152,13 +152,13 @@ afterEach(() => {
 });
 
 describe("layout editor", () => {
-  it("renders the locked Layout Tab shell without prototype-only metadata", async () => {
+  it("renders the locked editor shell without prototype-only metadata", async () => {
     const root = document.createElement("div");
     document.body.append(root);
 
     await mountLayoutEditor(root, bridge());
 
-    expect(root.querySelector("[data-product-subtitle]")?.textContent).toBe("Layout Tab");
+    expect(root.querySelector(".brand-mark")).not.toBeNull();
     expect(root.querySelectorAll("[data-zone]")).toHaveLength(3);
     expect(root.querySelector("[data-layout-metadata]")).toBeNull();
     expect(root.textContent).not.toContain("Prototype state");
@@ -549,7 +549,7 @@ describe("display selection", () => {
     picker.dispatchEvent(new Event("change", { bubbles: true }));
 
     expect(monitor().style.aspectRatio.replace(/\s/g, "")).toBe("1920/1040");
-    expect(root.querySelector(".work-label")?.textContent).toContain("1920 × 1040");
+    expect(root.querySelector(".display-meta")?.textContent).toContain("1920 × 1040");
   });
 });
 
