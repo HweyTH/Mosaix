@@ -1162,30 +1162,10 @@ pub fn handle_request(
             let value = serde_json::to_value(snapshot).unwrap();
             IpcResponse::Ok { data: Some(value) }
         }
-        IpcRequest::SnapLeft => send_event(
-            events,
-            Event::ZoneSnapRequested {
-                direction: ZoneSnapDirection::Left,
-            },
-        ),
-        IpcRequest::SnapRight => send_event(
-            events,
-            Event::ZoneSnapRequested {
-                direction: ZoneSnapDirection::Right,
-            },
-        ),
-        IpcRequest::SnapTop => send_event(
-            events,
-            Event::ZoneSnapRequested {
-                direction: ZoneSnapDirection::Top,
-            },
-        ),
-        IpcRequest::SnapBottom => send_event(
-            events,
-            Event::ZoneSnapRequested {
-                direction: ZoneSnapDirection::Bottom,
-            },
-        ),
+        IpcRequest::SnapLeft => snap(events, state_reader, ZoneSnapDirection::Left),
+        IpcRequest::SnapRight => snap(events, state_reader, ZoneSnapDirection::Right),
+        IpcRequest::SnapTop => snap(events, state_reader, ZoneSnapDirection::Top),
+        IpcRequest::SnapBottom => snap(events, state_reader, ZoneSnapDirection::Bottom),
         IpcRequest::Pause => send_event(events, Event::PauseRequested),
         IpcRequest::Resume => send_event(events, Event::ResumeRequested),
         IpcRequest::TogglePause => {
@@ -1221,9 +1201,32 @@ pub fn handle_request(
         }),
         IpcRequest::Rearrange => send_event(events, Event::RearrangeRequested),
         IpcRequest::ToggleAutomaticTiling => {
+            if !state_reader
+                .snapshot()
+                .resolved_config
+                .automatic_tiling_enabled
+            {
+                return IpcResponse::Error {
+                    message: "automatic tiling is not enabled for this display topology"
+                        .to_string(),
+                };
+            }
             send_event(events, Event::ToggleAutomaticTilingRequested)
         }
-        IpcRequest::ToggleFloating => send_event(events, Event::ToggleFloatingRequested),
+        IpcRequest::ToggleFloating => {
+            let state = state_reader.snapshot();
+            match state.focused_window {
+                None => IpcResponse::Error {
+                    message: "no focused window".to_string(),
+                },
+                Some(window_id) if !state.inventory.contains_key(&window_id) => {
+                    IpcResponse::Error {
+                        message: "the focused window is not managed by mosaix".to_string(),
+                    }
+                }
+                Some(_) => send_event(events, Event::ToggleFloatingRequested),
+            }
+        }
         IpcRequest::FocusLeft => send_event(
             events,
             Event::DirectionalFocusRequested {
@@ -1769,6 +1772,38 @@ fn with_focused_window(
         None => IpcResponse::Error {
             message: "no focused window".to_string(),
         },
+    }
+}
+
+/// Sends a zone snap, or says why it cannot happen.
+///
+/// The reducer re-checks every one of these conditions -- it owns the
+/// decision, and state can move between this read and the event arriving.
+/// What the check adds is an answer for the caller: without it a snap
+/// with nothing to snap returned `Ok`, and the CLI exited 0, which a
+/// script cannot tell from a snap that worked.
+fn snap(
+    events: &EventSender,
+    state_reader: &StateReader,
+    direction: ZoneSnapDirection,
+) -> IpcResponse {
+    let state = state_reader.snapshot();
+    let refusal = if state.paused {
+        Some("window management is paused")
+    } else {
+        match state.focused_window {
+            None => Some("no focused window"),
+            Some(window_id) if !state.windows.contains_key(&window_id) => {
+                Some("the focused window is not tracked by mosaix")
+            }
+            Some(_) => None,
+        }
+    };
+    match refusal {
+        Some(message) => IpcResponse::Error {
+            message: message.to_string(),
+        },
+        None => send_event(events, Event::ZoneSnapRequested { direction }),
     }
 }
 
@@ -3975,4 +4010,97 @@ mod tests {
         assert_eq!(json["recovery"]["outcomes"][0]["verdict"], "stale");
         assert_eq!(json["recovery"]["outcomes"][0]["native_handle"], 99);
     }
+
+    /// These commands used to answer `Ok` whatever the state was, so the
+    /// CLI exited 0 having done nothing -- indistinguishable, to a
+    /// script, from having worked.
+    #[test]
+    fn a_snap_with_nothing_focused_is_refused_rather_than_answered_ok() {
+        let engine = mosaix_engine::spawn_engine(Vec::new(), Default::default());
+        for request in [
+            IpcRequest::SnapLeft,
+            IpcRequest::SnapRight,
+            IpcRequest::SnapTop,
+            IpcRequest::SnapBottom,
+        ] {
+            let response = handle_request(
+                &request,
+                &engine.events(),
+                &engine.state_reader(),
+                &RecordingStore::wrote("config.toml", &[]),
+                &no_probe(),
+            );
+            let IpcResponse::Error { message } = response else {
+                panic!("{request:?} with nothing focused must refuse, got {response:?}");
+            };
+            assert_eq!(message, "no focused window");
+        }
+        engine.stop();
+    }
+
+    #[test]
+    fn toggling_floating_with_nothing_focused_is_refused() {
+        let engine = mosaix_engine::spawn_engine(Vec::new(), Default::default());
+        let response = handle_request(
+            &IpcRequest::ToggleFloating,
+            &engine.events(),
+            &engine.state_reader(),
+            &RecordingStore::wrote("config.toml", &[]),
+            &no_probe(),
+        );
+        engine.stop();
+
+        let IpcResponse::Error { message } = response else {
+            panic!("a float toggle with nothing focused must refuse, got {response:?}");
+        };
+        assert_eq!(message, "no focused window");
+    }
+
+    /// A manual topology has no automatic tiling to suspend, and saying
+    /// so beats reporting success for a no-op.
+    #[test]
+    fn toggling_automatic_tiling_on_a_manual_topology_is_refused() {
+        let engine = mosaix_engine::spawn_engine(Vec::new(), Default::default());
+        let response = handle_request(
+            &IpcRequest::ToggleAutomaticTiling,
+            &engine.events(),
+            &engine.state_reader(),
+            &RecordingStore::wrote("config.toml", &[]),
+            &no_probe(),
+        );
+        engine.stop();
+
+        let IpcResponse::Error { message } = response else {
+            panic!("a toggle on a manual topology must refuse, got {response:?}");
+        };
+        assert!(
+            message.contains("not enabled"),
+            "the message must say why: {message}"
+        );
+    }
+
+    /// The window-scoped additions refuse the same way.
+    #[test]
+    fn restore_and_throw_with_nothing_focused_are_refused() {
+        let engine = mosaix_engine::spawn_engine(Vec::new(), Default::default());
+        for request in [
+            IpcRequest::RestorePlacement,
+            IpcRequest::ThrowNext,
+            IpcRequest::ThrowPrev,
+        ] {
+            let response = handle_request(
+                &request,
+                &engine.events(),
+                &engine.state_reader(),
+                &RecordingStore::wrote("config.toml", &[]),
+                &no_probe(),
+            );
+            let IpcResponse::Error { message } = response else {
+                panic!("{request:?} with nothing focused must refuse, got {response:?}");
+            };
+            assert_eq!(message, "no focused window");
+        }
+        engine.stop();
+    }
+
 }
