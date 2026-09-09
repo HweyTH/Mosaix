@@ -70,7 +70,7 @@ pub enum Command {
     TogglePause,
     /// Return the focused window to the display and bounds it had before
     /// Mosaix last placed it. One step, not the persistent undo history.
-    RestoreWindow,
+    RestorePlacement,
     /// Move the focused window to the next display, keeping its position
     /// and size as a fraction of that display's work area.
     ThrowNext,
@@ -123,7 +123,7 @@ impl Command {
             Self::ResizeUp => "resize-up",
             Self::ResizeDown => "resize-down",
             Self::TogglePause => "toggle-pause",
-            Self::RestoreWindow => "restore-window",
+            Self::RestorePlacement => "restore-placement",
             Self::ThrowNext => "throw-next",
             Self::ThrowPrev => "throw-prev",
             Self::ApplyLayout { .. } => APPLY_LAYOUT_VERB,
@@ -159,7 +159,7 @@ impl Command {
             Self::ResizeUp,
             Self::ResizeDown,
             Self::TogglePause,
-            Self::RestoreWindow,
+            Self::RestorePlacement,
             Self::ThrowNext,
             Self::ThrowPrev,
         ]

@@ -143,7 +143,7 @@ The `mosaix` CLI drives a running agent over a versioned named pipe.
 ```powershell
 mosaix snap left-half          # snap the focused window
 mosaix throw next              # move the focused window to the next display
-mosaix restore-window          # put it back where it was before that
+mosaix restore-placement       # put it back where it was before that
 mosaix layout apply writing    # apply a saved layout
 mosaix arrangement             # report the tiling arrangement and container trees
 mosaix undo                    # reverse the newest placement command

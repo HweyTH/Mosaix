@@ -207,7 +207,7 @@ pub enum IpcRequest {
     ///
     /// Refused, rather than answered `Ok`, when no window is focused:
     /// there is no window the request could be about.
-    RestoreWindow,
+    RestorePlacement,
     /// Move the focused window to the next display, keeping its position
     /// and size as a fraction of that display's work area.
     ThrowNext,

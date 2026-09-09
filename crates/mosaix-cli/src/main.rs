@@ -11,27 +11,51 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Snap the focused window to a half zone.
+    ///
+    /// Repeating the same horizontal snap cycles half, third, two-thirds.
     Snap {
         #[command(subcommand)]
         direction: SnapDirection,
     },
+    /// Move focus to the nearest window that way, without moving anything.
+    ///
+    /// Does not wrap, and does not cross a display boundary when there is
+    /// no neighbour that way.
     Focus {
         #[command(subcommand)]
         direction: FocusDirection,
     },
+    /// Stop managing windows until resumed. Nothing is rearranged while
+    /// paused, and nothing moves when it takes effect.
     Pause,
+    /// Resume management after `pause`, rearranging to catch up.
     Resume,
+    /// Pause if running, resume if paused.
     TogglePause,
+    /// Recover the arrangement after windows have been moved by hand.
+    ///
+    /// Re-enumerates windows, resets open placement circuits once, and
+    /// reflows. Changes no rule and no floating state.
     Rearrange,
+    /// Suspend or resume automatic tiling for the current display
+    /// topology. Manual snapping keeps working either way.
     ToggleAutomaticTiling,
+    /// Float the focused window out of the tiling arrangement, or return
+    /// it to the arrangement if it is already floating.
     ToggleFloating,
     /// Select a display for commands such as saved-layout apply.
     FocusDisplay {
         display_id: isize,
     },
+    /// `focus left`, spelled as one word. Kept because bindings and
+    /// scripts already use it.
     FocusLeft,
+    /// `focus right`, spelled as one word.
     FocusRight,
+    /// `focus up`, spelled as one word.
     FocusUp,
+    /// `focus down`, spelled as one word.
     FocusDown,
     /// Exchange the focused window with its neighbor that way. Reports
     /// the typed outcome; a swap with no neighbor that way is refused
@@ -40,14 +64,17 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Exchange the focused window with its neighbour to the right.
     SwapRight {
         #[arg(long)]
         json: bool,
     },
+    /// Exchange the focused window with its neighbour above.
     SwapUp {
         #[arg(long)]
         json: bool,
     },
+    /// Exchange the focused window with its neighbour below.
     SwapDown {
         #[arg(long)]
         json: bool,
@@ -146,7 +173,7 @@ enum Command {
     /// One step back for one window, not the persistent undo history:
     /// `mosaix undo` reverses a whole transaction. Does nothing if the
     /// window has no remembered prior placement.
-    RestoreWindow,
+    RestorePlacement,
     /// Move the focused window to another display, keeping its position
     /// and size as a fraction of that display's work area.
     Throw {
@@ -283,6 +310,8 @@ enum SnapDirection {
 enum FocusDirection {
     Left,
     Right,
+    Up,
+    Down,
 }
 
 #[derive(Debug, Subcommand, Clone, Copy)]
@@ -381,6 +410,12 @@ fn main() {
         Command::Focus {
             direction: FocusDirection::Right,
         } => IpcRequest::FocusRight,
+        Command::Focus {
+            direction: FocusDirection::Up,
+        } => IpcRequest::FocusUp,
+        Command::Focus {
+            direction: FocusDirection::Down,
+        } => IpcRequest::FocusDown,
         Command::Pause => IpcRequest::Pause,
         Command::Resume => IpcRequest::Resume,
         Command::TogglePause => IpcRequest::TogglePause,
@@ -395,7 +430,7 @@ fn main() {
         Command::Layout {
             action: LayoutAction::Apply { name },
         } => IpcRequest::ApplyLayout { name },
-        Command::RestoreWindow => IpcRequest::RestoreWindow,
+        Command::RestorePlacement => IpcRequest::RestorePlacement,
         Command::Throw {
             direction: ThrowDirection::Next,
         } => IpcRequest::ThrowNext,

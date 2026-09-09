@@ -116,7 +116,7 @@ pub fn event_for_command(
         // than a direction, so they are the only ones with nothing to do
         // when no window is focused. `None` says so, rather than sending
         // an event the reducer would drop on the floor.
-        Command::RestoreWindow => Event::WindowRestoreRequested {
+        Command::RestorePlacement => Event::WindowRestoreRequested {
             window_id: focused_window?,
         },
         Command::ThrowNext => Event::WindowThrowToDisplayRequested {
@@ -464,7 +464,7 @@ mod tests {
     #[test]
     fn the_window_scoped_commands_carry_the_focused_window() {
         assert_eq!(
-            dispatched(Command::RestoreWindow, false),
+            dispatched(Command::RestorePlacement, false),
             rendered(Event::WindowRestoreRequested {
                 window_id: WindowId(1)
             })
@@ -490,7 +490,7 @@ mod tests {
     #[test]
     fn a_window_scoped_command_maps_to_nothing_without_a_focused_window() {
         for command in [
-            Command::RestoreWindow,
+            Command::RestorePlacement,
             Command::ThrowNext,
             Command::ThrowPrev,
         ] {
