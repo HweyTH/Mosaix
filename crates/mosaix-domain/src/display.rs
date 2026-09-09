@@ -1,6 +1,6 @@
-//! Display topology types (ARCHITECTURE §7.1): [`Display`], [`Rotation`],
-//! and [`topology_fingerprint`], the identity helper platform adapters use
-//! to tell a genuine topology change from a spurious re-enumeration.
+//! Display topology types: [`Display`], [`Rotation`], and
+//! [`topology_fingerprint`], the identity helper platform adapters use to
+//! tell a genuine topology change from a spurious re-enumeration.
 
 use serde::{Deserialize, Serialize};
 
@@ -16,7 +16,7 @@ pub enum Rotation {
     PortraitFlipped,
 }
 
-/// A monitor's geometry, scale, and identity (ARCHITECTURE §7.1).
+/// A monitor's geometry, scale, and identity.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Display {
     pub id: DisplayId,
@@ -29,13 +29,13 @@ pub struct Display {
     pub is_primary: bool,
 }
 
-/// A stable-ish fingerprint for a whole display topology: the sorted set of
-/// active display fingerprints plus their geometry and scale (ARCHITECTURE
-/// §7.1). Two calls return the same string if and only if the same
-/// displays, in the same arrangement and scale, are active -- use this to
-/// detect a genuine topology change versus a spurious re-enumeration.
-/// Deliberately ignores `id` (ephemeral) and `work_area` (can shift, e.g.
-/// taskbar auto-hide, without the topology itself changing).
+/// A stable-ish fingerprint for a whole display topology: the sorted set
+/// of active display fingerprints plus their geometry and scale. Two calls
+/// return the same string if and only if the same displays, in the same
+/// arrangement and scale, are active -- use this to detect a genuine
+/// topology change versus a spurious re-enumeration. Deliberately ignores
+/// `id` (ephemeral) and `work_area` (can shift, e.g. taskbar auto-hide,
+/// without the topology itself changing).
 pub fn topology_fingerprint(displays: &[Display]) -> String {
     let mut parts: Vec<String> = displays
         .iter()

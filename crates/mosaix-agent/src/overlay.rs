@@ -1,4 +1,4 @@
-//! Snap preview overlay controller (Feature 34).
+//! Snap preview overlay controller.
 //!
 //! One dedicated thread owns the single [`PreviewOverlay`] and serializes
 //! flash-after-snap and drag-to-snap requests so they never fight over the

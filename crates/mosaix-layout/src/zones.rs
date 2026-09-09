@@ -1,18 +1,16 @@
 //! Manual zone planner: named half/quarter/third zones, centering, and
 //! maximizing, each resolved against a container (typically a display's
-//! work area) -- architecture doc section 20's "Focused-window halves,
-//! quarters, thirds, center, maximize, restore" Phase 1 command set (minus
-//! `restore`, which needs a remembered pre-snap size and belongs with
-//! whatever tracks window state, not this stateless planner).
+//! work area). `restore` is not here: it needs a remembered pre-snap size
+//! and belongs with whatever tracks window state, not this stateless
+//! planner.
 //!
-//! Half and quarter zones are expressed as [`NormalizedRect`] fractions and
-//! resolved with [`NormalizedRect::to_rect`], the "one deterministic
-//! edge-allocation algorithm" (architecture doc section 10) that rounds
-//! shared edges consistently -- so e.g. `LeftHalf` and `RightHalf` always
-//! meet exactly, with no gap or overlap, even against an odd-sized
-//! container. `0.5` is a literal fraction shared by every half/quarter
-//! boundary, so resolving each zone independently is safe (see
-//! [`NormalizedRect::to_rect`]'s docs).
+//! Half and quarter zones are expressed as [`NormalizedRect`] fractions
+//! and resolved with [`NormalizedRect::to_rect`], the "one deterministic
+//! edge-allocation algorithm" that rounds shared edges consistently -- so
+//! e.g. `LeftHalf` and `RightHalf` always meet exactly, with no gap or
+//! overlap, even against an odd-sized container. `0.5` is a literal
+//! fraction shared by every half/quarter boundary, so resolving each zone
+//! independently is safe (see [`NormalizedRect::to_rect`]'s docs).
 //!
 //! Thirds can't use that trick -- `1.0 / 3.0` isn't representable exactly,
 //! so three independently-rounded thirds of e.g. a 100px span can fall a
@@ -38,8 +36,7 @@ pub fn resolve_layout_cells(work_area: Rect, cells: &[(f64, f64, f64, f64)]) -> 
         .collect()
 }
 
-/// A named half-zone a window can be snapped to (architecture doc section
-/// 8.1, "Snap to named zone"; section 20, "Focused-window halves").
+/// A named half-zone a window can be snapped to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HalfZone {
     LeftHalf,
@@ -87,13 +84,13 @@ pub fn snap_to_half(container: Rect, zone: HalfZone) -> Rect {
 }
 
 /// The half-zone an edge-triggered drag-to-snap would pick when the cursor
-/// is at `point` inside `work_area` (Feature 34). Returns `Some` only when
-/// `point` lies within `edge_threshold` pixels of a work-area edge;
-/// anywhere else (including outside the work area) is `None`.
+/// is at `point` inside `work_area`. Returns `Some` only when `point` lies
+/// within `edge_threshold` pixels of a work-area edge; anywhere else
+/// (including outside the work area) is `None`.
 ///
-/// Evaluation order is fixed — left, right, top, bottom — so a corner hit
-/// is deterministic (horizontal edges win). Matches the four half-zone
-/// hotkey commands; quarters are out of scope for the v1 drag preview.
+/// Evaluation order is fixed -- left, right, top, bottom -- so a corner
+/// hit is deterministic (horizontal edges win). Matches the four half-zone
+/// hotkey commands; quarters are not offered during a drag.
 pub fn half_zone_at_edge(
     work_area: Rect,
     point: (i32, i32),
@@ -120,8 +117,7 @@ pub fn half_zone_at_edge(
     None
 }
 
-/// A named quarter-zone a window can be snapped to (architecture doc
-/// section 20, "Focused-window ... quarters").
+/// A named quarter-zone a window can be snapped to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum QuarterZone {
     TopLeft,
@@ -169,7 +165,7 @@ pub fn snap_to_quarter(container: Rect, zone: QuarterZone) -> Rect {
 }
 
 /// A named third-zone a window can be snapped to, including the two-thirds
-/// combos (architecture doc section 20, "Focused-window ... thirds").
+/// combos.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ThirdZone {
     LeftThird,
@@ -209,9 +205,9 @@ pub fn snap_to_third(container: Rect, zone: ThirdZone) -> Rect {
     )
 }
 
-/// The horizontal direction a zone-snap hotkey cycles in (CONTEXT.md "Zone
-/// cycle"). Vertical snapping (top/bottom) never cycles, so it has no
-/// counterpart here -- it continues to resolve via [`snap_to_half`] alone.
+/// The horizontal direction a zone-snap hotkey cycles in. Vertical
+/// snapping (top/bottom) never cycles, so it has no counterpart here -- it
+/// continues to resolve via [`snap_to_half`] alone.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HorizontalDirection {
     Left,
@@ -220,7 +216,7 @@ pub enum HorizontalDirection {
 
 /// A window's position within its zone cycle for a given
 /// [`HorizontalDirection`] -- half, then the matching third, then the
-/// matching two-thirds, wrapping back to half (CONTEXT.md "Cycle step").
+/// matching two-thirds, wrapping back to half.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CycleStep {
     Half,
@@ -243,9 +239,9 @@ impl CycleStep {
 /// Resolves `direction`'s zone cycle at `step` against `container`
 /// (typically a display's work area) -- half on [`CycleStep::Half`], the
 /// matching third on [`CycleStep::Third`], the matching two-thirds on
-/// [`CycleStep::TwoThirds`] (CONTEXT.md "Zone cycle"). Delegates to
-/// [`snap_to_half`]/[`snap_to_third`], so it inherits their container-offset
-/// handling and gapless thirds.
+/// [`CycleStep::TwoThirds`]. Delegates to
+/// [`snap_to_half`]/[`snap_to_third`], so it inherits their
+/// container-offset handling and gapless thirds.
 pub fn resolve_zone_cycle(
     container: Rect,
     direction: HorizontalDirection,
@@ -275,8 +271,7 @@ pub fn resolve_zone_cycle(
 /// (typically a display's work area), preserving the window's size unless
 /// it's larger than `container` on an axis, in which case that axis is
 /// clamped to `container`'s extent so the result never extends past the
-/// container's edges (architecture doc section 20, "Focused-window ...
-/// center").
+/// container's edges.
 pub fn center_on(container: Rect, window_size: (i32, i32)) -> Rect {
     debug_assert!(
         container.width >= 0 && container.height >= 0,
@@ -298,15 +293,14 @@ pub fn center_on(container: Rect, window_size: (i32, i32)) -> Rect {
 }
 
 /// Resizes/repositions a window to exactly fill `container` (typically a
-/// display's work area) -- "maximize to work area" (architecture doc
-/// section 20, "Focused-window ... maximize").
+/// display's work area) -- "maximize to work area".
 pub fn maximize_to_work_area(container: Rect) -> Rect {
     container
 }
 
 /// Insets `raw_zone`'s edges by `gaps`, applied after a zone function has
-/// computed the raw rect (ADR 0006, CONTEXT.md "Gap (outer / inner)") --
-/// kept as a separate post-processing step rather than a parameter on
+/// computed the raw rect -- kept as a separate post-processing step rather
+/// than a parameter on
 /// `snap_to_half`/`snap_to_quarter`/`snap_to_third`/`resolve_zone_cycle`.
 ///
 /// An edge of `raw_zone` that coincides with the matching edge of

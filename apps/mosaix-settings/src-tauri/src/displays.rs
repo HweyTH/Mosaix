@@ -1,9 +1,9 @@
 //! The real displays a layout can be previewed against.
 //!
-//! A saved layout's cells are fractions of a display's work area (ADR
-//! 0018), so a preview that does not use a real work area is showing the
-//! wrong shape: a 16:9 canvas cannot tell a user what their cells will
-//! look like on a 21:9 panel.
+//! A saved layout's cells are fractions of a display's work area, so a
+//! preview that does not use a real work area is showing the wrong shape:
+//! a 16:9 canvas cannot tell a user what their cells will look like on a
+//! 21:9 panel.
 //!
 //! Enumeration is the platform adapter's job, the same one
 //! `mosaix-agent` uses. This module only reduces a `Display` to what the

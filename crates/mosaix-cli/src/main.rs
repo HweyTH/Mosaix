@@ -91,10 +91,9 @@ enum Command {
     },
     /// Reverse the newest placement command.
     ///
-    /// Refuses, and keeps the command available to retry, whenever a target
-    /// window cannot be identified beyond doubt or your displays have
-    /// changed. There is no way to force it. There is no redo: it is
-    /// deferred to issue #44.
+    /// Refuses, and keeps the command available to retry, whenever a
+    /// target window cannot be identified beyond doubt or your displays
+    /// have changed. There is no way to force it, and there is no redo.
     Undo {
         /// Report what undo would do without doing it.
         #[arg(long)]
@@ -791,9 +790,9 @@ fn format_workspace_result(result: &mosaix_domain::WorkspaceCommandResult) -> St
 
 /// The health condition a person should be told about first, if any.
 ///
-/// Published state orders the conditions once (issue #61) and every
-/// client reads that order rather than inventing one, so what the CLI
-/// leads with and what any other interface leads with are the same fact.
+/// Published state orders the conditions once and every client reads that
+/// order rather than inventing one, so what the CLI leads with and what
+/// any other interface leads with are the same fact.
 fn format_conditions(state: &serde_json::Value) -> Option<String> {
     let conditions: Vec<&str> = state["conditions"]
         .as_array()

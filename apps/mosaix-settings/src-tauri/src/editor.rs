@@ -44,7 +44,7 @@ pub struct DisplaySummary {
     pub scale_percent: u16,
     /// The work area's own pixel dimensions, so a preview is drawn at the
     /// proportions the layout will actually take. A layout's cells are
-    /// fractions of this rectangle (ADR 0018).
+    /// fractions of this rectangle.
     pub work_area_width: i32,
     pub work_area_height: i32,
 }
@@ -64,9 +64,8 @@ pub fn nominal_display() -> DisplaySummary {
     }
 }
 
-/// One saved layout as the interface lists it, with the file that
-/// supplies it -- and so the file a save of it would be written to
-/// (ADR 0022).
+/// One saved layout as the interface lists it, with the file that supplies
+/// it -- and so the file a save of it would be written to.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SavedLayoutView {
@@ -100,10 +99,7 @@ pub struct LayoutWriteReceipt {
     ///
     /// Reported because with a profile matched it is not necessarily the
     /// file a user would have guessed: the write goes to the layer that
-    /// supplies the layout (ADR 0022). ADR 0022 also wants the
-    /// destination shown *before* the save, with a control to redirect it
-    /// to base config; that needs per-layout provenance the agent does
-    /// not publish yet, and is issue #41.
+    /// supplies the layout.
     pub file: String,
 }
 
@@ -256,7 +252,7 @@ pub struct HotkeyList {
     /// Whether the agent currently has every binding unregistered for a
     /// hotkey editor. Shown rather than inferred: while it is true no
     /// Mosaix hotkey works anywhere on the system, and a user who is not
-    /// told will read that as Mosaix having stopped working (ADR 0021).
+    /// told will read that as Mosaix having stopped working.
     pub capture_suspended: bool,
     /// The commands whose bindings did not come back from the last
     /// registration pass, named so a shortcut another application took
@@ -391,7 +387,7 @@ impl Default for EditorSession {
 impl EditorSession {
     /// A session talking to `agent`. The connection is opened by the
     /// caller and held here, so the agent sees one connection per settings
-    /// window rather than one per request (ADR 0021).
+    /// window rather than one per request.
     pub fn with_agent(agent: Box<dyn AgentTransport>, displays: Vec<DisplaySummary>) -> Self {
         Self {
             agent,
@@ -593,9 +589,9 @@ impl EditorSession {
     ///
     /// Asked before the save, so a combination something else owns is
     /// reported while the user is still choosing rather than after they
-    /// have committed to it (ADR 0021). The command travels with the
-    /// question so re-pressing a binding's own combination is not
-    /// reported as a conflict with itself.
+    /// have committed to it. The command travels with the question so
+    /// re-pressing a binding's own combination is not reported as a
+    /// conflict with itself.
     pub fn probe_hotkey(
         &mut self,
         combo: &str,
@@ -614,8 +610,7 @@ impl EditorSession {
     ///
     /// `to_base` is the redirect beside the shown destination: it sends
     /// the write to base config rather than to the layer supplying the
-    /// binding, so a combination set at one desk applies everywhere
-    /// (ADR 0022).
+    /// binding, so a combination set at one desk applies everywhere.
     pub fn set_binding(
         &mut self,
         command: &str,
@@ -655,7 +650,7 @@ impl EditorSession {
     }
 
     /// Opens hotkey capture: the agent unregisters every binding until
-    /// this session closes it, or until the connection ends (ADR 0021).
+    /// this session closes it, or until the connection ends.
     ///
     /// Held for the editor's lifetime rather than for one dialog, so
     /// alt-tabbing away does not churn `RegisterHotKey` and risk losing a
@@ -677,10 +672,10 @@ impl EditorSession {
     /// The saved layouts the agent currently has, each naming the file
     /// that supplies it.
     ///
-    /// The file is what makes a write destination showable before the
-    /// save rather than only in the receipt afterwards: with a profile
-    /// matched, the layout on screen and the file that would receive the
-    /// write are different objects (ADR 0022).
+    /// The file is what makes a write destination showable before the save
+    /// rather than only in the receipt afterwards: with a profile matched,
+    /// the layout on screen and the file that would receive the write are
+    /// different objects.
     pub fn layouts(&mut self) -> Result<SavedLayoutList, EditorCommandError> {
         let state = self.agent.state().map_err(EditorCommandError::from)?;
         let mut sources = state.layout_sources;
@@ -727,10 +722,10 @@ impl EditorSession {
     /// taken, a layout declared in two layers -- is the agent's to
     /// answer, because only the agent can see the whole directory.
     ///
-    /// `to_base` is the redirect ADR 0022 asks for beside the shown
-    /// destination: it sends the write to base config rather than to the
-    /// layer that supplies the layout, moving a desk-specific layout out
-    /// of its profile so it applies everywhere.
+    /// `to_base` redirects the write beside the shown destination: it
+    /// sends the write to base config rather than to the layer that
+    /// supplies the layout, moving a desk-specific layout out of its
+    /// profile so it applies everywhere.
     pub fn save(
         &mut self,
         draft: LayoutDraft,

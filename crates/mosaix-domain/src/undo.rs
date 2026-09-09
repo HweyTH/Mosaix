@@ -1,4 +1,4 @@
-//! Persistent undo records (ADR 0024).
+//! Persistent undo records.
 //!
 //! One explicit placement-changing command produces one [`UndoTransaction`]
 //! holding every window it moved. Undo is **refusal-first**: it examines
@@ -60,9 +60,9 @@ pub struct UndoMember {
 ///
 /// Without this, undoing a swap or a resize would restore every window's
 /// rectangle and leave the tree describing the new arrangement -- and the
-/// next reflow would quietly redo the command. Stored in the durable
-/// form, so it is restored through the same confident matching a saved
-/// arrangement is (ADR 0024: "every reversible state change").
+/// next reflow would quietly redo the command. Stored in the durable form,
+/// so it is restored through the same confident matching a saved
+/// arrangement is.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct UndoTreeSnapshot {
     pub display_fingerprint: String,
@@ -71,7 +71,7 @@ pub struct UndoTreeSnapshot {
 
 /// Which logical workspace one display showed before the command, so
 /// undoing a workspace switch puts the assignment back and not only the
-/// windows (CONTEXT.md "Workspace switch transaction").
+/// windows.
 ///
 /// Recorded by fingerprint for the same reason a tree is: a display id is
 /// a native handle and means nothing in a later session. `workspace` is
@@ -274,9 +274,8 @@ pub struct UndoRestoredWindow {
     pub placement: Rect,
 }
 
-/// The result of asking to undo. Typed rather than a string, so IPC and the
-/// CLI can both report the same facts (spec: "typed success and failure
-/// results rather than string-only errors").
+/// The result of asking to undo. Typed rather than a string, so IPC and
+/// the CLI can both report the same facts.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UndoResult {

@@ -1,4 +1,4 @@
-//! System tray icon with pause / settings / quit menu (Feature 33).
+//! System tray icon with pause / settings / quit menu.
 //!
 //! Owned by a dedicated thread with a hidden top-level window (same shape
 //! as `display.rs`). Right-click opens a popup menu; pause state is pushed

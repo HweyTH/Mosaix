@@ -1,9 +1,8 @@
 //! Authoritative state reducer, reconciliation, placement diff, and transaction planning.
 //!
-//! Holds the event queue and reducer described in the architecture doc's
-//! "Concurrency model" (section 14.1): "Native adapter threads translate
-//! callbacks into normalized events. A bounded multi-producer queue feeds
-//! one reducer task. The reducer is the only writer of domain state."
+//! Holds the event queue and reducer: native adapter threads translate
+//! callbacks into normalized events, a bounded multi-producer queue feeds
+//! one reducer task, and the reducer is the only writer of domain state.
 //!
 //! [`spawn_engine`] starts one dedicated thread that owns [`EngineState`]
 //! outright -- no lock guards the mutation itself, because nothing else
@@ -15,25 +14,27 @@
 //! ## Resilience features
 //!
 //! - **Startup reconciliation** ([`Event::StartupReconciliation`]): The
-//!   agent enumerates all open windows at launch and bulk-registers them so
-//!   the engine starts with an accurate picture of what's already on screen.
+//!   agent enumerates all open windows at launch and bulk-registers them
+//!   so the engine starts with an accurate picture of what's already on
+//!   screen.
 //!
 //! - **Sleep/wake recovery** ([`Event::WakeReconciliation`]): After the
-//!   system resumes from sleep the display topology may have changed.  The
+//!   system resumes from sleep the display topology may have changed. The
 //!   agent re-enumerates displays and windows and sends this event, which
 //!   migrates any window whose previous display is gone to the nearest
 //!   surviving one.
 //!
-//! - **Display hotplug** ([`Event::DisplayTopologyChanged`]): When a monitor
-//!   is unplugged, windows tracked on the vanished display are migrated to
-//!   the nearest surviving display rather than being left off-screen.
+//! - **Display hotplug** ([`Event::DisplayTopologyChanged`]): When a
+//!   monitor is unplugged, windows tracked on the vanished display are
+//!   migrated to the nearest surviving display rather than being left
+//!   off-screen.
 //!
 //! - **Per-window circuit breaker** ([`Event::PlacementRejected`],
 //!   [`CIRCUIT_BREAKER_THRESHOLD`]): If a window repeatedly rejects
 //!   `SetWindowPos` (e.g. because it enforces a minimum size), the engine
-//!   marks it temporarily unmanaged after
-//!   [`CIRCUIT_BREAKER_THRESHOLD`] consecutive rejections.  A deliberate
-//!   zone-snap command from the user resets the breaker.
+//!   marks it temporarily unmanaged after [`CIRCUIT_BREAKER_THRESHOLD`]
+//!   consecutive rejections. A deliberate zone-snap command from the user
+//!   resets the breaker.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{sync_channel, SyncSender};
@@ -75,21 +76,22 @@ use mosaix_persistence::PersistenceHealth;
 use mosaix_rules::{builtin_rules, ManageAction, Rule, RuleEvaluator};
 
 /// Default bound on the event queue before a sender blocks. Chosen
-/// generously relative to expected event rates -- architecture doc section
-/// 18 budgets "ordinary OS event to stable layout plan" at under 100ms at
-/// p95, so a deep queue is not needed to absorb bursts.
+/// generously relative to expected event rates: the budget from an
+/// ordinary OS event to a stable layout plan is under 100ms at p95, so a
+/// deep queue is not needed to absorb bursts.
 pub const DEFAULT_QUEUE_CAPACITY: usize = 256;
 
 /// Number of consecutive placement rejections before a window's circuit
-/// breaker opens and the engine stops trying to manage it.  Chosen to
+/// breaker opens and the engine stops trying to manage it. Chosen to
 /// tolerate a transient mis-report while reacting quickly enough that the
 /// user never sees a sustained battle between Mosaix and a stubborn app.
 /// The breaker resets automatically on any explicit zone-snap command.
 pub const CIRCUIT_BREAKER_THRESHOLD: u8 = 3;
 
-/// A platform-neutral operation the engine has committed and an adapter must
-/// perform, in reducer order.  Effects contain no native handles or Win32
-/// structures so deterministic engine tests can observe intent directly.
+/// A platform-neutral operation the engine has committed and an adapter
+/// must perform, in reducer order. Effects contain no native handles or
+/// Win32 structures so deterministic engine tests can observe intent
+/// directly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EngineEffect {
     PlaceWindow {
@@ -103,10 +105,10 @@ pub enum EngineEffect {
     /// Requests a fresh native display/window observation before recovery.
     ReconcileWindows,
     /// Move `window_id` out of visible geometry. Emitted only once the
-    /// recovery ledger has acknowledged entry `entry_id` as durable
-    /// (ADR 0023), so a crash between this effect and its completion
-    /// still leaves enough on disk to put the window back. The adapter
-    /// answers with [`Event::WindowParked`] when the move landed.
+    /// recovery ledger has acknowledged entry `entry_id` as durable, so a
+    /// crash between this effect and its completion still leaves enough on
+    /// disk to put the window back. The adapter answers with
+    /// [`Event::WindowParked`] when the move landed.
     ParkWindow {
         window_id: WindowId,
         entry_id: RecoveryEntryId,
@@ -123,12 +125,12 @@ pub enum EngineEffect {
 
 /// A durable write the reducer has committed to but does not perform.
 ///
-/// The reducer owns no SQL connection (ADR 0025), so it records what must
-/// become durable and the persistence worker drains these in order, the
-/// same way the placement executor drains [`EngineEffect`]. Kept separate
-/// from effects because an effect touches the desktop and an intent
-/// touches the disk -- and because a storage failure must never look like
-/// a placement failure.
+/// The reducer owns no SQL connection, so it records what must become
+/// durable and the persistence worker drains these in order, the same way
+/// the placement executor drains [`EngineEffect`]. Kept separate from
+/// effects because an effect touches the desktop and an intent touches the
+/// disk -- and because a storage failure must never look like a placement
+/// failure.
 ///
 /// Not `Eq`: a container tree carries float weights.
 #[derive(Debug, Clone, PartialEq)]
@@ -145,8 +147,8 @@ pub enum PersistenceIntent {
         tree: Box<PersistedTree>,
     },
     /// Store one logical workspace: its origin, the display it is shown
-    /// on, and the tree it owns (ADR 0028). Written whenever any of those
-    /// change, so a restart finds the pool as it was.
+    /// on, and the tree it owns. Written whenever any of those change, so
+    /// a restart finds the pool as it was.
     SaveWorkspace(Box<PersistedWorkspace>),
     /// Forget a workspace the user deleted.
     DeleteWorkspace(WorkspaceName),
@@ -175,8 +177,7 @@ pub struct PendingParking {
     pub transaction: Option<u64>,
 }
 
-/// One all-or-nothing change of the workspace displayed on one monitor
-/// (CONTEXT.md "Workspace switch transaction").
+/// One all-or-nothing change of the workspace displayed on one monitor.
 ///
 /// The displayed assignment is not touched until every native move has
 /// landed. Until then this record is the whole memory of what the switch
@@ -216,8 +217,8 @@ pub struct WorkspaceSwitchTransaction {
     /// committed switch can be recorded as a reversible transaction.
     pub prior_placements: Vec<(WindowId, DisplayId, Rect)>,
     /// Whether this switch is undoing a recorded one, in which case
-    /// committing it must not record a new transaction: undo is not
-    /// itself undoable (ADR 0024).
+    /// committing it must not record a new transaction: undo is not itself
+    /// undoable.
     pub reverses_undo: Option<UndoTransactionId>,
 }
 
@@ -232,8 +233,7 @@ impl WorkspaceSwitchTransaction {
     }
 }
 
-/// What a workspace switch would move, decided before anything does
-/// (CONTEXT.md "Workspace switch transaction").
+/// What a workspace switch would move, decided before anything does.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceSwitchPlan {
     pub display_id: DisplayId,
@@ -241,7 +241,7 @@ pub struct WorkspaceSwitchPlan {
     pub outgoing: Option<WorkspaceName>,
     /// The outgoing workspace's windows that must leave the screen, in
     /// window-id order. A minimized member occupies no screen and is not
-    /// here (ADR 0029).
+    /// here.
     pub park: Vec<WindowId>,
     /// The target workspace's parked windows, in window-id order.
     pub restore: Vec<WindowId>,
@@ -258,8 +258,7 @@ impl WorkspaceSwitchPlan {
 
 /// A rule named a workspace the pool does not hold. The window stays in
 /// the workspace displayed where it appeared, and this records why, so a
-/// typo in a rule is visible rather than silently creating a workspace
-/// (ADR 0028).
+/// typo in a rule is visible rather than silently creating a workspace.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuleWorkspaceRefusal {
     pub window_id: WindowId,
@@ -310,7 +309,7 @@ pub struct InteractivePlacementSession {
 }
 
 /// Everything one explicit command has moved so far, gathered so it can be
-/// reversed as a unit (ADR 0024).
+/// reversed as a unit.
 ///
 /// A window is captured the first time the command moves it, at the
 /// position it held beforehand. Moving it again within the same command --
@@ -336,11 +335,10 @@ struct UndoScope {
 ///
 /// Display topology and per-window placement exist as real domain state
 /// today; a full window registry, workspaces, and rules will extend this
-/// as those domain types land (architecture doc section 7).
+/// as those domain types land.
 #[derive(Debug, Clone, Default)]
 pub struct EngineState {
-    /// Bumped on every committed mutation (architecture doc section 13:
-    /// "Monotonic state revision on every committed mutation").
+    /// Bumped on every committed mutation.
     pub revision: u64,
     /// Whether committed state is currently durable independently of the
     /// reducer's in-memory authority.
@@ -348,9 +346,9 @@ pub struct EngineState {
     /// Durable writes the reducer has committed to, drained in order by
     /// the persistence worker. Appended to, never rewritten.
     pub persistence_intents: Vec<PersistenceIntent>,
-    /// The only transaction undo will consider (ADR 0024). Published by
-    /// the agent from the state database, so the reducer never reads SQL
-    /// to decide what undo would do.
+    /// The only transaction undo will consider. Published by the agent
+    /// from the state database, so the reducer never reads SQL to decide
+    /// what undo would do.
     pub newest_undo: Option<UndoTransaction>,
     /// What the last undo request concluded, kept so IPC and the CLI can
     /// report a refusal that happened between requests.
@@ -360,9 +358,9 @@ pub struct EngineState {
     /// call, and is `None` between events.
     undo_scope: Option<UndoScope>,
     /// Each display's container tree, when tree mode is the resolved
-    /// arrangement (ADR 0023). Empty under the balanced grid, which keeps
-    /// no structure between reflows. A display that leaves the topology
-    /// takes its tree with it, the way its arrangement name does.
+    /// arrangement. Empty under the balanced grid, which keeps no
+    /// structure between reflows. A display that leaves the topology takes
+    /// its tree with it, the way its arrangement name does.
     pub trees: HashMap<DisplayId, ContainerTree>,
     /// Stored arrangements the agent read at startup, waiting for their
     /// display to have windows to match them against.
@@ -385,16 +383,15 @@ pub struct EngineState {
     /// the window -- and its inventory entry -- are gone.
     leaf_evidence: HashMap<WindowId, WindowEvidence>,
     /// The windows each display's tree could not fit at their minimum
-    /// size, newest insertion first (CONTEXT.md "Constraint-overflow
-    /// window"). They keep their leaves and stay managed; they are simply
-    /// not placed until the tree can satisfy them again. Distinct from
-    /// session-floating, which is the user's choice and outlives a reflow.
+    /// size, newest insertion first. They keep their leaves and stay
+    /// managed; they are simply not placed until the tree can satisfy them
+    /// again. Distinct from session-floating, which is the user's choice
+    /// and outlives a reflow.
     pub constraint_overflow: HashMap<DisplayId, Vec<WindowId>>,
-    /// The global pool of logical workspaces (CONTEXT.md "Logical
-    /// workspace", ADR 0028): which is displayed where, which window
-    /// belongs to which, and each one's stashed tree while hidden. A
-    /// displayed workspace's tree is the entry in `trees` for its
-    /// display; the two are exchanged whenever a display changes
+    /// The global pool of logical workspaces: which is displayed where,
+    /// which window belongs to which, and each one's stashed tree while
+    /// hidden. A displayed workspace's tree is the entry in `trees` for
+    /// its display; the two are exchanged whenever a display changes
     /// workspace, so the tree follows the workspace.
     pub workspaces: WorkspacePool,
     /// Stored workspace trees the agent read at startup, waiting for
@@ -403,8 +400,8 @@ pub struct EngineState {
     pub pending_workspace_trees: HashMap<WorkspaceName, PersistedTree>,
     /// Where each stored workspace was displayed when last written, by
     /// display fingerprint. Consumed when a display with no workspace is
-    /// filled: a workspace goes back where it was if that display is
-    /// here, and stays hidden otherwise (ADR 0028).
+    /// filled: a workspace goes back where it was if that display is here,
+    /// and stays hidden otherwise.
     pending_displayed: HashMap<WorkspaceName, String>,
     /// Each workspace as it was last written out, so a reflow that
     /// changed nothing about it writes nothing.
@@ -421,8 +418,8 @@ pub struct EngineState {
     /// [`EngineState::workspace_switching_status`].
     switching_unavailable: Option<WorkspaceSwitchingUnavailable>,
     /// What the platform adapter last said about a recoverable parking
-    /// site for this topology (ADR 0023). Parking is authorised only on
-    /// `Verified`; nothing in the reducer verifies it.
+    /// site for this topology. Parking is authorised only on `Verified`;
+    /// nothing in the reducer verifies it.
     pub parking_capability: ParkingCapability,
     /// This agent session's identity in the recovery ledger, so a later
     /// session can tell its own entries from a previous session's.
@@ -434,14 +431,13 @@ pub struct EngineState {
     /// Every window this session has parked, with the ledger entry that
     /// authorised it. Restoration consumes the entry.
     pub parked_windows: HashMap<WindowId, RecoveryEntryId>,
-    /// The workspace switch currently in flight, if any (CONTEXT.md
-    /// "Workspace switch transaction"). While this is set the displayed
-    /// assignment is still the one the switch started from.
+    /// The workspace switch currently in flight, if any. While this is set
+    /// the displayed assignment is still the one the switch started from.
     pub switch: Option<WorkspaceSwitchTransaction>,
     next_switch_id: u64,
     /// Set when compensation for a failed switch could not put every
-    /// window back (CONTEXT.md "Workspace-switch degraded"). Switching
-    /// stays blocked until the explicit restore path reconciles it.
+    /// window back. Switching stays blocked until the explicit restore
+    /// path reconciles it.
     pub switch_degraded: Option<WorkspaceSwitchDegraded>,
     /// What the last switch transaction concluded, kept so IPC and the
     /// CLI can report a failure that happened between requests.
@@ -476,14 +472,13 @@ pub struct EngineState {
     pub session_tiled: HashSet<WindowId>,
     /// The window that currently has OS foreground focus, `None` until the
     /// first [`Event::WindowFocused`] is observed. Sourced from the OS's
-    /// foreground-change notification (architecture doc section 8.2).
+    /// foreground-change notification.
     pub focused_window: Option<WindowId>,
     /// Last display targeted by focus or an explicit display command.
     pub focused_display: Option<DisplayId>,
-    /// The currently active hotkeys/gaps/behavior settings (CONTEXT.md
-    /// "Resolved config") -- whichever of `config_set`'s `base` or one of
-    /// its `profiles` currently matches `displays`' topology. Updated by
-    /// [`Event::ConfigChanged`] (ADR 0005) and, per ADR 0004/this ticket, by
+    /// The currently active hotkeys/gaps/behavior settings -- whichever of
+    /// `config_set`'s `base` or one of its `profiles` currently matches
+    /// `displays`' topology. Updated by [`Event::ConfigChanged`] and by
     /// [`Event::DisplayTopologyChanged`] re-selecting against the same
     /// `config_set` whenever the topology itself changes. Defaults to
     /// `ResolvedConfig::default()` (no hotkeys bound) before the first
@@ -491,7 +486,7 @@ pub struct EngineState {
     /// `displays: Vec::new()` plays for topology.
     pub resolved_config: ResolvedConfig,
     /// The full base-config-plus-profiles set most recently delivered by
-    /// [`Event::ConfigChanged`] (ADR 0004, 0005) -- kept around so
+    /// [`Event::ConfigChanged`] -- kept around so
     /// [`Event::DisplayTopologyChanged`] has something to re-select
     /// `resolved_config` from without needing its own copy of every
     /// profile. Never read directly by anything outside the reducer;
@@ -507,7 +502,7 @@ pub struct EngineState {
     /// Whether the matched topology profile currently owns automatic tiling.
     pub automatic_tiling_active: bool,
     /// Session-only override over a tiling-enabled profile. It clears when
-    /// topology changes or the agent restarts (ADR 0012).
+    /// topology changes or the agent restarts.
     pub automatic_tiling_suspended: bool,
     /// The one native move/resize session currently owned by the pointer.
     pub interactive_placement: Option<InteractivePlacementSession>,
@@ -530,7 +525,7 @@ pub struct EngineState {
     /// display that leaves the topology are dropped with it.
     pub last_applied_layouts: HashMap<DisplayId, String>,
     /// Whether a hotkey editor is open and every binding must therefore
-    /// stay unregistered (ADR 0021).
+    /// stay unregistered.
     ///
     /// A flag rather than an effect. The agent's hotkey-rebind poller --
     /// the same path a profile switch already re-registers through --
@@ -552,7 +547,7 @@ pub struct EngineState {
     /// already is: a combination another application took while Mosaix was
     /// suspended comes back failed. Recording which ones is what lets the
     /// editor name them rather than leaving the user to discover a dead
-    /// shortcut (ADR 0021).
+    /// shortcut.
     pub unregistered_bindings: Vec<Command>,
 }
 
@@ -594,8 +589,8 @@ impl EngineState {
         }
     }
 
-    /// The number of windows whose circuit breaker is currently open
-    /// (Feature 31).  Useful for diagnostics via `mosaix state --json`.
+    /// The number of windows whose circuit breaker is currently open.
+    /// Useful for diagnostics via `mosaix state --json`.
     pub fn circuit_breaker_count(&self) -> usize {
         self.windows.values().filter(|p| p.circuit_open()).count()
     }
@@ -603,54 +598,51 @@ impl EngineState {
 
 /// A tracked window's current bounds and display, plus the display and
 /// bounds it had immediately before its most recent placement, if any --
-/// the "remembered pre-snap size" [`mosaix_layout`]'s zone planner docs say
-/// belongs with whatever tracks window state, not the stateless planner
-/// itself (architecture doc section 20, "restore" command).
+/// the remembered pre-snap size that belongs with whatever tracks window
+/// state, not with [`mosaix_layout`]'s stateless zone planner.
 ///
 /// Both the display and the bounds are remembered together, not bounds
 /// alone: a placement can move a window to a different display (a throw),
 /// so bounds computed relative to the source display would be wrong if
 /// reapplied under the target display's `display_id`.
 ///
-/// Phase 1's restore is a single remembered step, not a full undo stack
-/// (that's Phase 2's "undo" -- architecture doc section 20), so
+/// Restore is a single remembered step, not a full undo stack, so
 /// `previous_placement` holds at most one prior placement, and restoring
 /// clears it rather than pushing the restored state back onto a stack.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct WindowPlacement {
     pub display_id: DisplayId,
     pub bounds: Rect,
-    /// Where the OS last reported this window, as opposed to [`bounds`], the
-    /// placement Mosaix last *intended* (architecture doc section 8.3's
-    /// expected-vs-actual distinction).
-    ///
+    /// Where the OS last reported this window, as opposed to [`bounds`],
+    /// the placement Mosaix last *intended*.
     /// The two agree whenever Mosaix owns the window's position, and
     /// diverge the moment anything else moves it -- an app repositioning
     /// its own window, a native OS snap, a session-floating window dragged
-    /// by the user. `bounds` deliberately keeps holding the intent, because
-    /// comparing the two is exactly how [`Event::WindowBoundsObserved`]
-    /// detects an external move and resets cycle state (ADR 0001); readers
-    /// that want to know where the window actually *is* -- drawing on or
-    /// around it, say -- want this field instead.
+    /// by the user. `bounds` deliberately keeps holding the intent,
+    /// because comparing the two is exactly how
+    /// [`Event::WindowBoundsObserved`] detects an external move and resets
+    /// cycle state; readers that want to know where the window actually
+    /// *is* -- drawing on or around it, say -- want this field instead.
     ///
     /// [`bounds`]: Self::bounds
     pub observed_bounds: Rect,
     pub previous_placement: Option<(DisplayId, Rect)>,
     /// The horizontal zone command and step that produced this placement,
     /// if it came from [`Event::ZoneSnapRequested`] with a left/right
-    /// direction (CONTEXT.md "Cycle step"). `None` for windows never
-    /// horizontally zone-snapped, and left untouched by placements that
-    /// don't participate in cycling (top/bottom zone-snaps, restores,
-    /// throws, plain [`Event::WindowPlaced`]) -- only a repeated
-    /// same-direction [`Event::ZoneSnapRequested`] advances it, and only a
-    /// future bounds-observed event mismatching the expected placement
-    /// transaction resets it (ADR 0001; that reset lands with ticket 05).
+    /// direction. `None` for windows never horizontally zone-snapped, and
+    /// left untouched by placements that don't participate in cycling
+    /// (top/bottom zone-snaps, restores, throws, plain
+    /// [`Event::WindowPlaced`]) -- only a repeated same-direction
+    /// [`Event::ZoneSnapRequested`] advances it, and only a future
+    /// bounds-observed event mismatching the expected placement
+    /// transaction resets it.
     pub cycle_step: Option<(HorizontalDirection, CycleStep)>,
     /// Consecutive `SetWindowPos` rejection count for the circuit breaker
-    /// (see [`CIRCUIT_BREAKER_THRESHOLD`]).  Each [`Event::PlacementRejected`]
-    /// increments this; reaching the threshold causes the engine to stop
-    /// issuing placements for this window.  Any explicit user zone-snap
-    /// command resets it to zero, giving the user a deliberate escape hatch.
+    /// (see [`CIRCUIT_BREAKER_THRESHOLD`]). Each
+    /// [`Event::PlacementRejected`] increments this; reaching the
+    /// threshold causes the engine to stop issuing placements for this
+    /// window. Any explicit user zone-snap command resets it to zero,
+    /// giving the user a deliberate escape hatch.
     pub rejection_count: u8,
 }
 
@@ -663,10 +655,11 @@ impl WindowPlacement {
     }
 }
 
-/// The direction a zone-snap hotkey requests (CONTEXT.md "Zone"). Only
+/// The direction a zone-snap hotkey requests. Only
 /// [`ZoneSnapDirection::Left`]/[`ZoneSnapDirection::Right`] participate in
 /// zone cycling -- `ZoneSnapDirection::horizontal` is how
-/// [`Event::ZoneSnapRequested`]'s handler tells them apart from top/bottom.
+/// [`Event::ZoneSnapRequested`]'s handler tells them apart from
+/// top/bottom.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ZoneSnapDirection {
     Left,
@@ -741,11 +734,9 @@ impl ZoneSnapDirection {
 #[derive(Debug, Clone)]
 pub enum Event {
     /// A platform adapter observed (or suspects) a display topology
-    /// change; carries a fresh enumeration, not a diff (architecture doc
-    /// section 8.2: "Platform adapters may emit incomplete events. The
-    /// reducer therefore treats them as hints"). The reducer itself
-    /// decides, via [`topology_fingerprint`], whether anything actually
-    /// changed.
+    /// change; carries a fresh enumeration, not a diff. Adapters may emit
+    /// incomplete events, so the reducer treats them as hints and decides,
+    /// via [`topology_fingerprint`], whether anything actually changed.
     DisplayTopologyChanged(Vec<Display>),
 
     /// Ordered persistence acknowledgement or failure from the worker.
@@ -756,7 +747,7 @@ pub enum Event {
     /// the reducer's view of history matches the database's.
     UndoHistoryLoaded(Option<Box<UndoTransaction>>),
 
-    /// Reverse the newest transaction, or refuse and keep it (ADR 0024).
+    /// Reverse the newest transaction, or refuse and keep it.
     UndoRequested,
 
     /// The container trees the state database holds, keyed by display
@@ -769,9 +760,9 @@ pub enum Event {
     /// displayed on a display that is here again goes back to it.
     WorkspacesLoaded(Vec<PersistedWorkspace>),
 
-    /// Create a hidden, empty workspace called `name` (ADR 0028). Every
-    /// way this changes nothing is a typed [`WorkspaceRefusal`], reached
-    /// by [`plan_workspace_create`].
+    /// Create a hidden, empty workspace called `name`. Every way this
+    /// changes nothing is a typed [`WorkspaceRefusal`], reached by
+    /// [`plan_workspace_create`].
     WorkspaceCreateRequested {
         name: String,
     },
@@ -784,22 +775,22 @@ pub enum Event {
 
     /// Display the hidden workspace `name` on the focused display, or, if
     /// it is already displayed somewhere, focus its last-focused live
-    /// window there (CONTEXT.md "Workspace focus"). A focus never moves a
-    /// displayed workspace between monitors.
+    /// window there. A focus never moves a displayed workspace between
+    /// monitors.
     WorkspaceFocusRequested {
         name: String,
     },
 
     /// Move the displayed workspace `name` to `display_id`, exchanging it
     /// with whatever that display showed. Identity and tree travel with
-    /// it (ADR 0028).
+    /// it.
     WorkspaceMoveRequested {
         name: String,
         display_id: DisplayId,
     },
 
     /// What the platform adapter concluded about a recoverable parking
-    /// site for the current topology (ADR 0023).
+    /// site for the current topology.
     ParkingCapabilityReported(ParkingCapability),
 
     /// Ask to park `window_id`. Every refusal is typed and reached by
@@ -857,7 +848,7 @@ pub enum Event {
     RestoreParkedWindowsRequested,
     /// Reconcile the windows a failed compensation left unaccounted for,
     /// which is the only way out of the workspace-switch-degraded
-    /// condition (CONTEXT.md "Workspace-switch degraded").
+    /// condition.
     WorkspaceSwitchRestoreRequested,
 
     /// What startup recovery did with the previous session's ledger,
@@ -877,20 +868,18 @@ pub enum Event {
     },
 
     /// Undo the window's most recent placement, returning it to the
-    /// display and bounds it had immediately before (architecture doc
-    /// section 20, "restore"). A no-op if the window isn't tracked, or has
-    /// no remembered prior placement (e.g. it was only ever placed once,
-    /// or was already restored).
+    /// display and bounds it had immediately before. A no-op if the window
+    /// isn't tracked, or has no remembered prior placement (e.g. it was
+    /// only ever placed once, or was already restored).
     WindowRestoreRequested {
         window_id: WindowId,
     },
 
     /// Move a window to the adjacent display in `direction`, preserving
-    /// its position/size as a fraction of the display's work area
-    /// (architecture doc section 20, "next-display" command). A no-op if
-    /// the window isn't tracked, its current display is no longer in the
-    /// topology, or there's no adjacent display to move to (e.g. only one
-    /// display is connected).
+    /// its position/size as a fraction of the display's work area. A no-op
+    /// if the window isn't tracked, its current display is no longer in
+    /// the topology, or there's no adjacent display to move to (e.g. only
+    /// one display is connected).
     WindowThrowToDisplayRequested {
         window_id: WindowId,
         direction: DisplayDirection,
@@ -921,8 +910,7 @@ pub enum Event {
         display_id: DisplayId,
     },
 
-    /// A zone-snap hotkey fired for `direction` (architecture doc section
-    /// 20's directional snap commands; CONTEXT.md "Zone cycle"). Carries no
+    /// A zone-snap hotkey fired for `direction`. Carries no
     /// window id -- it resolves against [`EngineState::focused_window`] at
     /// apply time and is a no-op if nothing is focused or the focused
     /// window isn't tracked. For [`ZoneSnapDirection::Left`]/`Right`, a
@@ -941,16 +929,15 @@ pub enum Event {
     /// its own location-changed notification -- which fires for both
     /// programmatic and interactive moves alike, so this does not by
     /// itself mean something *other* than Mosaix moved the window.
-    /// Compared against the window's own last placement transaction (ADR
-    /// 0001, ARCHITECTURE.md section 8.3): a match confirms the
-    /// observation is just an echo of Mosaix's own last placement and
-    /// leaves cycle-step state untouched; a mismatch means something else
-    /// moved or resized the window (a manual drag, another app, a native
-    /// OS snap), which invalidates (resets to step 1) the window's
-    /// cycle-step state. Either way this never alters the window's tracked
-    /// placement bounds -- reconciling tracked state from raw observation
-    /// is a separate, out-of-scope concern (`.scratch/cycle-sizes-and-global-hotkeys/issues/05-placement-transaction-correlation.md`).
-    /// A no-op for an untracked window.
+    /// Compared against the window's own last placement transaction: a
+    /// match confirms the observation is just an echo of Mosaix's own last
+    /// placement and leaves cycle-step state untouched; a mismatch means
+    /// something else moved or resized the window (a manual drag, another
+    /// app, a native OS snap), which invalidates (resets to step 1) the
+    /// window's cycle-step state. Either way this never alters the
+    /// window's tracked placement bounds -- reconciling tracked state from
+    /// raw observation is a separate concern. A no-op for an untracked
+    /// window.
     WindowBoundsObserved {
         window_id: WindowId,
         display_id: DisplayId,
@@ -958,15 +945,16 @@ pub enum Event {
     },
 
     /// `mosaix-config`'s directory watcher validated a new candidate
-    /// config directory successfully (ADR 0005, 0007, 0008); carries the
-    /// full base-config-plus-profiles set, not a diff. Sent for the
-    /// initial startup load as well as every subsequent hot-edit -- an
-    /// edit that fails validation never produces this event at all, so
-    /// [`EngineState::config_set`] (and the [`EngineState::resolved_config`]
-    /// re-selected from it) simply keeps its last-known-good value (ADR
-    /// 0007). The active profile is re-selected against [`EngineState`]'s
-    /// current topology exactly the way [`Event::DisplayTopologyChanged`]
-    /// re-selects it against the current config set (ADR 0004).
+    /// config directory successfully; carries the full
+    /// base-config-plus-profiles set, not a diff. Sent for the initial
+    /// startup load as well as every subsequent hot-edit -- an edit that
+    /// fails validation never produces this event at all, so
+    /// [`EngineState::config_set`] (and the
+    /// [`EngineState::resolved_config`] re-selected from it) simply keeps
+    /// its last-known-good value. The active profile is re-selected
+    /// against [`EngineState`]'s current topology exactly the way
+    /// [`Event::DisplayTopologyChanged`] re-selects it against the current
+    /// config set.
     ///
     /// Boxed because it dwarfs every other variant: a resolved config
     /// carries three maps plus its provenance, and `Event` is moved
@@ -1005,8 +993,8 @@ pub enum Event {
 
     /// Move the nearest container-tree divider facing `direction` by
     /// [`TREE_RESIZE_STEP_PERCENT`] points, growing the focused window's
-    /// side (CONTEXT.md "Tree resize"). Every way it can change nothing is
-    /// a typed [`TreeResizeRefusal`], reached by [`plan_tree_resize`] so a
+    /// side. Every way it can change nothing is a typed
+    /// [`TreeResizeRefusal`], reached by [`plan_tree_resize`] so a
     /// synchronous caller can report it; the reducer reaches the same
     /// verdict and, on a refusal, mutates nothing.
     TreeResizeRequested {
@@ -1014,9 +1002,8 @@ pub enum Event {
     },
 
     /// Delete the dormant slot numbered `position` from `display_id`'s
-    /// tree, closing the space its ancestors held for it (CONTEXT.md
-    /// "Dormant tree leaf"). Refusals are typed, reached by
-    /// [`plan_remove_position`], and mutate nothing.
+    /// tree, closing the space its ancestors held for it. Refusals are
+    /// typed, reached by [`plan_remove_position`], and mutate nothing.
     TreePositionRemoveRequested {
         display_id: DisplayId,
         position: u64,
@@ -1032,29 +1019,29 @@ pub enum Event {
     },
 
     /// Bulk-register all windows that were already open when the agent
-    /// started (feature 28 — startup reconciliation). Each entry is
-    /// `(window_id, display_id, bounds)` as observed by the platform
-    /// adapter's initial enumeration.  Windows already tracked (e.g. by
-    /// an earlier [`Event::WindowFocused`]) are silently skipped; windows
-    /// not yet tracked are registered with no `previous_placement`.  The
-    /// event is sent once, right after the engine is spawned, before any
-    /// OS event hooks are active.
+    /// started (startup reconciliation). Each entry is `(window_id,
+    /// display_id, bounds)` as observed by the platform adapter's initial
+    /// enumeration. Windows already tracked (e.g. by an earlier
+    /// [`Event::WindowFocused`]) are silently skipped; windows not yet
+    /// tracked are registered with no `previous_placement`. The event is
+    /// sent once, right after the engine is spawned, before any OS event
+    /// hooks are active.
     StartupReconciliation {
         windows: Vec<(WindowId, DisplayId, Rect)>,
     },
 
     /// Re-synchronise display topology and tracked windows after the
-    /// system wakes from sleep (feature 29 — sleep/wake recovery).
+    /// system wakes from sleep (sleep/wake recovery).
     ///
     /// The agent re-enumerates both displays and windows after a
-    /// configurable settling delay and sends this event.  The handler:
-    ///   1. Applies the new display topology (same fingerprint-based guard
-    ///      as [`Event::DisplayTopologyChanged`]).
-    ///   2. Migrates orphaned windows (whose previous `display_id` no
-    ///      longer exists) to the nearest surviving display, preserving
-    ///      their normalized position via [`throw_preserving_ratio`].
-    ///   3. Bulk-registers any newly observed windows that the engine
-    ///      doesn't know about yet.
+    /// configurable settling delay and sends this event. The handler:
+    /// 1. Applies the new display topology (same fingerprint-based guard
+    ///    as [`Event::DisplayTopologyChanged`]).
+    /// 2. Migrates orphaned windows (whose previous `display_id` no longer
+    ///    exists) to the nearest surviving display, preserving their
+    ///    normalized position via [`throw_preserving_ratio`].
+    /// 3. Bulk-registers any newly observed windows that the engine
+    ///    doesn't know about yet.
     WakeReconciliation {
         displays: Vec<Display>,
         windows: Option<Vec<Window>>,
@@ -1062,11 +1049,11 @@ pub enum Event {
 
     /// The platform reported that the `SetWindowPos` call for `window_id`
     /// was rejected — the window's actual bounds after a settling period
-    /// differ too much from the target (feature 31 — circuit breaker).
+    /// differ too much from the target (circuit breaker).
     ///
-    /// Increments the window's `rejection_count`.  When the count reaches
+    /// Increments the window's `rejection_count`. When the count reaches
     /// [`CIRCUIT_BREAKER_THRESHOLD`], subsequent automatic placements for
-    /// that window are suppressed and a warning is logged.  The count is
+    /// that window are suppressed and a warning is logged. The count is
     /// reset to zero by any explicit [`Event::ZoneSnapRequested`] so the
     /// user always has an escape hatch.
     PlacementRejected {
@@ -1102,9 +1089,9 @@ pub enum Event {
         rules: Vec<Rule>,
     },
 
-    /// Apply the saved layout called `name` (CONTEXT.md "Saved layout") to
-    /// the display of the focused managed window (ADR 0020), filling its
-    /// cells from that display's managed windows in visual window order.
+    /// Apply the saved layout called `name` to the display of the focused
+    /// managed window, filling its cells from that display's managed
+    /// windows in visual window order.
     ///
     /// Carries no display id: like the directional commands, it resolves
     /// its target at apply time. Every way it can change nothing is a
@@ -1117,8 +1104,8 @@ pub enum Event {
         name: String,
     },
 
-    /// The settings application opened its hotkey editor, so every
-    /// binding must stay unregistered until it closes (ADR 0021).
+    /// The settings application opened its hotkey editor, so every binding
+    /// must stay unregistered until it closes.
     ///
     /// Sets [`EngineState::hotkey_capture_suspended`]. Idempotent: a
     /// second editor window sets a flag that is already set, and the
@@ -1131,7 +1118,7 @@ pub enum Event {
     /// Emitted by the agent when the settings application's connection
     /// ends for any reason, because Windows closes the pipe handle even on
     /// a hard kill. That is what bounds suspension by the connection
-    /// rather than by a message that can be lost (ADR 0021).
+    /// rather than by a message that can be lost.
     HotkeyCaptureEnded,
 
     /// The outcome of a registration pass: the bindings the platform
@@ -1139,7 +1126,7 @@ pub enum Event {
     ///
     /// Sent by the agent after each pass, so a binding that did not come
     /// back from capture can be named to the user rather than discovered
-    /// as a dead shortcut (ADR 0021).
+    /// as a dead shortcut.
     HotkeyRegistrationReported {
         unregistered: Vec<Command>,
     },
@@ -1147,7 +1134,7 @@ pub enum Event {
 
 /// Why applying a saved layout changes nothing. Every variant names
 /// something the user can act on: a layout command never silently does
-/// nothing, and never falls back to another display (ADR 0020).
+/// nothing, and never falls back to another display.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SavedLayoutRejection {
     /// Window management is paused, as it is for every other placement.
@@ -1191,13 +1178,13 @@ impl std::fmt::Display for SavedLayoutRejection {
 /// simply go unfilled, which needs no reporting -- an empty cell is
 /// visible. Surplus *windows* do need reporting: a window the layout had
 /// no cell for stays exactly where it is, and the user is owed the count
-/// rather than left to notice the omission (spec #29 user story 15).
+/// rather than left to notice the omission.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SavedLayoutPlan {
     /// The one display every placement lands on: the focused managed
-    /// window's (ADR 0020). A field rather than a column repeated down
-    /// `placements`, because a plan touching two displays is not a thing
-    /// this type can represent.
+    /// window's. A field rather than a column repeated down `placements`,
+    /// because a plan touching two displays is not a thing this type can
+    /// represent.
     pub display_id: DisplayId,
     /// Cell *i* of the layout paired with window *i* of the target
     /// display's visual window order, gaps already applied. Stops at
@@ -1219,7 +1206,7 @@ pub struct SavedLayoutPlan {
 ///
 /// Gaps are applied here, by the same [`apply_gaps`] post-processing step
 /// the balanced grid and every zone snap already run through, so
-/// [`resolve_saved_layout`] stays gap-unaware (ADR 0006).
+/// [`resolve_saved_layout`] stays gap-unaware.
 pub fn plan_saved_layout(
     state: &EngineState,
     name: &str,
@@ -1268,12 +1255,11 @@ pub fn plan_saved_layout(
     })
 }
 
-/// `display_id`'s managed windows in visual window order (CONTEXT.md
-/// "Visual window order"): whatever order the engine already recorded for
-/// that display, then any managed window that order doesn't mention,
-/// seeded top-to-bottom then left-to-right with the native window id
-/// breaking final ties -- the same seeding [`reconcile_balanced_grids`]
-/// performs.
+/// `display_id`'s managed windows in visual window order: whatever order
+/// the engine already recorded for that display, then any managed window
+/// that order doesn't mention, seeded top-to-bottom then left-to-right
+/// with the native window id breaking final ties -- the same seeding
+/// [`reconcile_balanced_grids`] performs.
 ///
 /// A recorded order wins over the geometric seeding even when it disagrees
 /// with where the windows currently sit, and even after automatic tiling
@@ -1381,7 +1367,7 @@ fn apply(state: &mut EngineState, event: Event) {
                         // session and no longer does is not deleted --
                         // deletion is never implicit -- but it is no
                         // longer configuration's, so a command may delete
-                        // it (ADR 0028).
+                        // it.
                         let origin = if declared {
                             WorkspaceOrigin::Configuration
                         } else {
@@ -1453,7 +1439,7 @@ fn apply(state: &mut EngineState, event: Event) {
             }
             fill_empty_displays(state);
             // A resolved topology-profile preference outranks what was
-            // remembered (ADR 0028).
+            // remembered.
             apply_switching_mapping(state);
             assign_unassigned_windows(state);
             reconcile_hidden_workspace_windows(state);
@@ -1647,8 +1633,8 @@ fn apply(state: &mut EngineState, event: Event) {
             };
             let pending = state.pending_parking.remove(index);
             // Recovery data is durable; the window may leave visible
-            // geometry now, and not before (ADR 0023). A window that has
-            // since left management is not parked at all.
+            // geometry now, and not before. A window that has since left
+            // management is not parked at all.
             let parks = state.inventory.contains_key(&pending.window_id);
             if let Some(switch) = state
                 .switch
@@ -1860,8 +1846,8 @@ fn apply(state: &mut EngineState, event: Event) {
             let result = plan_undo(state);
             if let UndoResult::Applied(applied) = &result {
                 // No scope is opened here: undo is not itself undoable.
-                // Persistent redo is deferred to issue #44, and recording
-                // one would make a second undo reverse the first.
+                // Recording one would make a second undo reverse the
+                // first.
                 //
                 // Structure first, then windows. The trees the command
                 // reshaped go back to what they were, through the same
@@ -1945,19 +1931,20 @@ fn apply(state: &mut EngineState, event: Event) {
             let topology_identity_changed =
                 topology_fingerprint(&displays) != topology_fingerprint(&state.displays);
             tracing::info!(display_count = displays.len(), "display topology changed");
-            // Feature 30 — display hotplug: migrate windows whose previous
-            // display is no longer present in the new topology to the nearest
-            // surviving display.  We do this *before* committing `displays` so
-            // we can still read the old topology to compute the migration.
+            // Display hotplug: migrate windows whose previous display is
+            // no longer present in the new topology to the nearest
+            // surviving display. We do this *before* committing `displays`
+            // so we can still read the old topology to compute the
+            // migration.
             state.interactive_placement = None;
             state.deferred_reflow_displays.clear();
             migrate_orphaned_windows(state, &displays);
             migrate_focused_display(state, &displays);
             // A vanished display's workspace becomes hidden with its tree
-            // intact, and no surviving display's workspace is displaced
-            // to make room for it (ADR 0028). Its windows have already
-            // migrated physically, above; they simply are not arranged
-            // until the workspace is displayed again.
+            // intact, and no surviving display's workspace is displaced to
+            // make room for it. Its windows have already migrated
+            // physically, above; they simply are not arranged until the
+            // workspace is displayed again.
             hide_workspaces_on_vanished_displays(state, &displays);
             state.displays = displays;
             // A display that is gone has no arrangement to report. Keeping
@@ -2188,10 +2175,10 @@ fn apply(state: &mut EngineState, event: Event) {
                 return;
             };
 
-            // Feature 31 — circuit breaker reset: an explicit zone-snap command
-            // from the user always resets the rejection counter, giving a
-            // deliberate escape hatch even for windows that previously rejected
-            // automatic placements.
+            // Circuit breaker reset: an explicit zone-snap command from
+            // the user always resets the rejection counter, giving a
+            // deliberate escape hatch even for windows that previously
+            // rejected automatic placements.
             if let Some(placement) = state.windows.get_mut(&window_id) {
                 if placement.rejection_count > 0 {
                     tracing::info!(
@@ -2410,8 +2397,8 @@ fn apply(state: &mut EngineState, event: Event) {
             // visual order, so the exchange has to happen there too. It is
             // an exchange of the two leaves' occupants and nothing else:
             // containers, axes, weights, and parentage all stay as they
-            // were (ADR 0026). Focus is deliberately not moved, so the user
-            // keeps controlling the window they just moved.
+            // were. Focus is deliberately not moved, so the user keeps
+            // controlling the window they just moved.
             if state.resolved_config.tiling_mode == TilingMode::Tree {
                 capture_tree_for_undo(state, display_id);
                 if let Some(tree) = state.trees.get_mut(&display_id) {
@@ -2509,7 +2496,7 @@ fn apply(state: &mut EngineState, event: Event) {
             state.revision += 1;
         }
 
-        // Feature 28 — startup reconciliation.
+        // Startup reconciliation.
         Event::StartupReconciliation { windows } => {
             let mut registered = 0usize;
             for (window_id, display_id, bounds) in windows {
@@ -2536,7 +2523,7 @@ fn apply(state: &mut EngineState, event: Event) {
             }
         }
 
-        // Feature 29 — sleep/wake recovery.
+        // Sleep/wake recovery.
         Event::WakeReconciliation { displays, windows } => {
             tracing::info!(
                 display_count = displays.len(),
@@ -2572,7 +2559,7 @@ fn apply(state: &mut EngineState, event: Event) {
             state.revision += 1;
         }
 
-        // Feature 31 — per-window circuit breaker.
+        // Per-window circuit breaker.
         Event::PlacementRejected { window_id } => {
             let Some(rejection_count) = state.windows.get_mut(&window_id).map(|placement| {
                 placement.rejection_count = placement.rejection_count.saturating_add(1);
@@ -2692,8 +2679,8 @@ fn apply(state: &mut EngineState, event: Event) {
             // two, and a hotkey has no synchronous caller to ask at all.
             match plan_saved_layout(state, &name) {
                 Ok(plan) => {
-                    // One command, one transaction, however many windows it
-                    // moves -- including the reflow below (ADR 0024).
+                    // One command, one transaction, however many windows
+                    // it moves -- including the reflow below.
                     open_undo_scope(state, &format!("apply-layout {name}"));
                     if plan.unplaced > 0 {
                         tracing::info!(
@@ -2721,7 +2708,7 @@ fn apply(state: &mut EngineState, event: Event) {
                     // Applying a layout is an explicit placement, so it
                     // session-floats what it placed exactly as a zone snap
                     // does, and the rest of the tiling set reflows around
-                    // the result in one pass (ADR 0011).
+                    // the result in one pass.
                     if state.automatic_tiling_active && !placed.is_empty() {
                         for window_id in placed {
                             set_session_floating(state, window_id, true);
@@ -2755,7 +2742,7 @@ fn apply(state: &mut EngineState, event: Event) {
             // deliberately left standing. It is only known once
             // registration resumes, by which time the editor that caused
             // it has closed -- so the next editor to open is the only one
-            // that can tell the user (ADR 0021).
+            // that can tell the user.
             state.revision += 1;
         }
 
@@ -2832,8 +2819,7 @@ fn arranged_in_tree(state: &EngineState, display_id: DisplayId, window_id: Windo
 }
 
 /// Whether `window_id` can be an endpoint of a directional command on
-/// `display_id`: eligible for tiling and, in tree mode, actually arranged
-/// (CONTEXT.md "Directional focus", "Directional swap").
+/// `display_id`: eligible for tiling and, in tree mode, actually arranged.
 fn directional_endpoint(state: &EngineState, display_id: DisplayId, window_id: WindowId) -> bool {
     let eligible = state.inventory.get(&window_id).is_some_and(|managed| {
         managed.eligibility == EligibilityReason::Eligible
@@ -3067,18 +3053,18 @@ fn replace_inventory_from_observations(state: &mut EngineState, observed: Vec<Wi
     inventory_changed || placements_changed
 }
 
-/// Brings the parking site into agreement with the displayed assignment:
-/// a managed window whose workspace is hidden belongs there, and one
-/// whose workspace is displayed does not (issue #61).
+/// Brings the parking site into agreement with the displayed assignment: a
+/// managed window whose workspace is hidden belongs there, and one whose
+/// workspace is displayed does not.
 ///
 /// The switch transaction moves windows when the *assignment* changes.
-/// This covers everything else that can put the two out of step without
-/// a switch: a monitor disappearing and taking its displayed workspace
-/// with it, a rule sending a brand-new window to a hidden workspace, an
+/// This covers everything else that can put the two out of step without a
+/// switch: a monitor disappearing and taking its displayed workspace with
+/// it, a rule sending a brand-new window to a hidden workspace, an
 /// application restoring a window that was minimized while hidden, and a
 /// restart that reapplies stored assignments. Every one of those goes
 /// through the same durable-first path a switch uses, so a window never
-/// leaves the screen without its way back already on disk (ADR 0023).
+/// leaves the screen without its way back already on disk.
 ///
 /// It stands aside entirely while a switch is in flight or a failed one
 /// is unreconciled: both mean the truth about where windows are is the
@@ -3104,9 +3090,9 @@ fn reconcile_hidden_workspace_windows(state: &mut EngineState) {
             .any(|waiting| waiting.window_id == *window_id);
         if hidden && !parked && !pending {
             // A minimized window occupies no screen, and restoring it in
-            // order to park it would change a state the user chose
-            // (ADR 0029). A full-screen window is never forced out of
-            // full-screen either; it simply stays where it is.
+            // order to park it would change a state the user chose. A
+            // full-screen window is never forced out of full-screen
+            // either; it simply stays where it is.
             if matches!(
                 managed.window.lifecycle,
                 WindowLifecycle::Minimized | WindowLifecycle::Fullscreen
@@ -3168,8 +3154,7 @@ fn arrangement_display_of(state: &EngineState, window_id: WindowId) -> Option<Di
 /// Gives every managed window that belongs to no workspace the workspace
 /// displayed where it sits, if that display has one. Every tiled and
 /// floating managed window belongs to exactly one workspace whenever the
-/// pool can provide one (ADR 0028); the engine never creates one to make
-/// that true.
+/// pool can provide one; the engine never creates one to make that true.
 fn assign_unassigned_windows(state: &mut EngineState) {
     let unassigned: Vec<(WindowId, DisplayId)> = state
         .inventory
@@ -3187,7 +3172,7 @@ fn assign_unassigned_windows(state: &mut EngineState) {
 /// Brings the pool up to date with what configuration declares: every
 /// declared name exists, owned by configuration; a name configuration
 /// stopped declaring stays -- deletion is never implicit -- but becomes
-/// deletable by command (ADR 0028).
+/// deletable by command.
 fn sync_workspaces_from_config(state: &mut EngineState) {
     let declared: Vec<WorkspaceName> = state.resolved_config.workspaces.clone();
     for name in &declared {
@@ -3220,9 +3205,9 @@ fn sync_workspaces_from_config(state: &mut EngineState) {
 /// one to give: first the workspace that was displayed on that display
 /// when last written, then any hidden workspace that owns no live window,
 /// in name order. A hidden workspace with windows is never revealed by a
-/// display appearing (ADR 0028). A display the pool cannot fill stays
-/// without a workspace, and arranges its windows as it did before
-/// workspaces existed.
+/// display appearing. A display the pool cannot fill stays without a
+/// workspace, and arranges its windows as it did before workspaces
+/// existed.
 fn fill_empty_displays(state: &mut EngineState) {
     let mut displays: Vec<&Display> = state.displays.iter().collect();
     displays.sort_by_key(|display| (!display.is_primary, display.id.0));
@@ -3270,7 +3255,7 @@ fn fill_empty_displays(state: &mut EngineState) {
 }
 
 /// Applies the matched profile's switching mapping as one transition, or
-/// leaves the displayed assignment exactly as it was (ADR 0028).
+/// leaves the displayed assignment exactly as it was.
 ///
 /// Every display and every name is resolved before anything changes, so
 /// a mapping that cannot be completed changes nothing and is reported as
@@ -3444,8 +3429,7 @@ fn persist_workspaces(state: &mut EngineState) {
     }
 }
 
-// -- Workspace switch transaction (CONTEXT.md "Workspace switch
-// -- transaction", ADR 0023) --------------------------------------------
+// ---- Workspace switch transaction -------------------------------------
 //
 // A switch is all-or-nothing across native moves that each answer
 // separately, so it cannot be a single reducer arm. It is a small state
@@ -3460,9 +3444,8 @@ fn persist_workspaces(state: &mut EngineState) {
 /// data for everything it will park.
 ///
 /// Nothing moves here. The windows leave the screen only as their ledger
-/// entries are acknowledged durable, which is the ordering ADR 0023
-/// requires: a crash between this and the parking effect still leaves
-/// enough on disk to put the window back.
+/// entries are acknowledged durable: a crash between this and the parking
+/// effect still leaves enough on disk to put the window back.
 fn begin_workspace_switch(
     state: &mut EngineState,
     plan: WorkspaceSwitchPlan,
@@ -3769,8 +3752,8 @@ fn commit_switch(state: &mut EngineState) {
     let display_id = switch.display_id;
     let target = switch.target.clone();
     let replaced = switch.outgoing.clone();
-    // Undo is not itself undoable (ADR 0024), so a switch reversing a
-    // recorded transaction records nothing new.
+    // Undo is not itself undoable, so a switch reversing a recorded
+    // transaction records nothing new.
     if switch.reverses_undo.is_none() {
         open_undo_scope(state, &format!("workspace-focus {target}"));
         capture_assignment_for_undo(state, display_id);
@@ -3829,10 +3812,9 @@ fn commit_switch(state: &mut EngineState) {
 
 /// Closes a compensated switch, either cleanly or as a degraded one.
 ///
-/// A clean compensation leaves published state exactly as the switch
-/// found it. One that could not reach every window records the condition
-/// and blocks further switching until the explicit restore path clears it
-/// (CONTEXT.md "Workspace-switch degraded").
+/// A clean compensation leaves published state exactly as the switch found
+/// it. One that could not reach every window records the condition and
+/// blocks further switching until the explicit restore path clears it.
 fn finish_compensation(state: &mut EngineState) {
     let Some(switch) = state.switch.take() else {
         return;
@@ -3879,7 +3861,7 @@ fn finish_compensation(state: &mut EngineState) {
 }
 
 /// Which way a stranded window has to move to reach the place its
-/// workspace says it belongs (CONTEXT.md "Stranded window").
+/// workspace says it belongs.
 ///
 /// Being stranded says nothing about where the window currently is: a
 /// failed re-park leaves one visible and a failed restore leaves one
@@ -3913,7 +3895,7 @@ fn stranded_move_for(state: &EngineState, window_id: WindowId) -> Option<Strande
 }
 
 /// Decides what an explicit `restore-switch` would do about a degraded
-/// switch, without doing it (CONTEXT.md "Workspace-switch degraded").
+/// switch, without doing it.
 ///
 /// The answer names every stranded window that is not where its workspace
 /// says it belongs -- in either direction. A window whose re-park failed
@@ -3949,11 +3931,9 @@ pub fn plan_workspace_switch_restore(state: &EngineState) -> WorkspaceSwitchRest
 /// silent -- so the window is recorded as stranded, switching is blocked,
 /// and `restore-switch` is the way out, exactly as after a failed switch.
 ///
-/// This is a deliberate reading of issue #61's "reapplied only as fresh
-/// guarded switches" (spec story 90). An all-or-nothing batch would have
-/// to restore the windows it had already parked, and spec story 83 says
-/// two workspaces are never intentionally left mixed; stranding one
-/// window mixes less than un-parking the rest.
+/// An all-or-nothing batch would have to restore the windows it had
+/// already parked, and two workspaces are never intentionally left mixed;
+/// stranding one window mixes less than un-parking the rest.
 fn strand_window(state: &mut EngineState, window_id: WindowId, reason: String) {
     let Some(name) = state.workspaces.workspace_of(window_id).cloned() else {
         return;
@@ -4035,8 +4015,8 @@ fn capture_assignment_for_undo(state: &mut EngineState, display_id: DisplayId) {
     }
 }
 
-/// Decides whether `window_id` may be parked, and with what recovery
-/// data, without recording anything (ADR 0023).
+/// Decides whether `window_id` may be parked, and with what recovery data,
+/// without recording anything.
 ///
 /// Every refusal comes before the draft exists: a degraded state
 /// database, an unverified or refused parking site, a full-screen
@@ -4082,9 +4062,9 @@ pub fn plan_parking_authorization(
 /// Registers a parking request for `window_id` and returns its token.
 ///
 /// The single place a window starts waiting to be parked, so the ordering
-/// ADR 0023 rests on -- the ledger entry recorded first, the parking
-/// effect only once it is acknowledged durable -- is written once instead
-/// of being got right in three places and wrong in a fourth.
+/// -- the ledger entry recorded first, the parking effect only once it is
+/// acknowledged durable -- is written once instead of being got right in
+/// three places and wrong in a fourth.
 fn request_recovery_entry(
     state: &mut EngineState,
     window_id: WindowId,
@@ -4159,8 +4139,7 @@ pub fn plan_workspace_delete(
 }
 
 /// Decides what displaying the hidden workspace `name` on the focused
-/// monitor would move, and refuses before anything does (CONTEXT.md
-/// "Workspace switch transaction").
+/// monitor would move, and refuses before anything does.
 ///
 /// Everything the transaction depends on is checked here: that no other
 /// switch is in flight, that an earlier one did not leave windows
@@ -4224,8 +4203,8 @@ pub fn plan_workspace_switch_on(
 
     // What has to leave the screen: the outgoing workspace's live members
     // that are actually on it. A minimized member occupies no screen and
-    // is left as it is (ADR 0029), and one already parked is where the
-    // switch wants it.
+    // is left as it is, and one already parked is where the switch wants
+    // it.
     let mut park = Vec::new();
     if let Some(outgoing) = &outgoing {
         for window_id in state.workspaces.members_of(outgoing) {
@@ -4310,10 +4289,9 @@ fn switching_status_reason(status: &WorkspaceSwitchingStatus) -> Option<String> 
     }
 }
 
-/// Decides what focusing a workspace would do, without doing it
-/// (CONTEXT.md "Workspace focus"). The same function answers the IPC
-/// preflight and drives the reducer, so a caller is never told something
-/// different from what happens.
+/// Decides what focusing a workspace would do, without doing it. The same
+/// function answers the IPC preflight and drives the reducer, so a caller
+/// is never told something different from what happens.
 pub fn plan_workspace_focus(
     state: &EngineState,
     name: &str,
@@ -4399,11 +4377,11 @@ pub fn plan_workspace_move(
     })
 }
 
-/// Updates visual order and emits one final Balanced-grid plan per affected
-/// display. It is intentionally a no-op in manual mode, leaving current
-/// bounds untouched on profile deactivation (ADR 0015).
-/// Reflows every display's tiled windows using whichever arrangement the
-/// resolved configuration selects.
+/// Updates visual order and emits one final Balanced-grid plan per
+/// affected display. It is intentionally a no-op in manual mode, leaving
+/// current bounds untouched on profile deactivation. Reflows every
+/// display's tiled windows using whichever arrangement the resolved
+/// configuration selects.
 ///
 /// The two arrangements agree on *which* windows are tiled and disagree
 /// only on where they go, so membership is computed once by
@@ -4613,9 +4591,9 @@ fn reconcile_container_trees(state: &mut EngineState) {
 
         // A returning window takes its old slot back only on a confident
         // match; anything less inserts it fresh and leaves the slot for a
-        // better candidate (spec user story 39). Slots are offered in
-        // visual order and each window is claimed at most once, so the
-        // outcome does not depend on enumeration order.
+        // better candidate. Slots are offered in visual order and each
+        // window is claimed at most once, so the outcome does not depend
+        // on enumeration order.
         let mut unplaced: Vec<WindowId> = active
             .iter()
             .filter(|window_id| !tree.contains(window_id))
@@ -4698,9 +4676,9 @@ fn reconcile_container_trees(state: &mut EngineState) {
 
         // A window the display cannot fit at its minimum size is left
         // where it is rather than squeezed: it keeps its leaf and its
-        // management, and comes back the moment the tree can hold it
-        // (spec user stories 45 and 46). Nothing here floats it by choice,
-        // so the overflow set is recomputed from scratch every reflow.
+        // management, and comes back the moment the tree can hold it.
+        // Nothing here floats it by choice, so the overflow set is
+        // recomputed from scratch every reflow.
         let planned = plan_tree_constrained(&tree, work_area, state.resolved_config.gaps, |id| {
             state
                 .inventory
@@ -4761,11 +4739,11 @@ fn restore_tree(
         .confident_window()
         .filter(|window_id| claimed.insert(*window_id))
     };
-    // A stored slot whose window is not here becomes dormant from now:
-    // the structure is kept for a later confident return rather than
-    // dropped. A slot that was already dormant keeps the time it went
-    // dormant, so retention counts from the right moment, and is pruned
-    // here if that moment is far enough back (spec user story 40).
+    // A stored slot whose window is not here becomes dormant from now: the
+    // structure is kept for a later confident return rather than dropped.
+    // A slot that was already dormant keeps the time it went dormant, so
+    // retention counts from the right moment, and is pruned here if that
+    // moment is far enough back.
     let mut restored = stored.convert_leaves(&mut |leaf| match &leaf.occupant {
         Occupant::Live(evidence) => match identify(evidence) {
             Some(window_id) => LeafFate::Live(window_id),
@@ -4815,13 +4793,13 @@ const fn longer_axis_of(area: Rect) -> SplitAxis {
 }
 
 /// The resolved config that should be active for `displays`' current
-/// topology: whichever profile in `config_set.profiles` has a `fingerprint`
-/// matching [`topology_fingerprint`] of `displays`, or `config_set.base` if
-/// none does (ADR 0004 -- profiles are opt-in overrides, never
-/// auto-created, so "no match" is an ordinary outcome, not an error).
-/// Shared by [`Event::ConfigChanged`] and [`Event::DisplayTopologyChanged`]
-/// so a topology already seen before always re-selects the same profile it
-/// matched last time.
+/// topology: whichever profile in `config_set.profiles` has a
+/// `fingerprint` matching [`topology_fingerprint`] of `displays`, or
+/// `config_set.base` if none does. Profiles are opt-in overrides, never
+/// auto-created, so "no match" is an ordinary outcome, not an error.
+/// Shared by [`Event::ConfigChanged`] and
+/// [`Event::DisplayTopologyChanged`] so a topology already seen before
+/// always re-selects the same profile it matched last time.
 fn select_resolved_config(config_set: &ResolvedConfigSet, displays: &[Display]) -> ResolvedConfig {
     let fingerprint = topology_fingerprint(displays);
     config_set
@@ -4842,18 +4820,17 @@ fn work_area_of(displays: &[Display], id: DisplayId) -> Option<Rect> {
 
 /// The windows in `current` that need a real `SetWindowPos` call to catch
 /// up to the reducer -- new since `previous`, or moved/resized since
-/// `previous` (architecture doc section 6's "Placement diff" stage,
-/// scoped down to what a poll-driven executor needs: it doesn't do
-/// transaction planning, just "what changed since I last looked").
+/// `previous`. Scoped down to what a poll-driven executor needs: it does
+/// no transaction planning, just "what changed since I last looked".
 ///
 /// A window present in `previous` but missing from `current` needs no
 /// call -- there's nothing sensible to move it to, and the engine never
 /// removes tracked windows today anyway.
 ///
-/// Windows whose circuit breaker is open (Feature 31) are excluded from
-/// the diff so the executor never issues a `SetWindowPos` call for them --
-/// they will re-appear in the diff automatically once the user resets the
-/// breaker via a zone-snap command.
+/// Windows whose circuit breaker is open are excluded from the diff so the
+/// executor never issues a `SetWindowPos` call for them -- they will
+/// re-appear in the diff automatically once the user resets the breaker
+/// via a zone-snap command.
 pub fn diff_placements(
     previous: &HashMap<WindowId, WindowPlacement>,
     current: &HashMap<WindowId, WindowPlacement>,
@@ -4876,12 +4853,12 @@ pub fn diff_placements(
 /// Decides what undoing the newest transaction would do, without doing it.
 ///
 /// Every refusal path returns before a single placement is planned, which
-/// is what makes undo all-or-nothing (ADR 0024): there is no state in which
-/// some members have moved and a later one turns out to be unresolvable.
-/// The same function answers the IPC preflight and drives the reducer, so a
-/// caller is never told something different from what happens.
-/// Whether automatic tiling is currently producing container trees, which
-/// is what every tree command requires.
+/// is what makes undo all-or-nothing: there is no state in which some
+/// members have moved and a later one turns out to be unresolvable. The
+/// same function answers the IPC preflight and drives the reducer, so a
+/// caller is never told something different from what happens. Whether
+/// automatic tiling is currently producing container trees, which is what
+/// every tree command requires.
 fn tree_mode_active(state: &EngineState) -> bool {
     state.resolved_config.tiling_mode == TilingMode::Tree && state.automatic_tiling_active
 }
@@ -4916,14 +4893,14 @@ pub struct TreeResizePlan {
 /// against `state` right now, or the typed reason it would do nothing.
 ///
 /// Pure over `state`, so the IPC handler and the reducer reach the same
+/// Pure over `state`, so the IPC handler and the reducer reach the same
 /// verdict from the same state. The full five-point step is taken when
-/// every arranged window stays at or above its minimum size with the
-/// gaps it has; otherwise the largest smaller whole step that does is
-/// taken, and if not even one point is legal the command is refused
-/// without touching the tree (spec user stories 33, 34, and 37).
-/// "Legal" means the resize neither overflows a window that was arranged
-/// nor costs any decoration: a resize is a request about weights, and
-/// it must not be answered by degrading the arrangement.
+/// every arranged window stays at or above its minimum size with the gaps
+/// it has; otherwise the largest smaller whole step that does is taken,
+/// and if not even one point is legal the command is refused without
+/// touching the tree. "Legal" means the resize neither overflows a window
+/// that was arranged nor costs any decoration: a resize is a request about
+/// weights, and it must not be answered by degrading the arrangement.
 pub fn plan_tree_resize(
     state: &EngineState,
     direction: CardinalDirection,
@@ -5000,8 +4977,7 @@ pub fn plan_tree_resize(
 }
 
 /// What swapping the focused window in `direction` would do against
-/// `state` right now, or the typed reason it would do nothing (CONTEXT.md
-/// "Directional swap", ADR 0026).
+/// `state` right now, or the typed reason it would do nothing.
 ///
 /// The neighbor is exactly the one [`Event::DirectionalFocusRequested`]
 /// would focus, because both go through [`directional_neighbor`]: a
@@ -5131,8 +5107,8 @@ pub fn plan_undo(state: &EngineState) -> UndoResult {
     // The structure the undo puts back is preflighted too. A leaf whose
     // window is gone is fine -- it comes back dormant, which is exactly
     // what its slot would be by now -- but a leaf that could be either of
-    // two windows is refused, because restoring it would guess (ADR
-    // 0024). The same matcher decides here and at apply time.
+    // two windows is refused, because restoring it would guess. The same
+    // matcher decides here and at apply time.
     let mut structure: Vec<UndoTargetOutcome> = Vec::new();
     for snapshot in &transaction.prior_trees {
         let Some(display_id) = display_id_of(state, &snapshot.display_fingerprint) else {
@@ -5215,9 +5191,8 @@ pub fn plan_undo(state: &EngineState) -> UndoResult {
     }
 
     // Reversing a workspace switch means switching back, and that switch
-    // has to be authorised on its own terms: undo never moves a window
-    // out of a workspace without the same guarantees the forward switch
-    // had (CONTEXT.md "Workspace switch transaction").
+    // has to be authorised on its own terms: undo never moves a window out
+    // of a workspace without the same guarantees the forward switch had.
     if let Err(reason) = plan_undo_switch_back(state, transaction) {
         return UndoResult::Refused(UndoRefusal::WorkspaceSwitchRefused {
             transaction_id: transaction.id,
@@ -5306,7 +5281,7 @@ fn launch_order_of(state: &EngineState, window_id: WindowId) -> u32 {
 ///
 /// Everything [`place_window`] moves before the matching
 /// [`close_undo_scope`] becomes one reversible transaction, including the
-/// automatic reflow an explicit command provokes (spec user story 10).
+/// automatic reflow an explicit command provokes.
 fn open_undo_scope(state: &mut EngineState, command: &str) {
     state.undo_scope = Some(UndoScope {
         command: command.to_owned(),
@@ -5442,9 +5417,9 @@ fn record_undo_member(
 /// `Some((direction, step))` to record the cycle position it just resolved.
 ///
 /// Returns `false` if the placement was suppressed because the window's
-/// circuit breaker is open (Feature 31). The caller is free to ignore this
-/// return value -- it's informational only; the event has already been
-/// handled (by doing nothing).
+/// circuit breaker is open. The caller is free to ignore this return value
+/// -- it's informational only; the event has already been handled (by
+/// doing nothing).
 fn place_window(
     state: &mut EngineState,
     window_id: WindowId,
@@ -5453,8 +5428,8 @@ fn place_window(
     cycle_step: Option<(HorizontalDirection, CycleStep)>,
 ) -> bool {
     let existing = state.windows.get(&window_id);
-    // Feature 31 — circuit breaker: if the window is in open-circuit state
-    // (repeated rejections), suppress this placement without modifying state.
+    // Circuit breaker: if the window is in open-circuit state (repeated
+    // rejections), suppress this placement without modifying state.
     if existing.is_some_and(|p| p.circuit_open()) {
         tracing::debug!(
             ?window_id,
@@ -5464,9 +5439,10 @@ fn place_window(
     }
     let previous_placement = existing.map(|placement| (placement.display_id, placement.bounds));
     let cycle_step = cycle_step.or_else(|| existing.and_then(|placement| placement.cycle_step));
-    // Preserve rejection_count across placements so the breaker state survives
-    // non-user-initiated placements (e.g. throw-to-display).  Only an explicit
-    // zone-snap command resets it (handled in Event::ZoneSnapRequested above).
+    // Preserve rejection_count across placements so the breaker state
+    // survives non-user-initiated placements (e.g. throw-to-display). Only
+    // an explicit zone-snap command resets it (handled in
+    // Event::ZoneSnapRequested above).
     let rejection_count = existing.map_or(0, |p| p.rejection_count);
     state.windows.insert(
         window_id,
@@ -5497,17 +5473,20 @@ fn place_window(
     true
 }
 
-/// Migrate windows whose current `display_id` is absent from `new_displays`
-/// to the nearest surviving display, preserving their normalized position
-/// via [`throw_preserving_ratio`].  Called *before* `state.displays` is
-/// updated so the old topology is still available to compute ratios from.
+/// Migrate windows whose current `display_id` is absent from
+/// `new_displays` to the nearest surviving display, preserving their
+/// normalized position via [`throw_preserving_ratio`]. Called *before*
+/// `state.displays` is updated so the old topology is still available to
+/// compute ratios from.
 ///
-/// This is the shared implementation for both [`Event::DisplayTopologyChanged`]
-/// (hotplug, Feature 30) and [`Event::WakeReconciliation`] (sleep/wake, Feature 29).
+/// This is the shared implementation for both
+/// [`Event::DisplayTopologyChanged`] (hotplug) and
+/// [`Event::WakeReconciliation`] (sleep/wake).
 fn migrate_orphaned_windows(state: &mut EngineState, new_displays: &[Display]) {
     if new_displays.is_empty() {
-        // No surviving displays -- nothing sensible to migrate to.  Leave
-        // windows untouched; they'll be reconciled when a display comes back.
+        // No surviving displays -- nothing sensible to migrate to. Leave
+        // windows untouched; they'll be reconciled when a display comes
+        // back.
         tracing::warn!(
             "all displays disappeared; deferring window migration until a display returns"
         );
@@ -5629,12 +5608,12 @@ fn migrate_focused_display(state: &mut EngineState, new_displays: &[Display]) {
         .map(|display| display.id);
 }
 
-/// The queue actually carries this, not `Event` directly, so [`stop`]
-/// can terminate the reducer with an explicit poison pill rather than by
+/// The queue actually carries this, not `Event` directly, so [`stop`] can
+/// terminate the reducer with an explicit poison pill rather than by
 /// waiting for every sender to be dropped -- callers are expected to hand
-/// out cloned [`EventSender`]s to multiple producer threads (architecture
-/// doc's "bounded multi-producer queue"), so those threads' lifetimes, not
-/// the last sender's, would otherwise decide when `stop` can return.
+/// out cloned [`EventSender`]s to multiple producer threads, so those
+/// threads' lifetimes, not the last sender's, would otherwise decide when
+/// `stop` can return.
 ///
 /// [`stop`]: EngineHandle::stop
 enum Message {
@@ -5653,9 +5632,9 @@ pub struct EventSender {
 
 impl EventSender {
     /// Enqueues `event`, blocking the caller while the queue is full --
-    /// that backpressure is intentional (architecture doc's "Bounded
-    /// event queue"). Fails, returning the event back, once the reducer
-    /// has stopped.
+    /// that backpressure is intentional, because the event queue is
+    /// bounded. Fails, returning the event back, once the reducer has
+    /// stopped.
     pub fn send(&self, event: Event) -> std::result::Result<(), Event> {
         self.inner
             .send(Message::Event(event))
@@ -6295,12 +6274,13 @@ mod tests {
 
     #[test]
     fn apply_throw_is_a_noop_when_the_windows_display_left_the_topology() {
-        // Regression test: when a monitor unplugs, the window is *migrated*
-        // to the surviving display by `DisplayTopologyChanged`.  A subsequent
-        // throw then operates on that surviving display -- but with only one
-        // display remaining there is no adjacent display to throw to, so the
-        // throw is still a no-op.  The key assertion is that the window ends
-        // up on the surviving display, not stranded on the vanished one.
+        // Regression test: when a monitor unplugs, the window is
+        // *migrated* to the surviving display by `DisplayTopologyChanged`.
+        // A subsequent throw then operates on that surviving display --
+        // but with only one display remaining there is no adjacent display
+        // to throw to, so the throw is still a no-op. The key assertion is
+        // that the window ends up on the surviving display, not stranded
+        // on the vanished one.
         let mut state = EngineState::default();
         apply(
             &mut state,
@@ -6908,10 +6888,10 @@ mod tests {
 
     #[test]
     fn apply_zone_snap_on_migrated_window_works_on_surviving_display() {
-        // When a monitor unplugs, `migrate_orphaned_windows` moves any window
-        // that was on it to the nearest surviving display.  A subsequent
-        // zone-snap must therefore operate on the window's *new* display, not
-        // fail because the original display is gone.
+        // When a monitor unplugs, `migrate_orphaned_windows` moves any
+        // window that was on it to the nearest surviving display. A
+        // subsequent zone-snap must therefore operate on the window's
+        // *new* display, not fail because the original display is gone.
         let mut state = EngineState::default();
         apply(
             &mut state,
@@ -7923,7 +7903,7 @@ mod tests {
             placement.bounds,
             Rect::new(0, 0, 100, 100),
             "the intended placement stays put -- comparing the two is how an \
-             external move is detected (ADR 0001)"
+             external move is detected"
         );
         assert!(
             state.revision > revision_before,
@@ -7945,7 +7925,7 @@ mod tests {
         assert!(state.paused);
     }
 
-    // ── Feature 28: Startup reconciliation ────────────────────────────────
+    // ---- Startup reconciliation ---------------------------------------
 
     #[test]
     fn startup_reconciliation_registers_untracked_windows() {
@@ -8019,11 +7999,11 @@ mod tests {
         assert!(state.windows.is_empty());
     }
 
-    // ── Feature 29 / 30: Display migration (hotplug and wake) ─────────────
+    // ---- Display migration (hotplug and wake) -------------------------
 
     #[test]
     fn topology_change_migrates_window_to_nearest_surviving_display() {
-        // The window starts on MON-A (left monitor).  When MON-A unplugs,
+        // The window starts on MON-A (left monitor). When MON-A unplugs,
         // the window must be migrated to MON-B (the only survivor).
         let mut state = EngineState::default();
         apply(
@@ -8144,7 +8124,7 @@ mod tests {
         );
     }
 
-    // ── Feature 31: Per-window circuit breaker ────────────────────────────
+    // ---- Per-window circuit breaker -----------------------------------
 
     #[test]
     fn placement_rejected_increments_rejection_count() {
@@ -9157,8 +9137,8 @@ mod tests {
         assert!(placements(&state).is_empty());
     }
 
-    /// [`state_with_saved_layout`] plus gaps, for the ADR 0006
-    /// post-processing step.
+    /// [`state_with_saved_layout`] plus gaps, for the gap post-processing
+    /// step.
     fn state_with_saved_layout_and_gaps(
         name: &str,
         cells: &[(f64, f64, f64, f64)],
@@ -9233,7 +9213,7 @@ mod tests {
 
         // Same input, and gaps live in `resolved_config`, nowhere this
         // call can see -- so the ungapped rectangle is the only thing it
-        // can produce (ADR 0006).
+        // can produce.
         assert_eq!(
             resolve_saved_layout(work_area, &cells),
             vec![Rect::new(0, 0, 960, 1080)]
@@ -9680,7 +9660,7 @@ mod tests {
     fn a_rejected_layout_apply_records_nothing() {
         let mut state = state_with_saved_layout("half", &[(0.0, 0.0, 0.5, 1.0)]);
         // Nothing focused, so the apply is rejected with a reason and
-        // changes nothing (ADR 0020).
+        // changes nothing.
 
         apply(
             &mut state,
@@ -9754,7 +9734,7 @@ mod tests {
         assert_eq!(state.focused_display, Some(DisplayId(2)));
     }
 
-    // ---- Persistent undo (issue #48) ----------------------------------
+    // ---- Persistent undo ----------------------------------------------
 
     /// A state with one display, one managed window, and that window
     /// focused -- the smallest situation in which an explicit command has
@@ -9953,7 +9933,7 @@ mod tests {
 
         assert!(
             recorded_drafts(&state).is_empty(),
-            "redo is deferred to issue #44; undo must not become undoable"
+            "undo must not become undoable"
         );
     }
 
@@ -10160,7 +10140,7 @@ mod tests {
         }
     }
 
-    // ---- Command-level atomic undo (issue #49) ------------------------
+    // ---- Command-level atomic undo ------------------------------------
 
     /// Two managed windows on one display with a two-cell layout, so an
     /// explicit command has more than one window to move.
@@ -10510,7 +10490,7 @@ mod tests {
         );
     }
 
-    // ---- Undo coverage and retention (issue #50) ----------------------
+    // ---- Undo coverage and retention ----------------------------------
 
     /// Automatic tiling running over two windows on one display, which is
     /// the situation most explicit commands need in order to move anything.
@@ -10675,8 +10655,8 @@ mod tests {
             "undoing a restore returns the window to where the restore found it"
         );
 
-        // The distinct meaning the ticket asks to preserve: one remembered
-        // in-session placement, consumed when it is used.
+        // The distinct meaning to preserve: one remembered in-session
+        // placement, consumed when it is used.
         state.effects.clear();
         state.persistence_intents.clear();
         apply(
@@ -10739,7 +10719,7 @@ mod tests {
         );
     }
 
-    // ---- Container tree (issue #51) -----------------------------------
+    // ---- Container tree -----------------------------------------------
 
     /// Automatic tiling running in tree mode on one 1920x1080 display.
     fn tree_state() -> EngineState {
@@ -10933,7 +10913,7 @@ mod tests {
         );
     }
 
-    // ---- Directional swap in tree mode (issue #55) ---------------------
+    // ---- Directional swap in tree mode --------------------------------
 
     /// H[ 1, V[ 2, dormant, 3 ] ] with the root divider resized, so the
     /// tree carries every kind of state a swap must leave alone.
@@ -11171,7 +11151,7 @@ mod tests {
         assert_eq!(state.windows[&WindowId(1)].display_id, DisplayId(2));
     }
 
-    // ---- Dormant positions (issue #53) ---------------------------------
+    // ---- Dormant positions --------------------------------------------
 
     /// [`app_window_at`] with the class and executable path a real window
     /// carries, which is what lets the matcher recognise it again: a
@@ -11530,7 +11510,7 @@ mod tests {
         assert!(dormant_positions(&state).is_empty());
     }
 
-    // ---- Tree resize (issue #52) ---------------------------------------
+    // ---- Tree resize --------------------------------------------------
 
     /// H[ 1, V[ 2, 3 ] ] on a 1920x1080 display: window 1 takes the left
     /// half, windows 2 and 3 stack on the right.
@@ -11721,8 +11701,8 @@ mod tests {
     fn resizing_never_pays_for_itself_with_gaps() {
         // With 20px gaps, window 1 at 960px raw is 946px placed and needs
         // 940. A one-point move (19px) would put it below 940 -- and the
-        // planner could rescue that by shrinking the gaps, which a resize
-        // must not do.
+        //      planner could rescue that by shrinking the gaps, which a
+        //      resize must not do.
         let mut state = tree_state();
         state.resolved_config.gaps = mosaix_domain::Gaps::new(20, 12);
         observe(
@@ -12058,7 +12038,7 @@ mod tests {
         );
     }
 
-    // ---- Constraint overflow (issue #54) ------------------------------
+    // ---- Constraint overflow ------------------------------------------
 
     /// [`window_at`] with a known minimum size.
     fn window_needing(id: isize, display_id: isize, bounds: Rect, minimum: (i32, i32)) -> Window {
@@ -12301,9 +12281,9 @@ mod tests {
 
     #[test]
     fn a_storage_failure_leaves_the_committed_arrangement_intact() {
-        // ADR 0025: durability is a promise about the database, not about
-        // the desktop. Losing the first must not disturb the second, and
-        // must not provoke compensating movement either.
+        // Durability is a promise about the database, not about the
+        // desktop. Losing the first must not disturb the second, and must
+        // not provoke compensating movement either.
         let mut state = state_with_saved_layout("half", &[(0.0, 0.0, 0.5, 1.0)]);
         apply(
             &mut state,
@@ -12411,7 +12391,7 @@ mod tests {
         );
     }
 
-    // ---- Logical workspaces (ADR 0028) --------------------------------
+    // ---- Logical workspaces -------------------------------------------
 
     fn ws(name: &str) -> WorkspaceName {
         WorkspaceName::new(name).unwrap()
@@ -13374,7 +13354,7 @@ mod tests {
         );
     }
 
-    // ---- Experimental switching mappings (ADR 0028) --------------------
+    // ---- Experimental switching mappings ------------------------------
 
     fn switching_set(
         displays: &[Display],
@@ -13407,7 +13387,7 @@ mod tests {
         }
     }
 
-    // -- Workspace switch transaction (issue #60) ---------------------
+    // ---- Workspace switch transaction ---------------------------------
 
     /// Every window currently at the parking site, in window-id order:
     /// the map is keyed by handle, so its own iteration order says
@@ -13622,7 +13602,7 @@ mod tests {
         assert_eq!(
             plan.park,
             vec![WindowId(1)],
-            "a minimized window occupies no screen, so it is left as it is (ADR 0029)"
+            "a minimized window occupies no screen, so it is left as it is"
         );
 
         switch_to(&mut state, "chat");
@@ -14107,7 +14087,7 @@ mod tests {
         );
     }
 
-    // -- Hidden-workspace lifecycle and recovery (issue #61) ----------
+    // ---- Hidden-workspace lifecycle and recovery ----------------------
 
     /// A two-display state with experimental switching authorised, `dev`
     /// on display 1 and `chat` on display 2.
@@ -14342,7 +14322,7 @@ mod tests {
 
         assert!(
             recorded_recovery(&state).is_empty(),
-            "a minimized window occupies no screen and is left as it is (ADR 0029)"
+            "a minimized window occupies no screen and is left as it is"
         );
 
         // The application restores it: it is on screen now, in a hidden
@@ -14418,7 +14398,7 @@ mod tests {
 
         assert!(
             recorded_recovery(&state).is_empty(),
-            "nothing forces a full-screen window out of full-screen (ADR 0029)"
+            "nothing forces a full-screen window out of full-screen"
         );
         assert!(state.parked_windows.is_empty());
     }
@@ -14839,7 +14819,7 @@ mod tests {
         );
     }
 
-    // ---- Recovery ledger authorisation (ADR 0023, issue #58) ----------
+    // ---- Recovery ledger authorisation --------------------------------
 
     fn parkable_state() -> EngineState {
         let mut state = workspace_state(&[1], &["dev"]);

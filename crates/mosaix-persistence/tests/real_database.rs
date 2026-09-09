@@ -1005,7 +1005,7 @@ fn stored_workspaces_contain_no_window_titles() {
     );
 }
 
-// ---- The recovery ledger (issue #58) ----------------------------------
+// ---- The recovery ledger ----------------------------------------------
 
 fn ledger_draft(session: &str, handle: isize, pid: u32) -> mosaix_domain::RecoveryDraft {
     mosaix_domain::RecoveryDraft {
@@ -1290,8 +1290,7 @@ fn the_ledger_stores_no_window_titles() {
 #[test]
 fn a_switch_keeps_the_displayed_assignment_it_changed_across_a_restart() {
     // Undoing a workspace switch means switching back, which is only
-    // possible if the assignment the command changed is stored with it
-    // (CONTEXT.md "Workspace switch transaction").
+    // possible if the assignment the command changed is stored with it.
     let temporary = TempDatabase::new("undo-assignment");
     let mut store = mosaix_persistence::Persistence::open(&temporary.path()).expect("it opens");
     let mut draft = draft("workspace-focus chat", &["alpha.exe"]);

@@ -1,16 +1,14 @@
 //! OS-level window event hooks via `SetWinEventHook`.
 //!
-//! Same "raw spike" scope as `move_resize_window`: no dependency on
-//! `mosaix-domain` or `mosaix-platform-api`. Covers exactly the events the
-//! architecture doc calls out for the Windows adapter -- window lifecycle,
-//! focus, and move/resize -- via a dedicated thread that owns the hooks and
-//! pumps the message loop `WINEVENT_OUTOFCONTEXT` delivery requires.
+//! No dependency on `mosaix-domain` or `mosaix-platform-api`. Covers
+//! window lifecycle, focus, and move/resize via a dedicated thread that
+//! owns the hooks and pumps the message loop `WINEVENT_OUTOFCONTEXT`
+//! delivery requires.
 //!
 //! `EVENT_SYSTEM_MOVESIZESTART`/`END` only fire for an interactive
 //! (mouse/keyboard driven) move or resize, not for a programmatic
-//! `SetWindowPos` call, so they aren't exercised by the automated test here
-//! -- see the architecture doc's platform integration matrix for that
-//! tier of testing.
+//! `SetWindowPos` call, so they aren't exercised by the automated test
+//! here.
 
 use std::cell::RefCell;
 use std::ffi::c_void;
@@ -50,8 +48,7 @@ impl From<WindowHandle> for HWND {
     }
 }
 
-/// A normalized OS window event, covering the subset the architecture doc
-/// calls out for the Windows adapter: lifecycle, focus, and move/resize.
+/// A normalized OS window event: lifecycle, focus, and move/resize.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RawEvent {
     WindowCreated(WindowHandle),

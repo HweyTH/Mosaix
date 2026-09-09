@@ -5,7 +5,7 @@
 //! writes configuration files. The connection is *held* rather than opened
 //! per request, because hotkey-capture suspension is bounded by this
 //! connection's lifetime, so the agent recovers when the application dies
-//! and the operating system closes the pipe handle (ADR 0021).
+//! and the operating system closes the pipe handle.
 
 use mosaix_config::{BindingEdit, LayoutEdit};
 use mosaix_ipc::StateSnapshot;
@@ -42,14 +42,13 @@ pub trait AgentTransport: Send + std::fmt::Debug {
     /// Asks the agent to change the saved-layout set, returning the
     /// configuration file the write landed in.
     ///
-    /// The agent performs every configuration write (ADR 0022), so this
-    /// is the only way the settings application changes a layout, and a
-    /// change it cannot confirm is an error rather than a claim.
+    /// The agent performs every configuration write, so this is the only
+    /// way the settings application changes a layout, and a change it
+    /// cannot confirm is an error rather than a claim.
     fn edit_layouts(&mut self, edit: LayoutEdit) -> Result<String, AgentError>;
 
     /// Asks the agent to unregister every hotkey, so a combination the
-    /// user presses next reaches the editor instead of firing a command
-    /// (ADR 0021).
+    /// user presses next reaches the editor instead of firing a command.
     ///
     /// Suspension lasts until [`AgentTransport::end_hotkey_capture`] or,
     /// failing that, until this connection ends -- which is what brings
@@ -63,10 +62,10 @@ pub trait AgentTransport: Send + std::fmt::Debug {
 
     /// Asks whether `combo` can be bound, before the user commits to it.
     ///
-    /// The agent answers, not this application: only the agent can
-    /// attempt the registration, and only it knows Mosaix's own resolved
-    /// bindings well enough to say a conflict is one the user can resolve
-    /// themselves (ADR 0021).
+    /// The agent answers, not this application: only the agent can attempt
+    /// the registration, and only it knows Mosaix's own resolved bindings
+    /// well enough to say a conflict is one the user can resolve
+    /// themselves.
     fn probe_hotkey(
         &mut self,
         combo: &str,
@@ -173,11 +172,11 @@ mod windows_transport {
         connection: Option<IpcConnection>,
         /// Whether the editor believes hotkey capture is in effect.
         ///
-        /// Suspension is bounded by the connection (ADR 0021), so a
-        /// connection that breaks and is replaced takes the agent's
-        /// suspension with it. Remembering the intent here is what lets
-        /// the replacement re-assert it, rather than leaving the editor
-        /// showing a capture dialog while every hotkey is live again.
+        /// Suspension is bounded by the connection, so a connection that
+        /// breaks and is replaced takes the agent's suspension with it.
+        /// Remembering the intent here is what lets the replacement
+        /// re-assert it, rather than leaving the editor showing a capture
+        /// dialog while every hotkey is live again.
         capturing: bool,
     }
 

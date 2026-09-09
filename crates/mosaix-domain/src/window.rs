@@ -1,8 +1,8 @@
 //! Window domain types: role, capabilities, lifecycle, and the aggregate.
 //!
-//! These types correspond to ARCHITECTURE §7.2. Platform adapters populate
-//! them from native APIs; the rest of the domain operates on these types
-//! without knowing which platform produced them.
+//! Platform adapters populate these types from native APIs; the rest of
+//! the domain operates on them without knowing which platform produced
+//! them.
 
 use std::path::PathBuf;
 
@@ -90,8 +90,8 @@ pub enum WindowLifecycle {
     /// Maximized to fill the work area.
     Maximized,
     /// Application-controlled full-screen presentation. Unlike maximize,
-    /// this is temporarily ineligible and restores its visual-order slot on
-    /// exit (ADR 0014).
+    /// this is temporarily ineligible and restores its visual-order slot
+    /// on exit.
     Fullscreen,
     /// Not visible (hidden by the application or system).
     Hidden,

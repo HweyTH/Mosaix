@@ -1,10 +1,7 @@
-//! Default config generation and the startup-failure fallback (ADR 0007).
+//! Default config generation and the startup-failure fallback.
 //!
 //! The bindings here (Ctrl+Alt+Arrow) are what a first-run generated
-//! `config.toml` and the in-memory fallback both reproduce -- the same
-//! defaults `mosaix-agent`'s now-deleted hardcoded `keybindings.rs` table
-//! used to own directly, before config-driven hotkeys replaced it (ADR
-//! 0003, superseded by ADR 0005).
+//! `config.toml` and the in-memory fallback both reproduce.
 
 use std::collections::BTreeMap;
 
@@ -62,22 +59,22 @@ pub fn default_base_config() -> BaseConfig {
         version: CURRENT_VERSION,
         // One workspace, so a fresh install tiles exactly as it did before
         // workspaces existed. More are declared by the user, never
-        // invented by the engine (ADR 0028).
+        // invented by the engine.
         workspaces: crate::schema::default_workspaces(),
         hotkeys,
         gaps: Gaps::default(),
         behavior: BehaviorSection::default(),
         focus_border: crate::schema::FocusBorderSection::default(),
-        // No layouts ship as defaults: a saved layout describes a shape one
-        // user chose, so Mosaix has nothing to guess at (ADR 0018).
+        // No layouts ship as defaults: a saved layout describes a shape
+        // one user chose, so Mosaix has nothing to guess at.
         layouts: BTreeMap::new(),
         workspace_switching: None,
     }
 }
 
-/// The default `config.toml` file content, written on first run (ticket
-/// 03) and used as the pre-config-existing default (ticket 06). Its own
-/// output round-trips through [`crate::validate`] successfully.
+/// The default `config.toml` file content, written on first run and used
+/// as the pre-config-existing default. Its own output round-trips through
+/// [`crate::validate`] successfully.
 pub fn default_config_content() -> String {
     toml::to_string_pretty(&default_base_config())
         .expect("default base config is always representable as TOML")
@@ -85,7 +82,7 @@ pub fn default_config_content() -> String {
 
 /// The in-memory fallback resolved config, used only when the config
 /// directory can't be read or created at all on startup and there is no
-/// last-known-good config to fall back to (ADR 0007). Same bindings as
+/// last-known-good config to fall back to. Same bindings as
 /// [`default_base_config`], but constructed directly with no TOML parsing
 /// or disk access, so it stays available even if the TOML/filesystem layer
 /// itself is what's broken.

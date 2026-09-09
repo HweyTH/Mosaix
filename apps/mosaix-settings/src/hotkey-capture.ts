@@ -8,7 +8,7 @@
  *
  * The buffer is armed only while a single dialog is frontmost and clears
  * when that dialog loses foreground: a capture armed across a whole
- * settings page is a page on which no key does anything (ADR 0021).
+ * settings page is a page on which no key does anything.
  */
 
 /** The four modifiers a Mosaix combination can carry. */
@@ -38,7 +38,7 @@ export interface CaptureSession {
    * They are ignored while they last. Opening the dialog with Enter while
    * Ctrl is held would otherwise leave Ctrl in every combination the user
    * then presses, including after they let go of it -- the stuck modifier
-   * ADR 0021's snapshot exists to prevent.
+   * this snapshot exists to prevent.
    */
   ignoredModifiers: Modifier[];
   /** The combination captured so far, `undefined` until a key arrives. */

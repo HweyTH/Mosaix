@@ -3,13 +3,10 @@
 //! fired hotkey id back to the command it represents, and turning that
 //! command into the engine event it asks for.
 //!
-//! Replaces this crate's former hardcoded `keybindings.rs` table (ADR
-//! 0003, superseded by ADR 0005): the resolved bindings themselves now
-//! come from `EngineState::resolved_config.hotkeys`, hot-editable and
-//! per-profile. Only the platform-specific pieces stay here -- key-name ->
-//! virtual-key translation and modifier-flag assembly -- since
-//! `mosaix-config` is deliberately platform-neutral (its `KeyCombo` type
-//! doc comment).
+//! Bindings come from `EngineState::resolved_config.hotkeys`, so they are
+//! hot-editable and per-profile. Only the platform-specific pieces stay
+//! here -- key-name -> virtual-key translation and modifier-flag assembly
+//! -- since `mosaix-config` is deliberately platform-neutral.
 
 use std::collections::BTreeMap;
 
@@ -105,9 +102,8 @@ pub fn event_for_command(command: &Command, paused: bool) -> Event {
                 Event::PauseRequested
             }
         }
-        // The layout name travels with the command from the registry, so
-        // a binding to a user-named layout needs nothing looked up here
-        // (ADR 0019).
+        // The layout name travels with the command from the registry, so a
+        // binding to a user-named layout needs nothing looked up here.
         Command::ApplyLayout { name } => Event::SavedLayoutApplyRequested { name: name.clone() },
         Command::FocusWorkspace { name } => Event::WorkspaceFocusRequested { name: name.clone() },
     }
@@ -118,9 +114,9 @@ pub fn event_for_command(command: &Command, paused: bool) -> Event {
 ///
 /// Ids used to come from a static command-to-integer match and its hand-
 /// written inverse. That bijection cannot survive a command that carries a
-/// layout name, because layout names are user-created and unbounded (ADR
-/// 0019), so ids are now allocated as bindings are built and the reverse
-/// lookup reads this registry.
+/// layout name, because layout names are user-created and unbounded, so
+/// ids are now allocated as bindings are built and the reverse lookup
+/// reads this registry.
 ///
 /// A registry belongs to exactly one registration. Re-registering --
 /// which is what a profile switch or a config reload already does --
@@ -225,8 +221,8 @@ pub fn binding_parts(combo: &KeyCombo) -> Option<(HOT_KEY_MODIFIERS, u32)> {
 /// paired with the [`HotkeyRegistry`] resolving the ids it allocated. A
 /// command whose key name doesn't translate to a known virtual-key code is
 /// skipped (and logged) rather than failing the whole set -- the same
-/// partial-success posture ADR 0002 already applies to OS-level
-/// registration conflicts -- and consumes no id.
+/// partial-success posture that applies to OS-level registration conflicts
+/// -- and consumes no id.
 pub fn bindings_from_resolved(
     hotkeys: &BTreeMap<Command, KeyCombo>,
 ) -> (Vec<HotkeyBinding>, HotkeyRegistry) {
@@ -447,7 +443,7 @@ mod tests {
                 name: "writing".to_owned()
             }),
             "the layout name must reach the engine, which resolves the \
-             focused window's display for it (ADR 0020)"
+             focused window's display for it"
         );
     }
 

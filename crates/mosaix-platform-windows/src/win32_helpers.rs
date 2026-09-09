@@ -188,13 +188,14 @@ pub fn is_zoomed(hwnd: HWND) -> bool {
 /// Check whether the process owning `pid` is running elevated (as Administrator).
 ///
 /// Returns:
-/// - `Some(true)` — the process is elevated (high mandatory integrity level).
+/// - `Some(true)` — the process is elevated (high mandatory integrity
+///   level).
 /// - `Some(false)` — the process is not elevated.
-/// - `None` — the process token could not be opened.  This typically means
-///   Mosaix itself is running unelevated and the target process is elevated
-///   (or is a protected system process), which is functionally equivalent to
-///   `Some(true)` for the purposes of window management: we cannot send it
-///   `SetWindowPos` calls either way.
+/// - `None` — the process token could not be opened. This typically means
+///   Mosaix itself is running unelevated and the target process is
+///   elevated (or is a protected system process), which is functionally
+///   equivalent to `Some(true)` for the purposes of window management: we
+///   cannot send it `SetWindowPos` calls either way.
 ///
 /// Callers that cannot distinguish `None` from `Some(true)` should treat them
 /// identically — if we cannot even inspect the token, we certainly cannot

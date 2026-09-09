@@ -212,7 +212,7 @@ fn saving_over_a_layout_the_matched_profile_declares_writes_the_profile() {
 
     assert_eq!(
         write.file, "desk.toml",
-        "the write lands in the layer that supplies the value (ADR 0022)"
+        "the write lands in the layer that supplies the value"
     );
     let reloaded = load(&dir).unwrap().unwrap();
     assert_eq!(
@@ -388,7 +388,7 @@ fn rebinding_a_command_the_profile_overrides_writes_the_profile() {
 
     assert_eq!(
         write.file, "desk.toml",
-        "the write lands in the layer that supplies the value (ADR 0022)"
+        "the write lands in the layer that supplies the value"
     );
     let reloaded = load(&dir).unwrap().unwrap();
     assert_eq!(
@@ -583,7 +583,7 @@ fn a_rebind_onto_a_combination_another_binding_holds_persists_nothing() {
         BindingEdit::Set {
             command: Command::SnapRight,
             // Already snap-left's, and duplicate detection runs over the
-            // whole directory (ADR 0007).
+            // whole directory.
             combo: combo("ctrl+alt+left"),
             to_base: false,
         },

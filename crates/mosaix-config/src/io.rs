@@ -1,11 +1,11 @@
-//! Disk I/O and `notify`-based watching for a config directory (ADR 0008).
+//! Disk I/O and `notify`-based watching for a config directory.
 //!
 //! Everything here is the thin I/O shell around [`crate::validate`]'s pure
 //! logic: reading `config.toml` and `profiles/*.toml` off disk into a
-//! [`CandidateConfig`], writing the first-run default (ADR 0007), and
-//! debouncing raw filesystem events into a single validate-and-reload pass
-//! (ADR 0008). None of this crate's schema/validation logic lives here --
-//! this module only ever hands already-read strings to [`crate::validate`].
+//! [`CandidateConfig`], writing the first-run default, and debouncing raw
+//! filesystem events into a single validate-and-reload pass. None of this
+//! crate's schema/validation logic lives here -- this module only ever
+//! hands already-read strings to [`crate::validate`].
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -28,9 +28,9 @@ use crate::schema::{
 use crate::validate::{validate, CandidateConfig, CandidateProfile, ValidationError};
 
 /// Debounce window for coalescing raw filesystem events into one
-/// validate-and-reload pass (ADR 0008) -- comfortably above how long a
-/// small TOML write takes, comfortably below a delay a human editing the
-/// file would notice.
+/// validate-and-reload pass -- comfortably above how long a small TOML
+/// write takes, comfortably below a delay a human editing the file would
+/// notice.
 pub const DEBOUNCE_WINDOW: Duration = Duration::from_millis(300);
 
 const PROFILES_DIR_NAME: &str = "profiles";
@@ -65,10 +65,10 @@ pub enum ConfigIoError {
 /// Why a saved-layout edit was never attempted.
 ///
 /// Distinct from [`ConfigIoError::Validation`], which is whole-directory
-/// validation's verdict on the candidate an edit produced (ADR 0007).
-/// These are refusals reached before any file is written, so the caller
-/// can tell "your configuration would be invalid" from "that is not a
-/// change I can make".
+/// validation's verdict on the candidate an edit produced. These are
+/// refusals reached before any file is written, so the caller can tell
+/// "your configuration would be invalid" from "that is not a change I can
+/// make".
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum LayoutEditError {
     #[error("there is no saved layout named {name:?}")]
@@ -93,19 +93,19 @@ pub enum LayoutEditError {
 
 /// One change to the saved-layout set, performed by the agent on the
 /// user's behalf. The settings application never writes a configuration
-/// file itself (ADR 0022).
+/// file itself.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LayoutEdit {
     /// Create `name`, or replace the cells of the one that exists.
     ///
-    /// `to_base` is ADR 0022's redirect: the write normally lands in the
-    /// layer that supplies the layout, and this sends it to base config
-    /// instead. Redirecting a layout the matched profile declares *moves*
-    /// it -- base config gains it and the profile loses it -- because a
-    /// copy would leave the profile still winning the merge, so the
-    /// redirect would appear to succeed and change nothing at this desk.
-    /// It is a no-op for a layout base config already supplies, and for a
-    /// layout that does not exist yet, which goes to base config anyway.
+    /// `to_base` is the redirect: the write normally lands in the layer
+    /// that supplies the layout, and this sends it to base config instead.
+    /// Redirecting a layout the matched profile declares *moves* it --
+    /// base config gains it and the profile loses it -- because a copy
+    /// would leave the profile still winning the merge, so the redirect
+    /// would appear to succeed and change nothing at this desk. It is a
+    /// no-op for a layout base config already supplies, and for a layout
+    /// that does not exist yet, which goes to base config anyway.
     Save {
         name: String,
         cells: Vec<NormalizedRect>,
@@ -127,13 +127,13 @@ pub enum LayoutEdit {
 
 /// One change to a hotkey binding, performed by the agent on the user's
 /// behalf. The settings application never writes a configuration file
-/// itself (ADR 0022).
+/// itself.
 #[derive(Debug, Clone, PartialEq)]
 pub enum BindingEdit {
     /// Bind `command` to `combo`.
     ///
-    /// `to_base` is ADR 0022's redirect: the write normally lands in the
-    /// layer that supplies the binding, and this sends it to base config
+    /// `to_base` is the redirect: the write normally lands in the layer
+    /// that supplies the binding, and this sends it to base config
     /// instead. Redirecting a binding the matched profile overrides
     /// *moves* it -- base config takes the new combination and the profile
     /// drops its override -- because leaving the override in place would
@@ -180,11 +180,11 @@ pub struct BindingWrite {
 /// directory as it now stands.
 ///
 /// The resolved set travels back so the agent can make the change live
-/// immediately rather than waiting out the reload debounce (ADR 0008) --
-/// a user who saves a layout and presses its hotkey should not have to
-/// pause first. The echo that arrives through the watcher a moment later
-/// is then identical, and the reducer already discards a config change
-/// that changes nothing.
+/// immediately rather than waiting out the reload debounce -- a user who
+/// saves a layout and presses its hotkey should not have to pause first.
+/// The echo that arrives through the watcher a moment later is then
+/// identical, and the reducer already discards a config change that
+/// changes nothing.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LayoutWrite {
     pub file: String,
@@ -362,7 +362,7 @@ pub fn save_profile_settings(
 
 /// A candidate's base config and its `fingerprint`-matched profile (if
 /// any), each paired with the file it was read from -- the two layers a
-/// saved-layout edit can land in (ADR 0022).
+/// saved-layout edit can land in.
 struct LayoutLayers {
     base: BaseConfig,
     profile: Option<(String, ProfileConfig)>,
@@ -495,8 +495,8 @@ struct EditPlan {
     /// The layout to write into `destination`.
     added: Option<(String, Vec<NormalizedRect>)>,
     /// The layout to take out of the matched profile, for a redirect that
-    /// moves it to base config (ADR 0022). Always `None` when
-    /// `destination` is the profile itself.
+    /// moves it to base config. Always `None` when `destination` is the
+    /// profile itself.
     vacated: Option<String>,
 }
 
@@ -649,14 +649,14 @@ fn plan_binding_edit(
 
 /// Applies `edit` to the configuration directory `dir`, writing the layer
 /// that currently supplies the binding being edited: the profile matching
-/// `fingerprint` if it overrides that command, otherwise base config
-/// (ADR 0022). A command neither layer binds yet goes to base config.
+/// `fingerprint` if it overrides that command, otherwise base config. A
+/// command neither layer binds yet goes to base config.
 ///
 /// The whole directory is validated as one candidate before anything is
-/// written (ADR 0007), so an edit that would leave an invalid
-/// configuration -- a duplicate binding, say -- is refused and nothing is
-/// persisted. The write itself is a temp file and an atomic replace,
-/// matching [`edit_layouts`].
+/// written, so an edit that would leave an invalid configuration -- a
+/// duplicate binding, say -- is refused and nothing is persisted. The
+/// write itself is a temp file and an atomic replace, matching
+/// [`edit_layouts`].
 pub fn edit_bindings(
     dir: &Path,
     fingerprint: &str,
@@ -757,11 +757,11 @@ struct PendingWrite {
 /// Validates the whole directory with `pending` applied and, only if that
 /// holds, writes it.
 ///
-/// Whole-directory validation runs before anything is written (ADR 0007),
-/// so an edit that would leave the configuration invalid is refused and
-/// nothing is persisted. The destination is written before the profile a
-/// redirect empties, so a failure between the two leaves the value
-/// declared twice -- recoverable by hand -- rather than nowhere.
+/// Whole-directory validation runs before anything is written, so an edit
+/// that would leave the configuration invalid is refused and nothing is
+/// persisted. The destination is written before the profile a redirect
+/// empties, so a failure between the two leaves the value declared twice
+/// -- recoverable by hand -- rather than nowhere.
 ///
 /// Shared by both edit paths because a saved layout and a hotkey binding
 /// differ only in what they put in the file, never in how the file gets
@@ -806,14 +806,14 @@ fn commit(
 
 /// Applies `edit` to the configuration directory `dir`, writing the layer
 /// that currently supplies the layout being edited: the profile matching
-/// `fingerprint` if it declares that layout, otherwise base config
-/// (ADR 0022). A layout being created belongs to neither layer yet, so it
-/// goes to base config.
+/// `fingerprint` if it declares that layout, otherwise base config. A
+/// layout being created belongs to neither layer yet, so it goes to base
+/// config.
 ///
 /// The whole directory is validated as one candidate before anything is
-/// written (ADR 0007), so an edit that would leave an invalid
-/// configuration is refused and nothing is persisted. The write itself is
-/// a temp file and an atomic replace, matching [`save_profile_settings`].
+/// written, so an edit that would leave an invalid configuration is
+/// refused and nothing is persisted. The write itself is a temp file and
+/// an atomic replace, matching [`save_profile_settings`].
 pub fn edit_layouts(
     dir: &Path,
     fingerprint: &str,
@@ -903,9 +903,9 @@ fn validation_message(errors: Vec<ValidationError>) -> ConfigIoError {
 
 /// Ensures `dir` (and its `profiles/` subdirectory) exist and that
 /// `config.toml` is present, writing the generated default content
-/// ([`default_config_content`]) if it's missing (ADR 0007's first-run
-/// case). A no-op if everything is already there -- never overwrites an
-/// existing `config.toml`, valid or not.
+/// ([`default_config_content`]) if it's missing. A no-op if everything is
+/// already there -- never overwrites an existing `config.toml`, valid or
+/// not.
 pub fn ensure_default_config(dir: &Path) -> Result<(), ConfigIoError> {
     let profiles_dir = dir.join(PROFILES_DIR_NAME);
     fs::create_dir_all(&profiles_dir).map_err(|err| io_error(&profiles_dir, err))?;
@@ -923,7 +923,7 @@ pub fn ensure_default_config(dir: &Path) -> Result<(), ConfigIoError> {
 /// reads fine but fails validation surfaces as `Ok(Err(errors))` --
 /// callers (startup, and [`watch`]'s reload loop) need to tell those two
 /// failure modes apart, since only the former has no last-known-good to
-/// fall back to at all (ADR 0007).
+/// fall back to at all.
 pub fn load(dir: &Path) -> Result<Result<ResolvedConfigSet, Vec<ValidationError>>, ConfigIoError> {
     let candidate = read_candidate(dir)?;
     Ok(validate(&candidate))
@@ -985,7 +985,7 @@ impl Drop for ConfigWatcher {
 
 /// Starts watching `dir` (recursively, so `profiles/` is covered too) for
 /// changes, debouncing raw filesystem events ~300ms before reading and
-/// validating the whole directory again (ADR 0008).
+/// validating the whole directory again.
 ///
 /// Returns a handle controlling the watcher's lifetime and a channel of
 /// [`ConfigEvent`]s. Callers are expected to have already run

@@ -1,6 +1,6 @@
-//! The agent's side of the recovery ledger (ADR 0023): the platform
-//! closures the shared recovery routine needs, and the enrichment a
-//! recovery draft gets from the live window before it is written.
+//! The agent's side of the recovery ledger: the platform closures the
+//! shared recovery routine needs, and the enrichment a recovery draft gets
+//! from the live window before it is written.
 //!
 //! Both the startup pass and the clean-exit pass in `main` go through
 //! [`recover_with_platform`], and so does `mosaix restore-windows`, which

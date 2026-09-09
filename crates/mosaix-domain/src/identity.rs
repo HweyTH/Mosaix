@@ -1,6 +1,6 @@
 //! Durable window identity: the one definition of "this is the same
 //! window" that persistent undo and identity-based scene restoration both
-//! use (spec: "one window-identity matcher shared by undo and issue #28").
+//! use.
 //!
 //! Native handles are ephemeral, so a window that outlives a restart has to
 //! be recognised from evidence instead. Two rules shape what that evidence

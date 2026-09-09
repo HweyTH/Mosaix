@@ -1,9 +1,9 @@
 //! Geometry primitives for window and display bounds.
 //!
 //! All coordinates are logical, top-left origin. Negative values are valid
-//! for monitors left of or above the primary display. Only platform adapters
-//! convert between core logical coordinates and native coordinate systems
-//! (see ARCHITECTURE §10).
+//! for monitors left of or above the primary display. Only platform
+//! adapters convert between core logical coordinates and native coordinate
+//! systems.
 
 use serde::{Deserialize, Serialize};
 
@@ -79,13 +79,12 @@ impl Size {
 }
 
 /// Configurable gap insets applied to a computed zone [`Rect`] as a
-/// post-processing step (ADR 0006), kept separate from the pure zone
-/// functions that compute the rect itself.
+/// post-processing step, kept separate from the pure zone functions that
+/// compute the rect itself.
 ///
-/// Both values are uniform scalars, not per-edge -- see CONTEXT.md's "Gap
-/// (outer / inner)" glossary entry. *Outer gap* insets edges that touch the
-/// container's boundary; *inner gap* insets edges that would border a
-/// neighboring zone.
+/// Both values are uniform scalars, not per-edge. *Outer gap* insets edges
+/// that touch the container's boundary; *inner gap* insets edges that
+/// would border a neighboring zone.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Gaps {
     pub outer: i32,

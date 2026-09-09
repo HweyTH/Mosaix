@@ -20,8 +20,8 @@ pub struct RuleActions {
     pub manage: ManageAction,
     /// The logical workspace a matching managed window belongs to, by
     /// name. `None` leaves the window in the workspace displayed where it
-    /// appeared. The engine resolves the name against its pool and
-    /// refuses an unknown one rather than creating it (ADR 0028).
+    /// appeared. The engine resolves the name against its pool and refuses
+    /// an unknown one rather than creating it.
     pub workspace: Option<String>,
 }
 

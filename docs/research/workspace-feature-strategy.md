@@ -19,7 +19,7 @@ The second capability is where the platform boundary appears. Treating both as o
 
 The complete public `IVirtualDesktopManager` surface has three methods: determine a window's desktop ID, test whether it is on the current desktop, and move it to a specified desktop. It has no method to enumerate, create, delete, name, reorder, or activate desktops. Microsoft also tells applications that only the user should initiate switching ([Microsoft, `IVirtualDesktopManager`](https://learn.microsoft.com/en-us/windows/win32/api/shobjidl_core/nn-shobjidl_core-ivirtualdesktopmanager)).
 
-This is not merely an omission in the documentation. A PowerToys maintainer recorded that switching is unavailable through the public API, identified private `IVirtualDesktopManagerInternal::SwitchDesktop` as the alternative, and noted that its GUID changes between Windows builds ([PowerToys #38287](https://github.com/microsoft/PowerToys/issues/38287)). Therefore a Mosaix-owned native desktop switcher would require exactly the private, version-sensitive integration that `ACHITECTURE.md` excludes.
+This is not merely an omission in the documentation. A PowerToys maintainer recorded that switching is unavailable through the public API, identified private `IVirtualDesktopManagerInternal::SwitchDesktop` as the alternative, and noted that its GUID changes between Windows builds ([PowerToys #38287](https://github.com/microsoft/PowerToys/issues/38287)). Therefore a Mosaix-owned native desktop switcher would require exactly the private, version-sensitive integration that `ARCHITECTURE.md` excludes.
 
 The narrower public `MoveWindowToDesktop` method is not a substitute. It requires the target desktop GUID, while the public interface cannot enumerate desktops or activate the target. It can support limited cooperation with desktops the user already owns, but not Mosaix's named, per-monitor workspace contract.
 
@@ -83,7 +83,7 @@ That is enough to keep one domain model and adapter contract. It is not enough t
 
 ### SQLite should precede any switching experiment
 
-`ACHITECTURE.md` §12.2 assigns workspace trees, placement/undo history, restoration metadata, migrations, and onboarding state to SQLite. None of those needs a native window handle to survive across sessions; the architecture explicitly forbids persisting handles. This is the right separation: persist logical identities and geometry in SQLite, while keeping the current session's native handles in a short-lived recovery ledger.
+`ARCHITECTURE.md` §12.2 assigns workspace trees, placement/undo history, restoration metadata, migrations, and onboarding state to SQLite. None of those needs a native window handle to survive across sessions; the architecture explicitly forbids persisting handles. This is the right separation: persist logical identities and geometry in SQLite, while keeping the current session's native handles in a short-lived recovery ledger.
 
 Switching raises the consequence of lost state from “layout resets” to “the user's windows appear missing.” Therefore the database is not merely Phase 4 infrastructure once switching is considered. Before an experimental switcher, Mosaix needs:
 
@@ -124,7 +124,7 @@ The experiment should not graduate unless all of these are demonstrated in live 
 
 ### Documentation correction now
 
-`CONTEXT.md` currently opens by promising “per-monitor workspaces,” while the implemented product and current ADRs defer them. Until switching graduates, change that sentence to promise manual snapping and automatic tiling, and describe workspaces as a researched, deferred capability. `ACHITECTURE.md` should likewise split §7.3 into “container tree” and “workspace visibility mechanism,” because they no longer share a delivery or platform-risk profile.
+`CONTEXT.md` currently opens by promising “per-monitor workspaces,” while the implemented product and current ADRs defer them. Until switching graduates, change that sentence to promise manual snapping and automatic tiling, and describe workspaces as a researched, deferred capability. `ARCHITECTURE.md` should likewise split §7.3 into “container tree” and “workspace visibility mechanism,” because they no longer share a delivery or platform-risk profile.
 
 ## Sources
 

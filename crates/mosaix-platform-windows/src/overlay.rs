@@ -1,5 +1,5 @@
 //! Snap preview overlay: a single layered, click-through popup that shows
-//! where a window will land (Feature 34).
+//! where a window will land.
 //!
 //! Owned by a dedicated thread with a message loop (same shape as
 //! `display.rs` / `hotkeys.rs`). Callers post show/hide requests; the

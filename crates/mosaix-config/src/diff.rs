@@ -1,9 +1,9 @@
 //! Pure diff between two resolved hotkey binding sets, mirroring
-//! `mosaix_engine::diff_placements`'s shape (ADR 0005): both let a
-//! poll-driven executor ask "what changed since I last acted on this?"
-//! against committed reducer state, rather than reacting to individual
-//! events. `mosaix-agent`'s hotkey-rebind poller is [`diff_bindings`]'s
-//! only caller today.
+//! `mosaix_engine::diff_placements`'s shape: both let a poll-driven
+//! executor ask "what changed since I last acted on this?" against
+//! committed reducer state, rather than reacting to individual events.
+//! `mosaix-agent`'s hotkey-rebind poller is [`diff_bindings`]'s only
+//! caller today.
 
 use std::collections::BTreeMap;
 

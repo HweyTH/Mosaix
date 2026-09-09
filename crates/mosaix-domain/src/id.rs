@@ -2,7 +2,7 @@
 //!
 //! These are thin newtypes that keep native handles from leaking into
 //! platform-independent code. Native handles are ephemeral and must never
-//! be persisted as stable identities (see ARCHITECTURE §7.2).
+//! be persisted as stable identities.
 
 use serde::{Deserialize, Serialize};
 

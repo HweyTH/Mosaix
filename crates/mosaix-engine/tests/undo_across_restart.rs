@@ -1,5 +1,5 @@
 //! Persistent undo end to end, across a real state database and a real
-//! restart of the engine (issue #48).
+//! restart of the engine.
 //!
 //! The reducer's own tests cover each refusal in isolation. What only this
 //! level can show is the round trip: a command recorded through the
@@ -144,7 +144,7 @@ fn a_snap_survives_a_restart_and_undoes_against_a_new_native_handle() {
             .expect("the transaction records")
     };
 
-    // --- restart: a fresh database handle and a fresh engine ---
+    // ---- restart: a fresh database handle and a fresh engine ----------
     let store = Persistence::open(&temporary.path()).expect("database reopens");
     let transaction = store
         .newest_transaction()

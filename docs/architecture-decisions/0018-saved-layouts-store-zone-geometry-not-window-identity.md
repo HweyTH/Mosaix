@@ -5,7 +5,7 @@
 
 ## Context
 
-`ACHITECTURE.md` uses "saved arrangements" (section 1) and "the requested arrangement" (section 9.3) for two different things, and the gap between them is the whole cost question for this feature. Restoring a *shape* is geometry. Restoring an *arrangement of particular windows* requires the scored-evidence matching of section 7.2, the SQLite state database of section 12.2, an evidence inspector so users can repair a bad match, and partial-success reporting -- essentially all of Phase 4.
+`ARCHITECTURE.md` uses "saved arrangements" (section 1) and "the requested arrangement" (section 9.3) for two different things, and the gap between them is the whole cost question for this feature. Restoring a *shape* is geometry. Restoring an *arrangement of particular windows* requires the scored-evidence matching of section 7.2, the SQLite state database of section 12.2, an evidence inspector so users can repair a bad match, and partial-success reporting -- essentially all of Phase 4.
 
 The settings app already drafts the geometry half. `apps/mosaix-settings/src-tauri/src/editor.rs` defines `ZoneDraft` and `LayoutDraft` as pure rectangles with no window identity, but `BaseConfig` has no layouts field, so a draft has nowhere to persist, and `save_and_apply_layout` is deliberately rejected until the versioned `mosaix-ipc` transport lands.
 

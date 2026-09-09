@@ -5,7 +5,7 @@
 //! held connection the settings application uses instead, kept open for
 //! its window's lifetime -- required because hotkey-capture suspension is
 //! bounded by that connection's lifetime, so the agent recovers when the
-//! application dies and the OS closes the pipe handle (ADR 0021).
+//! application dies and the OS closes the pipe handle.
 
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
