@@ -6,8 +6,10 @@
 //! `EngineState::paused` regardless of who toggled it.
 
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 use windows::core::{w, PCWSTR};
@@ -19,8 +21,8 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Shell::{
-    Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY,
-    NOTIFYICONDATAW, NOTIFY_ICON_MESSAGE,
+    Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_WARNING, NIM_ADD,
+    NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW, NOTIFY_ICON_MESSAGE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreateIconIndirect, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon,
@@ -36,6 +38,12 @@ use crate::{Result, WindowError};
 
 const WM_TRAYICON: u32 = WM_APP + 50;
 const WM_SET_STATUS: u32 = WM_APP + 51;
+/// Show the balloon at the head of the pending-notification queue.
+///
+/// The text travels through the shared queue rather than through
+/// `WPARAM`/`LPARAM`, because a message carries no owned string and this
+/// crossing is between two threads.
+const WM_SHOW_BALLOON: u32 = WM_APP + 52;
 
 const TRAY_UID: u32 = 1;
 const IDM_TOGGLE_PAUSE: usize = 1001;
@@ -72,7 +80,11 @@ impl TrayStatus {
     }
 }
 
+/// A balloon waiting to be shown: title, then body.
+type PendingBalloons = Arc<Mutex<VecDeque<(String, String)>>>;
+
 thread_local! {
+    static TRAY_BALLOONS: RefCell<Option<PendingBalloons>> = const { RefCell::new(None) };
     static TRAY_SENDER: RefCell<Option<Sender<TrayEvent>>> = const { RefCell::new(None) };
     static TRAY_STATUS: RefCell<TrayStatus> = const { RefCell::new(TrayStatus::Manual) };
     static TRAY_ICONS: RefCell<[Option<HICON>; 5]> = const { RefCell::new([None; 5]) };
@@ -114,6 +126,39 @@ fn notify_data(hwnd: HWND, status: TrayStatus) -> NOTIFYICONDATAW {
         szTip: tip_for(status),
         ..Default::default()
     }
+}
+
+/// Copies `text` into a fixed shell buffer, truncated to fit and always
+/// NUL-terminated. The shell reads these as C strings, so the last slot
+/// is left as the terminator rather than filled.
+fn shell_text<const N: usize>(text: &str) -> [u16; N] {
+    let mut buf = [0u16; N];
+    for (i, c) in text.encode_utf16().take(N - 1).enumerate() {
+        buf[i] = c;
+    }
+    buf
+}
+
+/// Shows one balloon over the existing tray icon.
+///
+/// `NIF_INFO` on a `NIM_MODIFY` is the whole mechanism: the icon is
+/// already registered, so this adds text to it rather than creating
+/// anything. Failure is ignored -- a user who has notifications switched
+/// off is not a problem this process can solve, and the same fact is in
+/// the log either way.
+fn show_balloon(hwnd: HWND, status: TrayStatus, title: &str, body: &str) {
+    let data = NOTIFYICONDATAW {
+        cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+        hWnd: hwnd,
+        uID: TRAY_UID,
+        uFlags: NIF_INFO,
+        szInfo: shell_text(body),
+        szInfoTitle: shell_text(title),
+        dwInfoFlags: NIIF_WARNING,
+        hIcon: current_icon(status),
+        ..Default::default()
+    };
+    let _ = unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) };
 }
 
 fn add_or_modify(hwnd: HWND, status: TrayStatus, message: NOTIFY_ICON_MESSAGE) {
@@ -306,6 +351,20 @@ unsafe extern "system" fn tray_wndproc(
             add_or_modify(hwnd, status, NIM_MODIFY);
             LRESULT(0)
         }
+        WM_SHOW_BALLOON => {
+            // One message per queued balloon, so taking exactly one here
+            // keeps the two in step.
+            let pending = TRAY_BALLOONS.with(|cell| {
+                cell.borrow()
+                    .as_ref()
+                    .and_then(|queue| queue.lock().ok()?.pop_front())
+            });
+            if let Some((title, body)) = pending {
+                let status = TRAY_STATUS.with(|cell| *cell.borrow());
+                show_balloon(hwnd, status, &title, &body);
+            }
+            LRESULT(0)
+        }
         WM_COMMAND => {
             // Defensive: some paths deliver menu commands via WM_COMMAND.
             let id = wparam.0 & 0xFFFF;
@@ -372,6 +431,7 @@ pub struct TrayHandle {
     thread_id: u32,
     join_handle: Option<JoinHandle<()>>,
     stopped: AtomicBool,
+    balloons: PendingBalloons,
 }
 
 impl TrayHandle {
@@ -382,6 +442,29 @@ impl TrayHandle {
         let hwnd = HWND(self.hwnd as *mut _);
         unsafe {
             let _ = PostMessageW(hwnd, WM_SET_STATUS, WPARAM(status as usize), LPARAM(0));
+        }
+    }
+
+    /// Shows a balloon over the tray icon.
+    ///
+    /// For the things a user has to be told rather than have logged: a
+    /// hotkey another application already owns is the first, because the
+    /// only other evidence of it is a key that quietly does nothing.
+    ///
+    /// Best effort. A stopped tray drops it, and so does the shell when
+    /// the user has notifications switched off.
+    pub fn notify(&self, title: &str, body: &str) {
+        if self.stopped.load(Ordering::Relaxed) {
+            return;
+        }
+        let Ok(mut queue) = self.balloons.lock() else {
+            return;
+        };
+        queue.push_back((title.to_owned(), body.to_owned()));
+        drop(queue);
+        let hwnd = HWND(self.hwnd as *mut _);
+        unsafe {
+            let _ = PostMessageW(hwnd, WM_SHOW_BALLOON, WPARAM(0), LPARAM(0));
         }
     }
 
@@ -424,9 +507,12 @@ impl Drop for TrayHandle {
 pub fn start_tray() -> Result<(TrayHandle, Receiver<TrayEvent>)> {
     let (tx, rx) = mpsc::channel();
     let (ready_tx, ready_rx) = mpsc::channel::<Result<(u32, isize)>>();
+    let balloons: PendingBalloons = Arc::new(Mutex::new(VecDeque::new()));
+    let thread_balloons = Arc::clone(&balloons);
 
     let join_handle = thread::spawn(move || {
         TRAY_SENDER.with(|s| *s.borrow_mut() = Some(tx));
+        TRAY_BALLOONS.with(|s| *s.borrow_mut() = Some(thread_balloons));
 
         // BGR colors: gray manual, blue active, orange degraded, gold
         // suspended, and muted red paused.
@@ -490,6 +576,7 @@ pub fn start_tray() -> Result<(TrayHandle, Receiver<TrayEvent>)> {
                 thread_id,
                 join_handle: Some(join_handle),
                 stopped: AtomicBool::new(false),
+                balloons,
             },
             rx,
         )),
@@ -520,4 +607,28 @@ mod tests {
         std::thread::sleep(Duration::from_millis(50));
         tray.stop();
     }
+
+    /// The shell reads these buffers as C strings, so the terminator has
+    /// to survive a title or body longer than the buffer.
+    #[test]
+    fn shell_text_truncates_and_always_leaves_a_terminator() {
+        let short: [u16; 8] = shell_text("hi");
+        assert_eq!(&short[..2], &['h' as u16, 'i' as u16]);
+        assert_eq!(short[2], 0, "a short string is terminated where it ends");
+
+        let long: [u16; 4] = shell_text("abcdefgh");
+        assert_eq!(&long[..3], &['a' as u16, 'b' as u16, 'c' as u16]);
+        assert_eq!(long[3], 0, "the last slot stays the terminator");
+    }
+
+    /// A queued balloon that is never pumped must not wedge the caller,
+    /// and a stopped tray must drop it rather than queue it forever.
+    #[test]
+    fn notify_on_a_stopped_tray_queues_nothing() {
+        let (tray, _events) = start_tray().expect("tray starts");
+        tray.notify("title", "body");
+        std::thread::sleep(Duration::from_millis(50));
+        tray.stop();
+    }
+
 }

@@ -1206,6 +1206,11 @@ fn main() {
                         mosaix_platform_windows::TrayStatus::Manual
                     }
                 };
+                // A binding the OS refused is otherwise evidenced only by
+                // a key that quietly does nothing, so it is told to the
+                // user rather than left in the log. Reported on change,
+                // so a standing failure is not repeated every poll.
+                let mut last_unregistered: Vec<mosaix_config::Command> = Vec::new();
                 let mut last_status = status_for(&state_reader.snapshot());
                 tray.set_status(last_status);
                 loop {
@@ -1252,10 +1257,38 @@ fn main() {
                             break;
                         }
                         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                            let status = status_for(&tray_for_status.snapshot());
+                            let snapshot = tray_for_status.snapshot();
+                            let status = status_for(&snapshot);
                             if status != last_status {
                                 tray.set_status(status);
                                 last_status = status;
+                            }
+                            if snapshot.unregistered_bindings != last_unregistered {
+                                if !snapshot.unregistered_bindings.is_empty() {
+                                    // Naming the combination as well as the
+                                    // command is what makes the message
+                                    // actionable: the user has to know which
+                                    // keys to change.
+                                    let refused = snapshot
+                                        .unregistered_bindings
+                                        .iter()
+                                        .map(|command| {
+                                            match snapshot.resolved_config.hotkeys.get(command) {
+                                                Some(combo) => format!("{command} ({combo})"),
+                                                None => command.to_string(),
+                                            }
+                                        })
+                                        .collect::<Vec<_>>()
+                                        .join(", ");
+                                    tray.notify(
+                                        "Mosaix could not register a hotkey",
+                                        &format!(
+                                            "{refused} is already held by another application.                                              Pick a different combination in the settings app                                              or in config.toml."
+                                        ),
+                                    );
+                                }
+                                last_unregistered
+                                    .clone_from(&snapshot.unregistered_bindings);
                             }
                         }
                         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
