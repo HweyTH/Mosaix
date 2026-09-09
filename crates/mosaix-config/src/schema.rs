@@ -68,6 +68,14 @@ pub enum Command {
     ResizeUp,
     ResizeDown,
     TogglePause,
+    /// Return the focused window to the display and bounds it had before
+    /// Mosaix last placed it. One step, not the persistent undo history.
+    RestoreWindow,
+    /// Move the focused window to the next display, keeping its position
+    /// and size as a fraction of that display's work area.
+    ThrowNext,
+    /// The same, to the previous display.
+    ThrowPrev,
     /// Apply the saved layout called `name` to the focused window's
     /// display. Ordered last so every layout binding sorts after every
     /// unit verb, which is what lets the serializer emit the nested
@@ -115,6 +123,9 @@ impl Command {
             Self::ResizeUp => "resize-up",
             Self::ResizeDown => "resize-down",
             Self::TogglePause => "toggle-pause",
+            Self::RestoreWindow => "restore-window",
+            Self::ThrowNext => "throw-next",
+            Self::ThrowPrev => "throw-prev",
             Self::ApplyLayout { .. } => APPLY_LAYOUT_VERB,
             Self::FocusWorkspace { .. } => FOCUS_WORKSPACE_VERB,
         }
@@ -126,7 +137,7 @@ impl Command {
     /// [`Command::verb`] rather than repeating them, so the spelling of a
     /// verb lives in exactly one place and the two directions cannot drift
     /// apart -- which is what the serde derive used to guarantee for free.
-    pub fn unit_verbs() -> [Self; 20] {
+    pub fn unit_verbs() -> [Self; 23] {
         [
             Self::SnapLeft,
             Self::SnapRight,
@@ -148,6 +159,9 @@ impl Command {
             Self::ResizeUp,
             Self::ResizeDown,
             Self::TogglePause,
+            Self::RestoreWindow,
+            Self::ThrowNext,
+            Self::ThrowPrev,
         ]
     }
 
@@ -158,7 +172,7 @@ impl Command {
     /// layout name inside. Callers turn a `None` into the load-time
     /// "unknown command" rejection that names the file and line.
     ///
-    /// A linear scan of twenty, run once per binding at config load.
+    /// A linear scan of twenty-three, run once per binding at config load.
     fn unit_from_verb(verb: &str) -> Option<Self> {
         Self::unit_verbs()
             .into_iter()

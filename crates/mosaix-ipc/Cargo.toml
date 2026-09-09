@@ -10,6 +10,7 @@ mosaix-engine = { path = "../mosaix-engine" }
 mosaix-config = { path = "../mosaix-config" }
 mosaix-domain = { path = "../mosaix-domain" }
 mosaix-rules = { path = "../mosaix-rules" }
+mosaix-layout = { path = "../mosaix-layout" }
 mosaix-persistence = { path = "../mosaix-persistence" }
 serde = { workspace = true }
 serde_json = { workspace = true }

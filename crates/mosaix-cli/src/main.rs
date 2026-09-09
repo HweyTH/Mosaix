@@ -140,11 +140,34 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Return the focused window to where it was before Mosaix last
+    /// placed it.
+    ///
+    /// One step back for one window, not the persistent undo history:
+    /// `mosaix undo` reverses a whole transaction. Does nothing if the
+    /// window has no remembered prior placement.
+    RestoreWindow,
+    /// Move the focused window to another display, keeping its position
+    /// and size as a fraction of that display's work area.
+    Throw {
+        #[command(subcommand)]
+        direction: ThrowDirection,
+    },
+    /// Report the agent's published state.
     State {
         #[arg(long)]
         json: bool,
     },
+    /// Check that an agent is running and answering.
     Ping,
+}
+
+/// Displays are ordered left-to-right then top-to-bottom, and the ends
+/// wrap, so `next` from the last display reaches the first.
+#[derive(Debug, Subcommand)]
+enum ThrowDirection {
+    Next,
+    Prev,
 }
 
 #[derive(Debug, Subcommand)]
@@ -372,6 +395,13 @@ fn main() {
         Command::Layout {
             action: LayoutAction::Apply { name },
         } => IpcRequest::ApplyLayout { name },
+        Command::RestoreWindow => IpcRequest::RestoreWindow,
+        Command::Throw {
+            direction: ThrowDirection::Next,
+        } => IpcRequest::ThrowNext,
+        Command::Throw {
+            direction: ThrowDirection::Prev,
+        } => IpcRequest::ThrowPrev,
         Command::State { .. } => IpcRequest::GetState,
         Command::Ping => IpcRequest::Ping,
         Command::Persistence { .. }

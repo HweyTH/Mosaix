@@ -73,6 +73,8 @@ editing `config.toml` or by pressing a new combination in the settings app.
 | `Win+Alt+Space` | Float or unfloat the focused window |
 | `Win+Alt+E` | Rearrange -- recover the grid after manual moves |
 | `Win+Alt+P` | Pause and resume window management |
+| `Win+Alt+N` / `Shift+N` | Move the focused window to the next / previous display |
+| `Win+Alt+Z` | Return the focused window to where it was before that |
 
 `Win+Alt` rather than `Ctrl+Alt`, because `Ctrl+Alt` is `AltGr`: on a European
 layout every binding here would fire while you were typing an ordinary
@@ -140,6 +142,8 @@ The `mosaix` CLI drives a running agent over a versioned named pipe.
 
 ```powershell
 mosaix snap left-half          # snap the focused window
+mosaix throw next              # move the focused window to the next display
+mosaix restore-window          # put it back where it was before that
 mosaix layout apply writing    # apply a saved layout
 mosaix arrangement             # report the tiling arrangement and container trees
 mosaix undo                    # reverse the newest placement command

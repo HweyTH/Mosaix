@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 /// older agent has no tag for a request this build added -- and no field
 /// for one an existing request grew -- so the version is what makes the
 /// mismatch reportable instead of surfacing as a deserialization failure.
-pub const PROTOCOL_VERSION: u32 = 14;
+pub const PROTOCOL_VERSION: u32 = 15;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct IpcEnvelope {
@@ -200,6 +200,19 @@ pub enum IpcRequest {
     ResetBinding {
         command_path: String,
     },
+    /// Return the focused window to the display and bounds it had before
+    /// Mosaix last placed it -- one step, not the persistent undo
+    /// history. This and the two below reach engine events that existed
+    /// with no way to ask for them, hence [`PROTOCOL_VERSION`] 15.
+    ///
+    /// Refused, rather than answered `Ok`, when no window is focused:
+    /// there is no window the request could be about.
+    RestoreWindow,
+    /// Move the focused window to the next display, keeping its position
+    /// and size as a fraction of that display's work area.
+    ThrowNext,
+    /// The same, to the previous display.
+    ThrowPrev,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
