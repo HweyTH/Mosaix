@@ -29,3 +29,7 @@ apps/mosaix-settings/src-tauri/gen/schemas/
 # Environment
 .env
 .env.local
+
+# Agent working directories
+.agents/
+.scratch/
