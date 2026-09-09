@@ -397,7 +397,7 @@ fn rebinding_a_command_the_profile_overrides_writes_the_profile() {
     );
     assert_eq!(
         reloaded.base.hotkeys[&Command::SnapLeft],
-        combo("win+alt+left"),
+        combo("win+alt+shift+left"),
         "base config keeps whatever it said; only the override moved"
     );
 
@@ -459,7 +459,7 @@ fn resetting_a_profile_override_falls_back_to_base_config() {
     assert_eq!(write.file, "desk.toml");
     assert_eq!(
         write.combo,
-        Some(combo("win+alt+left")),
+        Some(combo("win+alt+shift+left")),
         "one step back toward the default is base config's value, not nothing"
     );
     let profile_file = fs::read_to_string(dir.join("profiles").join("desk.toml")).unwrap();
@@ -497,7 +497,7 @@ fn resetting_a_base_binding_restores_the_shipped_default() {
 
     assert_eq!(
         write.combo,
-        Some(combo("win+alt+left")),
+        Some(combo("win+alt+shift+left")),
         "a user undoing an experiment should not have to remember the default"
     );
 
@@ -584,7 +584,7 @@ fn a_rebind_onto_a_combination_another_binding_holds_persists_nothing() {
             command: Command::SnapRight,
             // Already snap-left's, and duplicate detection runs over the
             // whole directory.
-            combo: combo("win+alt+left"),
+            combo: combo("win+alt+shift+left"),
             to_base: false,
         },
     )
@@ -594,7 +594,7 @@ fn a_rebind_onto_a_combination_another_binding_holds_persists_nothing() {
     let reloaded = load(&dir).unwrap().unwrap();
     assert_eq!(
         reloaded.base.hotkeys[&Command::SnapRight],
-        combo("win+alt+right"),
+        combo("win+alt+shift+right"),
         "a refused candidate leaves the previous configuration untouched"
     );
 
@@ -857,7 +857,7 @@ fn a_layout_edit_leaves_hand_written_hotkeys_intact() {
     let reloaded = load(&dir).unwrap().unwrap();
     assert_eq!(
         reloaded.base.hotkeys.get(&Command::SnapLeft),
-        Some(&KeyCombo::parse("win+alt+left").unwrap()),
+        Some(&KeyCombo::parse("win+alt+shift+left").unwrap()),
         "the generated default bindings must still be there"
     );
 

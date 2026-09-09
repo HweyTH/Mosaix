@@ -65,10 +65,10 @@ editing `config.toml` or by pressing a new combination in the settings app.
 
 | Keys | Command |
 | --- | --- |
-| `Win+Alt+←` / `→` / `↑` / `↓` | Snap the focused window to a half zone; repeat to cycle |
+| `Win+Alt+Shift+←` / `→` / `↑` / `↓` | Snap the focused window to a half zone; repeat to cycle |
 | `Win+Alt+H` / `J` / `K` / `L` | Move focus left / down / up / right |
 | `Win+Alt+Shift+H` / `J` / `K` / `L` | Swap the focused window with its neighbour |
-| `Win+Alt+Shift+←` / `→` / `↑` / `↓` | Resize by moving the nearest divider |
+| `Win+Ctrl+Alt+←` / `→` / `↑` / `↓` | Resize by moving the nearest divider |
 | `Win+Alt+A` | Toggle automatic tiling for this topology |
 | `Win+Alt+Space` | Float or unfloat the focused window |
 | `Win+Alt+E` | Rearrange -- recover the grid after manual moves |
@@ -82,6 +82,19 @@ character. It also collides with JetBrains IDEs, where `Ctrl+Alt+L` reformats
 code. `A` and `E` rather than the more obvious `T` and `R` because Xbox Game
 Bar holds `Win+Alt+R` and `Win+Alt+T` system-wide.
 
+The arrow keys carry a third modifier because Windows 11 reserves
+`Win+Alt+Arrow` outright -- `RegisterHotKey` refuses it, so a binding there
+would be a key that does nothing. There is no free two-modifier arrow
+combination left on Windows: `Ctrl+Alt` is AltGr, `Win+Shift` and `Win+Ctrl`
+move windows and desktops, `Ctrl+Shift` selects words in every text editor,
+and `Alt+Shift` switches keyboard layout. So `Win+Alt+Shift` moves a window --
+arrows to a zone, home row to swap with a neighbour -- and `Win+Ctrl+Alt`,
+the least-used of the three, resizes.
+
+If a binding still cannot be registered because another application owns it,
+Mosaix says so in a tray notification naming the command and the combination,
+rather than leaving you with a key that quietly does nothing.
+
 ## Configuration
 
 Configuration lives in `%APPDATA%\Mosaix\config\`: a `config.toml` base, plus
@@ -94,8 +107,8 @@ version = 1
 workspaces = ["main"]
 
 [hotkeys]
-snap-left = "win+alt+left"
-snap-right = "win+alt+right"
+snap-left = "win+alt+shift+left"
+snap-right = "win+alt+shift+right"
 
 [hotkeys.apply-layout]
 writing = "win+alt+1"

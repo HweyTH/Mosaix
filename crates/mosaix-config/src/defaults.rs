@@ -1,7 +1,14 @@
 //! Default config generation and the startup-failure fallback.
 //!
-//! The bindings here (Win+Alt) are what a first-run generated
-//! `config.toml` and the in-memory fallback both reproduce.
+//! The bindings here are what a first-run generated `config.toml` and the
+//! in-memory fallback both reproduce. Win+Alt carries the letters,
+//! Win+Alt+Shift moves a window (arrows to a zone, home row to swap), and
+//! Win+Ctrl+Alt resizes.
+//!
+//! The arrows do not sit on plain Win+Alt because Windows 11 reserves
+//! Win+Alt+Arrow: `RegisterHotKey` refuses it with
+//! ERROR_HOTKEY_ALREADY_REGISTERED, so the four snap commands -- the ones
+//! the product is mostly used for -- silently did nothing.
 //!
 //! Win rather than Ctrl as the second modifier because Ctrl+Alt *is*
 //! AltGr: on a European layout every Ctrl+Alt binding here would fire
@@ -38,15 +45,27 @@ fn shifted_combo(key: &str) -> KeyCombo {
     }
 }
 
+/// Win+Ctrl+Alt: the only modifier set left for the arrow keys once the
+/// others are ruled out.
+///
+/// Not AltGr, despite carrying Ctrl and Alt -- AltGr produces Ctrl+Alt,
+/// never Ctrl+Alt+Win, so a European layout cannot reach this by typing.
+fn tertiary_combo(key: &str) -> KeyCombo {
+    KeyCombo {
+        ctrl: true,
+        ..default_combo(key)
+    }
+}
+
 /// The default `config.toml` content, as a fully-populated [`BaseConfig`]
 /// value rather than a hand-written string -- guarantees the generated
 /// TOML and this crate's own schema/parsing never drift apart.
 pub fn default_base_config() -> BaseConfig {
     let mut hotkeys = BTreeMap::new();
-    hotkeys.insert(Command::SnapLeft, default_combo("LEFT"));
-    hotkeys.insert(Command::SnapRight, default_combo("RIGHT"));
-    hotkeys.insert(Command::SnapTop, default_combo("UP"));
-    hotkeys.insert(Command::SnapBottom, default_combo("DOWN"));
+    hotkeys.insert(Command::SnapLeft, shifted_combo("LEFT"));
+    hotkeys.insert(Command::SnapRight, shifted_combo("RIGHT"));
+    hotkeys.insert(Command::SnapTop, shifted_combo("UP"));
+    hotkeys.insert(Command::SnapBottom, shifted_combo("DOWN"));
     hotkeys.insert(Command::Rearrange, default_combo("E"));
     hotkeys.insert(Command::ToggleAutomaticTiling, default_combo("A"));
     hotkeys.insert(Command::ToggleFloating, default_combo("SPACE"));
@@ -58,10 +77,10 @@ pub fn default_base_config() -> BaseConfig {
     hotkeys.insert(Command::SwapDown, shifted_combo("J"));
     hotkeys.insert(Command::SwapUp, shifted_combo("K"));
     hotkeys.insert(Command::SwapRight, shifted_combo("L"));
-    hotkeys.insert(Command::ResizeLeft, shifted_combo("LEFT"));
-    hotkeys.insert(Command::ResizeRight, shifted_combo("RIGHT"));
-    hotkeys.insert(Command::ResizeUp, shifted_combo("UP"));
-    hotkeys.insert(Command::ResizeDown, shifted_combo("DOWN"));
+    hotkeys.insert(Command::ResizeLeft, tertiary_combo("LEFT"));
+    hotkeys.insert(Command::ResizeRight, tertiary_combo("RIGHT"));
+    hotkeys.insert(Command::ResizeUp, tertiary_combo("UP"));
+    hotkeys.insert(Command::ResizeDown, tertiary_combo("DOWN"));
     hotkeys.insert(Command::TogglePause, default_combo("P"));
     hotkeys.insert(Command::RestorePlacement, default_combo("Z"));
     hotkeys.insert(Command::ThrowNext, default_combo("N"));
@@ -116,21 +135,26 @@ mod tests {
         let base = default_base_config();
 
         assert_eq!(base.version, CURRENT_VERSION);
+        // Win+Alt+Shift, not Win+Alt: Windows 11 reserves Win+Alt+Arrow.
         assert_eq!(
             base.hotkeys.get(&Command::SnapLeft),
-            Some(&default_combo("LEFT"))
+            Some(&shifted_combo("LEFT"))
         );
         assert_eq!(
             base.hotkeys.get(&Command::SnapRight),
-            Some(&default_combo("RIGHT"))
+            Some(&shifted_combo("RIGHT"))
         );
         assert_eq!(
             base.hotkeys.get(&Command::SnapTop),
-            Some(&default_combo("UP"))
+            Some(&shifted_combo("UP"))
         );
         assert_eq!(
             base.hotkeys.get(&Command::SnapBottom),
-            Some(&default_combo("DOWN"))
+            Some(&shifted_combo("DOWN"))
+        );
+        assert_eq!(
+            base.hotkeys.get(&Command::ResizeLeft),
+            Some(&tertiary_combo("LEFT"))
         );
         assert_eq!(base.gaps, Gaps::default());
         assert!(base.focus_border.enabled);
@@ -164,7 +188,7 @@ mod tests {
 
         assert_eq!(
             fallback.hotkeys.get(&Command::SnapLeft),
-            Some(&KeyCombo::parse("win+alt+left").unwrap())
+            Some(&KeyCombo::parse("win+alt+shift+left").unwrap())
         );
         assert_eq!(fallback.gaps, Gaps::default());
     }
@@ -176,4 +200,97 @@ mod tests {
 
         assert_eq!(parsed, default_base_config());
     }
+
+    /// Combinations a shipped default must never use, because the OS or a
+    /// near-universal Microsoft component already owns them and
+    /// `RegisterHotKey` refuses with ERROR_HOTKEY_ALREADY_REGISTERED. A
+    /// binding that lands here does not warn at build time and does not
+    /// warn at run time -- it is simply a key that does nothing.
+    ///
+    /// Kept as data rather than discovered by probing, so the check is
+    /// deterministic and runs on any machine, including CI with no
+    /// interactive desktop. Probing the live machine is a diagnostic, not
+    /// a test: it answers a different question, and its answer changes
+    /// with whatever the user happens to be running.
+    const OS_RESERVED: &[&str] = &[
+        // Windows 11 reserves the whole Win+Alt+Arrow set. This is what
+        // shipped broken: all four snap commands silently did nothing.
+        "win+alt+left",
+        "win+alt+right",
+        "win+alt+up",
+        "win+alt+down",
+        // Shell: snap, move-to-monitor, virtual desktop.
+        "win+left",
+        "win+right",
+        "win+up",
+        "win+down",
+        "win+shift+left",
+        "win+shift+right",
+        "win+ctrl+left",
+        "win+ctrl+right",
+        "win+l",
+        "win+d",
+        "win+e",
+        "win+r",
+        "win+g",
+        "win+tab",
+        // Xbox Game Bar, present and enabled on a stock Windows 11.
+        "win+alt+r",
+        "win+alt+g",
+        "win+alt+m",
+        "win+alt+t",
+        "win+alt+b",
+        "win+alt+w",
+    ];
+
+    #[test]
+    fn no_shipped_default_lands_on_a_combination_the_os_already_owns() {
+        let base = default_base_config();
+        let reserved: Vec<KeyCombo> = OS_RESERVED
+            .iter()
+            .map(|raw| KeyCombo::parse(raw).expect("the reserved table parses"))
+            .collect();
+
+        for (command, combo) in &base.hotkeys {
+            assert!(
+                !reserved.contains(combo),
+                "default binding {command} is {combo}, which the OS already \
+                 owns; RegisterHotKey refuses it and the command silently \
+                 does nothing"
+            );
+        }
+    }
+
+    /// Ctrl+Alt is AltGr. A European layout reaches it by typing an
+    /// ordinary character, so no default may sit there -- which is the
+    /// whole reason the table moved off Ctrl+Alt in the first place.
+    ///
+    /// Win+Ctrl+Alt is exempt and is where the resize bindings live:
+    /// AltGr produces Ctrl+Alt, never Ctrl+Alt+Win.
+    #[test]
+    fn no_shipped_default_is_reachable_as_altgr() {
+        for (command, combo) in &default_base_config().hotkeys {
+            assert!(
+                !(combo.ctrl && combo.alt && !combo.win),
+                "default binding {command} is {combo}, which is AltGr plus a key"
+            );
+        }
+    }
+
+    /// Two commands on one combination means one of them never fires:
+    /// the second registration is refused. `validate` rejects this in a
+    /// user's file, so the shipped table must not contain it either.
+    #[test]
+    fn no_two_shipped_defaults_share_a_combination() {
+        let base = default_base_config();
+        let mut seen: BTreeMap<String, &Command> = BTreeMap::new();
+
+        for (command, combo) in &base.hotkeys {
+            if let Some(first) = seen.insert(combo.to_string(), command) {
+                panic!("{first} and {command} are both bound to {combo}");
+            }
+        }
+        assert_eq!(seen.len(), base.hotkeys.len());
+    }
+
 }
