@@ -13,7 +13,10 @@ use std::os::windows::io::{FromRawHandle, RawHandle};
 
 use thiserror::Error;
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, HANDLE};
+use windows::core::HRESULT;
+use windows::Win32::Foundation::{
+    ERROR_ACCESS_DENIED, GENERIC_READ, GENERIC_WRITE, HANDLE,
+};
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_MODE, OPEN_EXISTING,
 };
@@ -25,6 +28,10 @@ use crate::protocol::{decode_response, wrap_request, IpcRequest, IpcResponse, Pr
 pub enum IpcError {
     #[error("connection failed: mosaix may not be running")]
     ConnectionFailed,
+    #[error(
+        "connection refused: the mosaix agent is running at a different privilege level.          Start the agent and this command with the same elevation."
+    )]
+    AccessDenied,
     #[error("the mosaix agent closed the connection")]
     ConnectionClosed,
     #[error("io error: {0}")]
@@ -43,6 +50,23 @@ impl From<ProtocolError> for IpcError {
             },
             ProtocolError::Malformed(message) => IpcError::Protocol(message),
         }
+    }
+}
+
+/// The error a failed `CreateFileW` on the agent's pipe reports.
+///
+/// `ERROR_ACCESS_DENIED` means the pipe is there and this process may not
+/// open it, which in practice means the agent is elevated and the caller
+/// is not, or the reverse. Reporting that as "mosaix may not be running"
+/// sent people looking for a stopped agent that was in fact running.
+///
+/// Split out from [`IpcConnection::connect`] so the mapping can be tested
+/// without a second privilege level to run the tests under.
+fn connect_error(code: HRESULT) -> IpcError {
+    if code == HRESULT::from_win32(ERROR_ACCESS_DENIED.0) {
+        IpcError::AccessDenied
+    } else {
+        IpcError::ConnectionFailed
     }
 }
 
@@ -70,7 +94,7 @@ impl IpcConnection {
                 HANDLE::default(),
             )
         }
-        .map_err(|_| IpcError::ConnectionFailed)?;
+        .map_err(|error| connect_error(error.code()))?;
         if handle.is_invalid() {
             return Err(IpcError::ConnectionFailed);
         }
@@ -106,4 +130,42 @@ impl IpcConnection {
 /// what the CLI does, where the process itself is the session.
 pub fn send_request(request: IpcRequest) -> Result<IpcResponse, IpcError> {
     IpcConnection::connect()?.send(request)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PIPE_BUSY};
+
+    /// An elevated agent and an unelevated caller produce this, and it
+    /// used to be reported as "mosaix may not be running" -- which sent
+    /// people looking for a stopped agent that was running the whole
+    /// time.
+    #[test]
+    fn access_denied_names_the_privilege_mismatch_rather_than_a_missing_agent() {
+        let error = connect_error(HRESULT::from_win32(ERROR_ACCESS_DENIED.0));
+
+        assert!(matches!(error, IpcError::AccessDenied));
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("privilege level"),
+            "the message must say what is actually wrong: {rendered}"
+        );
+        assert!(
+            !rendered.contains("may not be running"),
+            "and must not send the reader after a stopped agent: {rendered}"
+        );
+    }
+
+    /// Everything else keeps the message it had. A missing pipe really
+    /// does mean no agent is listening.
+    #[test]
+    fn every_other_failure_still_reads_as_a_missing_agent() {
+        for code in [ERROR_FILE_NOT_FOUND, ERROR_PIPE_BUSY] {
+            assert!(matches!(
+                connect_error(HRESULT::from_win32(code.0)),
+                IpcError::ConnectionFailed
+            ));
+        }
+    }
 }
