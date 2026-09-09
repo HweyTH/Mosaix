@@ -174,8 +174,12 @@ enum Command {
     /// `mosaix undo` reverses a whole transaction. Does nothing if the
     /// window has no remembered prior placement.
     RestorePlacement,
-    /// Move the focused window to another display, keeping its position
-    /// and size as a fraction of that display's work area.
+    /// Transfer the focused window to another display.
+    ///
+    /// A display transfer: the window keeps its position and size as a
+    /// fraction of the destination's work area, leaves the source
+    /// display's visual window order, joins the end of the
+    /// destination's, and each display reflows once.
     Throw {
         #[command(subcommand)]
         direction: ThrowDirection,

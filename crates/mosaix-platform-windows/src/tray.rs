@@ -158,7 +158,9 @@ fn show_balloon(hwnd: HWND, status: TrayStatus, title: &str, body: &str) {
         hIcon: current_icon(status),
         ..Default::default()
     };
-    let _ = unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) };
+    if !unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) }.as_bool() {
+        tracing::debug!(title, "the shell refused a tray balloon");
+    }
 }
 
 fn add_or_modify(hwnd: HWND, status: TrayStatus, message: NOTIFY_ICON_MESSAGE) {
@@ -621,14 +623,20 @@ mod tests {
         assert_eq!(long[3], 0, "the last slot stays the terminator");
     }
 
-    /// A queued balloon that is never pumped must not wedge the caller,
-    /// and a stopped tray must drop it rather than queue it forever.
+    /// A queued balloon must not wedge shutdown.
+    ///
+    /// `notify` posts to the tray thread's own message loop, which is the
+    /// same loop `stop` needs to service in order to exit. If a queued
+    /// balloon blocked that loop, `stop` would hang here rather than
+    /// return, so reaching the assertion is the assertion.
     #[test]
-    fn notify_on_a_stopped_tray_queues_nothing() {
+    fn a_queued_balloon_does_not_wedge_tray_shutdown() {
         let (tray, _events) = start_tray().expect("tray starts");
         tray.notify("title", "body");
-        std::thread::sleep(Duration::from_millis(50));
         tray.stop();
+
+        // Reached only if `stop` returned, which means the loop drained.
+        assert!(start_tray().is_ok(), "the tray can be started again");
     }
 
 }

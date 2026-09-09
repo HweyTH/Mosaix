@@ -29,7 +29,9 @@ pub enum IpcError {
     #[error("connection failed: mosaix may not be running")]
     ConnectionFailed,
     #[error(
-        "connection refused: the mosaix agent is running at a different privilege level.          Start the agent and this command with the same elevation."
+        "connection refused: the mosaix agent is running at a different \
+         privilege level. Start the agent and this command with the same \
+         elevation."
     )]
     AccessDenied,
     #[error("the mosaix agent closed the connection")]

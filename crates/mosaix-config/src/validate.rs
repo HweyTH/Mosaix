@@ -145,7 +145,9 @@ pub enum ValidationError {
     WorkspaceSwitchingInBaseConfig { file: String },
 
     #[error(
-        "{file}: [[rules]] belongs in base config, never in a topology profile;          a window's management decision must not change when a monitor is unplugged"
+        "{file}: [[rules]] belongs in base config, never in a topology \
+         profile; a window's management decision must not change when a \
+         monitor is unplugged"
     )]
     RulesInProfile { file: String },
 
