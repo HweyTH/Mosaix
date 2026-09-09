@@ -2266,4 +2266,38 @@ chat = "ctrl+alt+2"
         );
     }
 
+
+    /// `edit_bindings` and `edit_layouts` rewrite config.toml by
+    /// round-tripping this struct, so rules have to survive a write they
+    /// had nothing to do with. The array of tables also has to serialize
+    /// after every other table, which is TOML's rule rather than serde's,
+    /// and is decided here by field order alone.
+    #[test]
+    fn a_config_carrying_both_layouts_and_rules_round_trips() {
+        let source = format!(
+            "{VALID_BASE}
+             [[layouts.writing.cells]]
+             x = 0.0
+             y = 0.0
+             width = 0.6
+             height = 1.0
+             
+             [[rules]]
+             id = \"float-calc\"
+             match.application_id = \"calc\"
+             actions.manage = \"float\"
+"
+        );
+
+        let parsed: BaseConfig = toml::from_str(&source).expect("the fixture parses");
+        let rewritten = toml::to_string_pretty(&parsed).expect("and serializes");
+        let reparsed: BaseConfig = toml::from_str(&rewritten)
+            .unwrap_or_else(|error| panic!("a rewrite must re-parse: {error}
+{rewritten}"));
+
+        assert_eq!(reparsed, parsed, "a rewrite loses nothing");
+        assert_eq!(reparsed.rules.len(), 1);
+        assert_eq!(reparsed.layouts.len(), 1);
+    }
+
 }
