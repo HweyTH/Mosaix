@@ -36,8 +36,7 @@ A keyboard-driven tiling window manager for Windows 11.
 
 ## Status
 
-Pre-release. Windows 11 only, and there are no binary releases yet -- see
-[Installation](#installation).
+Pre-release. Windows 11 only -- see [Installation](#installation).
 
 - The **macOS adapter is not implemented**; `mosaix-platform-macos` is a stub.
   The name "cross-platform" describes the architecture, not today's build.
@@ -52,8 +51,10 @@ Pre-release. Windows 11 only, and there are no binary releases yet -- see
 
 ## Installation
 
-There are no binary releases yet. Build from source -- see
-[Building from source](#building-from-source).
+Download the latest zip from
+[GitHub Releases](https://github.com/HweyTH/Mosaix/releases), extract it,
+and place `mosaix-agent.exe` and `mosaix.exe` somewhere on your `PATH`.
+Alternatively, [build from source](#building-from-source).
 
 On first run the agent writes a default configuration to
 `%APPDATA%\Mosaix\config\config.toml` and adds a tray icon.
