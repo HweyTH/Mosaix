@@ -5,7 +5,6 @@
 A keyboard-driven tiling window manager for Windows 11.
 
 [![CI](https://github.com/HweyTH/Mosaix/actions/workflows/ci.yml/badge.svg)](https://github.com/HweyTH/Mosaix/actions/workflows/ci.yml)
-[![Latest release](https://img.shields.io/github/v/release/HweyTH/Mosaix)](https://github.com/HweyTH/Mosaix/releases/latest)
 
 [Installation](#installation) · [Keybindings](#default-keybindings) · [Configuration](#configuration) · [CLI](#cli) · [Documentation](#documentation)
 
