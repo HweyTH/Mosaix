@@ -1,0 +1,48 @@
+version: 2
+
+updates:
+  # The workspace ships binaries, and Cargo.lock is tracked, so cargo
+  # updates change what a release is actually built from.
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      cargo-minor-and-patch:
+        update-types:
+          - "minor"
+          - "patch"
+    ignore:
+      # glib reaches this tree only through Tauri's GTK stack
+      # (tauri -> muda/tao -> gtk -> atk -> glib), which pins 0.18.x. The
+      # advisory wants 0.20.0, so no resolvable upgrade exists until Tauri
+      # moves, and Dependabot fails the run on every push while it retries.
+      # Nothing ships from it either: the release builds are Windows-only
+      # and glib is absent from that target's graph entirely.
+      - dependency-name: "glib"
+
+  # The settings app is a separate lockfile and needs its own entry.
+  - package-ecosystem: "npm"
+    directory: "/apps/mosaix-settings"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      npm-minor-and-patch:
+        update-types:
+          - "minor"
+          - "patch"
+
+  # CI and release both pin actions by major version, so these updates are
+  # what keeps the pins current.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "chore(ci)"
