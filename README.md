@@ -4,6 +4,9 @@
 
 A keyboard-driven tiling window manager for Windows 11.
 
+[![CI](https://github.com/HweyTH/Mosaix/actions/workflows/ci.yml/badge.svg)](https://github.com/HweyTH/Mosaix/actions/workflows/ci.yml)
+[![Latest release](https://img.shields.io/github/v/release/HweyTH/Mosaix)](https://github.com/HweyTH/Mosaix/releases/latest)
+
 [Installation](#installation) · [Keybindings](#default-keybindings) · [Configuration](#configuration) · [CLI](#cli) · [Documentation](#documentation)
 
 ## Key features
@@ -36,8 +39,7 @@ A keyboard-driven tiling window manager for Windows 11.
 
 ## Status
 
-Pre-release. Windows 11 only, and there are no binary releases yet -- see
-[Installation](#installation).
+Pre-release. Windows 11 only -- see [Installation](#installation).
 
 - The **macOS adapter is not implemented**; `mosaix-platform-macos` is a stub.
   The name "cross-platform" describes the architecture, not today's build.
@@ -52,13 +54,10 @@ Pre-release. Windows 11 only, and there are no binary releases yet -- see
 
 ## Installation
 
-No binary release is published yet, so
-[build from source](#building-from-source) for now.
-
-Once a version is tagged, each release at
-[GitHub Releases](https://github.com/HweyTH/Mosaix/releases) carries a zip
-for Windows: extract it and place `mosaix-agent.exe` and `mosaix.exe`
-somewhere on your `PATH`.
+Download the latest zip from
+[GitHub Releases](https://github.com/HweyTH/Mosaix/releases/latest), extract
+it, and place `mosaix-agent.exe` and `mosaix.exe` somewhere on your `PATH`.
+Alternatively, [build from source](#building-from-source).
 
 On first run the agent writes a default configuration to
 `%APPDATA%\Mosaix\config\config.toml` and adds a tray icon.
