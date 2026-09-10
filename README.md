@@ -38,7 +38,8 @@ A keyboard-driven tiling window manager for Windows 11.
 
 ## Status
 
-Pre-release. Windows 11 only -- see [Installation](#installation).
+Pre-release: `v0.1.0` is the first tagged build. Windows 11 only -- see
+[Installation](#installation).
 
 - The **macOS adapter is not implemented**; `mosaix-platform-macos` is a stub.
   The name "cross-platform" describes the architecture, not today's build.
@@ -186,8 +187,11 @@ with npm for the settings app.
 ```powershell
 git clone https://github.com/HweyTH/Mosaix.git
 cd Mosaix
-cargo build --release
+cargo build --release --locked
 ```
+
+`--locked` builds against the tracked `Cargo.lock`, so you get the same
+dependency versions the released binaries were built from.
 
 Start the background agent:
 
