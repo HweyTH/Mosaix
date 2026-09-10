@@ -1,10 +1,13 @@
 //! Live probe of the macOS recovery and parking surface against the real
 //! windows on this machine. Read-only: it never moves a window.
 
+#[cfg(target_os = "macos")]
 use std::collections::BTreeMap;
 
+#[cfg(target_os = "macos")]
 use mosaix_platform_macos as mac;
 
+#[cfg(target_os = "macos")]
 fn main() {
     println!(
         "Accessibility trusted: {}",
@@ -77,9 +80,15 @@ fn main() {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn on_screen_window_ids() -> Vec<u32> {
     // Reuse the adapter's own frontmost walk by asking for a wide range of
     // ids is not possible; instead probe the ids the window server hands
     // out for on-screen windows via the public list.
     mac::on_screen_window_ids()
 }
+
+/// There is no live macOS window server to probe on other platforms,
+/// but an example target needs a `main` wherever the workspace builds.
+#[cfg(not(target_os = "macos"))]
+fn main() {}
